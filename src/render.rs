@@ -151,16 +151,10 @@ impl Renderer {
             if y >= pane_rows {
                 continue;
             }
-            let mut style = Style::default();
-            style.reverse = true;
-            let mut x = pv.rect.x;
-            let x_end = pv.rect.x.saturating_add(pv.rect.w);
-            for ch in "[exited]".chars() {
-                if x >= x_end || x >= cols {
-                    break;
-                }
+            let style = Style { reverse: true, ..Style::default() };
+            let x_end = pv.rect.x.saturating_add(pv.rect.w).min(cols);
+            for (x, ch) in (pv.rect.x..x_end).zip("[exited]".chars()) {
                 self.set(x, y, Cell { ch, style });
-                x += 1;
             }
         }
 
@@ -172,15 +166,13 @@ impl Renderer {
         let cols_u = cols as usize;
         let (style, message) = match &scene.message {
             Some(m) => {
-                let mut s = Style::default();
-                s.fg = Color::Idx(0); // black
-                s.bg = Color::Idx(3); // yellow
+                // black on yellow
+                let s = Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() };
                 (s, Some(m.clone()))
             }
             None => {
-                let mut s = Style::default();
-                s.fg = Color::Idx(0); // black
-                s.bg = Color::Idx(2); // green
+                // black on green
+                let s = Style { fg: Color::Idx(0), bg: Color::Idx(2), ..Style::default() };
                 (s, None)
             }
         };

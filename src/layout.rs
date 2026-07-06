@@ -190,6 +190,8 @@ impl Layout {
         v
     }
 
+    // is_empty is not part of the locked contract; a Layout is never empty.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.panes().len()
     }
@@ -419,12 +421,12 @@ impl Layout {
         let mut target: Option<usize> = None;
         {
             let mut node = &self.root;
-            for i in 0..path.len() {
+            for (i, &step) in path.iter().enumerate() {
                 if let Node::Split { dir: sd, first, second, .. } = node {
-                    if *sd == orient && path[i] == !want_first {
+                    if *sd == orient && step != want_first {
                         target = Some(i);
                     }
-                    node = if path[i] { &**second } else { &**first };
+                    node = if step { &**second } else { &**first };
                 } else {
                     break;
                 }

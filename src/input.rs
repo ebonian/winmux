@@ -68,6 +68,12 @@ fn flush_forward(fwd: &mut Vec<u8>, out: &mut Vec<InputEvent>) {
     }
 }
 
+impl Default for InputMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputMachine {
     pub fn new() -> Self {
         InputMachine {
