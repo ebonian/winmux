@@ -39,17 +39,22 @@ pub struct Layout {
 // ---- pure geometry helpers -------------------------------------------------
 
 /// First child's length along the split axis, per the contract formula:
-/// round((L - 1) * ratio). Requires L >= 1 (callers guard this).
+/// round((L - 1) * ratio), computed totally: saturates at 0 for L == 0 and
+/// the result is clamped to the available length, so it never exceeds L - 1.
 fn child_first(l: u16, ratio: f32) -> u16 {
-    (((l - 1) as f32) * ratio).round() as u16
+    let avail = l.saturating_sub(1);
+    ((avail as f32) * ratio).round().min(avail as f32) as u16
 }
 
 /// The two child rects of a split, EXCLUDING the single border row/column.
+/// Total: never panics; on areas too small to hold both children plus the
+/// border, the children degrade to zero-size rects (downstream minimum
+/// checks handle those).
 fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
     match dir {
         SplitDir::Horizontal => {
             let c1 = child_first(area.w, ratio);
-            let c2 = area.w - 1 - c1;
+            let c2 = area.w.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: c1, h: area.h },
                 Rect { x: area.x + c1 + 1, y: area.y, w: c2, h: area.h },
@@ -57,7 +62,7 @@ fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
         }
         SplitDir::Vertical => {
             let c1 = child_first(area.h, ratio);
-            let c2 = area.h - 1 - c1;
+            let c2 = area.h.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: area.w, h: c1 },
                 Rect { x: area.x, y: area.y + c1 + 1, w: area.w, h: c2 },
@@ -312,5 +317,62 @@ mod tests {
     fn constants_match_contract() {
         assert_eq!(MIN_PANE_W, 2);
         assert_eq!(MIN_PANE_H, 2);
+    }
+
+    /// Every returned rect's w/h must fit within `area` (zero sizes allowed);
+    /// rects with nonzero size must additionally lie fully inside `area`.
+    fn assert_rects_fit(rects: &[(PaneId, Rect)], area: Rect) {
+        for (id, r) in rects {
+            assert!(
+                r.w <= area.w && r.h <= area.h,
+                "pane {id} rect {r:?} exceeds area {area:?} dimensions"
+            );
+            if r.w > 0 && r.h > 0 {
+                assert!(
+                    r.x >= area.x
+                        && r.y >= area.y
+                        && (r.x as u32 + r.w as u32) <= (area.x as u32 + area.w as u32)
+                        && (r.y as u32 + r.h as u32) <= (area.y as u32 + area.h as u32),
+                    "pane {id} rect {r:?} does not fit in area {area:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rects_do_not_panic_on_tiny_area() {
+        // Build H(Leaf1, Leaf2) on a normal area, then ask for rects with
+        // areas smaller than the tree's structural needs. The geometry must
+        // be total: no underflow panic, rects degrade to zero size but stay
+        // within the area.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+
+        let zero_w = Rect { x: 0, y: 0, w: 0, h: 24 };
+        let r = l.rects(zero_w);
+        assert_eq!(r.len(), 2);
+        assert_rects_fit(&r, zero_w);
+
+        let one_by_one = Rect { x: 0, y: 0, w: 1, h: 1 };
+        let r = l.rects(one_by_one);
+        assert_eq!(r.len(), 2);
+        assert_rects_fit(&r, one_by_one);
+    }
+
+    #[test]
+    fn split_refused_on_tiny_area_tree_unchanged() {
+        // Same tiny areas: split must refuse (not panic) and leave the tree
+        // unchanged.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+
+        let zero_w = Rect { x: 0, y: 0, w: 0, h: 24 };
+        assert_eq!(l.split(SplitDir::Horizontal, 3, zero_w), Err(SplitRefused));
+        let one_by_one = Rect { x: 0, y: 0, w: 1, h: 1 };
+        assert_eq!(l.split(SplitDir::Vertical, 3, one_by_one), Err(SplitRefused));
+
+        assert_eq!(l.panes(), vec![1, 2]);
+        assert_eq!(l.focused(), 2);
+        assert_eq!(l.len(), 2);
     }
 }
