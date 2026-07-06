@@ -333,49 +333,59 @@ impl TermState {
                 90..=97 => self.style.fg = Color::Idx((flat[i] - 90 + 8) as u8),
                 100..=107 => self.style.bg = Color::Idx((flat[i] - 100 + 8) as u8),
                 38 => {
-                    if i + 1 < flat.len() {
-                        match flat[i + 1] {
-                            5 => {
-                                if i + 2 < flat.len() {
-                                    self.style.fg = Color::Idx(flat[i + 2] as u8);
-                                    i += 2;
-                                }
+                    // Extended fg color. A truncated or unknown-mode sequence
+                    // makes the rest of the params unparseable: discard them
+                    // (break) rather than reinterpret color args as SGR codes.
+                    if i + 1 >= flat.len() {
+                        break;
+                    }
+                    match flat[i + 1] {
+                        5 => {
+                            if i + 2 >= flat.len() {
+                                break;
                             }
-                            2 => {
-                                if i + 4 < flat.len() {
-                                    self.style.fg = Color::Rgb(
-                                        flat[i + 2] as u8,
-                                        flat[i + 3] as u8,
-                                        flat[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
+                            self.style.fg = Color::Idx(flat[i + 2] as u8);
+                            i += 2;
                         }
+                        2 => {
+                            if i + 4 >= flat.len() {
+                                break;
+                            }
+                            self.style.fg = Color::Rgb(
+                                flat[i + 2] as u8,
+                                flat[i + 3] as u8,
+                                flat[i + 4] as u8,
+                            );
+                            i += 4;
+                        }
+                        _ => break,
                     }
                 }
                 48 => {
-                    if i + 1 < flat.len() {
-                        match flat[i + 1] {
-                            5 => {
-                                if i + 2 < flat.len() {
-                                    self.style.bg = Color::Idx(flat[i + 2] as u8);
-                                    i += 2;
-                                }
+                    // Extended bg color; same discard-on-truncation rule.
+                    if i + 1 >= flat.len() {
+                        break;
+                    }
+                    match flat[i + 1] {
+                        5 => {
+                            if i + 2 >= flat.len() {
+                                break;
                             }
-                            2 => {
-                                if i + 4 < flat.len() {
-                                    self.style.bg = Color::Rgb(
-                                        flat[i + 2] as u8,
-                                        flat[i + 3] as u8,
-                                        flat[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
+                            self.style.bg = Color::Idx(flat[i + 2] as u8);
+                            i += 2;
                         }
+                        2 => {
+                            if i + 4 >= flat.len() {
+                                break;
+                            }
+                            self.style.bg = Color::Rgb(
+                                flat[i + 2] as u8,
+                                flat[i + 3] as u8,
+                                flat[i + 4] as u8,
+                            );
+                            i += 4;
+                        }
+                        _ => break,
                     }
                 }
                 _ => {}
@@ -997,6 +1007,41 @@ mod tests {
         let d = g.cell(3, 0);
         assert!(!d.style.underline);
         assert!(!d.style.reverse);
+    }
+
+    #[test]
+    fn sgr_truncated_extended_colors_ignored() {
+        // Truncated extended-color sequences must be discarded, not
+        // reinterpreted: [38,2,30] is NOT "dim + fg black".
+        let mut g = Grid::new(5, 1);
+        g.feed(b"\x1b[38;2;30mA"); // truecolor fg missing g,b
+        let a = g.cell(0, 0);
+        assert!(!a.style.dim);
+        assert_eq!(a.style.fg, Color::Default);
+        g.feed(b"\x1b[48;2mB"); // truecolor bg missing r,g,b
+        let b = g.cell(1, 0);
+        assert!(!b.style.dim);
+        assert_eq!(b.style.fg, Color::Default);
+        assert_eq!(b.style.bg, Color::Default);
+        g.feed(b"\x1b[1;38;2mC"); // params before the truncated introducer apply
+        let c = g.cell(2, 0);
+        assert!(c.style.bold);
+        assert_eq!(c.style.fg, Color::Default);
+    }
+
+    #[test]
+    fn il_dl_noop_outside_scroll_region() {
+        // IL/DL with the cursor outside the DECSTBM region must not move rows.
+        let mut g = Grid::new(3, 4);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
+        g.feed(b"\x1b[2;3r"); // region indices 1..2
+        g.feed(b"\x1b[4;1H"); // cursor row index 3, outside region
+        g.feed(b"\x1b[L");
+        g.feed(b"\x1b[M");
+        assert_eq!(row_str(&g, 0), "aaa");
+        assert_eq!(row_str(&g, 1), "bbb");
+        assert_eq!(row_str(&g, 2), "ccc");
+        assert_eq!(row_str(&g, 3), "ddd");
     }
 
     #[test]
