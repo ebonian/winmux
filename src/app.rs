@@ -21,7 +21,7 @@ use crate::host::{self, Host};
 use crate::input::{Action, InputEvent, InputMachine};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::pty::Pty;
-use crate::render::{PaneView, Renderer, Scene};
+use crate::render::{PaneView, Renderer, Scene, StatusSpan};
 
 /// Shell launched in every pane (single window/session MVP).
 const SHELL: &str = "powershell.exe -NoLogo";
@@ -151,7 +151,18 @@ fn render(
         None
     };
 
-    let status_left = "[winmux] 0:powershell*".to_string();
+    // Single-window MVP status text "[winmux] 0:powershell*", split into two
+    // spans matching the new Scene shape. The window span is `underline:
+    // false` (rather than tmux's true-for-current) to keep this module's
+    // hardcoded byte-stream assertions (see tests/e2e.rs) stable; sub-project
+    // 2's real multi-window status line (src/status.rs) does underline the
+    // current window.
+    let status_spans = || {
+        vec![
+            StatusSpan { text: "[winmux] ".to_string(), underline: false },
+            StatusSpan { text: "0:powershell*".to_string(), underline: false },
+        ]
+    };
 
     // Terminal too small: blank panes, message override, no cursor.
     if too_small {
@@ -159,7 +170,7 @@ fn render(
             size,
             panes: Vec::new(),
             zoomed,
-            status_left,
+            status_spans: status_spans(),
             status_right: clock.to_string(),
             message,
         };
@@ -199,7 +210,7 @@ fn render(
         size,
         panes: views,
         zoomed,
-        status_left,
+        status_spans: status_spans(),
         status_right: clock.to_string(),
         message,
     };

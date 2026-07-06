@@ -217,13 +217,32 @@ pub struct PaneView<'a> {
     pub dead: bool,
 }
 
+/// One run of status-bar text; `underline` draws it with SGR 4 (tmux
+/// `window-status-current-style` = `underscore` default). Built by
+/// `status::status_spans` — see the sibling `2026-07-07-server-client-interfaces.md`
+/// "status" section for the span-composition rule.
+///
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-07, Task 5):** `Scene::status_left:
+/// String` was replaced by `Scene::status_spans: Vec<StatusSpan>` so the
+/// status bar can render a real window list with the current window
+/// underlined, instead of one opaque left-aligned string. `app.rs` (the MVP
+/// single-window loop, removed in a later sub-project-2 task) adapts by
+/// building two spans, `"[winmux] "` and `"0:powershell*"`, both
+/// `underline: false` — chosen over tmux's true-for-current so this module's
+/// existing hardcoded byte-stream assertions stay stable; it does not use
+/// `status::status_spans`.
+pub struct StatusSpan {
+    pub text: String,
+    pub underline: bool,
+}
+
 pub struct Scene<'a> {
     /// Host terminal size (cols, rows). The status bar is the bottom row;
     /// panes live in rows 0..rows-1.
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
     pub zoomed: bool,
-    pub status_left: String,   // e.g. "[winmux] 0:powershell*"
+    pub status_spans: Vec<StatusSpan>,  // e.g. spans for "[winmux] 0:powershell*"
     pub status_right: String,  // e.g. "21:04 06-Jul-26"
     /// When Some, the status row shows this message instead (confirm prompt,
     /// "terminal too small"), styled bg yellow(SGR 43) fg black(30) like tmux
@@ -256,9 +275,16 @@ impl Renderer {
   (tmux default `pane-active-border-style fg=green`). When zoomed, no borders.
 - Dead pane: its grid still renders; the string `[exited]` is overlaid in
   reverse video at the pane rect's top-left.
-- Status bar (bottom row): bg green (42) fg black (30), tmux default.
-  `status_left` at col 0, `status_right` right-aligned; middle padded with
-  spaces; truncate right-first if too narrow.
+- Status bar (bottom row): bg green (42) fg black (30), tmux default (bg
+  yellow 43 fg black 30 when `message` overrides). `status_spans` drawn
+  left-to-right starting at col 0, each span's cells carrying the status-row
+  style with `underline` set from that span (SGR is always emitted as one
+  combined `\x1b[0;...m` sequence per style change — see `sgr()` — so an
+  underlined span's SGR includes `4`, and the following non-underlined span's
+  SGR simply omits it; there is no separate SGR 24 reset), then
+  `status_right` right-aligned; middle padded with spaces; truncate
+  right-first if too narrow (left length for this purpose is the sum of all
+  spans' char counts).
 - Diff emission: for each changed cell, emit minimal CUP (skip if the cursor is
   already adjacent from the previous emitted cell) + SGR (only on style change)
   + the char. UTF-8 encode chars. Reset SGR (CSI 0m) at stream end.

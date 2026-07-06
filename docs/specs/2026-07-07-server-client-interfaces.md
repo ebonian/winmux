@@ -245,3 +245,54 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 (no-op arms with a `wired up by server (sub-project 2)` comment); a later
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
+
+## `status` — status-line span builder (pure, Task 5)
+
+```rust
+// status.rs
+pub struct WindowEntry {
+    pub index: u32,
+    pub name: String,
+    pub current: bool,
+    pub last: bool,
+    pub zoomed: bool,
+}
+
+pub fn status_spans(session_name: &str, windows: &[WindowEntry]) -> Vec<StatusSpan>;
+```
+
+`StatusSpan { text: String, underline: bool }` is defined in `render.rs` (see
+the **LOCKED-CONTRACT AMENDMENT** in `2026-07-06-mvp-interfaces.md`'s `render`
+section: `Scene::status_left: String` → `Scene::status_spans:
+Vec<StatusSpan>`). `status.rs` is pure bookkeeping with no dependency on
+`model.rs`; a caller (future server/client wiring task) maps a `Session`'s
+`Window`s to `WindowEntry`s (`current`/`last` from `Session::current`/`last`,
+`zoomed` from `Window::layout.is_zoomed()`).
+
+**Span composition** (index order as given in `windows`):
+1. One span `"[<session_name>] "` (trailing space included), `underline: false`.
+2. Per window, one span `"<index>:<name><flags>"`, `underline: true` iff
+   `current`, else `false`.
+3. Between window spans (not after the last one), a separate single-space
+   span `" "`, `underline: false` — the separator itself is never underlined,
+   even when the window before or after it is current.
+
+**Flags string** for a window (exact rule — resolves the apparent ambiguity
+between "else a literal space" and "else empty" phrasings that circulated
+during design; empty is correct and is what's implemented/tested):
+- `*` if `current`, else `-` if `last`, else nothing (empty).
+- Then `Z` appended if `zoomed`.
+- So: current+zoomed → `*Z`; last+zoomed → `-Z`; zoomed only (neither current
+  nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
+  all → bare `<index>:<name>` (e.g. `2:logs`).
+
+**Render integration:** `render::compose_back`'s status-bar step draws
+`status_spans` left-to-right from column 0 (each span's cells get the
+status-row style — green bg/black fg, or yellow/black under a `message`
+override — with that span's `underline` flag set on the style), then
+`status_right` right-aligned as before; the "total left length" used for
+right-truncation is the summed char count of all spans' text.
+
+**Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
+exact expected `Vec<(String, bool)>` span vectors (mirrors `render.rs`'s
+exact-VT-bytes test style).
