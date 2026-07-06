@@ -10,7 +10,8 @@ use std::ptr;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_BROKEN_PIPE, HANDLE};
 use windows::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, ResizePseudoConsole,
+    CONSOLE_MODE, COORD, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
@@ -25,6 +26,29 @@ const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 /// Map a `windows::core::Error` into a `std::io::Error` (HRESULT as raw OS error).
 fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0)
+}
+
+/// True if any of OUR OWN std streams (stdin/stdout/stderr) is not a live
+/// console — i.e. it is null/invalid or redirected to a pipe/file (as under
+/// `cargo test` or any harness). In that state, CreateProcessW's legacy
+/// std-handle duplication would leak the redirected handles into a
+/// pseudoconsole child; `spawn` uses this to decide whether to suppress it.
+fn parent_stdio_is_redirected() -> bool {
+    unsafe {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = match GetStdHandle(which) {
+                Ok(h) if !h.is_invalid() => h,
+                // Error, null, or INVALID_HANDLE_VALUE: not a live console.
+                _ => return true,
+            };
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(handle, &mut mode).is_err() {
+                // Valid handle but not a console (pipe/file redirection).
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// RAII guard for the pseudoconsole during `spawn`: closes it if any later
@@ -153,23 +177,31 @@ impl Pty {
             // 6. STARTUPINFOEXW with cb = size of the extended struct and the
             //    attribute list attached.
             //
-            //    IMPORTANT (deviation from the brief): also set
-            //    STARTF_USESTDHANDLES with the std handle fields left null/zero
-            //    (the default). Without this flag, when OUR OWN process's
-            //    standard handles are themselves redirected (e.g. under a test
-            //    harness, or `cargo test | tee`), Windows' legacy CreateProcess
-            //    behavior duplicates those redirected handles into the child's
-            //    standard handles even though `bInheritHandles` is FALSE and even
-            //    though a pseudoconsole is attached via the proc-thread
-            //    attribute. That causes the child's stdout to bypass the
-            //    pseudoconsole pipes entirely and write to wherever our own
-            //    stdout was redirected. Setting STARTF_USESTDHANDLES with null
-            //    handles suppresses that legacy duplication so the child relies
-            //    solely on the ConPTY attribute for its console. See
-            //    https://github.com/microsoft/terminal/discussions/15814.
+            //    STARTF_USESTDHANDLES (with the std handle fields left
+            //    null/zero) is set ONLY when our own stdio is redirected. Both
+            //    sides matter:
+            //
+            //    - Redirected parent (test harness, `cargo test | tee`):
+            //      without the flag, CreateProcessW's legacy behavior
+            //      duplicates our redirected std handles into the child even
+            //      though bInheritHandles is FALSE and a pseudoconsole is
+            //      attached, so the child's output bypasses the ConPTY pipes
+            //      entirely. The null-handle trick suppresses that duplication
+            //      (microsoft/terminal discussion #15814).
+            //
+            //    - Console parent (normal interactive winmux): leave the flag
+            //      absent, matching what interactive terminal hosts (e.g.
+            //      Windows Terminal) do. There is no leak-through hazard here:
+            //      console-type std handles are not duplicated into a child
+            //      that has its own (pseudo)console; the child receives fresh
+            //      handles to its own console either way. Only setting the
+            //      flag when actually needed keeps the interactive path on
+            //      the default, well-trodden ConPTY startup behavior.
             let mut si_ex = STARTUPINFOEXW::default();
             si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            si_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            if parent_stdio_is_redirected() {
+                si_ex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+            }
             si_ex.lpAttributeList = attr_list;
 
             // 7. CreateProcessW may write to the command-line buffer, so it must

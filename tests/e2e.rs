@@ -113,6 +113,30 @@ fn e2e_split_kill_exit() {
         screen_text(&grid).join("\n")
     );
 
+    // 1b. The pane's PowerShell prompt appears and PSReadLine loaded. winmux
+    //     itself runs under THIS test's ConPTY, so winmux's own stdio IS a
+    //     console and its panes take the no-STARTF_USESTDHANDLES path — the
+    //     same path interactive use takes. If spawn nulled the pane's std
+    //     handles, PSReadLine would fail its GetStdHandle probe and print
+    //     "Cannot load PSReadline module. Console is running without
+    //     PSReadline."
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            screen_text(&grid).iter().any(|l| l.contains("PS "))
+        }),
+        "PowerShell prompt 'PS ' never appeared in the pane; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    assert!(
+        !screen_text(&grid)
+            .iter()
+            .any(|l| l.to_lowercase().contains("psreadline")),
+        "pane PowerShell reported a PSReadline failure; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
     // 2. Split vertically: Ctrl-b %  → a `│` border column appears.
     pty.write_input(b"\x02%").expect("send split");
     let deadline = Instant::now() + Duration::from_secs(15);
