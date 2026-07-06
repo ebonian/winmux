@@ -64,6 +64,8 @@ struct TermState {
 
 impl TermState {
     fn new(cols: u16, rows: u16) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         TermState {
             cols,
             rows,
@@ -183,6 +185,8 @@ impl TermState {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let mut new_cells = vec![Cell::default(); cols as usize * rows as usize];
         let copy_cols = cols.min(self.cols) as usize;
         let copy_rows = rows.min(self.rows) as usize;
@@ -345,6 +349,8 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Create a grid. Dimensions are clamped to a 1x1 minimum: a grid is
+    /// never zero-sized.
     pub fn new(cols: u16, rows: u16) -> Self {
         Grid { parser: Parser::new(), state: TermState::new(cols, rows) }
     }
@@ -355,6 +361,8 @@ impl Grid {
         }
     }
 
+    /// Resize the grid, preserving the overlapping region. Dimensions are
+    /// clamped to a 1x1 minimum: a grid is never zero-sized.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.state.resize(cols, rows);
     }
@@ -577,6 +585,24 @@ mod tests {
         let y = g.cell(1, 0);
         assert_eq!(y.style.fg, Color::Default);
         assert_eq!(y.style.bg, Color::Default);
+    }
+
+    #[test]
+    fn zero_size_new_clamps_to_1x1() {
+        let mut g = Grid::new(0, 0);
+        assert_eq!(g.cols(), 1);
+        assert_eq!(g.rows(), 1);
+        g.feed(b"\x1b[5;5Hx"); // must not panic
+        assert_eq!(g.cell(0, 0).ch, 'x');
+    }
+
+    #[test]
+    fn zero_size_resize_clamps_to_1x1() {
+        let mut g = Grid::new(5, 5);
+        g.resize(0, 5);
+        assert_eq!(g.cols(), 1);
+        assert_eq!(g.rows(), 5);
+        g.feed(b"\x1b[2;2HX\x1b[1;1C"); // must not panic
     }
 
     #[test]
