@@ -9,4 +9,5 @@ pub mod pipe;
 pub mod protocol;
 pub mod pty;
 pub mod render;
+pub mod server;
 pub mod status;

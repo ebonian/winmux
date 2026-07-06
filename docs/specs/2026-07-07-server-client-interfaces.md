@@ -320,3 +320,124 @@ right-truncation is the summed char count of all spans' text.
 
 **Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
 exact expected `Vec<(String, bool)>` span vectors (mirrors `render.rs`'s
+exact-VT-bytes test style).
+
+## `server` — headless multiplexer server (Task 6)
+
+```rust
+pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>>;
+```
+
+That is the ENTIRE public surface of `src/server.rs`; every type named below
+(`ServerEvent`, `PaneRuntime`, `ClientState`, `ClientMode`, `Server`, and the
+various free helper functions) is private to the module.
+
+**Behavior:**
+
+- `run` binds `pipe_full_name` via `pipe::PipeListener::bind`, spawns an
+  accept thread (`while let Ok(conn) = listener.accept() { ... }`, sending
+  `ServerEvent::Connected`), then loops: `recv_timeout(50ms)` on a single
+  `mpsc<ServerEvent>` (falling back to a synthetic `Tick` on timeout), then
+  drains every immediately-available further event via `try_recv` before
+  rendering once (follow-up #4's coalescing). Every attached client is
+  re-rendered on any dirty turn (see "Design choices" below) — not a
+  per-session dirty set.
+- `run` returns `Ok(())` once the registry has held at least one session
+  AND is now empty (`had_session` flag guards against mistaking a
+  never-yet-used server for exit-empty at startup). It does not touch the
+  console and installs no panic hook (both remain `main.rs`'s job, Task 8).
+- **Attach** (`ClientMsg::Attach`): `NewAuto` mints an auto session name and
+  always succeeds (barring pane-spawn failure); `NewNamed` checks for a
+  duplicate name up front (`Exit{1, "duplicate session: <n>"}`) before
+  spawning a pane, and rolls the pane back if `Registry::create_session`
+  still rejects the name (bad chars); `Existing` resolves the name via
+  `Registry::find` (tmux `-t` prefix rules) and — when `detach_others` is
+  set — sends every OTHER client currently attached to that session a plain
+  `Exit{0, "[detached]"}` (distinct from the named `Detach`-action/-frame
+  message) before attaching the new one. First window is always index 0,
+  name `powershell`; shell is `powershell.exe -NoLogo`. A fresh `Renderer`
+  is constructed and immediately `resize()`d to its own dimensions (forcing
+  `force_full`) so the very first `compose()` is a guaranteed full repaint.
+- **Session size**: `min(cols)` x `min(rows - 1)` over all clients attached
+  to that session (the `- 1` reserves the client's own bottom row for its
+  status bar, which is not part of the shared pane area); recomputed on
+  attach, `Resize` frame, detach (frame or action), and client disconnect.
+  No attached clients: keeps the last size. `apply_layout` (private,
+  mirrors `app.rs`'s function of the same name but keyed by `HashMap`
+  instead of a flat `Vec`) then resizes every pane whose rect changed.
+- **Input routing**: `Stdin` frames are fed to the client's own
+  `InputMachine`; the resulting events are dispatched one at a time against
+  live `Registry`/pane state. `Split`/`Focus`/`FocusNext`/`FocusLast`/
+  `ToggleZoom`/`Resize` mutate the session's current window's `Layout`
+  directly. `RequestClose` arms `ClientMode::ConfirmKillPane(pane_id)` +
+  `InputMachine::set_confirming(true)`; the render-time message text is
+  `kill-pane <idx>? (y/n)` where `<idx>` is that pane's position in
+  `layout.panes()` (recomputed at render time, not cached). Confirming
+  removes the pane (or, if it was the window's only pane, destroys the
+  whole session — same "last pane" logic as a natural process exit).
+  `Action::Detach` and the `Detach` frame both end in the SAME per-client
+  teardown: `Exit{0, "[detached (from session <name>)]"}`, size/layout
+  recomputed for any clients left. Window/session `Action` variants
+  (`NewWindow`, `NextWindow`, ..., `RenameSession`) and `InputEvent::Captured`
+  are explicit, listed no-op arms — Task 7's job — not a wildcard, so adding
+  a new `Action` variant without updating this module is a compile error,
+  not a silent no-op.
+- **Pane exit**: the waiter thread's `ServerEvent::Exited(pane_id)` drops
+  that pane's `Pty` immediately (`PaneRuntime.pty = None`, follow-up #1) and
+  marks it dead. If every pane in the session's (only, in this task's
+  scope) window is now dead, the session is destroyed exactly like a
+  confirmed last-pane kill: every attached client gets
+  `Exit{0, "[exited]"}`.
+- **`Cli` frames** get a stub reply: `CliDone{1, "", "unknown command"}`
+  (Task 7 implements real commands).
+- **Confirm race (follow-up #2): left open, by design choice.** `Ctrl-b x`
+  immediately followed by `y` in the SAME `Stdin` frame still races exactly
+  as in the MVP — `InputMachine::feed` tokenizes the whole frame before this
+  module gets a chance to call `set_confirming`, so the `y` is forwarded to
+  the pane instead of confirming. This is one of the two options the task
+  brief sanctioned (structurally fix vs. leave documented); chosen here to
+  avoid a fiddly re-interpretation pass given the interactive impact is
+  minor (an errant `y` reaching a shell prompt) and no test exercises the
+  same-frame case.
+- **Test thread lifecycle** (`tests/server_proto.rs`): each test uses a
+  unique pipe name. Where the test's own flow naturally destroys every
+  session (most of them, via `exit` in the last shell), the server thread
+  is joined to prove clean exit-empty shutdown. `attach_missing_session_error`
+  never creates a session, so its server thread is intentionally left
+  running (detached) — safe because its pipe name is unique to that test
+  and the process exits at the end of the test binary regardless.
+- **Thread-shutdown note**: `run`'s accept thread is not joined or
+  cancelled when `run` returns — it is left blocked in `PipeListener::accept`
+  (or, in practice, simply abandoned) since nothing will ever connect to a
+  now-unbound name. This is intentional: the only real caller (`main.rs`,
+  Task 8) exits the whole process immediately after `run` returns, which
+  reclaims the thread; there is currently no in-process "stop the server
+  and keep the process alive" path.
+
+**Internal shape** (private; matches the design spec's sketch with one
+documented simplification): `ServerEvent::{Output(PaneId, Vec<u8>),
+Exited(PaneId), Connected(PipeConn), FromClient(ClientId, ClientMsg),
+ClientGone(ClientId), Tick}`; `PaneRuntime{pty: Option<Pty>, grid: Grid,
+dead: bool}`; `ClientState{session: Option<String>, cols: u16, rows: u16,
+renderer: Renderer, input: InputMachine, mode: ClientMode, tx:
+Sender<Vec<u8>>}`. `ClientMode` here is only `{Normal,
+ConfirmKillPane(PaneId)}` — the design sketch's `ConfirmKillWindow`/`Prompt`
+variants are Task 7's (window ops) concern and are deliberately NOT modeled
+yet, to avoid unused-variant dead code under `-D warnings`; Task 7 adding
+them is not a breaking change to anything outside this module, since none
+of this is public.
+
+**A bug found and fixed along the way:** `src/pipe.rs`'s handles were not
+overlapped (`FILE_FLAG_OVERLAPPED`), which meant a pending blocking read on
+one `try_clone`'d duplicate serialized against (and forever blocked) a write
+on another duplicate of the same connection — a real deadlock hit while
+implementing this module's mandatory reader-thread/writer-thread-per-client
+shape. Fixed in `pipe.rs` itself (see its `## pipe` section above and the
+module's own doc comment); `PipeListener`/`PipeConn`'s public signatures are
+unchanged. Regression coverage:
+`tests/pipe_smoke.rs::write_on_one_clone_does_not_block_behind_a_pending_read_on_another`.
+
+**Implementation module:** `src/server.rs`. Consumes `protocol`, `pipe`,
+`model`, `input`, `render`, `status`, `pty`, `grid`, `layout`; produces only
+`pub fn run`. Integration-tested end to end (no console, no ConPTY on the
+client side) by `tests/server_proto.rs`'s 9 tests.
