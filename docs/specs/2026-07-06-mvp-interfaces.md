@@ -4,6 +4,12 @@
 signatures exactly. If a signature must change during implementation, the change
 must be applied consistently to every consumer named here.
 
+**Amendment (sub-project 2, Task 4):** the `input` section below was extended
+with new `Action` variants (window/session/detach bindings), a new
+`InputEvent::Captured` variant, and a new `InputMachine::set_capture` method.
+See [`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md)
+for the session/window model these new actions dispatch into.
+
 **Parent spec:** [`2026-07-06-multiplexing-mvp-design.md`](2026-07-06-multiplexing-mvp-design.md)
 
 ## Crate layout
@@ -274,6 +280,19 @@ pub enum Action {
     ToggleZoom,      // prefix z
     Resize(Direction), // prefix Ctrl-arrow, repeatable
     Quit,            // internal: not bound to a key in MVP (app exits when last pane dies)
+    // --- Added in sub-project 2 (see docs/specs/2026-07-07-server-client-interfaces.md
+    // for the window/session model these dispatch into): ---
+    NewWindow,          // prefix c
+    NextWindow,         // prefix n
+    PrevWindow,         // prefix p
+    LastWindow,         // prefix l
+    SelectWindow(u32),  // prefix 0-9 (digit value, not the ASCII byte)
+    RequestKillWindow,  // prefix &
+    RenameWindow,       // prefix ,
+    RenameSession,      // prefix $
+    Detach,             // prefix d
+    SwitchClientPrev,   // prefix (
+    SwitchClientNext,   // prefix )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +302,11 @@ pub enum InputEvent {
     Action(Action),
     /// Emitted while confirming a close: true = confirmed (y/Y), false = cancelled.
     ConfirmClose(bool),
+    /// Added in sub-project 2. Emitted only while capture mode is on
+    /// (`set_capture(true)`): raw, uninterpreted bytes for a status-line
+    /// prompt (e.g. rename-window line editing), coalesced per `feed()`
+    /// call like `Forward`.
+    Captured(Vec<u8>),
 }
 
 pub struct InputMachine { /* private */ }
@@ -295,6 +319,16 @@ impl InputMachine {
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<InputEvent>;
     /// App arms/disarms confirm mode after Action::RequestClose.
     pub fn set_confirming(&mut self, on: bool);
+    /// Added in sub-project 2. Turn raw capture mode on/off. While on,
+    /// `feed()` bypasses all state-machine dispatch (Prefixed/Repeat/
+    /// Confirming) and returns every byte verbatim as `InputEvent::Captured`
+    /// — including the prefix byte and escape sequences (no parsing).
+    /// Turning on clears any pending escape-sequence buffer and prefix
+    /// state, mirroring `set_confirming`. Capture takes precedence over
+    /// Confirming if both were somehow set (capture is checked first in
+    /// `feed()`, independently of the underlying `state`). Turning off
+    /// resumes Normal.
+    pub fn set_capture(&mut self, on: bool);
 }
 
 pub const PREFIX: u8 = 0x02;                       // Ctrl-b
@@ -314,12 +348,23 @@ pub const REPEAT_TIME: std::time::Duration = std::time::Duration::from_millis(50
   - `0x02` again → `Forward(vec![0x02])` (send literal Ctrl-b)
   - anything else → disarm silently (swallow the key).
   - An incomplete `ESC`-sequence tail is buffered until the next `feed`.
+  - Added in sub-project 2, also consumed and returning to Normal: `c` →
+    `NewWindow`; `n` → `NextWindow`; `p` → `PrevWindow`; `l` → `LastWindow`;
+    `0`..=`9` → `SelectWindow(digit)` (u32 digit value, not the ASCII byte);
+    `&` → `RequestKillWindow`; `,` → `RenameWindow`; `$` → `RenameSession`;
+    `d` → `Detach`; `(` → `SwitchClientPrev`; `)` → `SwitchClientNext`.
 - Repeat: a Ctrl-arrow within the window → another `Resize` and the window
   restarts. Any other input → leave Repeat, process that input as Normal.
 - Confirming (set via `set_confirming(true)`): next key `y`/`Y` →
   `ConfirmClose(true)`; any other key → `ConfirmClose(false)`. Either way the
   machine returns to Normal (the app also calls `set_confirming(false)`).
   Keys in this mode are consumed, never forwarded.
+- Capture (added in sub-project 2, set via `set_capture(true)`): every byte,
+  regardless of what `state` would otherwise dispatch to — including the
+  prefix byte and escape sequences — comes out as `Captured(bytes)`, raw and
+  unparsed, coalesced per `feed()` call. This check happens before any
+  `state` match, so capture wins even over Confirming if both flags were
+  somehow set at once. `set_capture(false)` resumes Normal.
 
 ## `pty` — ConPTY wrapper
 

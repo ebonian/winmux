@@ -331,7 +331,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Action::Quit => exit = true,
+                            // Window/session actions: wired up by server (sub-project 2).
+                            Action::NewWindow
+                            | Action::NextWindow
+                            | Action::PrevWindow
+                            | Action::LastWindow
+                            | Action::SelectWindow(_)
+                            | Action::RequestKillWindow
+                            | Action::RenameWindow
+                            | Action::RenameSession
+                            | Action::Detach
+                            | Action::SwitchClientPrev
+                            | Action::SwitchClientNext => {}
                         },
+                        InputEvent::Captured(_) => {
+                            // Raw capture mode: wired up by server (sub-project 2).
+                        }
                         InputEvent::ConfirmClose(confirmed) => {
                             input.set_confirming(false);
                             let target = confirm_pane.take();

@@ -227,3 +227,21 @@ impl Session {
 **Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
 APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends
 only on `crate::layout` (`Layout`, `PaneId`) and `std`.
+
+## `input` — window/session bindings and capture mode (Task 4 amendment)
+
+`src/input.rs` (locked by
+[`2026-07-06-mvp-interfaces.md`](2026-07-06-mvp-interfaces.md)) gained new
+`Action` variants — `NewWindow`, `NextWindow`, `PrevWindow`, `LastWindow`,
+`SelectWindow(u32)`, `RequestKillWindow`, `RenameWindow`, `RenameSession`,
+`Detach`, `SwitchClientPrev`, `SwitchClientNext` — bound from the Prefixed
+state (`c n p l 0-9 & , $ d ( )` respectively), a new `InputEvent::Captured
+(Vec<u8>)` variant, and a new `InputMachine::set_capture(&mut self, on:
+bool)` method for raw byte passthrough (status-line prompts: rename-window,
+rename-session). Full details, including capture-vs-confirming precedence,
+are in the amended `input` section of `2026-07-06-mvp-interfaces.md` — this
+entry is only a cross-reference for readers starting from this document.
+None of these new `Action` variants are dispatched by `src/app.rs` yet
+(no-op arms with a `wired up by server (sub-project 2)` comment); a later
+task wires them into `Registry`/`Session` (defined above) and the
+server/client loop.
