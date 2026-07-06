@@ -214,6 +214,81 @@ impl Renderer {
         }
     }
 
+    /// Reallocate both buffers to the new size and invalidate the front buffer
+    /// so the next compose() emits a full repaint preceded by CSI 2J.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        let n = cols as usize * rows as usize;
+        self.front = vec![Cell::default(); n];
+        self.back = vec![Cell::default(); n];
+        self.force_full = true;
+    }
+
+    /// Compose the scene into the back buffer, diff it against the front buffer,
+    /// emit the minimal VT byte stream, swap buffers, and return the bytes.
+    pub fn compose(
+        &mut self,
+        scene: &Scene,
+        cursor: Option<(u16, u16)>,
+        cursor_visible: bool,
+    ) -> Vec<u8> {
+        self.compose_back(scene);
+
+        let mut out: Vec<u8> = Vec::new();
+        if self.force_full {
+            out.extend_from_slice(b"\x1b[2J");
+        }
+
+        let cols = self.cols as usize;
+        let mut last_pos: Option<(u16, u16)> = None; // real cursor after last emit
+        let mut cur_style: Option<Style> = None; // last SGR emitted
+
+        for y in 0..self.rows {
+            for x in 0..self.cols {
+                let idx = y as usize * cols + x as usize;
+                let b = self.back[idx];
+                let f = self.front[idx];
+                if !self.force_full && b == f {
+                    continue;
+                }
+                // CUP only when not already positioned at (x, y)
+                let need_move = !matches!(last_pos, Some((lx, ly)) if lx == x && ly == y);
+                if need_move {
+                    out.extend_from_slice(cup(x, y).as_bytes());
+                }
+                // SGR only on style change
+                if cur_style != Some(b.style) {
+                    out.extend_from_slice(sgr(&b.style).as_bytes());
+                    cur_style = Some(b.style);
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(b.ch.encode_utf8(&mut buf).as_bytes());
+                last_pos = Some((x + 1, y)); // advanced one column right
+            }
+        }
+
+        // trailing reset if any style was emitted
+        if cur_style.is_some() {
+            out.extend_from_slice(b"\x1b[0m");
+        }
+
+        // cursor placement
+        match cursor {
+            Some((cx, cy)) if cursor_visible => {
+                out.extend_from_slice(cup(cx, cy).as_bytes());
+                out.extend_from_slice(b"\x1b[?25h");
+            }
+            _ => {
+                out.extend_from_slice(b"\x1b[?25l");
+            }
+        }
+
+        std::mem::swap(&mut self.front, &mut self.back);
+        self.force_full = false;
+        out
+    }
+
     #[cfg(test)]
     fn back_cell(&self, x: u16, y: u16) -> Cell {
         self.back[y as usize * self.cols as usize + x as usize]
@@ -242,6 +317,67 @@ fn border_glyph(up: bool, down: bool, left: bool, right: bool) -> char {
         (false, false, false, true) => '─',
         (false, false, false, false) => '─',
     }
+}
+
+fn cup(x: u16, y: u16) -> String {
+    format!("\x1b[{};{}H", y + 1, x + 1)
+}
+
+/// Build a single combined SGR sequence `\x1b[0;...m` from a Style.
+fn sgr(s: &Style) -> String {
+    let mut parts: Vec<String> = vec!["0".to_string()];
+    if s.bold {
+        parts.push("1".to_string());
+    }
+    if s.dim {
+        parts.push("2".to_string());
+    }
+    if s.italic {
+        parts.push("3".to_string());
+    }
+    if s.underline {
+        parts.push("4".to_string());
+    }
+    if s.reverse {
+        parts.push("7".to_string());
+    }
+    // foreground
+    match s.fg {
+        Color::Default => parts.push("39".to_string()),
+        Color::Idx(n) if n < 8 => parts.push((30 + n as u16).to_string()),
+        Color::Idx(n) if n < 16 => parts.push((90 + n as u16 - 8).to_string()),
+        Color::Idx(n) => {
+            parts.push("38".to_string());
+            parts.push("5".to_string());
+            parts.push(n.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            parts.push("38".to_string());
+            parts.push("2".to_string());
+            parts.push(r.to_string());
+            parts.push(g.to_string());
+            parts.push(b.to_string());
+        }
+    }
+    // background
+    match s.bg {
+        Color::Default => parts.push("49".to_string()),
+        Color::Idx(n) if n < 8 => parts.push((40 + n as u16).to_string()),
+        Color::Idx(n) if n < 16 => parts.push((100 + n as u16 - 8).to_string()),
+        Color::Idx(n) => {
+            parts.push("48".to_string());
+            parts.push("5".to_string());
+            parts.push(n.to_string());
+        }
+        Color::Rgb(r, g, b) => {
+            parts.push("48".to_string());
+            parts.push("2".to_string());
+            parts.push(r.to_string());
+            parts.push(g.to_string());
+            parts.push(b.to_string());
+        }
+    }
+    format!("\x1b[{}m", parts.join(";"))
 }
 
 #[cfg(test)]
@@ -423,5 +559,134 @@ mod tests {
         let mut r = Renderer::new(7, 2);
         r.compose_back(&scene);
         assert_eq!(r.back_cell(3, 0).ch, ' '); // gap left blank, no box char
+    }
+
+    // Helper: a fresh 4x2 renderer with one full-width pane over the top row
+    // and an empty (green) status bar on the bottom row. Returns nothing;
+    // callers build the Scene inline so the borrowed grid can be mutated
+    // between composes.
+
+    #[test]
+    fn single_cell_change_emits_only_that_cell() {
+        let mut g = grid_with(4, 1, b"ab");
+        let mut r = Renderer::new(4, 2);
+
+        // prime: front <- back (discard the output)
+        {
+            let scene = Scene {
+                size: (4, 2),
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                zoomed: false,
+                status_left: String::new(),
+                status_right: String::new(),
+                message: None,
+            };
+            let _ = r.compose(&scene, Some((0, 0)), true);
+        }
+
+        // change exactly cell (0,0): 'a' -> 'X'
+        g.feed(b"\x1b[1;1HX");
+
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status_left: String::new(),
+            status_right: String::new(),
+            message: None,
+        };
+        let out = r.compose(&scene, Some((1, 0)), true);
+        let got = String::from_utf8_lossy(&out);
+        let want = "\x1b[1;1H\x1b[0;39;49mX\x1b[0m\x1b[1;2H\x1b[?25h";
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn adjacent_changes_coalesce_one_cup_one_sgr() {
+        let mut g = grid_with(4, 1, b"ab");
+        let mut r = Renderer::new(4, 2);
+        {
+            let scene = Scene {
+                size: (4, 2),
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                zoomed: false,
+                status_left: String::new(),
+                status_right: String::new(),
+                message: None,
+            };
+            let _ = r.compose(&scene, Some((0, 0)), true);
+        }
+
+        // change (0,0) and (1,0): "ab" -> "XY"
+        g.feed(b"\x1b[1;1HXY");
+
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status_left: String::new(),
+            status_right: String::new(),
+            message: None,
+        };
+        let out = r.compose(&scene, Some((2, 0)), true);
+        let got = String::from_utf8_lossy(&out);
+        // one CUP, one SGR, "XY" as a single run
+        let want = "\x1b[1;1H\x1b[0;39;49mXY\x1b[0m\x1b[1;3H\x1b[?25h";
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn hidden_cursor_when_not_visible_and_no_change() {
+        let g = grid_with(4, 1, b"ab");
+        let mut r = Renderer::new(4, 2);
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status_left: String::new(),
+            status_right: String::new(),
+            message: None,
+        };
+        let _ = r.compose(&scene, Some((0, 0)), true); // prime
+        // identical recompose, cursor hidden -> no diff bytes, just hide
+        let out = r.compose(&scene, Some((0, 0)), false);
+        assert_eq!(String::from_utf8_lossy(&out), "\x1b[?25l");
+    }
+
+    #[test]
+    fn resize_forces_full_repaint() {
+        let g = grid_with(4, 1, b"ab");
+        let mut r = Renderer::new(4, 2);
+        {
+            let scene = Scene {
+                size: (4, 2),
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                zoomed: false,
+                status_left: String::new(),
+                status_right: String::new(),
+                message: None,
+            };
+            let _ = r.compose(&scene, Some((0, 0)), true); // prime
+        }
+
+        r.resize(4, 2); // invalidates front
+
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status_left: String::new(),
+            status_right: String::new(),
+            message: None,
+        };
+        let out = r.compose(&scene, Some((0, 0)), true);
+        let got = String::from_utf8_lossy(&out);
+        // full repaint: 2J, then every cell in row-major order.
+        // row0 "ab  " default style; row1 "    " status style (green bg).
+        let want = "\x1b[2J\
+\x1b[1;1H\x1b[0;39;49mab  \
+\x1b[2;1H\x1b[0;30;42m    \
+\x1b[0m\x1b[1;1H\x1b[?25h";
+        assert_eq!(got, want);
     }
 }
