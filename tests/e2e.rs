@@ -155,7 +155,10 @@ fn e2e_split_kill_exit() {
     pty.write_input(b"exit\r").expect("send exit");
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
-        wait_until(deadline, || process_exited(proc_raw)),
+        wait_until(deadline, || {
+            pump(&mut grid, &rx); // keep the failure screen-dump current
+            process_exited(proc_raw)
+        }),
         "winmux process did not exit within 15s after 'exit'; screen:\n{}",
         screen_text(&grid).join("\n")
     );

@@ -8,9 +8,9 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCP, SetConsoleMode,
-    SetConsoleOutputCP, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN,
-    ENABLE_EXTENDED_FLAGS, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle,
+    SetConsoleCP, SetConsoleMode, SetConsoleOutputCP, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO,
+    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_EXTENDED_FLAGS, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
@@ -33,6 +33,8 @@ struct RestoreState {
     stdout: isize,
     stdin_mode: u32,
     stdout_mode: u32,
+    input_cp: u32,
+    output_cp: u32,
 }
 
 /// Populated by `Host::enter`; read by both `Drop` and the panic hook so both
@@ -40,13 +42,16 @@ struct RestoreState {
 static RESTORE: Mutex<Option<RestoreState>> = Mutex::new(None);
 
 /// Best-effort, infallible, idempotent restoration. Leaves alt-screen, shows
-/// cursor, resets SGR, then restores the saved console modes. Every error is
-/// ignored — restoration must never fail or panic.
+/// cursor, resets SGR, then restores the saved console modes and the saved
+/// input/output code pages. Every error is ignored — restoration must never
+/// fail or panic.
 unsafe fn apply_restore(
     stdin: HANDLE,
     stdout: HANDLE,
     stdin_mode: CONSOLE_MODE,
     stdout_mode: CONSOLE_MODE,
+    input_cp: u32,
+    output_cp: u32,
 ) {
     // CSI ?1049l = leave alt screen, CSI ?25h = show cursor, CSI 0m = reset SGR.
     let seq = b"\x1b[?1049l\x1b[?25h\x1b[0m";
@@ -54,6 +59,8 @@ unsafe fn apply_restore(
     let _ = WriteFile(stdout, Some(seq), Some(&mut written), None);
     let _ = SetConsoleMode(stdout, stdout_mode);
     let _ = SetConsoleMode(stdin, stdin_mode);
+    let _ = SetConsoleOutputCP(output_cp);
+    let _ = SetConsoleCP(input_cp);
 }
 
 pub struct Host {
@@ -61,6 +68,8 @@ pub struct Host {
     stdout: HANDLE,
     saved_stdin: CONSOLE_MODE,
     saved_stdout: CONSOLE_MODE,
+    saved_input_cp: u32,
+    saved_output_cp: u32,
 }
 
 impl Host {
@@ -69,12 +78,15 @@ impl Host {
             let stdin = GetStdHandle(STD_INPUT_HANDLE).map_err(win_err)?;
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE).map_err(win_err)?;
 
-            // Force UTF-8 in and out. Without this, the console's default
-            // (locale-dependent, often OEM 437) code page mangles every
-            // multi-byte UTF-8 byte we write (e.g. the box-drawing border
-            // chars) or read, decoding/encoding each raw byte individually
-            // instead of treating the stream as UTF-8. Best-effort: a
-            // failure here is not fatal to starting winmux.
+            // Save the current code pages, then force UTF-8 in and out.
+            // Without UTF-8, the console's default (locale-dependent, often
+            // OEM 437) code page mangles every multi-byte UTF-8 byte we write
+            // (e.g. the box-drawing border chars) or read, decoding/encoding
+            // each raw byte individually instead of treating the stream as
+            // UTF-8. Best-effort: a failure here is not fatal to starting
+            // winmux. The saved pages are restored by Drop / the panic hook.
+            let saved_output_cp = GetConsoleOutputCP();
+            let saved_input_cp = GetConsoleCP();
             let _ = SetConsoleOutputCP(CP_UTF8);
             let _ = SetConsoleCP(CP_UTF8);
 
@@ -110,9 +122,18 @@ impl Host {
                 stdout: stdout.0 as isize,
                 stdin_mode: saved_stdin.0,
                 stdout_mode: saved_stdout.0,
+                input_cp: saved_input_cp,
+                output_cp: saved_output_cp,
             });
 
-            let mut host = Host { stdin, stdout, saved_stdin, saved_stdout };
+            let mut host = Host {
+                stdin,
+                stdout,
+                saved_stdin,
+                saved_stdout,
+                saved_input_cp,
+                saved_output_cp,
+            };
             // Enter alt screen, clear it, home the cursor.
             host.write(b"\x1b[?1049h\x1b[2J\x1b[H")?;
             Ok(host)
@@ -154,7 +175,14 @@ impl Drop for Host {
     fn drop(&mut self) {
         // Infallible: apply_restore ignores every error internally.
         unsafe {
-            apply_restore(self.stdin, self.stdout, self.saved_stdin, self.saved_stdout);
+            apply_restore(
+                self.stdin,
+                self.stdout,
+                self.saved_stdin,
+                self.saved_stdout,
+                self.saved_input_cp,
+                self.saved_output_cp,
+            );
         }
     }
 }
@@ -176,6 +204,8 @@ pub fn install_panic_hook() {
                     HANDLE(r.stdout as *mut c_void),
                     CONSOLE_MODE(r.stdin_mode),
                     CONSOLE_MODE(r.stdout_mode),
+                    r.input_cp,
+                    r.output_cp,
                 );
             }
         }
