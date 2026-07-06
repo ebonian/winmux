@@ -89,7 +89,9 @@ impl Host {
             SetConsoleMode(stdin, new_stdin).map_err(win_err)?;
 
             // Publish the restore snapshot for Drop and the panic hook.
-            *RESTORE.lock().unwrap() = Some(RestoreState {
+            // Recover from mutex poisoning: the data is a plain POD snapshot,
+            // still valid even if another thread panicked while holding the lock.
+            *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(RestoreState {
                 stdin: stdin.0 as isize,
                 stdout: stdout.0 as isize,
                 stdin_mode: saved_stdin.0,
@@ -150,16 +152,17 @@ impl Drop for Host {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Ok(guard) = RESTORE.lock() {
-            if let Some(r) = guard.as_ref() {
-                unsafe {
-                    apply_restore(
-                        HANDLE(r.stdin as *mut c_void),
-                        HANDLE(r.stdout as *mut c_void),
-                        CONSOLE_MODE(r.stdin_mode),
-                        CONSOLE_MODE(r.stdout_mode),
-                    );
-                }
+        // Recover from mutex poisoning: restoration must run even if another
+        // thread panicked while holding the lock (the snapshot is plain POD).
+        let guard = RESTORE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = guard.as_ref() {
+            unsafe {
+                apply_restore(
+                    HANDLE(r.stdin as *mut c_void),
+                    HANDLE(r.stdout as *mut c_void),
+                    CONSOLE_MODE(r.stdin_mode),
+                    CONSOLE_MODE(r.stdout_mode),
+                );
             }
         }
         previous(info);
