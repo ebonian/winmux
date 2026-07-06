@@ -88,3 +88,62 @@ false, cols: 80, rows: 24, name: "main" }` encodes to:
 no unsafe, no Windows APIs, no dependency on any other new module. Works
 identically over a named pipe handle, a TCP stream, or an in-memory
 `Vec<u8>`/`Cursor` (as the unit tests do).
+
+## `pipe` — named-pipe transport (Windows)
+
+```rust
+pub fn pipe_name(socket_name: &str) -> String; // "\\.\pipe\winmux-<username>-<socket_name>"
+
+pub struct PipeListener; // opaque: owns nothing between accepts
+impl PipeListener {
+    pub fn bind(full_name: &str) -> std::io::Result<PipeListener>;
+    pub fn accept(&self) -> std::io::Result<PipeConn>;
+}
+
+pub struct PipeConn; // opaque: HANDLE wrapped in std::fs::File
+impl PipeConn {
+    pub fn connect(full_name: &str) -> std::io::Result<PipeConn>;
+    pub fn try_clone(&self) -> std::io::Result<PipeConn>;
+}
+impl std::io::Read for PipeConn { ... }
+impl std::io::Write for PipeConn { ... }
+```
+
+**Behavior:**
+
+- `pipe_name` builds `\\.\pipe\winmux-<username>-<socket_name>`. `<username>`
+  comes from `GetUserNameW` (`"unknown"` on failure); both `<username>` and
+  `<socket_name>` are sanitized by keeping `[A-Za-z0-9_-]` and replacing every
+  other character with `_`.
+- `PipeListener::bind` calls `CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX,
+  PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+  64*1024, 64*1024, 0, None)` and **holds** the resulting instance — this
+  proves the name is creatable before `bind` returns. The first `accept`
+  consumes that held instance; every subsequent `accept` creates a fresh
+  instance via the same `CreateNamedPipeW` call before waiting on it. Each
+  `accept` blocks in `ConnectNamedPipe`; a client that connects in the race
+  window before `ConnectNamedPipe` is called surfaces as `ERROR_PIPE_CONNECTED`,
+  which `accept` treats as success rather than an error.
+- `PipeConn::connect` calls `CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
+  0, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)`. `ERROR_FILE_NOT_FOUND`
+  (no server bound to that name) maps to `io::ErrorKind::NotFound` — the CLI's
+  "no server running" signal. `ERROR_PIPE_BUSY` (instance limit momentarily
+  exhausted) triggers one `WaitNamedPipeW(name, 2000)` wait followed by exactly
+  one retry of `CreateFileW`.
+- Reads map `ERROR_BROKEN_PIPE`/`ERROR_PIPE_NOT_CONNECTED` to `Ok(0)` (clean
+  EOF), matching `src/pty.rs`'s `ERROR_BROKEN_PIPE` convention. Writes pass
+  through `std::fs::File`'s `Write` impl unchanged.
+- Windows-rs wraps a failed call's `GetLastError()` code as an HRESULT
+  (`HRESULT_FROM_WIN32`); `pipe.rs` unwraps that back to the raw Win32 code
+  before constructing an `io::Error` so `.kind()` classification (e.g.
+  `NotFound`) matches what calling `GetLastError()` directly would give.
+
+**Cargo.toml:** requires the `Win32_System_WindowsProgramming` feature (for
+`GetUserNameW`), added alongside the already-enabled `Win32_System_Pipes`
+(`CreateNamedPipeW`/`ConnectNamedPipe`/`WaitNamedPipeW`) and
+`Win32_Storage_FileSystem` (`CreateFileW`).
+
+**Implementation module:** `src/pipe.rs`. Depends only on `windows` Win32
+APIs and `std`; does not depend on `protocol` (frames flow over `PipeConn`
+via its `Read`/`Write` impls, exercised together in
+`tests/pipe_smoke.rs::roundtrip_client_server`).
