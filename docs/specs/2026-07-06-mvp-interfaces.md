@@ -32,10 +32,15 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 ```
+
+(`Win32_System_IO` was added during implementation: windows 0.58 gates
+`ReadFile`/`WriteFile` behind it. The `app` task adds
+`Win32_System_SystemInformation` for `GetLocalTime`.)
 
 `vte` is pinned to 0.13: `Parser::advance(&mut performer, byte)` takes a single
 byte. If a pinned version fails to resolve or compile, the implementer may bump
