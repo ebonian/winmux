@@ -46,6 +46,50 @@ fn roundtrip_client_server() {
     server.join().expect("server thread panicked");
 }
 
+/// Regression test for a real deadlock hit while building `src/server.rs`
+/// (Task 6): a `try_clone`'d duplicate of a connection must support a
+/// blocking read that never completes on ONE duplicate while a write
+/// proceeds independently on ANOTHER duplicate of the same connection —
+/// exactly the reader-thread / writer-thread-per-client shape the server
+/// architecture requires. Before `pipe.rs` opened handles with
+/// `FILE_FLAG_OVERLAPPED`, a pending synchronous `ReadFile` on one duplicate
+/// serialized against (and forever blocked) a `WriteFile` on another
+/// duplicate of the same underlying pipe object.
+#[test]
+fn write_on_one_clone_does_not_block_behind_a_pending_read_on_another() {
+    let name = unique_pipe_name("clone-concurrency");
+    let listener = PipeListener::bind(&name).expect("bind pipe");
+
+    let server = thread::spawn(move || {
+        let conn = listener.accept().expect("accept connection");
+        let mut reader_conn = conn.try_clone().expect("clone for reader");
+        let mut writer_conn = conn;
+
+        // Reader half: consume one frame, then block forever waiting for a
+        // second one that the client never sends.
+        let reader = thread::spawn(move || {
+            let _ = read_client_msg(&mut reader_conn).expect("read first frame");
+            let _ = read_client_msg(&mut reader_conn); // blocks; thread is abandoned
+        });
+
+        // Give the reader thread time to be solidly parked in its second
+        // (never-satisfied) read before attempting the write.
+        thread::sleep(std::time::Duration::from_millis(200));
+        write_server_msg(&mut writer_conn, &ServerMsg::Exit { code: 0, msg: "ok".to_string() })
+            .expect("write must not block behind the other clone's pending read");
+
+        let _ = reader; // never joined: it blocks forever by design
+    });
+
+    let mut client = PipeConn::connect(&name).expect("client connect");
+    write_client_msg(&mut client, &ClientMsg::Stdin(vec![1, 2, 3])).expect("client write");
+    let reply = read_server_msg(&mut client).expect("client read reply");
+    assert_eq!(reply, ServerMsg::Exit { code: 0, msg: "ok".to_string() });
+
+    drop(client);
+    server.join().expect("server thread panicked");
+}
+
 /// Connecting to a pipe nobody has bound must surface as `NotFound` — the
 /// CLI's "no server running" signal.
 #[test]

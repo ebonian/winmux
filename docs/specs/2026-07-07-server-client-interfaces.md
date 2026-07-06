@@ -115,33 +115,58 @@ impl std::io::Write for PipeConn { ... }
   comes from `GetUserNameW` (`"unknown"` on failure); both `<username>` and
   `<socket_name>` are sanitized by keeping `[A-Za-z0-9_-]` and replacing every
   other character with `_`.
-- `PipeListener::bind` calls `CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX,
-  PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
-  64*1024, 64*1024, 0, None)` and **holds** the resulting instance — this
-  proves the name is creatable before `bind` returns. The first `accept`
-  consumes that held instance; every subsequent `accept` creates a fresh
-  instance via the same `CreateNamedPipeW` call before waiting on it. Each
-  `accept` blocks in `ConnectNamedPipe`; a client that connects in the race
+- `PipeListener::bind` calls `CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX |
+  FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+  PIPE_UNLIMITED_INSTANCES, 64*1024, 64*1024, 0, None)` and **holds** the
+  resulting instance — this proves the name is creatable before `bind`
+  returns. The first `accept` consumes that held instance; every subsequent
+  `accept` creates a fresh instance via the same `CreateNamedPipeW` call
+  before waiting on it. Each `accept` blocks in `ConnectNamedPipe` (issued
+  with an `OVERLAPPED` and waited out via `GetOverlappedResult(..., bWait:
+  TRUE)` when it doesn't complete synchronously — required because the
+  handle is overlapped, see below); a client that connects in the race
   window before `ConnectNamedPipe` is called surfaces as `ERROR_PIPE_CONNECTED`,
   which `accept` treats as success rather than an error.
 - `PipeConn::connect` calls `CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
-  0, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)`. `ERROR_FILE_NOT_FOUND`
-  (no server bound to that name) maps to `io::ErrorKind::NotFound` — the CLI's
-  "no server running" signal. `ERROR_PIPE_BUSY` (instance limit momentarily
-  exhausted) triggers one `WaitNamedPipeW(name, 2000)` wait followed by exactly
-  one retry of `CreateFileW`.
+  0, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, None)`.
+  `ERROR_FILE_NOT_FOUND` (no server bound to that name) maps to
+  `io::ErrorKind::NotFound` — the CLI's "no server running" signal.
+  `ERROR_PIPE_BUSY` (instance limit momentarily exhausted) triggers one
+  `WaitNamedPipeW(name, 2000)` wait followed by exactly one retry of
+  `CreateFileW`.
+- **Every handle is opened with `FILE_FLAG_OVERLAPPED`** (added during Task
+  6). `Read`/`Write` issue raw `ReadFile`/`WriteFile` calls against a
+  private-per-`PipeConn` auto-reset event (bypassing `std::fs::File`'s own
+  read/write, which cannot be used on a handle opened this way) and block
+  via `GetOverlappedResult(..., bWait: TRUE)` until that specific call
+  completes — so from the outside, `Read`/`Write` are still plain blocking
+  calls. This is a correctness fix, not an optimization: a
+  *non*-overlapped handle serializes ALL synchronous I/O against the
+  underlying file object, including across `try_clone`'d duplicates of the
+  same handle. A blocking read parked on one duplicate (e.g. a per-client
+  reader thread waiting for the next frame) would stall a write on
+  *another* duplicate of the very same connection (e.g. a writer thread
+  sending a reply) forever — discovered as a real deadlock while building
+  `src/server.rs`, whose architecture requires exactly that shape (one
+  reader thread + one writer thread per client, each with its own cloned
+  `PipeConn`). Every `PipeConn` (including each `try_clone`) gets its OWN
+  event; sharing one across concurrently-used duplicates would let one
+  operation's completion spuriously wake a wait on an unrelated operation.
+  Regression coverage: `tests/pipe_smoke.rs::write_on_one_clone_does_not_block_behind_a_pending_read_on_another`.
 - Reads map `ERROR_BROKEN_PIPE`/`ERROR_PIPE_NOT_CONNECTED` to `Ok(0)` (clean
-  EOF), matching `src/pty.rs`'s `ERROR_BROKEN_PIPE` convention. Writes pass
-  through `std::fs::File`'s `Write` impl unchanged.
+  EOF), matching `src/pty.rs`'s `ERROR_BROKEN_PIPE` convention.
 - Windows-rs wraps a failed call's `GetLastError()` code as an HRESULT
   (`HRESULT_FROM_WIN32`); `pipe.rs` unwraps that back to the raw Win32 code
   before constructing an `io::Error` so `.kind()` classification (e.g.
   `NotFound`) matches what calling `GetLastError()` directly would give.
 
 **Cargo.toml:** requires the `Win32_System_WindowsProgramming` feature (for
-`GetUserNameW`), added alongside the already-enabled `Win32_System_Pipes`
-(`CreateNamedPipeW`/`ConnectNamedPipe`/`WaitNamedPipeW`) and
-`Win32_Storage_FileSystem` (`CreateFileW`).
+`GetUserNameW`), alongside the already-enabled `Win32_System_Pipes`
+(`CreateNamedPipeW`/`ConnectNamedPipe`/`WaitNamedPipeW`), `Win32_Storage_FileSystem`
+(`CreateFileW`/`ReadFile`/`WriteFile`/`FILE_FLAG_OVERLAPPED`), and — added in
+Task 6 for overlapped I/O — `Win32_System_IO` (`OVERLAPPED`,
+`GetOverlappedResult`) and `Win32_Security` (required by the `CreateEventW`
+binding used for each `PipeConn`'s completion event).
 
 **Implementation module:** `src/pipe.rs`. Depends only on `windows` Win32
 APIs and `std`; does not depend on `protocol` (frames flow over `PipeConn`
@@ -295,4 +320,3 @@ right-truncation is the summed char count of all spans' text.
 
 **Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
 exact expected `Vec<(String, bool)>` span vectors (mirrors `render.rs`'s
-exact-VT-bytes test style).
