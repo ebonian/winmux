@@ -46,6 +46,14 @@ impl Default for Cell {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SavedCursor {
+    col: u16,
+    row: u16,
+    style: Style,
+    autowrap: bool,
+}
+
 /// Emulator state; the vte performer. Separate from the Parser so `feed`
 /// can borrow the parser and this state disjointly.
 struct TermState {
@@ -60,6 +68,7 @@ struct TermState {
     cursor_visible: bool,
     scroll_top: u16,
     scroll_bottom: u16,
+    saved: Option<SavedCursor>,
 }
 
 impl TermState {
@@ -78,6 +87,7 @@ impl TermState {
             cursor_visible: true,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            saved: None,
         }
     }
 
@@ -104,6 +114,137 @@ impl TermState {
                 }
             }
         }
+    }
+
+    /// Scroll the region [scroll_top, scroll_bottom] down by `n`, blanking
+    /// the vacated top rows.
+    fn scroll_down(&mut self, n: u16) {
+        let top = self.scroll_top as usize;
+        let bottom = self.scroll_bottom as usize;
+        let cols = self.cols as usize;
+        let n = n as usize;
+        for row in (top..=bottom).rev() {
+            if row >= top + n {
+                let src = row - n;
+                for col in 0..cols {
+                    self.cells[row * cols + col] = self.cells[src * cols + col];
+                }
+            } else {
+                for col in 0..cols {
+                    self.cells[row * cols + col] = Cell::default();
+                }
+            }
+        }
+    }
+
+    /// RI: move up one row, scrolling the region down if at its top.
+    fn reverse_index(&mut self) {
+        if self.cursor_row == self.scroll_top {
+            self.scroll_down(1);
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+        }
+    }
+
+    fn insert_chars(&mut self, n: u16) {
+        let cols = self.cols as usize;
+        let start = self.cursor_row as usize * cols;
+        let col = self.cursor_col as usize;
+        let n = (n as usize).min(cols - col);
+        for c in (col..cols).rev() {
+            if c >= col + n {
+                self.cells[start + c] = self.cells[start + c - n];
+            } else {
+                self.cells[start + c] = Cell::default();
+            }
+        }
+    }
+
+    fn delete_chars(&mut self, n: u16) {
+        let cols = self.cols as usize;
+        let start = self.cursor_row as usize * cols;
+        let col = self.cursor_col as usize;
+        let n = (n as usize).min(cols - col);
+        for c in col..cols {
+            if c + n < cols {
+                self.cells[start + c] = self.cells[start + c + n];
+            } else {
+                self.cells[start + c] = Cell::default();
+            }
+        }
+    }
+
+    fn erase_chars(&mut self, n: u16) {
+        let cols = self.cols as usize;
+        let start = self.cursor_row as usize * cols;
+        let col = self.cursor_col as usize;
+        let end = (col + n as usize).min(cols);
+        for c in col..end {
+            self.cells[start + c] = Cell::default();
+        }
+    }
+
+    fn insert_lines(&mut self, n: u16) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let cols = self.cols as usize;
+        let top = self.cursor_row as usize;
+        let bottom = self.scroll_bottom as usize;
+        let n = (n as usize).min(bottom - top + 1);
+        for row in (top..=bottom).rev() {
+            if row >= top + n {
+                let src = row - n;
+                for col in 0..cols {
+                    self.cells[row * cols + col] = self.cells[src * cols + col];
+                }
+            } else {
+                for col in 0..cols {
+                    self.cells[row * cols + col] = Cell::default();
+                }
+            }
+        }
+    }
+
+    fn delete_lines(&mut self, n: u16) {
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let cols = self.cols as usize;
+        let top = self.cursor_row as usize;
+        let bottom = self.scroll_bottom as usize;
+        let n = (n as usize).min(bottom - top + 1);
+        for row in top..=bottom {
+            let src = row + n;
+            if src <= bottom {
+                for col in 0..cols {
+                    self.cells[row * cols + col] = self.cells[src * cols + col];
+                }
+            } else {
+                for col in 0..cols {
+                    self.cells[row * cols + col] = Cell::default();
+                }
+            }
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved = Some(SavedCursor {
+            col: self.cursor_col,
+            row: self.cursor_row,
+            style: self.style,
+            autowrap: self.autowrap,
+        });
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(s) = self.saved {
+            self.cursor_col = s.col.min(self.cols - 1);
+            self.cursor_row = s.row.min(self.rows - 1);
+            self.style = s.style;
+            self.autowrap = s.autowrap;
+        }
+        self.wrap_pending = false;
     }
 
     /// LF: move down one row, scrolling the region up if at its bottom.
@@ -160,8 +301,10 @@ impl TermState {
         }
     }
 
-    /// SGR — basic subset for Task 4 (Task 5 replaces this with the full set).
     fn apply_sgr(&mut self, params: &Params) {
+        // Flatten every subparameter in order. Semicolon form "38;5;n" and
+        // colon form "38:5:n" both flatten to [38,5,n], so one code path
+        // serves both.
         let flat: Vec<u16> = params.iter().flat_map(|s| s.iter().copied()).collect();
         if flat.is_empty() {
             self.style = Style::default();
@@ -172,12 +315,69 @@ impl TermState {
             match flat[i] {
                 0 => self.style = Style::default(),
                 1 => self.style.bold = true,
+                2 => self.style.dim = true,
+                3 => self.style.italic = true,
                 4 => self.style.underline = true,
                 7 => self.style.reverse = true,
+                22 => {
+                    self.style.bold = false;
+                    self.style.dim = false;
+                }
+                23 => self.style.italic = false,
+                24 => self.style.underline = false,
+                27 => self.style.reverse = false,
                 30..=37 => self.style.fg = Color::Idx((flat[i] - 30) as u8),
                 39 => self.style.fg = Color::Default,
                 40..=47 => self.style.bg = Color::Idx((flat[i] - 40) as u8),
                 49 => self.style.bg = Color::Default,
+                90..=97 => self.style.fg = Color::Idx((flat[i] - 90 + 8) as u8),
+                100..=107 => self.style.bg = Color::Idx((flat[i] - 100 + 8) as u8),
+                38 => {
+                    if i + 1 < flat.len() {
+                        match flat[i + 1] {
+                            5 => {
+                                if i + 2 < flat.len() {
+                                    self.style.fg = Color::Idx(flat[i + 2] as u8);
+                                    i += 2;
+                                }
+                            }
+                            2 => {
+                                if i + 4 < flat.len() {
+                                    self.style.fg = Color::Rgb(
+                                        flat[i + 2] as u8,
+                                        flat[i + 3] as u8,
+                                        flat[i + 4] as u8,
+                                    );
+                                    i += 4;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                48 => {
+                    if i + 1 < flat.len() {
+                        match flat[i + 1] {
+                            5 => {
+                                if i + 2 < flat.len() {
+                                    self.style.bg = Color::Idx(flat[i + 2] as u8);
+                                    i += 2;
+                                }
+                            }
+                            2 => {
+                                if i + 4 < flat.len() {
+                                    self.style.bg = Color::Rgb(
+                                        flat[i + 2] as u8,
+                                        flat[i + 3] as u8,
+                                        flat[i + 4] as u8,
+                                    );
+                                    i += 4;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -282,6 +482,13 @@ impl Perform for TermState {
                     match p.first().copied() {
                         Some(7) => self.autowrap = set,   // DECAWM
                         Some(25) => self.cursor_visible = set, // DECTCEM
+                        Some(1049) => {
+                            // Alt screen enter/leave: both clear + home (MVP).
+                            self.erase_display(2);
+                            self.cursor_col = 0;
+                            self.cursor_row = 0;
+                            self.wrap_pending = false;
+                        }
                         _ => {}
                     }
                 }
@@ -335,12 +542,47 @@ impl Perform for TermState {
             }
             'J' => self.erase_display(param_or(params, 0, 0)),
             'K' => self.erase_line(param_or(params, 0, 0)),
+            '@' => self.insert_chars(param_or(params, 0, 1).max(1)),
+            'P' => self.delete_chars(param_or(params, 0, 1).max(1)),
+            'X' => self.erase_chars(param_or(params, 0, 1).max(1)),
+            'L' => self.insert_lines(param_or(params, 0, 1).max(1)),
+            'M' => self.delete_lines(param_or(params, 0, 1).max(1)),
+            'S' => self.scroll_up(param_or(params, 0, 1).max(1)),
+            'T' => self.scroll_down(param_or(params, 0, 1).max(1)),
+            'r' => {
+                // DECSTBM: set scroll region (1-based, inclusive) and home.
+                let top = param_or(params, 0, 1).max(1) - 1;
+                let bottom = param_or(params, 1, self.rows).max(1) - 1;
+                if top < bottom && bottom < self.rows {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                } else {
+                    self.scroll_top = 0;
+                    self.scroll_bottom = self.rows - 1;
+                }
+                self.cursor_col = 0;
+                self.cursor_row = 0;
+                self.wrap_pending = false;
+            }
+            's' => self.save_cursor(),
+            'u' => self.restore_cursor(),
             'm' => self.apply_sgr(params),
             _ => {}
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'7' => self.save_cursor(),    // DECSC
+            b'8' => self.restore_cursor(), // DECRC
+            b'M' => {
+                // RI (reverse index)
+                self.wrap_pending = false;
+                self.reverse_index();
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct Grid {
@@ -613,5 +855,194 @@ mod tests {
         assert!(!g.cursor_visible());
         g.feed(b"\x1b[?25h");
         assert!(g.cursor_visible());
+    }
+
+    #[test]
+    fn insert_chars() {
+        // "abcde", cursor at col1, ICH 2: 'a' | 2 blanks | 'b','c' (d,e drop off)
+        let mut g = Grid::new(5, 1);
+        g.feed(b"abcde");
+        g.feed(b"\x1b[1;2H\x1b[2@");
+        assert_eq!(row_str(&g, 0), "a  bc");
+    }
+
+    #[test]
+    fn delete_chars() {
+        // "abcde", cursor at col1, DCH 2: 'a' + shift 'd','e' left, blanks fill
+        let mut g = Grid::new(5, 1);
+        g.feed(b"abcde");
+        g.feed(b"\x1b[1;2H\x1b[2P");
+        assert_eq!(row_str(&g, 0), "ade  ");
+    }
+
+    #[test]
+    fn erase_chars() {
+        // "abcde", cursor at col1, ECH 2: blank col1,col2 in place (no shift)
+        let mut g = Grid::new(5, 1);
+        g.feed(b"abcde");
+        g.feed(b"\x1b[1;2H\x1b[2X");
+        assert_eq!(row_str(&g, 0), "a  de");
+    }
+
+    #[test]
+    fn insert_lines() {
+        let mut g = Grid::new(3, 4);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
+        g.feed(b"\x1b[2;1H\x1b[L"); // cursor row1 (0-based); insert 1 blank line
+        assert_eq!(row_str(&g, 0), "aaa");
+        assert_eq!(row_str(&g, 1), "   ");
+        assert_eq!(row_str(&g, 2), "bbb");
+        assert_eq!(row_str(&g, 3), "ccc");
+    }
+
+    #[test]
+    fn delete_lines() {
+        let mut g = Grid::new(3, 4);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
+        g.feed(b"\x1b[2;1H\x1b[M"); // cursor row1; delete 1 line
+        assert_eq!(row_str(&g, 0), "aaa");
+        assert_eq!(row_str(&g, 1), "ccc");
+        assert_eq!(row_str(&g, 2), "ddd");
+        assert_eq!(row_str(&g, 3), "   ");
+    }
+
+    #[test]
+    fn scroll_up_su() {
+        let mut g = Grid::new(3, 3);
+        g.feed(b"aaa\r\nbbb\r\nccc");
+        g.feed(b"\x1b[S");
+        assert_eq!(row_str(&g, 0), "bbb");
+        assert_eq!(row_str(&g, 1), "ccc");
+        assert_eq!(row_str(&g, 2), "   ");
+    }
+
+    #[test]
+    fn scroll_down_sd() {
+        let mut g = Grid::new(3, 3);
+        g.feed(b"aaa\r\nbbb\r\nccc");
+        g.feed(b"\x1b[T");
+        assert_eq!(row_str(&g, 0), "   ");
+        assert_eq!(row_str(&g, 1), "aaa");
+        assert_eq!(row_str(&g, 2), "bbb");
+    }
+
+    #[test]
+    fn scroll_region_linefeed() {
+        // Region rows 2..3 (1-based) => indices 1..2. LF at region bottom
+        // scrolls only that region.
+        let mut g = Grid::new(3, 4);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
+        g.feed(b"\x1b[2;3r"); // DECSTBM
+        g.feed(b"\x1b[3;1H"); // cursor to index (0,2) = region bottom
+        g.feed(b"\n");
+        assert_eq!(row_str(&g, 0), "aaa");
+        assert_eq!(row_str(&g, 1), "ccc");
+        assert_eq!(row_str(&g, 2), "   ");
+        assert_eq!(row_str(&g, 3), "ddd");
+    }
+
+    #[test]
+    fn reverse_index_at_top() {
+        // RI at region top scrolls the region down.
+        let mut g = Grid::new(3, 4);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
+        g.feed(b"\x1b[2;3r"); // region indices 1..2
+        g.feed(b"\x1b[2;1H"); // cursor to index (0,1) = region top
+        g.feed(b"\x1bM");     // RI
+        assert_eq!(row_str(&g, 0), "aaa");
+        assert_eq!(row_str(&g, 1), "   ");
+        assert_eq!(row_str(&g, 2), "bbb");
+        assert_eq!(row_str(&g, 3), "ddd");
+    }
+
+    #[test]
+    fn save_restore_cursor_esc() {
+        let mut g = Grid::new(10, 5);
+        g.feed(b"\x1b[3;4H\x1b7\x1b[H"); // to (3,2), save, home
+        assert_eq!(g.cursor(), (0, 0));
+        g.feed(b"\x1b8");
+        assert_eq!(g.cursor(), (3, 2));
+    }
+
+    #[test]
+    fn save_restore_cursor_csi() {
+        let mut g = Grid::new(10, 5);
+        g.feed(b"\x1b[3;4H\x1b[s\x1b[H");
+        assert_eq!(g.cursor(), (0, 0));
+        g.feed(b"\x1b[u");
+        assert_eq!(g.cursor(), (3, 2));
+    }
+
+    #[test]
+    fn sgr_extended_colors() {
+        let mut g = Grid::new(5, 1);
+        g.feed(b"\x1b[38;5;196mA");        // 256-color fg
+        assert_eq!(g.cell(0, 0).style.fg, Color::Idx(196));
+        g.feed(b"\x1b[48;2;10;20;30mB");   // truecolor bg
+        assert_eq!(g.cell(1, 0).style.bg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn sgr_bright_and_reset_attrs() {
+        let mut g = Grid::new(5, 1);
+        g.feed(b"\x1b[90;103mA"); // bright fg -> Idx(8), bright bg -> Idx(11)
+        let a = g.cell(0, 0);
+        assert_eq!(a.style.fg, Color::Idx(8));
+        assert_eq!(a.style.bg, Color::Idx(11));
+        g.feed(b"\x1b[1;22mB");   // bold then clear bold
+        assert!(!g.cell(1, 0).style.bold);
+        g.feed(b"\x1b[3;23mC");   // italic then clear italic
+        assert!(!g.cell(2, 0).style.italic);
+        g.feed(b"\x1b[4;24;7;27mD"); // underline+clear, reverse+clear
+        let d = g.cell(3, 0);
+        assert!(!d.style.underline);
+        assert!(!d.style.reverse);
+    }
+
+    #[test]
+    fn alt_screen_clears_and_homes() {
+        let mut g = Grid::new(3, 3);
+        g.feed(b"xxxxxxxxx");
+        g.feed(b"\x1b[?1049h");
+        assert_eq!(row_str(&g, 0), "   ");
+        assert_eq!(row_str(&g, 1), "   ");
+        assert_eq!(row_str(&g, 2), "   ");
+        assert_eq!(g.cursor(), (0, 0));
+        g.feed(b"yyy");
+        g.feed(b"\x1b[?1049l"); // leave also clears + homes in MVP
+        assert_eq!(row_str(&g, 0), "   ");
+        assert_eq!(g.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn osc_and_unknown_ignored() {
+        let mut g = Grid::new(5, 1);
+        g.feed(b"\x1b]0;my title\x07A"); // OSC set-title then print 'A'
+        assert_eq!(g.cell(0, 0).ch, 'A');
+        g.feed(b"\x1b[99;99Z");           // unknown CSI final byte -> ignored
+        assert_eq!(g.cell(0, 0).ch, 'A');
+        assert_eq!(g.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn resize_clips_and_clamps() {
+        let mut g = Grid::new(5, 3);
+        g.feed(b"abc"); // cursor at (3,0)
+        g.resize(2, 2);
+        assert_eq!(g.cols(), 2);
+        assert_eq!(g.rows(), 2);
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(1, 0).ch, 'b'); // 'c' clipped
+        assert_eq!(g.cursor(), (1, 0));   // clamped from (3,0)
+    }
+
+    #[test]
+    fn resize_grows_and_pads() {
+        let mut g = Grid::new(2, 2);
+        g.feed(b"ab");
+        g.resize(4, 3);
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(1, 0).ch, 'b');
+        assert_eq!(g.cell(3, 2).ch, ' '); // padded
     }
 }
