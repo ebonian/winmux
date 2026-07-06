@@ -4,5 +4,6 @@ pub mod grid;
 pub mod host;
 pub mod input;
 pub mod layout;
+pub mod protocol;
 pub mod pty;
 pub mod render;
