@@ -977,4 +977,54 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn resize_steps_back_when_nested_min_violated() {
+        // Tree = H(H(Leaf1, Leaf3), Leaf2); focus 2 (outer SECOND child).
+        // Build: split(H,2) -> H(1,2) focus 2; focus Left -> 1;
+        // split(H,3) -> H(H(1,3),2) focus 3; focus Right -> 2.
+        // Outer H on 80: child1 = round(79*0.5) = 40 -> inner area {0,0,40,24},
+        //   pane2 {41,0,39,24}. Inner H on 40: child1 = round(39*0.5) = 20
+        //   -> pane1 {0,0,20,24}, pane3 {21,0,19,24}.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        assert!(l.focus_dir(Direction::Left, A));
+        l.split(SplitDir::Horizontal, 3, A).unwrap();
+        assert!(l.focus_dir(Direction::Right, A));
+        assert_eq!(l.focused(), 2);
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 20, h: 24 }),
+                (3, Rect { x: 21, y: 0, w: 19, h: 24 }),
+                (2, Rect { x: 41, y: 0, w: 39, h: 24 }),
+            ]
+        );
+        // Left with cells=40 acts on the OUTER split (the only H ancestor with
+        // the focus in its second child). l=80, child1=40, lo=MIN_PANE_W=2,
+        // hi=79-2=77 -> c = clamp(40-40, 2, 77) = 2. The outer split's OWN
+        // bounds accept c=2, but the shrinking first child is the nested
+        // H(1,3), whose pane widths (inner child1 = round((c-1)*0.5),
+        // c-1-child1) are:
+        //   c=2 -> (1,0)  FAIL   (all_min_ok false, loop steps c by +1)
+        //   c=3 -> (1,1)  FAIL
+        //   c=4 -> (2,1)  FAIL
+        //   c=5 -> (2,2)  OK     both inner panes exactly at MIN_PANE_W
+        // -> 3 failed iterations before settling: a PARTIAL move (35 of the
+        // 40 requested cells), returns true.
+        assert!(l.resize_focused(Direction::Left, A, 40));
+        // Final: outer child1=5 -> inner area {0,0,5,24}, border x=5,
+        // pane2 {6,0,80-1-5=74,24}. Inner on 5: child1 = round(4*0.5) = 2
+        // -> pane1 {0,0,2,24}, border x=2, pane3 {3,0,5-1-2=2,24}.
+        // (A naive resize that applied the clamped c=2 without the step-back
+        // would instead yield pane1 w=1, pane3 w=0, pane2 w=77.)
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 2, h: 24 }),
+                (3, Rect { x: 3, y: 0, w: 2, h: 24 }),
+                (2, Rect { x: 6, y: 0, w: 74, h: 24 }),
+            ]
+        );
+    }
 }
