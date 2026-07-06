@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, HANDLE};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCP, SetConsoleMode,
+    SetConsoleOutputCP, CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN,
     ENABLE_EXTENDED_FLAGS, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -20,6 +20,11 @@ use windows::Win32::System::Console::{
 fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0)
 }
+
+/// UTF-8 code page id. Not exported as a named constant without the
+/// `Win32_Globalization` feature; define it ourselves rather than pull in
+/// that feature for one constant.
+const CP_UTF8: u32 = 65001;
 
 /// Snapshot needed to restore the console. Stored as plain integers (not raw
 /// HANDLE pointers, which are neither Send nor Sync) so it can live in a static.
@@ -63,6 +68,15 @@ impl Host {
         unsafe {
             let stdin = GetStdHandle(STD_INPUT_HANDLE).map_err(win_err)?;
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE).map_err(win_err)?;
+
+            // Force UTF-8 in and out. Without this, the console's default
+            // (locale-dependent, often OEM 437) code page mangles every
+            // multi-byte UTF-8 byte we write (e.g. the box-drawing border
+            // chars) or read, decoding/encoding each raw byte individually
+            // instead of treating the stream as UTF-8. Best-effort: a
+            // failure here is not fatal to starting winmux.
+            let _ = SetConsoleOutputCP(CP_UTF8);
+            let _ = SetConsoleCP(CP_UTF8);
 
             // Save the current modes so Drop / panic hook can restore them.
             let mut saved_stdin = CONSOLE_MODE::default();
