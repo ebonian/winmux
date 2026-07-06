@@ -147,3 +147,83 @@ impl std::io::Write for PipeConn { ... }
 APIs and `std`; does not depend on `protocol` (frames flow over `PipeConn`
 via its `Read`/`Write` impls, exercised together in
 `tests/pipe_smoke.rs::roundtrip_client_server`).
+
+## `model` — session/window registry (pure)
+
+```rust
+pub type WindowId = u32; // server-global, monotonic — NOT the tmux window index
+pub struct Window {
+    pub id: WindowId,
+    pub index: u32,          // tmux window index (lowest unused >= 0 at creation)
+    pub name: String,        // default "powershell"
+    pub layout: crate::layout::Layout,
+}
+pub struct Session {
+    pub name: String,
+    pub created: std::time::SystemTime,
+    pub windows: Vec<Window>,        // kept sorted by index
+    pub current: WindowId,
+    pub last: Option<WindowId>,
+    pub size: (u16, u16),            // current window size (smallest attached client)
+}
+pub struct Registry { /* sessions: Vec<Session> in creation order, next_window_id */ }
+impl Registry {
+    pub fn new() -> Registry;
+    pub fn create_session(&mut self, name: Option<&str>, first_pane: crate::layout::PaneId, size: (u16, u16))
+        -> Result<&mut Session, String>;                    // Err("duplicate session: <name>")
+    pub fn find(&mut self, target: &str) -> Result<&mut Session, String>; // tmux -t rules: "=x" exact only; else exact, then unambiguous prefix; Err("can't find session: <t>")
+    pub fn kill_session(&mut self, name: &str) -> bool;
+    pub fn sessions(&self) -> &[Session];
+    pub fn session_mut(&mut self, name: &str) -> Option<&mut Session>;
+    pub fn is_empty(&self) -> bool;
+    pub fn auto_name(&self) -> String;                      // lowest unused non-negative integer as string
+    pub fn neighbor_session(&self, current: &str, next: bool) -> Option<&str>; // for ( / ) switch-client, wraps
+}
+impl Session {
+    pub fn new_window(&mut self, id: WindowId, first_pane: crate::layout::PaneId) -> &mut Window; // index = lowest unused, becomes current, updates last
+    pub fn kill_window(&mut self, id: WindowId) -> bool;    // removes; retargets current to last-or-nearest; false if it was the only window
+    pub fn select_window(&mut self, index: u32) -> bool;    // exact index; updates current/last
+    pub fn next_window(&mut self) / pub fn prev_window(&mut self); // wrap by index order
+    pub fn last_window(&mut self) -> bool;
+    pub fn current_window(&self) -> &Window; pub fn current_window_mut(&mut self) -> &mut Window;
+    pub fn window_by_pane(&mut self, pane: crate::layout::PaneId) -> Option<&mut Window>;
+}
+```
+
+**Behavior notes:**
+
+- Session/window name validation: reject empty names and names containing
+  `:` or `.` (tmux's target separators) → `Err("bad session name: <n>")`.
+  Applied in `create_session`; there is no rename API yet (deferred to a
+  later task alongside the `,`/`$` prefix bindings).
+- `Registry` allocates `WindowId`s itself only for a session's initial
+  window (via `create_session`'s internal `next_window_id` counter).
+  `Session::new_window` takes the id as a parameter — a future task that
+  adds a "create window on session" entry point on `Registry` is
+  responsible for minting that id from the same counter.
+- `find`'s `=name` form strips the sigil before matching and before building
+  the error message, so `find("=foo")` that fails reports
+  `can't find session: foo` (not `=foo`).
+- Exact name match always wins over prefix matching, even when the exact
+  name is itself a prefix of another session's name (e.g. sessions "foo"
+  and "foobar": `find("foo")` returns "foo", not an ambiguity error).
+- `kill_session`/`session_mut` are exact-name-only (no prefix rules, no `=`
+  handling) — `find` is the only tmux-target-resolving entry point.
+- `Session::kill_window` on the only remaining window is a no-op returning
+  `false` (mirrors `Layout::remove`'s single-pane guard); the caller is
+  expected to destroy the whole session instead, as for the last pane in a
+  window. On removing a non-only window: if `last` pointed at the removed
+  window, it's cleared to `None` first; if the *current* window was
+  removed, it falls back to `last` (if still alive) else to the nearest
+  window by index (highest index below the removed one, else lowest index
+  above).
+- `next_window`/`prev_window`/`select_window`/`new_window` maintain `last =
+  <previous current>` on every change; re-selecting the already-current
+  window via `select_window` is a no-op (doesn't disturb `last`).
+  `next_window`/`prev_window` are no-ops with a single window.
+- `last_window` swaps `current`/`last` (like `Layout::focus_last`); `false`
+  if there is no `last` or it no longer exists.
+
+**Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
+APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends
+only on `crate::layout` (`Layout`, `PaneId`) and `std`.
