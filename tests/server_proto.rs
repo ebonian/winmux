@@ -65,6 +65,32 @@ fn has_vertical_border(grid: &Grid) -> bool {
     false
 }
 
+/// Validate the tmux `ls`/`lsw` creation-time text against
+/// `%a %b %e %H:%M:%S %Y` (`%e` = space-padded day), e.g. `Tue Jul  7
+/// 09:14:22 2026` — exactly 24 chars: `Www Mmm eD HH:MM:SS YYYY`.
+fn assert_ctime_format(text: &str) {
+    assert_eq!(text.len(), 24, "unexpected ctime length: {text:?}");
+    let b = text.as_bytes();
+    assert!(text[0..3].chars().all(|c| c.is_ascii_alphabetic()), "weekday: {text:?}");
+    assert_eq!(b[3], b' ', "sep after weekday: {text:?}");
+    assert!(text[4..7].chars().all(|c| c.is_ascii_alphabetic()), "month: {text:?}");
+    assert_eq!(b[7], b' ', "sep after month: {text:?}");
+    let day0 = b[8] as char;
+    assert!(day0 == ' ' || day0.is_ascii_digit(), "day tens: {text:?}");
+    assert!((b[9] as char).is_ascii_digit(), "day ones: {text:?}");
+    assert_eq!(b[10], b' ', "sep after day: {text:?}");
+    let time = &text[11..19];
+    assert_eq!(time.as_bytes()[2], b':', "time: {text:?}");
+    assert_eq!(time.as_bytes()[5], b':', "time: {text:?}");
+    for (i, c) in time.chars().enumerate() {
+        if i != 2 && i != 5 {
+            assert!(c.is_ascii_digit(), "time: {text:?}");
+        }
+    }
+    assert_eq!(b[19], b' ', "sep before year: {text:?}");
+    assert!(text[20..24].chars().all(|c| c.is_ascii_digit()), "year: {text:?}");
+}
+
 /// A connected test client: writes `ClientMsg` frames directly, and reads
 /// `ServerMsg` frames off a background reader thread via an mpsc channel so
 /// `recv`/`recv_output_until` can apply a deadline (a blocking `PipeConn`
@@ -379,4 +405,444 @@ fn two_clients_smallest_size_wins() {
     // Either client observing the session end is fine; both are attached.
     a.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+// ---- Task 7: window ops, prompts, CLI --------------------------------------
+
+#[test]
+fn new_window_updates_status() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // Clean up: kill the new (current) window, falls back to window 0.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn next_prev_last_window_flags() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'n']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-"))
+    });
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'p']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'l']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-"))
+    });
+
+    // Clean up: current is window 0; killing its (only) pane removes just
+    // that window (tmux remain-on-exit parity) and falls back to window 1
+    // (still `last`), then a second exit ends the whole session.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("1:powershell*")) && !lines.iter().any(|l| l.contains("0:powershell"))
+    });
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn select_window_by_digit() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-"))
+    });
+
+    // Clean up: current (window 0) exits, falls back to window 1 (last),
+    // second exit ends the session.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn select_missing_window_shows_message() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'5']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("window not found: 5")));
+
+    // Any further input clears the transient message.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("window not found")));
+
+    c.send(&ClientMsg::Stdin(b"\rexit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn kill_window_confirm_text() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    // Window list shrinks back to just window 0.
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("[0] 0:powershell*")) && !lines.iter().any(|l| l.contains("1:powershell"))
+    });
+
+    // Killing the only remaining window destroys the session.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn kill_only_pane_confirm_destroys_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-pane 0? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn pane_exit_autocloses_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // The split gives focus to the new (right) pane; exiting its shell
+    // naturally removes just that pane (remain-on-exit off parity) instead
+    // of leaving a dead overlay — the border disappears and the session
+    // (and its other pane's shell) lives on.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn rename_window_prompt_flow() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b',']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) powershell")));
+
+    // "powershell" is 10 chars; wipe it, then type the new name.
+    c.send(&ClientMsg::Stdin(vec![0x7f; 10]));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) ") && !l.contains("powershell")));
+    c.send(&ClientMsg::Stdin(b"web".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) web")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:web*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn rename_session_prompt_flow() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "s1", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'$']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-session) s1")));
+
+    // "s1" is 2 chars; wipe it, then type the new name.
+    c.send(&ClientMsg::Stdin(vec![0x7f, 0x7f]));
+    c.send(&ClientMsg::Stdin(b"mysess".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-session) mysess")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[mysess]")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn prompt_escape_cancels() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b',']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) powershell")));
+
+    c.send(&ClientMsg::Stdin(vec![0x1b]));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("(rename-window)")));
+    // Name unchanged.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn switch_client_next_cycles_sessions() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "sA", 80, 24);
+    let mut grid_a = Grid::new(80, 24);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid_b = Grid::new(80, 24);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // Creation order is [sA, sB]; `)` from sA moves client A to sB.
+    a.send(&ClientMsg::Stdin(vec![0x02, b')']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    // Wraps: `)` again from sB (only 2 sessions) goes back to sA.
+    a.send(&ClientMsg::Stdin(vec![0x02, b')']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[sA]")));
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+fn cli_client(name: &str) -> Client {
+    Client::connect(name)
+}
+
+fn expect_cli_done(client: &Client, code: u8) -> (String, String) {
+    match client.recv() {
+        ServerMsg::CliDone { code: c, out, err } => {
+            assert_eq!(c, code, "cli exit code (out={out:?} err={err:?})");
+            (out, err)
+        }
+        other => panic!("expected CliDone, got {other:?}"),
+    }
+}
+
+#[test]
+fn cli_ls_format_exact() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["ls".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    let line = out.trim_end_matches('\n');
+    assert!(!line.contains('\n'), "expected exactly one ls line: {line:?}");
+    let prefix = "s1: 1 windows (created ";
+    assert!(line.starts_with(prefix), "line: {line:?}");
+    let rest = &line[prefix.len()..];
+    let rest = rest.strip_suffix(" (attached)").unwrap_or(rest);
+    let rest = rest.strip_suffix(')').expect("missing closing paren");
+    assert_ctime_format(rest);
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_has_session_codes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "hx".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "hx".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "nope".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "can't find session: nope");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "hx".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_kill_session_notifies_attached() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "ks1", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "ks1".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_new_detached_then_attach() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "nd1".into()]));
+    expect_cli_done(&cli, 0);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::Existing, "nd1", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_rename_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "rn1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["rename-session".into(), "-t".into(), "rn1".into(), "rn2".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "rn2".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "rn1".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "can't find session: rn1");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "rn2".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_list_windows_format() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "lw1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "lw1".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "0: powershell* (1 panes) [80x24] (active)\n");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "lw1".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_kill_server_exits_all() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut c = Client::connect(&name);
+    let _grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.expect_exit(0, "[server exited]");
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn cli_unknown_command_err() {
+    let name = unique_pipe_name();
+    let _server = start_server(&name); // never creates a session; left running
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["frobnicate".into()]));
+    let (out, err) = expect_cli_done(&cli, 1);
+    assert_eq!(out, "");
+    assert_eq!(err, "unknown command");
 }

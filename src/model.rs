@@ -181,6 +181,18 @@ impl Registry {
         let new_idx = if next { (idx + 1) % len } else { (idx + len - 1) % len };
         Some(self.sessions[new_idx].name.as_str())
     }
+
+    /// Mint a fresh `WindowId` from the same monotonic counter
+    /// `create_session` uses internally for a session's first window. Callers
+    /// adding a window to an EXISTING session (`Session::new_window`, e.g.
+    /// the `NewWindow` action) must mint the id here first, since
+    /// `Session::new_window` takes the id as a plain parameter and does not
+    /// mint its own.
+    pub fn mint_window_id(&mut self) -> WindowId {
+        let id = self.next_window_id;
+        self.next_window_id += 1;
+        id
+    }
 }
 
 impl Session {
@@ -497,6 +509,24 @@ mod tests {
         assert_eq!(s.current, only);
         s.prev_window();
         assert_eq!(s.current, only);
+    }
+
+    #[test]
+    fn mint_window_id_does_not_collide_with_create_session() {
+        let mut r = Registry::new();
+        // create_session mints id 0 internally for the session's first window.
+        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        assert_eq!(s.current, 0);
+        // mint_window_id continues the SAME counter, so the next id is 1 —
+        // never re-minting an id already claimed by an existing window.
+        let minted = r.mint_window_id();
+        assert_eq!(minted, 1);
+        let s = r.session_mut("s").unwrap();
+        let w = s.new_window(minted, 10);
+        assert_eq!(w.id, 1);
+        assert_eq!(w.index, 1);
+        // Next mint continues from 2, still no collision.
+        assert_eq!(r.mint_window_id(), 2);
     }
 
     #[test]

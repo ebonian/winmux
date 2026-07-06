@@ -203,6 +203,7 @@ impl Registry {
     pub fn is_empty(&self) -> bool;
     pub fn auto_name(&self) -> String;                      // lowest unused non-negative integer as string
     pub fn neighbor_session(&self, current: &str, next: bool) -> Option<&str>; // for ( / ) switch-client, wraps
+    pub fn mint_window_id(&mut self) -> WindowId;           // fresh id from the SAME counter create_session uses internally
 }
 impl Session {
     pub fn new_window(&mut self, id: WindowId, first_pane: crate::layout::PaneId) -> &mut Window; // index = lowest unused, becomes current, updates last
@@ -221,11 +222,14 @@ impl Session {
   `:` or `.` (tmux's target separators) → `Err("bad session name: <n>")`.
   Applied in `create_session`; there is no rename API yet (deferred to a
   later task alongside the `,`/`$` prefix bindings).
-- `Registry` allocates `WindowId`s itself only for a session's initial
-  window (via `create_session`'s internal `next_window_id` counter).
-  `Session::new_window` takes the id as a parameter — a future task that
-  adds a "create window on session" entry point on `Registry` is
-  responsible for minting that id from the same counter.
+- `Registry` allocates `WindowId`s from a single internal `next_window_id`
+  counter. `create_session` mints one internally for a session's initial
+  window; `mint_window_id` (Task 7) exposes that SAME counter for any other
+  caller adding a window to an EXISTING session (e.g. the `NewWindow`
+  action) — `Session::new_window` itself only takes the id as a plain
+  parameter and never mints its own, so the caller must mint via
+  `Registry::mint_window_id` first. The two minting paths never collide
+  since they share one counter.
 - `find`'s `=name` form strips the sigil before matching and before building
   the error message, so `find("=foo")` that fails reports
   `can't find session: foo` (not `=foo`).
@@ -378,18 +382,98 @@ various free helper functions) is private to the module.
   `Action::Detach` and the `Detach` frame both end in the SAME per-client
   teardown: `Exit{0, "[detached (from session <name>)]"}`, size/layout
   recomputed for any clients left. Window/session `Action` variants
-  (`NewWindow`, `NextWindow`, ..., `RenameSession`) and `InputEvent::Captured`
-  are explicit, listed no-op arms — Task 7's job — not a wildcard, so adding
-  a new `Action` variant without updating this module is a compile error,
-  not a silent no-op.
-- **Pane exit**: the waiter thread's `ServerEvent::Exited(pane_id)` drops
-  that pane's `Pty` immediately (`PaneRuntime.pty = None`, follow-up #1) and
-  marks it dead. If every pane in the session's (only, in this task's
-  scope) window is now dead, the session is destroyed exactly like a
-  confirmed last-pane kill: every attached client gets
-  `Exit{0, "[exited]"}`.
-- **`Cli` frames** get a stub reply: `CliDone{1, "", "unknown command"}`
-  (Task 7 implements real commands).
+  (`NewWindow`, `NextWindow`, `PrevWindow`, `LastWindow`, `SelectWindow`,
+  `RequestKillWindow`, `RenameWindow`, `RenameSession`, `SwitchClientPrev`,
+  `SwitchClientNext`) and `InputEvent::Captured` are wired by Task 7 (below);
+  `Action::Quit` remains a listed no-op arm (never emitted by
+  `InputMachine::feed`, an MVP-only hook) — the match is still exhaustive,
+  not a wildcard, so a new `Action` variant without a corresponding arm is a
+  compile error.
+- **Pane exit** (Task 7 rewrite — tmux `remain-on-exit off` parity): the
+  waiter thread's `ServerEvent::Exited(pane_id)` drops that pane's `Pty`
+  immediately (`PaneRuntime.pty = None`, follow-up #1) and marks it dead.
+  `handle_exited` then finds which (session, window) owns the pane (any
+  window, not just the current one). If another pane in that SAME window is
+  still alive, the dead pane is removed outright — `Layout::remove` plus
+  dropping its `PaneRuntime`/`last_rects` entry, same path as a confirmed
+  `kill-pane` — instead of leaving a dead `[exited]` overlay; no window/
+  session-level change. Otherwise (it was the window's last live pane): if
+  the window was the session's only window, the whole session is destroyed
+  (`destroy_session`, every attached client gets `Exit{0, "[exited]"}`);
+  otherwise just that window is killed (`Session::kill_window` plus
+  dropping all its panes) and the session lives on with its remaining
+  windows. The `dead` flag on `PaneRuntime` stays in the struct — it is
+  still read (briefly, between the `Exited` event and this handler running)
+  by `render_one`'s dead-pane overlay and by `other_panes_alive`'s liveness
+  check — even though a dead pane's `PaneRuntime` is now always removed
+  within the same `handle_exited` call rather than lingering.
+- **`Cli` frames** execute a real command set against the registry (Task 7)
+  — see "CLI subset" below.
+- **Window/session `Action`s** (Task 7): `NewWindow` mints a `PaneId` +
+  spawns a pane sized to the session's current size, mints a `WindowId` via
+  `Registry::mint_window_id`, and calls `Session::new_window`, becoming
+  current; a spawn failure leaves the window uncreated and sets a transient
+  message (`open terminal failed: <io error>`). `NextWindow`/`PrevWindow`/
+  `LastWindow` call the matching `Session` method and reapply layout.
+  `SelectWindow(n)` calls `Session::select_window`; a miss sets the
+  transient message `window not found: <n>`. `RequestKillWindow` arms
+  `ClientMode::ConfirmKillWindow(WindowId)` (`InputMachine::set_confirming
+  (true)`); the render-time message is `kill-window <name>? (y/n)`.
+  Confirming it removes every pane of that window and calls
+  `Session::kill_window`, or — if it was the session's only window —
+  destroys the whole session (same as a confirmed only-pane kill).
+  `RenameWindow`/`RenameSession` arm `ClientMode::Prompt{label, buf, kind}`
+  (`InputMachine::set_capture(true)`) with `label` `"(rename-window) "` /
+  `"(rename-session) "` and `buf` pre-filled with the current name.
+  `SwitchClientPrev`/`SwitchClientNext` move ONLY the acting client to the
+  session adjacent in `Registry::neighbor_session` order (wraps; a single
+  session is a no-op), force a full repaint via `Renderer::resize`
+  (unconditionally sets `force_full`, regardless of whether the
+  cols/rows actually changed), and trigger a resize/layout recompute of
+  BOTH the old and new session once the client is back in `self.clients`.
+- **Prompt line editor** (`ClientMode::Prompt`, Task 7): while
+  `InputMachine::set_capture(true)` is active, `Stdin` frames decode to
+  `InputEvent::Captured(Vec<u8>)`; each byte of a captured chunk is fed one
+  at a time to `Server::feed_prompt_byte`: printable ASCII (0x20-0x7e)
+  appends to `buf`; Backspace (0x7f or 0x08) removes the last char;
+  Enter (`\r`/`\n`) commits; Esc/Ctrl-c/Ctrl-g (0x1b/0x03/0x07) cancels
+  outright (discards `buf`, no validation). Either way, `set_capture(false)`
+  and `mode` returns to `Normal`. On commit: `PromptKind::RenameWindow`
+  validates `buf` (reject empty or containing `:`/`.`, mirroring
+  `model.rs`'s session-name rule) and renames `session.current_window_mut()
+  .name` directly (`Window::name` is a public field; the model has no
+  rename API of its own). `PromptKind::RenameSession` additionally rejects
+  a duplicate (any OTHER existing session already using `buf`); on success
+  it mutates `Session::name` directly AND propagates the new name to every
+  attached client's `ClientState::session` (`rename_session_everywhere`,
+  since clients look their session up by name) plus the acting client's own
+  `session`/local tracking variable, so mid-batch events after the commit
+  (and any later Stdin frame) keep routing correctly. Either validation
+  failure becomes a transient status message (see below); the prompt itself
+  is still discarded (same as a cancel).
+- **Transient status messages** (`ClientState::message: Option<(String,
+  Instant)>`, Task 7): set by `window not found: <n>` (`SelectWindow` miss),
+  `NewWindow` spawn failures, and prompt-commit validation errors. Shown in
+  the message slot only while `mode` is `Normal` AND not `too_small`.
+  Precedence matches the pre-Task-7 code exactly: `ConfirmKillPane`'s match
+  arm had no guard, so it always won regardless of `too_small`; `Prompt`/
+  `ConfirmKillWindow` are new sibling arms with the same unconditional
+  priority (a confirm/prompt overlay doesn't depend on pane space, so it
+  stays visible even on a too-small terminal) — `too_small` and the
+  transient message only compete with each other, in `Normal` mode, and
+  `too_small` wins there too. Cleared two ways: unconditionally at the top
+  of `handle_stdin` for ANY `Stdin` frame
+  from that client (so any keystroke dismisses it, whether or not it maps
+  to an action), or after `MESSAGE_LIFETIME` (750ms, tmux's `display-time`
+  default) elapses, checked on the 50ms `Tick` (which also now returns
+  `dirty = true` whenever a message actually expires, in addition to its
+  existing clock-changed check).
+- **`ClientMode`** (Task 7 additions): `ConfirmKillWindow(WindowId)` (armed
+  by `RequestKillWindow`, resolved by the SAME `InputEvent::ConfirmClose`
+  event `ConfirmKillPane` uses — the two are now separate match arms over
+  `client.mode` rather than a single `if let`) and `Prompt { label: String,
+  buf: String, kind: PromptKind }` where `PromptKind::{RenameWindow,
+  RenameSession}` (both server-private types).
 - **Confirm race (follow-up #2): left open, by design choice.** `Ctrl-b x`
   immediately followed by `y` in the SAME `Stdin` frame still races exactly
   as in the MVP — `InputMachine::feed` tokenizes the whole frame before this
@@ -414,18 +498,59 @@ various free helper functions) is private to the module.
   reclaims the thread; there is currently no in-process "stop the server
   and keep the process alive" path.
 
+**CLI subset** (Task 7): `handle_cli` looks up the calling connection's
+writer channel (attached or still-`pending_writers`, i.e. never attached —
+a bare CLI connection sends exactly one `Cli` frame and disconnects after
+its `CliDone` reply) and replies with `execute_cli`'s `(code, out, err)`.
+Argv parsing is a small hand-rolled `CliArgs` (`-t`/`-s` string, `-x`/`-y`
+`u16`, `-d` bare flag, everything else collected as `positional` in order)
+— no external arg-parsing crate. Unrecognized/empty argv:
+`CliDone{1, "", "unknown command"}`.
+
+| command | args | success | failure |
+|---|---|---|---|
+| `list-sessions`/`ls` | (none) | `out` = one line per session, creation order: `"{name}: {n} windows (created {ctime}){attached}"` (`{n}` always plural, tmux quirk; `{attached}` = `" (attached)"` iff ≥1 client attached, else empty), each line `\n`-terminated | empty registry → `{1, "", "no sessions"}` |
+| `has-session`/`has` | `-t name` (required) | `{0, "", ""}` | no `-t` → `{1,"","usage: has-session -t target"}`; not found → `{1,"","can't find session: <t>"}` (from `Registry::find`, tmux prefix rules) |
+| `kill-session` | `[-t name]` | `{0,"",""}`, `destroy_session` (attached clients get `Exit{0,"[exited]"}`) | `-t` given but not found → `find`'s error; no `-t` and no sessions → `{1,"","no sessions"}`; default target (no `-t`) is the MOST RECENTLY CREATED session (`Registry::sessions().last()` — creation order) |
+| `kill-server` | (none) | `{0,"",""}`; every attached client gets `Exit{0,"[server exited]"}`, every pane's `Pty` is dropped (`self.panes.clear()`), registry is cleared and `had_session` forced `true` so `run`'s exit-empty check fires this turn | (infallible) |
+| `new-session`/`new` | `[-d] [-s name] [-x cols] [-y rows]` | `{0,"",""}`; spawns a pane sized `(x.unwrap_or(80), y.unwrap_or(24))` (both `.max(1)`) and calls `Registry::create_session` — `-d` is accepted but otherwise a no-op here (the `Cli` path never attaches a client regardless) | duplicate/bad name → `create_session`'s error (pane rolled back); spawn failure → `"failed to spawn shell: <io error>"` |
+| `rename-session` | `[-t target] new-name` (both required) | `{0,"",""}`; renames `Session::name` directly and propagates to every attached client via `rename_session_everywhere` | missing `-t` or new-name → `"usage: rename-session [-t target] new-name"`; target not found → `find`'s error; bad new name → `"bad session name: <n>"`; duplicate → `"duplicate session: <n>"` |
+| `rename-window` | `[-t target[:idx]] new-name` (both required) | `{0,"",""}`; renames `Window::name` directly | missing `-t` or new-name → `"usage: rename-window [-t target] new-name"`; session part not found → `find`'s error; `:idx` given but no such window index → `"window not found: <idx>"`; bad new name → `"bad window name: <n>"` |
+| `list-windows`/`lsw` | `[-t name]` (default: most recently created session) | `out` = one line per window, index order: `"{index}: {name}{flag} ({n} panes) [{w}x{h}]{active}"` (`flag` = `*`/`-`/empty; `active` = `" (active)"` iff current), `\n`-terminated | target given but not found → `find`'s error; no sessions at all → `{1,"","no sessions"}` |
+| `detach-client` | `-s name` (required) | `{0,"",""}`; every client attached to that session gets `Exit{0,"[detached (from session <name>)]"}`, then a size/layout recompute | no `-s` → `"usage: detach-client -s target"`; not found → `find`'s error |
+
+`rename-window`'s `[-t target[:idx]]`: a `:` splits into session part +
+window-index part (`idx` parsed as `u32`); no `:` means the whole target is
+the session name and the RENAME applies to that session's CURRENT window
+(no default target at all, i.e. no `-t`, is still an error — the CLI has
+no "current client" context to fall back on, unlike the interactive
+prefix-key binding).
+
+`ls`/`lsw`'s `{ctime}` is `%a %b %e %H:%M:%S %Y` (C-locale weekday/month,
+`%e` = space-padded day, e.g. `Tue Jul  7 09:14:22 2026`). Implementation
+(`to_local_systemtime`/`format_ctime`): convert the session's `SystemTime`
+(`created`, or `SYSTEMTIME`-equivalent) to a Win32 `FILETIME`, call
+`FileTimeToLocalFileTime` (UTC → local, applying timezone/DST) then
+`FileTimeToSystemTime` (→ `SYSTEMTIME`, which carries `wDayOfWeek` — the
+only reason for this two-hop conversion instead of a manual epoch-to-date
+calculation is getting the weekday without hand-rolling Zeller's
+congruence). No extra state is stored per session for this — `created` is
+converted on demand each time `ls`/`lsw` runs, so it stays correct across a
+`rename-session` (which does not touch `created`). Requires the
+`Win32_System_Time` Cargo feature (`FileTimeToLocalFileTime` itself is
+`Win32_Storage_FileSystem`, already enabled).
+
 **Internal shape** (private; matches the design spec's sketch with one
 documented simplification): `ServerEvent::{Output(PaneId, Vec<u8>),
 Exited(PaneId), Connected(PipeConn), FromClient(ClientId, ClientMsg),
 ClientGone(ClientId), Tick}`; `PaneRuntime{pty: Option<Pty>, grid: Grid,
 dead: bool}`; `ClientState{session: Option<String>, cols: u16, rows: u16,
-renderer: Renderer, input: InputMachine, mode: ClientMode, tx:
-Sender<Vec<u8>>}`. `ClientMode` here is only `{Normal,
-ConfirmKillPane(PaneId)}` — the design sketch's `ConfirmKillWindow`/`Prompt`
-variants are Task 7's (window ops) concern and are deliberately NOT modeled
-yet, to avoid unused-variant dead code under `-D warnings`; Task 7 adding
-them is not a breaking change to anything outside this module, since none
-of this is public.
+renderer: Renderer, input: InputMachine, mode: ClientMode, message:
+Option<(String, Instant)>, tx: Sender<Vec<u8>>}`. `ClientMode` is now
+`{Normal, ConfirmKillPane(PaneId), ConfirmKillWindow(WindowId), Prompt{
+label: String, buf: String, kind: PromptKind }}` (`PromptKind::{
+RenameWindow, RenameSession}`) — see the CLI/prompt/transient-message
+paragraphs above for Task 7's wiring of the last three variants.
 
 **A bug found and fixed along the way:** `src/pipe.rs`'s handles were not
 overlapped (`FILE_FLAG_OVERLAPPED`), which meant a pending blocking read on
@@ -440,4 +565,6 @@ unchanged. Regression coverage:
 **Implementation module:** `src/server.rs`. Consumes `protocol`, `pipe`,
 `model`, `input`, `render`, `status`, `pty`, `grid`, `layout`; produces only
 `pub fn run`. Integration-tested end to end (no console, no ConPTY on the
-client side) by `tests/server_proto.rs`'s 9 tests.
+client side) by `tests/server_proto.rs`'s 28 tests (9 from Task 6 plus 19
+added in Task 7: window ops, prompts, transient messages, switch-client,
+pane-exit auto-close, and the CLI subset).
