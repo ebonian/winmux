@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::ptr;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -27,6 +27,40 @@ fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0)
 }
 
+/// RAII guard for the pseudoconsole during `spawn`: closes it if any later
+/// step fails. On success, `disarm` hands the HPCON to the constructed `Pty`,
+/// whose `Drop` then owns the `ClosePseudoConsole` call.
+struct HpconGuard(Option<HPCON>);
+
+impl HpconGuard {
+    fn get(&self) -> HPCON {
+        self.0.expect("hpcon guard already disarmed")
+    }
+
+    fn disarm(mut self) -> HPCON {
+        self.0.take().expect("hpcon guard already disarmed")
+    }
+}
+
+impl Drop for HpconGuard {
+    fn drop(&mut self) {
+        if let Some(hpcon) = self.0.take() {
+            unsafe { ClosePseudoConsole(hpcon) };
+        }
+    }
+}
+
+/// RAII guard for an initialized proc-thread attribute list: frees it on every
+/// exit path (success and error). The backing buffer must be declared before
+/// the guard so it is dropped after it.
+struct AttrListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+
+impl Drop for AttrListGuard {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.0) };
+    }
+}
+
 pub struct Pty {
     hpcon: HPCON,
     process: HANDLE,
@@ -47,24 +81,42 @@ impl Pty {
     pub fn spawn(cmdline: &str, cols: u16, rows: u16) -> io::Result<Pty> {
         unsafe {
             // 1. Two anonymous pipes. Child stdin = in_read; we write in_write.
-            //    Child stdout = out_write; we read out_read.
+            //    Child stdout = out_write; we read out_read. Each end is
+            //    wrapped as an owning `File` immediately after its pipe is
+            //    created, so every later error path releases it via RAII
+            //    (`from_raw_handle` transfers ownership; nothing below may
+            //    also CloseHandle these).
             let mut in_read = HANDLE::default();
             let mut in_write = HANDLE::default();
+            CreatePipe(&mut in_read, &mut in_write, None, 0).map_err(win_err)?;
+            let in_read = File::from_raw_handle(in_read.0 as RawHandle);
+            let input = File::from_raw_handle(in_write.0 as RawHandle);
+
             let mut out_read = HANDLE::default();
             let mut out_write = HANDLE::default();
-            CreatePipe(&mut in_read, &mut in_write, None, 0).map_err(win_err)?;
             CreatePipe(&mut out_read, &mut out_write, None, 0).map_err(win_err)?;
+            let reader = File::from_raw_handle(out_read.0 as RawHandle);
+            let out_write = File::from_raw_handle(out_write.0 as RawHandle);
 
-            // 2. Create the pseudoconsole from the child's pipe ends.
+            // 2. Create the pseudoconsole from the child's pipe ends. Guarded:
+            //    any later `?` return closes it (each failed spawn would
+            //    otherwise leak a conhost process).
             let size = COORD { X: cols as i16, Y: rows as i16 };
-            let hpcon: HPCON =
-                CreatePseudoConsole(size, in_read, out_write, 0).map_err(win_err)?;
+            let hpcon = HpconGuard(Some(
+                CreatePseudoConsole(
+                    size,
+                    HANDLE(in_read.as_raw_handle()),
+                    HANDLE(out_write.as_raw_handle()),
+                    0,
+                )
+                .map_err(win_err)?,
+            ));
 
-            // 3. ConPTY now owns duplicates of in_read + out_write; close our
-            //    local copies. We keep in_write (to child stdin) and out_read
-            //    (from child stdout).
-            let _ = CloseHandle(in_read);
-            let _ = CloseHandle(out_write);
+            // 3. ConPTY now owns duplicates of in_read + out_write; drop our
+            //    local copies (File close). We keep `input` (to child stdin)
+            //    and `reader` (from child stdout).
+            drop(in_read);
+            drop(out_write);
 
             // 4. Size the process/thread attribute list (two-call pattern: the
             //    first call is EXPECTED to fail with ERROR_INSUFFICIENT_BUFFER
@@ -81,13 +133,17 @@ impl Pty {
                 LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut c_void);
             InitializeProcThreadAttributeList(attr_list, 1, 0, &mut bytes_required)
                 .map_err(win_err)?;
+            // Initialized: from here DeleteProcThreadAttributeList must run on
+            // every exit path. Declared after `attr_buf` so the guard drops
+            // (deletes) before the backing buffer is freed.
+            let _attr_guard = AttrListGuard(attr_list);
 
             // 5. Attach the pseudoconsole to the attribute list.
             UpdateProcThreadAttribute(
                 attr_list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                Some(hpcon.0 as *const c_void),
+                Some(hpcon.get().0 as *const c_void),
                 std::mem::size_of::<HPCON>(),
                 None,
                 None,
@@ -136,18 +192,16 @@ impl Pty {
             )
             .map_err(win_err)?;
 
-            // 8. Free the attribute list; close the child's thread handle (we do
-            //    not need it) but KEEP the process handle for waiting.
-            DeleteProcThreadAttributeList(attr_list);
+            // 8. Close the child's thread handle (we do not need it) but KEEP
+            //    the process handle for waiting. The attribute list is freed by
+            //    `_attr_guard` when it drops at the end of this scope.
             let _ = CloseHandle(pi.hThread);
 
-            // 9. Wrap our pipe ends as `std::fs::File` (Send, RAII-closing) for
-            //    cross-thread blocking I/O. HANDLE.0 is *mut c_void == RawHandle.
-            let input = File::from_raw_handle(in_write.0 as RawHandle);
-            let reader = File::from_raw_handle(out_read.0 as RawHandle);
-
+            // 9. Success: disarm the pseudoconsole guard — from here `Pty`'s
+            //    Drop owns the ClosePseudoConsole call. `input`/`reader` were
+            //    already wrapped as owning Files in step 1.
             Ok(Pty {
-                hpcon,
+                hpcon: hpcon.disarm(),
                 process: pi.hProcess,
                 pid: pi.dwProcessId,
                 input,

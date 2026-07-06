@@ -69,6 +69,22 @@ fn echo_output_flows_through_conpty() {
     );
 }
 
+/// A spawn that fails (nonexistent executable) must return Err promptly and
+/// release everything created up to the failure point (pseudoconsole, pipe
+/// handles, attribute list). True leak detection is not practical in-test;
+/// looping 50 times at least proves no panic, hang, or handle/process
+/// exhaustion, and the RAII restructure in `spawn` is verified by review.
+#[test]
+fn spawn_failure_does_not_hang_or_leak() {
+    for i in 0..50 {
+        let result = Pty::spawn("definitely-not-a-real-executable-xyz.exe", 80, 24);
+        assert!(
+            result.is_err(),
+            "iteration {i}: spawning a nonexistent executable must fail"
+        );
+    }
+}
+
 /// The exit-waiter protocol: a child that exits immediately must signal its
 /// process handle so a waiter thread's WaitForSingleObject returns.
 #[test]
