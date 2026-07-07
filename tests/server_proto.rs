@@ -1161,6 +1161,68 @@ fn cli_send_keys_literal() {
     server.join().expect("server exits after last session dies");
 }
 
+/// tmux parity: a `-t` target that names only a SESSION (no `:`/`.`) resolves
+/// to that session's current window's active pane -- the single most common
+/// scripting idiom, `tmux send-keys -t mysession ...`. `demo` has no window
+/// named/indexed "demo", so before the fix this fell through to "pane not
+/// found: demo"; the practical rule now says a bare NON-NUMERIC token is a
+/// session name via `Registry::find`, not a pane spec.
+#[test]
+fn send_keys_bare_session_target() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "demo".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        "demo".into(),
+        "echo bare-ok".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::Existing, "demo", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("bare-ok")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// The same bare-token session-name fallback, when the name doesn't resolve
+/// to any session at all, surfaces `Registry::find`'s own error rather than
+/// a generic "pane not found" -- that's what the user actually meant by a
+/// non-numeric `-t`.
+#[test]
+fn bare_nonnumeric_unknown_session_errors() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "onlysession".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        "nosuch".into(),
+        "echo nope".into(),
+        "Enter".into(),
+    ]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "can't find session: nosuch");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "onlysession".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn command_prompt_executes() {
     let name = unique_pipe_name();

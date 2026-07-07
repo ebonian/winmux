@@ -114,6 +114,13 @@ fn split_session_prefix(t: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// `true` if `s` (optionally `=`-prefixed) parses as a window/pane index --
+/// i.e. keeps its TODAY meaning (index in the contextual session/window)
+/// rather than falling back to session-name resolution for a bare token.
+fn looks_like_index(s: &str) -> bool {
+    s.strip_prefix('=').unwrap_or(s).parse::<u32>().is_ok()
+}
+
 /// Resolve a window spec (the part of a target after any `session:` prefix,
 /// used whole for window-targeting commands): empty/absent -> the session's
 /// current window; `=N` or a bare number -> exact index match; otherwise a
@@ -237,6 +244,19 @@ impl Server {
             }
             None => (None, None),
         };
+        // Bare token, no `:` in the original target: tmux tries session name
+        // FIRST for target-window. A number keeps today's meaning (window
+        // index in the contextual session); a non-numeric token is a session
+        // name (via `Registry::find`), yielding that session's CURRENT
+        // window -- never a window-name lookup in the contextual session.
+        if sess_part.is_none() {
+            if let Some(w) = win_spec {
+                if !looks_like_index(w) {
+                    let session = self.registry.find(w)?;
+                    return Ok((session.name.clone(), session.current));
+                }
+            }
+        }
         let session_name = self.resolve_session_name(sess_part, client_session)?;
         let wid = {
             let session = self.registry.session_mut(&session_name).ok_or_else(|| format!("can't find session: {session_name}"))?;
@@ -253,13 +273,30 @@ impl Server {
             }
             None => (None, None),
         };
-        let (win_spec, pane_spec) = match rest {
+        let (win_spec, pane_spec, had_dot) = match rest {
             Some(r) => match r.split_once('.') {
-                Some((w, p)) => (if w.is_empty() { None } else { Some(w) }, if p.is_empty() { None } else { Some(p) }),
-                None => (None, if r.is_empty() { None } else { Some(r) }),
+                Some((w, p)) => (if w.is_empty() { None } else { Some(w) }, if p.is_empty() { None } else { Some(p) }, true),
+                None => (None, if r.is_empty() { None } else { Some(r) }, false),
             },
-            None => (None, None),
+            None => (None, None, false),
         };
+        // Bare token, no `:` or `.` in the original target: same session-name
+        // fallback as `resolve_window_target`, but yielding that session's
+        // current window's FOCUSED pane. `+`/`-` (relative-to-focus) and
+        // numeric indexes keep today's meaning (a pane position in the
+        // contextual window); a non-numeric token is a session name.
+        if sess_part.is_none() && !had_dot {
+            if let Some(p) = pane_spec {
+                if p != "+" && p != "-" && p.parse::<usize>().is_err() {
+                    let session = self.registry.find(p)?;
+                    let name = session.name.clone();
+                    let wid = session.current;
+                    let window = session.windows.iter().find(|w| w.id == wid).expect("session.current is a live window id");
+                    let pid = window.layout.focused();
+                    return Ok((name, wid, pid));
+                }
+            }
+        }
         let session_name = self.resolve_session_name(sess_part, client_session)?;
         let (wid, pid) = {
             let session = self.registry.session_mut(&session_name).ok_or_else(|| format!("can't find session: {session_name}"))?;

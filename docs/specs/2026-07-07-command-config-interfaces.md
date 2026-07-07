@@ -1041,10 +1041,34 @@ A target string is `[session:][window][.pane]`:
   session): empty/absent -> the window's focused pane; `+`/`-` -> next/
   previous pane (cyclic); a bare number -> **position** in
   `Layout::panes()` order (leaf/tree order), per the design spec's own
-  "pane index = position in layout.panes()" note. A bare target with no
-  `:`/`.` (e.g. `-t 0`) is therefore a PANE position in the current window,
-  never a session/window name -- this is what `cli_split_window_command`/
-  `kill_pane_via_command_targets` exercise.
+  "pane index = position in layout.panes()" note.
+- **Bare-token session-name fallback (tmux parity, post-Task-6 fix):** a
+  target with no `:` and (for pane-targeting commands) no `.` either is a
+  "bare token". Real tmux tries the session name FIRST for
+  target-session/target-window, and the full pane-resolution rules are more
+  involved than this codebase implements; this project adopts one
+  PRACTICAL rule instead of the full tmux algorithm: a bare token that
+  PARSES AS A NUMBER (optionally `=`-prefixed) keeps the meaning above
+  unchanged -- a window index (window contexts) or a pane position in the
+  contextual window (pane contexts), both scoped to the contextual session
+  (`cli_split_window_command`/`kill_pane_via_command_targets`/
+  `select_missing_window_shows_message` pin this). A bare token that is
+  NON-NUMERIC is instead resolved as a SESSION NAME via `Registry::find`
+  (exact, then unambiguous prefix) -- **not** a window-name lookup in the
+  contextual session -- yielding that session's CURRENT window (window
+  contexts: `resolve_window_target`) or that window's FOCUSED pane (pane
+  contexts: `resolve_pane_target`). This is what makes `send-keys -t
+  mysession ...` (a target naming only a session) work, the single most
+  common scripting idiom (`send_keys_bare_session_target`). `+`/`-`
+  (relative-to-focus) pane specs are exempted from this fallback -- they're
+  never treated as session names. If `Registry::find` fails, its own error
+  (`"can't find session: <t>"`) is surfaced as-is, rather than a generic
+  `"pane not found: <t>"`/`"window not found: <t>"`, since a non-numeric
+  bare token can now only ever mean "session name"
+  (`bare_nonnumeric_unknown_session_errors`). Session-name-with-colon forms
+  (`demo:1`, `demo:1.0`, `demo:`) are unaffected -- the `session:` prefix
+  already resolves via `Registry::find`, and the window/pane parts after it
+  keep their ordinary index-or-name resolution.
 - Cross-session targeting for pane/window commands is NOT implemented
   beyond the `session:` prefix picking which session's registry state to
   read -- `split-window -t othersession:2.1` resolves fully; there is no
