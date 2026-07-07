@@ -178,19 +178,60 @@ enum ChooseTreeView {
     Sessions,
 }
 
-/// choose-tree's per-client state (Task 8). `sel` is a plain index into
-/// whatever `dispatch::Server::build_tree_rows(session_name, view)` returns
-/// THIS render/keypress -- always clamped fresh, never stale (see
-/// `ClientMode::ChooseTree`'s doc comment). `pending_kill` is `Some((target,
-/// prompt))` between pressing `x` and answering y/n: the confirm PROMPT TEXT
-/// is precomputed at `x`-press time (mirrors `ClientMode::ConfirmCmd`'s own
-/// `prompt` field, deliberately NOT routed through `client.message` --
-/// message is cleared on every `Stdin` frame, which would make the prompt
-/// vanish before the user could answer it).
+/// choose-tree's per-client state (Task 8; review fix, Critical #1).
+/// `selected` is the STABLE IDENTITY of the currently-selected row -- the
+/// single source of truth for "what did the user actually select" -- and
+/// `sel` is only a best-effort cache of its last-known display INDEX, used
+/// solely as the fallback clamp point if that identity's row vanishes
+/// entirely (see [`resolve_tree_sel`]). A plain array index is NOT a safe
+/// primary key here: `dispatch::Server::build_tree_rows(session_name, view)`
+/// is rebuilt fresh from live registry state on every render AND every
+/// keypress, so "fresh" only means "current data," not "the same row the
+/// user was looking at" -- if the row list shrinks (another client's
+/// `kill-window`, or a pane exiting naturally) between the last render this
+/// client saw and the keypress that commits/kills, a raw index can silently
+/// resolve to a DIFFERENT, still-live row (reachable because the server's
+/// event loop coalesces multiple queued events into one batch before
+/// rendering). `Up`/`Down`/`Commit`/`Kill` all resolve through
+/// [`resolve_tree_sel`] against the freshly rebuilt row list, never against
+/// a bare index. `pending_kill` is `Some((target, prompt))` between pressing
+/// `x` and answering y/n: the confirm PROMPT TEXT is precomputed at
+/// `x`-press time (mirrors `ClientMode::ConfirmCmd`'s own `prompt` field,
+/// deliberately NOT routed through `client.message` -- message is cleared on
+/// every `Stdin` frame, which would make the prompt vanish before the user
+/// could answer it). `pending_kill` was already identity-based before this
+/// fix (`TreeTarget`, not an index) -- only `sel` needed the fix.
 struct ChooseTreeState {
     view: ChooseTreeView,
     sel: usize,
+    selected: Option<TreeTarget>,
     pending_kill: Option<(TreeTarget, String)>,
+}
+
+/// Re-resolve choose-tree's selection identity to a display INDEX into a
+/// freshly-rebuilt row list (Task 8 review fix, Critical #1): the single
+/// seam every read of `ChooseTreeState.sel`/`selected` must go through,
+/// shared by `Server::build_render_overlay` (render time) and
+/// `dispatch::Server::dispatch_choose_tree_key` (Up/Down/Commit/Kill time).
+/// If `selected`'s target is still present in `rows`, its CURRENT position
+/// wins outright, regardless of what `fallback` says (this is the fix: a
+/// row that moved because an EARLIER row was killed is still found by
+/// identity, not lost to a stale positional index). Only when the
+/// previously-selected row is genuinely gone does this fall back to
+/// `fallback` (the last-known index), clamped into the new, possibly
+/// shorter, row list -- mirroring how `cancel_stale_choose_trees` already
+/// re-validates `pending_kill` against live state. An empty `rows` resolves
+/// to `0` (the caller must check `rows.is_empty()` separately before
+/// indexing).
+fn resolve_tree_sel(rows: &[dispatch::TreeRow], selected: &Option<TreeTarget>, fallback: usize) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let clamped_fallback = fallback.min(rows.len() - 1);
+    match selected {
+        Some(target) => rows.iter().position(|r| &r.target == target).unwrap_or(clamped_fallback),
+        None => clamped_fallback,
+    }
 }
 
 /// A choose-tree row's underlying identity (Task 8): resolved fresh from the
@@ -1514,29 +1555,60 @@ impl Server {
                     }
                 }
                 KeyInputEvent::Key { table, key, raw } => {
-                    // choose-tree/display-panes (Task 8): a `Root`-table Key
-                    // event is fully intercepted (never falls to the normal
-                    // bindings-table/pane-forwarding logic below); a
-                    // `Prefix`-table event is left alone so prefix bindings
-                    // still fire, same rule as copy mode.
-                    if table == WhichTable::Root {
-                        if matches!(client.mode, ClientMode::ChooseTree(_)) {
-                            if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name) {
-                                dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
-                                if detach || destroy {
-                                    break 'events;
-                                }
-                            }
-                            continue;
-                        }
-                        if matches!(client.mode, ClientMode::DisplayPanes(_)) {
-                            let outcome = self.dispatch_display_panes_key(&key, &mut client, &session_name);
+                    // choose-tree/display-panes (Task 8; review fix,
+                    // Important #2): EVERY Key event is intercepted while
+                    // one of these overlays is open, regardless of `table`
+                    // -- INCLUDING a `Prefix`-table event, i.e. the
+                    // completion of a prefix sequence typed WHILE THE
+                    // OVERLAY WAS ALREADY OPEN (`KeyMachine` swallows the
+                    // bare prefix keypress itself with no event at all --
+                    // only the key that completes the sequence surfaces,
+                    // tagged `Prefix` -- so this is the only seam available
+                    // to catch it). Before this fix the interception was
+                    // gated on `table == WhichTable::Root` only, so a
+                    // completed prefix sequence fell through to ordinary
+                    // prefix-binding dispatch below and ran an unrelated
+                    // bound command UNDER the open overlay. This
+                    // deliberately does NOT mirror copy mode's own
+                    // "`Prefix`-table events pass through untouched" rule
+                    // (`C-b c` still works from copy mode, a long-lived
+                    // mode where that's desirable) -- choose-tree and
+                    // display-panes are momentary, modal overlays, and the
+                    // design spec's display-panes rule is explicit ("other
+                    // key dismisses ... and is NOT reprocessed").
+                    //
+                    // choose-tree: `dispatch_choose_tree_key` already
+                    // treats a key outside its hardcoded table as swallowed
+                    // (`resolve_choose_tree_key` returns `None` for
+                    // anything but Up/Down/`k`/`j`/Enter/`q`/Escape/`C-c`/
+                    // `x`) -- so routing a `Prefix`-table event through it
+                    // unconditionally reproduces tmux's own modal choose
+                    // mode: a completed prefix sequence is either
+                    // reinterpreted as a choose-tree action or silently
+                    // ignored (overlay stays open either way), never as the
+                    // prefix-bound command.
+                    if matches!(client.mode, ClientMode::ChooseTree(_)) {
+                        if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name) {
                             dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                             if detach || destroy {
                                 break 'events;
                             }
-                            continue;
                         }
+                        continue;
+                    }
+                    // display-panes: per the design spec's "other key
+                    // dismisses (and is NOT reprocessed)" rule -- a
+                    // completed prefix sequence's second key dismisses the
+                    // overlay exactly like any other non-digit key, and the
+                    // prefix-bound command is never dispatched underneath
+                    // it.
+                    if matches!(client.mode, ClientMode::DisplayPanes(_)) {
+                        let outcome = self.dispatch_display_panes_key(&key, &mut client, &session_name);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
+                        continue;
                     }
                     // Copy mode (Task 2): a `Root`-table Key event while the
                     // acting client is in `ClientMode::Copy` is looked up
@@ -1678,7 +1750,13 @@ impl Server {
         match &client.mode {
             ClientMode::ChooseTree(state) => {
                 let rows = self.build_tree_rows(session_name, state.view);
-                let sel = state.sel.min(rows.len().saturating_sub(1));
+                // Task 8 review fix, Critical #1: resolve by IDENTITY, not
+                // a raw clamped index -- see `resolve_tree_sel`'s doc
+                // comment. `build_render_overlay` runs with `&self` only
+                // (before `render_all`'s mutable per-client loop), so this
+                // is a read-only re-derivation, same as every other render
+                // pass; the persisted `ChooseTreeState` is not mutated here.
+                let sel = resolve_tree_sel(&rows, &state.selected, state.sel);
                 Some(RenderOverlay::Tree { rows: rows.into_iter().map(|r| r.text).collect(), sel })
             }
             ClientMode::DisplayPanes(_) => {
@@ -1922,7 +2000,18 @@ fn render_one(
 
     let overlay = overlay_data.map(|ov| match ov {
         RenderOverlay::Tree { rows, sel } => {
-            let visible = scene_size.1 as usize;
+            // Task 8 review fix, Important #3: `compose_back`'s actual paint
+            // pass reserves the panel's OWN last row for `scene.message`
+            // (choose-tree's `x` kill-confirm prompt) whenever it's `Some`
+            // -- `msg_reserved`/`visible` there, mirrored exactly here so
+            // `top`'s "keep `sel` on screen" math never assumes one more
+            // paintable row than `compose_back` will actually use. Without
+            // this, a scrolled selection at the bottom of a long list with
+            // a just-armed kill-confirm showing could be computed as
+            // "visible" here while `compose_back` paints one row less,
+            // pushing the selected/prompted row off-screen.
+            let msg_reserved = if message.is_some() { 1 } else { 0 };
+            let visible = (scene_size.1 as usize).saturating_sub(msg_reserved);
             let top = sel.saturating_sub(visible.saturating_sub(1));
             Overlay::List(ListOverlay {
                 title: String::new(),

@@ -1534,14 +1534,43 @@ enum ChooseTreeView { Windows, Sessions }
 
 struct ChooseTreeState {
     view: ChooseTreeView,
-    /// Plain index into whatever `dispatch::Server::build_tree_rows`
-    /// returns THIS render/keypress — clamped fresh every time, never
-    /// stored as a stale snapshot (see below).
+    /// AMENDED, Task 8 review fix (Critical #1): a plain index alone is NOT
+    /// a safe primary key — see `selected` below, the field this fix added.
+    /// `sel` is now only a best-effort cache of `selected`'s last-known
+    /// display position, consulted solely as the fallback clamp point if
+    /// `selected`'s row vanishes entirely (`resolve_tree_sel`).
     sel: usize,
+    /// Task 8 review fix (Critical #1): the STABLE IDENTITY of the
+    /// currently-selected row — the actual source of truth. The original
+    /// design ("`sel` is clamped fresh every render/keypress, so it's never
+    /// stale") was correct about the ROW LIST never being stale (see the
+    /// design-decision paragraph below) but WRONG that a bare index into it
+    /// is therefore always correct: `dispatch::Server::build_tree_rows` is
+    /// rebuilt fresh, but "fresh" only means "current data," not "the same
+    /// row the user was looking at." If the row list shrinks (another
+    /// client's `kill-window`, or a pane exiting naturally) between the
+    /// last render this client saw and the keypress that commits/kills — a
+    /// real window, not merely a hypothetical: the server's event loop
+    /// coalesces multiple queued events into one batch before rendering
+    /// (`server.rs`'s `run()`) — a raw index can silently resolve to a
+    /// DIFFERENT, still-live row instead of the dead/wrong-target failure
+    /// the original design anticipated. `Up`/`Down`/`Commit`/`Kill` all
+    /// resolve through `resolve_tree_sel(rows, selected, sel) -> usize`
+    /// (a free fn in `server.rs`, shared by `build_render_overlay` and
+    /// `dispatch_choose_tree_key`): if `selected`'s target is still present
+    /// in the freshly-rebuilt `rows`, its CURRENT position wins outright
+    /// regardless of `sel`; only when the row is genuinely gone does it
+    /// fall back to `sel`, clamped into the new (possibly shorter) list —
+    /// mirroring how `cancel_stale_choose_trees` already re-validates
+    /// `pending_kill`. `Up`/`Down` update both `sel` and `selected` together
+    /// after moving.
+    selected: Option<TreeTarget>,
     /// `Some((target, prompt))` between pressing `x` and answering y/n; the
     /// prompt text is precomputed at `x`-press time and rendered directly
     /// from here (NOT via `client.message`, which is cleared on every
     /// `Stdin` frame and would make the prompt vanish before an answer).
+    /// Already identity-based before the Task 8 review fix — untouched by
+    /// it (the flaw was specifically in `sel`, not here).
     pending_kill: Option<(TreeTarget, String)>,
 }
 
@@ -1561,17 +1590,33 @@ struct DisplayPanesState {
 **Design decision — no stored row/pane snapshot (the brief's "multi-client
 and staleness" requirement, addressed structurally rather than by a bolt-on
 recheck):** unlike the brief's literal `ChooseTree{rows: Vec<TreeRow>, sel:
-usize}` sketch, `ChooseTreeState` carries only `view`/`sel`/`pending_kill` —
-the actual row list (text + target identity) is rebuilt FRESH from live
-registry state by `dispatch::Server::build_tree_rows` both when RENDERING
-(`Server::build_render_overlay`) and when a key COMMITS `sel` to a concrete
-target (`dispatch::Server::dispatch_choose_tree_key`). This makes "a listed
-window/session died mid-overlay, Enter/x must not act on a stale/wrong
-target" unreachable by construction for navigation/commit — there is no
-snapshot to go stale. The ONE piece of state that DOES persist across
-renders, `pending_kill`, is re-validated by `Server::cancel_stale_choose_
-trees` (parallels `cancel_stale_confirms`/`cancel_stale_copy_modes`, called
-from the same two sites: end of `handle_exited`, end of `handle_stdin`).
+usize}` sketch, `ChooseTreeState` carries only `view`/`sel`/`selected`/
+`pending_kill` — the actual row list (text + target identity) is rebuilt
+FRESH from live registry state by `dispatch::Server::build_tree_rows` both
+when RENDERING (`Server::build_render_overlay`) and when a key resolves
+`sel`/`selected` to a concrete target (`dispatch::Server::
+dispatch_choose_tree_key`). This makes "a listed window/session died
+mid-overlay, Enter/x must not act on a stale/DEAD target" unreachable by
+construction for navigation/commit — there is no row-list snapshot to go
+stale.
+**Task 8 review fix (Critical #1), narrowing that claim:** a fresh row
+LIST is not the same guarantee as a fresh SELECTION — the original text
+here overclaimed "unreachable by construction" to cover the index too, but
+a plain `sel: usize` can still resolve to a DIFFERENT, still-LIVE row if
+the list shifts underneath it (e.g. another client's `kill-window` on an
+earlier row) between the last render this client saw and the keypress
+that commits/kills, which the server's event-loop coalescing (multiple
+queued events processed in one batch before rendering, `server.rs`'s
+`run()`) makes reachable with no intervening render to warn the user. The
+fix adds `selected: Option<TreeTarget>` as the actual source of truth (see
+its own doc comment above) and a `resolve_tree_sel` free fn every read of
+the selection goes through; `sel` is now only used as `resolve_tree_sel`'s
+fallback clamp point when `selected`'s row is genuinely gone. The ONE
+piece of state that DOES persist across renders, `pending_kill`, is
+re-validated by `Server::cancel_stale_choose_trees` (parallels
+`cancel_stale_confirms`/`cancel_stale_copy_modes`, called from the same two
+sites: end of `handle_exited`, end of `handle_stdin`) — this was already
+identity-based and needed no fix.
 `DisplayPanesState` follows the identical pattern — no pane-set snapshot;
 `pane_digit_entries(window: &model::Window) -> Vec<(PaneId, u32)>` (a free
 fn in `server.rs`, digits 0-9 only, `layout.panes()` order, capped at the
@@ -1586,10 +1631,11 @@ DECODED key events), NOT `set_capture`-based raw-byte capture**, despite
 both overlays superficially resembling a "capture the next input" prompt:
 capture mode's shared `edit_line_buf` treats a lone `0x1b` as an immediate
 cancel byte, which would make `Up`/`Down`/`Escape`-as-cancel unusable (a lone
-ESC never even reaches that far — see the next paragraph). Instead,
-`handle_stdin`'s existing copy-mode interception (both the `Forward`-blob
-re-decode arm and the `Key{table: Root, ..}` arm) is extended with two more
-`matches!(client.mode, ..)` branches:
+ESC never even reaches that far — see the next paragraph). `handle_stdin`'s
+existing copy-mode interception (the `Forward`-blob re-decode arm) is
+extended with two more `matches!(client.mode, ..)` branches for the
+`Forward` path; the `Key{table, ..}` arm gets the same two branches, with
+one difference from copy mode's own precedent, below.
 
 - `ClientMode::ChooseTree(_)`: every decoded key (Forward-redecoded or
   direct) is resolved via the HARDCODED `resolve_choose_tree_key(key:
@@ -1601,12 +1647,14 @@ re-decode arm and the `Key{table: Root, ..}` arm) is extended with two more
   `dispatch_choose_tree_key(key, client, session_name) -> Option<ExecOutcome>`
   handles the pending-kill y/n sub-state FIRST (y/Y/Enter confirms via
   `exec_tree_kill`; anything else just clears `pending_kill`), then
-  navigation (`Up`/`Down` clamp `sel` against a freshly-built row list),
-  `Cancel` (-> `ClientMode::Normal`), `Kill` (resolves the selected row's
-  target, computes the `kill-session <name>? (y/n)` / `kill-window <name>?
-  (y/n)` prompt via `tree_kill_prompt`, arms `pending_kill`), and `Commit`
-  (resolves the selected row's target, dispatches to `exec_tree_commit`,
-  always returns to `ClientMode::Normal` regardless of the outcome).
+  navigation (`Up`/`Down` re-resolve `sel` via `resolve_tree_sel` against a
+  freshly-built row list, Task 8 review fix — see `ChooseTreeState`'s doc
+  comment above), `Cancel` (-> `ClientMode::Normal`), `Kill` (re-resolves
+  the selected row's target the same way, computes the `kill-session
+  <name>? (y/n)` / `kill-window <name>? (y/n)` prompt via
+  `tree_kill_prompt`, arms `pending_kill`), and `Commit` (re-resolves the
+  selected row's target, dispatches to `exec_tree_commit`, always returns
+  to `ClientMode::Normal` regardless of the outcome).
 - `ClientMode::DisplayPanes(_)`: exactly ONE key is ever consumed —
   `dispatch_display_panes_key(key, client, session_name) -> ExecOutcome`
   unconditionally resets `client.mode = ClientMode::Normal` first, then (for
@@ -1617,6 +1665,28 @@ re-decode arm and the `Key{table: Root, ..}` arm) is extended with two more
   On the `Forward`-blob path, only the FIRST decoded key of a coalesced blob
   is consulted; the rest of the blob is discarded (design spec's documented
   "not reprocessed" simplification).
+
+**Task 8 review fix (Important #2) — interception applies to EVERY `Key`
+event, not just `table: Root`:** the original `Key{table, ..}` arm gated
+both branches above on `table == WhichTable::Root`, mirroring copy mode's
+own rule of leaving `Prefix`-table events alone so `C-b c` still works
+while in copy mode. That rule does not transfer to these two overlays:
+`input::KeyMachine` swallows the bare prefix keypress itself with NO event
+at all (only the key that COMPLETES a prefix sequence surfaces, tagged
+`table: Prefix`), so a `Root`-only guard let a prefix sequence typed WHILE
+either overlay was open fall through to ordinary prefix-binding dispatch
+and run the bound command UNDER the still-open overlay — contradicting the
+design spec's display-panes rule ("other key dismisses ... and is NOT
+reprocessed") and, for choose-tree, contradicting tmux's own modal choose
+mode. The fix drops the `table == WhichTable::Root` condition entirely:
+both branches now run for a `Key` event regardless of `table`. For
+display-panes this means a completed prefix sequence dismisses the overlay
+like any other non-digit key, without running the prefix-bound command.
+For choose-tree, `resolve_choose_tree_key` already returns `None` for
+anything outside its hardcoded set, so this reproduces tmux's own modal
+behavior for free: a completed prefix sequence is either reinterpreted as
+a choose-tree action or silently swallowed (overlay stays open either
+way), never dispatched as the prefix-bound command.
 
 **Why not `Escape` in tests (a genuine, PRE-EXISTING harness/architecture
 limitation, not introduced by this task):** a bare, unterminated `0x1b` byte
@@ -1634,9 +1704,11 @@ tests `q`, never a bare `Escape`, despite `Escape -> copy-cancel` being a
 real default binding too).
 
 **`build_tree_rows(session_name: &str, view: ChooseTreeView) -> Vec<TreeRow>`**
-(`TreeRow { text: String, target: TreeTarget }`, `text`/`build_tree_rows`
-itself `pub(super)` for `server.rs`'s `build_render_overlay` to reach; `target`
-private): `Sessions` — one row per session, `<name>: N windows[ (attached)]`
+(`TreeRow { text: String, target: TreeTarget }`, `build_tree_rows` and BOTH
+fields `pub(super)` — `target` was widened from private by the Task 8 review
+fix so `server.rs`'s new `resolve_tree_sel` free fn, which needs to compare
+row identities, can read it too — for `server.rs`'s `build_render_overlay`
+to reach): `Sessions` — one row per session, `<name>: N windows[ (attached)]`
 (attached = ANY client currently has that session). `Windows` — the CURRENT
 session only: a header row in the same format, then one indented row per
 window, `  <index>: <name><flags>` (`*` current / `-` last / `` neither).

@@ -36,10 +36,10 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, sel_key, send_msg, spawn_pane,
-    system_time_parts, ChooseTreeState, ChooseTreeView, ClientId, ClientMode, ClientState, ConfigCandidate, CopyState,
-    DisplayPanesState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState, Server, TreeTarget, MONTHS,
-    MOUSE_WHEEL_STEP,
+    advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key, send_msg,
+    spawn_pane, system_time_parts, ChooseTreeState, ChooseTreeView, ClientId, ClientMode, ClientState,
+    ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState,
+    Server, TreeTarget, MONTHS, MOUSE_WHEEL_STEP,
 };
 use crate::grid::Grid;
 use std::time::Duration;
@@ -2611,7 +2611,7 @@ impl Server {
             BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
-            ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client),
+            ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
         }
     }
@@ -2859,7 +2859,7 @@ impl Server {
 /// (see `ClientMode::ChooseTree`'s doc comment for why).
 pub(super) struct TreeRow {
     pub(super) text: String,
-    target: TreeTarget,
+    pub(super) target: TreeTarget,
 }
 
 /// Hardcoded choose-tree key resolution (Task 8) — deliberately NOT routed
@@ -3059,22 +3059,40 @@ impl Server {
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let (view, sel) = match &client.mode {
-            ClientMode::ChooseTree(state) => (state.view, state.sel),
+        let view = match &client.mode {
+            ClientMode::ChooseTree(state) => state.view,
             _ => return None,
         };
         let rows = self.build_tree_rows(session_name, view);
 
+        // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
+        // IDENTITY against this freshly rebuilt `rows`, rather than trusting
+        // `state.sel` as a raw array position. If a kill (another client, or
+        // a pane exiting naturally) and this keypress land in the same
+        // coalesced event batch, the row list can shift underneath a stale
+        // index without an intervening render ever showing the user the
+        // shift — re-resolving by identity is what makes Commit/Kill act on
+        // what the user actually selected. See `resolve_tree_sel`'s doc
+        // comment for the full mechanics.
+        let sel = match &client.mode {
+            ClientMode::ChooseTree(state) => resolve_tree_sel(&rows, &state.selected, state.sel),
+            _ => return None,
+        };
+
         match action {
             ChooseTreeAction::Up => {
+                let new_sel = sel.saturating_sub(1);
                 if let ClientMode::ChooseTree(state) = &mut client.mode {
-                    state.sel = sel.saturating_sub(1);
+                    state.sel = new_sel;
+                    state.selected = rows.get(new_sel).map(|r| r.target.clone());
                 }
                 Some(ExecOutcome::Ok(String::new()))
             }
             ChooseTreeAction::Down => {
+                let new_sel = (sel + 1).min(rows.len().saturating_sub(1));
                 if let ClientMode::ChooseTree(state) = &mut client.mode {
-                    state.sel = (sel + 1).min(rows.len().saturating_sub(1));
+                    state.sel = new_sel;
+                    state.selected = rows.get(new_sel).map(|r| r.target.clone());
                 }
                 Some(ExecOutcome::Ok(String::new()))
             }
@@ -3130,9 +3148,14 @@ impl Server {
     /// behavior — no special-casing for "already in copy mode"/"prompt open"
     /// etc., since a prompt/confirm keeps capture armed and therefore can
     /// never actually dispatch this command in the first place).
-    fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState) -> ExecOutcome {
+    fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel: 0, pending_kill: None });
+        // Task 8 review fix, Critical #1: seed `selected` with row 0's
+        // identity (not just index 0) so the very first Up/Down/Commit/Kill
+        // has an identity to re-resolve, same as every subsequent keypress.
+        let rows = self.build_tree_rows(session_name, view);
+        let selected = rows.first().map(|r| r.target.clone());
+        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel: 0, selected, pending_kill: None });
         ExecOutcome::Ok(String::new())
     }
 
@@ -3325,5 +3348,140 @@ mod mouse_dispatch_tests {
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         let ClientMode::Copy(cs) = &client_plain.mode else { panic!("expected Copy mode after plain copy-mode") };
         assert!(!cs.scroll_exit, "plain copy-mode entry (no -e) must not set scroll_exit");
+    }
+}
+
+/// Task 8 review fix, Critical #1: unit-level regression coverage mirroring
+/// the reviewer's own probe (no ConPTY, no background threads -- built the
+/// same way `mouse_dispatch_tests` builds a real `Server`+`Registry` state
+/// directly).
+#[cfg(test)]
+mod choose_tree_dispatch_tests {
+    use super::*;
+    use crate::grid::Grid;
+    use crate::render::Renderer;
+    use std::sync::mpsc::channel;
+
+    fn test_client(cols: u16, rows: u16) -> ClientState {
+        let (tx, _rx) = channel::<Vec<u8>>();
+        ClientState {
+            session: Some("0".to_string()),
+            cols,
+            rows,
+            renderer: Renderer::new(cols, rows),
+            key_machine: crate::input::KeyMachine::new(crate::keys::parse_key("C-b").unwrap()),
+            mode: ClientMode::Normal,
+            message: None,
+            tx,
+            mouse: super::super::MouseClientState::default(),
+        }
+    }
+
+    fn insert_blank_pane(server: &mut Server) -> PaneId {
+        let pane_id = server.mint_pane_id();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false });
+        pane_id
+    }
+
+    /// One session ("0") with three windows named A, B, C, in that row
+    /// order (A is the session's initial window; B and C added via
+    /// `Session::new_window`). Window A is left CURRENT on return (which
+    /// window is "current" is irrelevant to the bug under test -- only the
+    /// row ORDER and which one is choose-tree-SELECTED matter).
+    fn test_server_with_three_windows() -> (Server, String, [WindowId; 3]) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        let pane_a = insert_blank_pane(&mut server);
+        let session = server.registry.create_session(Some("0"), pane_a, (20, 10), 0).expect("create_session");
+        let a_id = session.current;
+        session.windows[0].name = "A".to_string();
+        let session_name = session.name.clone();
+
+        let b_id = server.registry.mint_window_id();
+        let pane_b = insert_blank_pane(&mut server);
+        server.registry.session_mut(&session_name).unwrap().new_window(b_id, pane_b).name = "B".to_string();
+
+        let c_id = server.registry.mint_window_id();
+        let pane_c = insert_blank_pane(&mut server);
+        server.registry.session_mut(&session_name).unwrap().new_window(c_id, pane_c).name = "C".to_string();
+
+        // `new_window` makes the new window current each time -- reset to A
+        // so the row order (A, B, C) is the only thing this test relies on.
+        server.registry.session_mut(&session_name).unwrap().current = a_id;
+
+        (server, session_name, [a_id, b_id, c_id])
+    }
+
+    fn key(code: KeyCode) -> Key {
+        Key { code, ctrl: false, meta: false, shift: false }
+    }
+
+    /// The review's Critical #1, reproduced: `ChooseTreeState.sel` used to be
+    /// a raw array index into a row list rebuilt fresh every keypress -- not
+    /// a stable target identity. Rows = `[header, A, B, C]`. Select row 2
+    /// (window B) via real `Down` dispatches, then simulate a SAME-BATCH
+    /// concurrent kill of window A (an EARLIER row) -- directly, bypassing
+    /// this client's key machine and with NO intervening render, exactly
+    /// the scenario the server's event-loop coalescing makes reachable
+    /// (`server.rs`'s `run()` drains the whole channel before rendering).
+    /// Rows are now `[header, B, C]`; the OLD raw index 2 would silently
+    /// point at C instead of B. Enter must still commit to B.
+    #[test]
+    fn choose_tree_commit_targets_selected_row_after_concurrent_kill() {
+        let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
+        let mut client = test_client(20, 10);
+        let mut sname = session_name.clone();
+
+        let outcome = server.exec_choose_tree_client(false, &mut client, &sname);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        // Down, Down: header -> A's row -> B's row.
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        match &client.mode {
+            ClientMode::ChooseTree(state) => {
+                assert_eq!(state.selected, Some(TreeTarget::Window(session_name.clone(), b_id)), "test setup: selection must be window B before the concurrent kill")
+            }
+            _ => panic!("expected ChooseTree mode"),
+        }
+
+        // Same-batch concurrent kill of window A (bypasses dispatch/render).
+        server.kill_window_by_id(&session_name, a_id).expect("kill window A");
+
+        let outcome = server.dispatch_choose_tree_key(&key(KeyCode::Enter), &mut client, &mut sname).expect("Enter dispatches");
+        assert!(matches!(outcome, ExecOutcome::Ok(_)), "commit to a same-session window is a plain Ok, not SwitchedSession");
+        let current = server.registry.session_mut(&session_name).unwrap().current;
+        assert_eq!(
+            current, b_id,
+            "Enter must commit to what the user actually selected (window B), not whatever now sits at the stale index (window C)"
+        );
+    }
+
+    /// Same root cause, `x` (Kill) variant: arming the kill-confirm must
+    /// target the re-resolved identity too, not the stale index.
+    #[test]
+    fn choose_tree_kill_targets_selected_row_after_concurrent_kill() {
+        let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
+        let mut client = test_client(20, 10);
+        let mut sname = session_name.clone();
+
+        server.exec_choose_tree_client(false, &mut client, &sname);
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+
+        server.kill_window_by_id(&session_name, a_id).expect("kill window A");
+
+        server.dispatch_choose_tree_key(&key(KeyCode::Char('x')), &mut client, &mut sname).expect("x dispatches");
+        match &client.mode {
+            ClientMode::ChooseTree(state) => {
+                let (target, _) = state.pending_kill.as_ref().expect("x must arm a pending kill");
+                assert_eq!(
+                    target,
+                    &TreeTarget::Window(session_name.clone(), b_id),
+                    "x must arm the kill-confirm on what the user actually selected (window B), not the stale index"
+                );
+            }
+            _ => panic!("expected ChooseTree mode"),
+        }
     }
 }

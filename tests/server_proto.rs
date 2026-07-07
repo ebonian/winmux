@@ -4265,3 +4265,152 @@ fn choose_tree_x_kills_with_confirm() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+/// Task 8 review fix, Important #2: `KeyMachine` swallows the bare prefix
+/// keypress itself with no event at all -- only the key that COMPLETES a
+/// prefix sequence surfaces, tagged `WhichTable::Prefix`. Before this fix,
+/// `handle_stdin`'s choose-tree/display-panes interception was gated on
+/// `table == WhichTable::Root` only, so a completed prefix sequence typed
+/// while the overlay was open fell through to ordinary prefix-binding
+/// dispatch and ran the bound command (here, `C-b c` -> `new-window`) UNDER
+/// the still-open overlay. Per the design spec's display-panes rule ("other
+/// key dismisses ... and is NOT reprocessed"), the prefix keystroke counts
+/// as "other key": the overlay must close AND `new-window` must NOT run.
+#[test]
+fn display_panes_prefix_sequence_dismisses_without_executing_bound_command() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Only one pane exists (no split), so its digit block is the ACTIVE
+    // colour (red, `Color::Idx(1)`).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'q']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(1), 0, 80, 0, 23));
+
+    // A full prefix sequence typed WHILE display-panes is open (`C-b c`,
+    // bound to new-window): the overlay must dismiss and `new-window` must
+    // NOT execute underneath it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(1), 0, 80, 0, 23) && !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Confirm from a fresh CLI connection (avoids racing this client's own
+    // redraw): still exactly one window.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "0".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(
+        out.lines().filter(|l| !l.is_empty()).count(),
+        1,
+        "new-window bound under C-b c must NOT have executed while display-panes was open: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Same root cause as the display-panes test above, choose-tree side.
+/// choose-tree's hardcoded key table (`resolve_choose_tree_key`) has no
+/// entry for `c`, so per tmux's own modal choose-tree semantics (the
+/// review's adjudicated reading of the design spec, which only documents
+/// the "other key dismisses" rule for display-panes explicitly) the
+/// completed `C-b c` sequence is silently IGNORED: the overlay stays open
+/// and `new-window` does not run.
+#[test]
+fn choose_tree_prefix_sequence_ignored_overlay_stays_open() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    // A full prefix sequence typed WHILE choose-tree is open (`C-b c`,
+    // bound to new-window) must be swallowed by the overlay, not
+    // dispatched as a prefix command underneath it. Immediately follow
+    // with `q` (a REAL choose-tree action, Cancel) for a deterministic,
+    // non-racy signal: with the bug, `new-window` would already have run
+    // and switched focus to a brand-new window 1 before `q` cancels, so
+    // the resulting status line reads "[0] 0:powershell- 1:powershell*"
+    // (window 0 no longer current); with the fix, exactly one window
+    // still exists and cancelling lands right back on it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("1:powershell")),
+        "new-window bound under C-b c must NOT have executed while choose-tree was open"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task 8 review fix, Important #3: `render_one`'s choose-tree scroll `top`
+/// used to be computed from the FULL client height, but `compose_back`'s
+/// actual paint pass reserves one row for `scene.message` (choose-tree's
+/// `x` kill-confirm prompt) whenever it's shown -- one fewer row than
+/// `top`'s old math assumed. With a long, scrolled list and the selection
+/// at the very bottom, arming the kill-confirm (`x`) could push the
+/// selected/prompted row off the actually-painted area. 9 windows (10
+/// total with the session's original one) overflow a 10-row terminal;
+/// select the LAST row (the newest window, clamped there by sending far
+/// more `Down`s than there are rows) and arm `x` -- the selected row and
+/// its confirm prompt must both still be visible together.
+#[test]
+fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 10);
+
+    for _ in 0..9 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+        c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    }
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 10 windows (attached)")));
+    // Selection starts at the header row (row 0, unscrolled): window 9's
+    // row is off the bottom of a 10-row terminal until we scroll down to
+    // it below.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("9: powershell")), "test setup: window 9's row must start OFF-screen (unscrolled)");
+
+    // Clamp-drive the selection all the way to the last row (far more Downs
+    // than there are rows), then arm the kill-confirm.
+    for _ in 0..20 {
+        c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    }
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+
+    let lines = screen_text(&grid);
+    assert!(lines.iter().any(|l| l.contains("(y/n)")), "kill-confirm message must be showing");
+    assert!(
+        lines.iter().any(|l| l.contains("9: powershell*")),
+        "the selected row (window 9, the last one) must still be visible alongside the kill-confirm message, not scrolled off by one row: {lines:?}"
+    );
+
+    // Clean up: cancel the confirm (anything but y/Y/Enter), close the
+    // overlay, exit. (Not asserting on the post-`q` status line text here:
+    // with 10 windows its "N:powershell<flag> " entries overflow an 80-col
+    // status line long before reaching window 9's, so waiting for it to
+    // appear there would hang regardless of this fix -- the pane prompt
+    // reappearing is enough to prove the overlay actually closed.)
+    c.send(&ClientMsg::Stdin(b"n".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // 10 windows survive -- `exit\r` on just the current one wouldn't end
+    // the session, so clean up via `kill-server` from a fresh CLI
+    // connection instead (same pattern `choose_tree_s_sessions` uses).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
