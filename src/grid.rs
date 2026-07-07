@@ -630,7 +630,9 @@ impl Grid {
     pub fn cell(&self, col: u16, row: u16) -> Cell {
         assert!(
             col < self.state.cols && row < self.state.rows,
-            "cell out of range"
+            "cell({col}, {row}) out of bounds {}x{}",
+            self.state.cols,
+            self.state.rows
         );
         self.state.cells[self.state.idx(col, row)]
     }
@@ -837,6 +839,15 @@ mod tests {
         let y = g.cell(1, 0);
         assert_eq!(y.style.fg, Color::Default);
         assert_eq!(y.style.bg, Color::Default);
+    }
+
+    #[test]
+    #[should_panic(expected = "cell(90, 5) out of bounds 80x24")]
+    fn cell_panic_message_includes_coordinates_and_dimensions() {
+        // Follow-up #6: the panic message must include both the requested
+        // coordinates AND the grid's actual dimensions.
+        let g = Grid::new(80, 24);
+        g.cell(90, 5);
     }
 
     #[test]

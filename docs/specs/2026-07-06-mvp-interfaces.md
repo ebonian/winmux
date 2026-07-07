@@ -4,6 +4,12 @@
 signatures exactly. If a signature must change during implementation, the change
 must be applied consistently to every consumer named here.
 
+**Amendment (sub-project 2, Task 4):** the `input` section below was extended
+with new `Action` variants (window/session/detach bindings), a new
+`InputEvent::Captured` variant, and a new `InputMachine::set_capture` method.
+See [`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md)
+for the session/window model these new actions dispatch into.
+
 **Parent spec:** [`2026-07-06-multiplexing-mvp-design.md`](2026-07-06-multiplexing-mvp-design.md)
 
 ## Crate layout
@@ -122,6 +128,11 @@ impl Layout {
     pub fn toggle_zoom(&mut self);
     pub fn is_zoomed(&self) -> bool;
 
+    // Hardening note (follow-up #5, resolved sub-project-2 Task 10):
+    // `focus_dir`'s Right/Down adjacency checks use `saturating_add` instead
+    // of `+` so extreme-coordinate areas (near u16::MAX) can't overflow-panic
+    // in debug builds. Behavior-preserving for all reachable terminal sizes.
+
     /// Compute pane rectangles within `area`. Exactly ONE border row/column
     /// separates siblings; rects EXCLUDE border cells. When zoomed, returns
     /// only [(focused, area)]. Split arithmetic: along the split axis with
@@ -170,6 +181,9 @@ impl Grid {
     pub fn cols(&self) -> u16;
     pub fn rows(&self) -> u16;
     pub fn cell(&self, col: u16, row: u16) -> Cell;   // panics out of range
+    // Hardening note (follow-up #6, resolved sub-project-2 Task 10): the
+    // panic message is `"cell({col}, {row}) out of bounds {cols}x{rows}"`,
+    // including both the requested coordinates and the grid's dimensions.
     pub fn cursor(&self) -> (u16, u16);               // (col, row)
     pub fn cursor_visible(&self) -> bool;             // DECTCEM state, default true
 }
@@ -211,13 +225,32 @@ pub struct PaneView<'a> {
     pub dead: bool,
 }
 
+/// One run of status-bar text; `underline` draws it with SGR 4 (tmux
+/// `window-status-current-style` = `underscore` default). Built by
+/// `status::status_spans` — see the sibling `2026-07-07-server-client-interfaces.md`
+/// "status" section for the span-composition rule.
+///
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-07, Task 5):** `Scene::status_left:
+/// String` was replaced by `Scene::status_spans: Vec<StatusSpan>` so the
+/// status bar can render a real window list with the current window
+/// underlined, instead of one opaque left-aligned string. `app.rs` (the MVP
+/// single-window loop, removed in a later sub-project-2 task) adapts by
+/// building two spans, `"[winmux] "` and `"0:powershell*"`, both
+/// `underline: false` — chosen over tmux's true-for-current so this module's
+/// existing hardcoded byte-stream assertions stay stable; it does not use
+/// `status::status_spans`.
+pub struct StatusSpan {
+    pub text: String,
+    pub underline: bool,
+}
+
 pub struct Scene<'a> {
     /// Host terminal size (cols, rows). The status bar is the bottom row;
     /// panes live in rows 0..rows-1.
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
     pub zoomed: bool,
-    pub status_left: String,   // e.g. "[winmux] 0:powershell*"
+    pub status_spans: Vec<StatusSpan>,  // e.g. spans for "[winmux] 0:powershell*"
     pub status_right: String,  // e.g. "21:04 06-Jul-26"
     /// When Some, the status row shows this message instead (confirm prompt,
     /// "terminal too small"), styled bg yellow(SGR 43) fg black(30) like tmux
@@ -250,9 +283,16 @@ impl Renderer {
   (tmux default `pane-active-border-style fg=green`). When zoomed, no borders.
 - Dead pane: its grid still renders; the string `[exited]` is overlaid in
   reverse video at the pane rect's top-left.
-- Status bar (bottom row): bg green (42) fg black (30), tmux default.
-  `status_left` at col 0, `status_right` right-aligned; middle padded with
-  spaces; truncate right-first if too narrow.
+- Status bar (bottom row): bg green (42) fg black (30), tmux default (bg
+  yellow 43 fg black 30 when `message` overrides). `status_spans` drawn
+  left-to-right starting at col 0, each span's cells carrying the status-row
+  style with `underline` set from that span (SGR is always emitted as one
+  combined `\x1b[0;...m` sequence per style change — see `sgr()` — so an
+  underlined span's SGR includes `4`, and the following non-underlined span's
+  SGR simply omits it; there is no separate SGR 24 reset), then
+  `status_right` right-aligned; middle padded with spaces; truncate
+  right-first if too narrow (left length for this purpose is the sum of all
+  spans' char counts).
 - Diff emission: for each changed cell, emit minimal CUP (skip if the cursor is
   already adjacent from the previous emitted cell) + SGR (only on style change)
   + the char. UTF-8 encode chars. Reset SGR (CSI 0m) at stream end.
@@ -274,6 +314,19 @@ pub enum Action {
     ToggleZoom,      // prefix z
     Resize(Direction), // prefix Ctrl-arrow, repeatable
     Quit,            // internal: not bound to a key in MVP (app exits when last pane dies)
+    // --- Added in sub-project 2 (see docs/specs/2026-07-07-server-client-interfaces.md
+    // for the window/session model these dispatch into): ---
+    NewWindow,          // prefix c
+    NextWindow,         // prefix n
+    PrevWindow,         // prefix p
+    LastWindow,         // prefix l
+    SelectWindow(u32),  // prefix 0-9 (digit value, not the ASCII byte)
+    RequestKillWindow,  // prefix &
+    RenameWindow,       // prefix ,
+    RenameSession,      // prefix $
+    Detach,             // prefix d
+    SwitchClientPrev,   // prefix (
+    SwitchClientNext,   // prefix )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +336,11 @@ pub enum InputEvent {
     Action(Action),
     /// Emitted while confirming a close: true = confirmed (y/Y), false = cancelled.
     ConfirmClose(bool),
+    /// Added in sub-project 2. Emitted only while capture mode is on
+    /// (`set_capture(true)`): raw, uninterpreted bytes for a status-line
+    /// prompt (e.g. rename-window line editing), coalesced per `feed()`
+    /// call like `Forward`.
+    Captured(Vec<u8>),
 }
 
 pub struct InputMachine { /* private */ }
@@ -295,6 +353,16 @@ impl InputMachine {
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<InputEvent>;
     /// App arms/disarms confirm mode after Action::RequestClose.
     pub fn set_confirming(&mut self, on: bool);
+    /// Added in sub-project 2. Turn raw capture mode on/off. While on,
+    /// `feed()` bypasses all state-machine dispatch (Prefixed/Repeat/
+    /// Confirming) and returns every byte verbatim as `InputEvent::Captured`
+    /// — including the prefix byte and escape sequences (no parsing).
+    /// Turning on clears any pending escape-sequence buffer and prefix
+    /// state, mirroring `set_confirming`. Capture takes precedence over
+    /// Confirming if both were somehow set (capture is checked first in
+    /// `feed()`, independently of the underlying `state`). Turning off
+    /// resumes Normal.
+    pub fn set_capture(&mut self, on: bool);
 }
 
 pub const PREFIX: u8 = 0x02;                       // Ctrl-b
@@ -314,12 +382,23 @@ pub const REPEAT_TIME: std::time::Duration = std::time::Duration::from_millis(50
   - `0x02` again → `Forward(vec![0x02])` (send literal Ctrl-b)
   - anything else → disarm silently (swallow the key).
   - An incomplete `ESC`-sequence tail is buffered until the next `feed`.
+  - Added in sub-project 2, also consumed and returning to Normal: `c` →
+    `NewWindow`; `n` → `NextWindow`; `p` → `PrevWindow`; `l` → `LastWindow`;
+    `0`..=`9` → `SelectWindow(digit)` (u32 digit value, not the ASCII byte);
+    `&` → `RequestKillWindow`; `,` → `RenameWindow`; `$` → `RenameSession`;
+    `d` → `Detach`; `(` → `SwitchClientPrev`; `)` → `SwitchClientNext`.
 - Repeat: a Ctrl-arrow within the window → another `Resize` and the window
   restarts. Any other input → leave Repeat, process that input as Normal.
 - Confirming (set via `set_confirming(true)`): next key `y`/`Y` →
   `ConfirmClose(true)`; any other key → `ConfirmClose(false)`. Either way the
   machine returns to Normal (the app also calls `set_confirming(false)`).
   Keys in this mode are consumed, never forwarded.
+- Capture (added in sub-project 2, set via `set_capture(true)`): every byte,
+  regardless of what `state` would otherwise dispatch to — including the
+  prefix byte and escape sequences — comes out as `Captured(bytes)`, raw and
+  unparsed, coalesced per `feed()` call. This check happens before any
+  `state` match, so capture wins even over Confirming if both flags were
+  somehow set at once. `set_capture(false)` resumes Normal.
 
 ## `pty` — ConPTY wrapper
 
@@ -357,6 +436,26 @@ pseudoconsole and unblocks the reader thread.
 
 ## `host` — host terminal control
 
+**Amendment (sub-project 2, Task 8):**
+
+- `Host::enter()`'s internal ordering changed (follow-up #3): every value
+  needed to restore the console (code pages via `Get*`, console modes via
+  `GetConsoleMode`) is now gathered FIRST, the `RESTORE` snapshot is
+  published, and only THEN do the `Set*` mutations (UTF-8 code pages, VT
+  processing / raw stdin mode) run. Previously the code pages were mutated
+  before `RESTORE` was published, so a panic between those two steps would
+  have left the panic hook/`Drop` restoring a snapshot that didn't yet
+  reflect the just-mutated code pages. Observable behavior of `enter()`
+  (final modes, alt-screen entry) is unchanged; only the failure-window
+  ordering is tightened.
+- New free function `pub fn console_size() -> std::io::Result<(u16, u16)>`:
+  queries `GetConsoleScreenBufferInfo` against `STD_OUTPUT_HANDLE` directly
+  (shares its `srWindow`-based calculation with `Host::size` via a private
+  `query_size` helper), without constructing a `Host` — no mode changes, no
+  alt-screen entry. Used by `main.rs` to size the initial `Attach` frame
+  (and as an 80x24 fallback source) before deciding whether to become an
+  attached client at all.
+
 ```rust
 pub struct Host { /* private: saved stdin/stdout modes */ }
 
@@ -388,6 +487,15 @@ Host resize detection: no event in the byte stream — the app polls
 `host.size()` on its tick (see below) and compares.
 
 ## `app` — event loop
+
+**Superseded (sub-project 2, Task 8):** `src/app.rs` and its `pub mod app;`
+declaration are DELETED. The single-process event loop described below was
+replaced wholesale by the server/client split — `src/server.rs` owns the
+loop shape server-side (headless, multi-session/window) and `src/client.rs`
++ `src/cli.rs` + `src/main.rs` are the thin client/CLI side. See
+[`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md)'s
+`## server`, `## cli`, and `## client` sections. This section is kept only
+as a historical record of the MVP's shape.
 
 ```rust
 pub enum Event {

@@ -10,11 +10,19 @@ pub struct PaneView<'a> {
     pub dead: bool,
 }
 
+/// One run of status-bar text; `underline` draws it with SGR 4 (tmux
+/// `window-status-current-style` = `underscore` default, used for the
+/// current window's span). Built by `status::status_spans`.
+pub struct StatusSpan {
+    pub text: String,
+    pub underline: bool,
+}
+
 pub struct Scene<'a> {
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
     pub zoomed: bool,
-    pub status_left: String,
+    pub status_spans: Vec<StatusSpan>,
     pub status_right: String,
     pub message: Option<String>,
 }
@@ -188,15 +196,23 @@ impl Renderer {
                 self.set(i as u16, y, Cell { ch, style });
             }
         } else {
-            let left: Vec<char> = scene.status_left.chars().collect();
+            let left_len_total: usize =
+                scene.status_spans.iter().map(|s| s.text.chars().count()).sum();
             let right: Vec<char> = scene.status_right.chars().collect();
-            for (i, &ch) in left.iter().enumerate() {
-                if i >= cols_u {
-                    break;
+
+            let mut x = 0usize;
+            'spans: for span in &scene.status_spans {
+                let mut span_style = style;
+                span_style.underline = span.underline;
+                for ch in span.text.chars() {
+                    if x >= cols_u {
+                        break 'spans;
+                    }
+                    self.set(x as u16, y, Cell { ch, style: span_style });
+                    x += 1;
                 }
-                self.set(i as u16, y, Cell { ch, style });
             }
-            let left_len = left.len().min(cols_u);
+            let left_len = left_len_total.min(cols_u);
             let max_right = cols_u - left_len;
             let right_len = right.len().min(max_right); // truncate right first
             let start = cols_u - right_len;
@@ -397,7 +413,7 @@ mod tests {
                 PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false },
             ],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -431,7 +447,7 @@ mod tests {
                 PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false },
             ],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -453,7 +469,7 @@ mod tests {
             size: (10, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: "AB".into(),
+            status_spans: vec![StatusSpan { text: "AB".into(), underline: false }],
             status_right: "Z".into(),
             message: None,
         };
@@ -478,7 +494,7 @@ mod tests {
             size: (6, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: "ab".into(),
+            status_spans: vec![StatusSpan { text: "ab".into(), underline: false }],
             status_right: "123456".into(),
             message: None,
         };
@@ -496,7 +512,7 @@ mod tests {
             size: (5, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: "ignored".into(),
+            status_spans: vec![StatusSpan { text: "ignored".into(), underline: false }],
             status_right: "ignored".into(),
             message: Some("hey".into()),
         };
@@ -518,7 +534,7 @@ mod tests {
             size: (10, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true }],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -544,7 +560,7 @@ mod tests {
                 PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false },
             ],
             zoomed: true,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -569,7 +585,7 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_left: String::new(),
+                status_spans: Vec::new(),
                 status_right: String::new(),
                 message: None,
             };
@@ -583,7 +599,7 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -602,7 +618,7 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_left: String::new(),
+                status_spans: Vec::new(),
                 status_right: String::new(),
                 message: None,
             };
@@ -616,7 +632,7 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -635,7 +651,7 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -654,7 +670,7 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_left: String::new(),
+                status_spans: Vec::new(),
                 status_right: String::new(),
                 message: None,
             };
@@ -667,7 +683,7 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_left: String::new(),
+            status_spans: Vec::new(),
             status_right: String::new(),
             message: None,
         };
@@ -680,5 +696,30 @@ mod tests {
 \x1b[2;1H\x1b[0;30;42m    \
 \x1b[0m\x1b[1;1H\x1b[?25h";
         assert_eq!(got, want);
+    }
+
+    // Status spans: a non-underlined run ("AB") followed by the current
+    // window's underlined span ("C") must emit SGR 4 only for the latter.
+    #[test]
+    fn underlined_span_emits_sgr4() {
+        let g = grid_with(10, 1, b"");
+        let scene = Scene {
+            size: (10, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status_spans: vec![
+                StatusSpan { text: "AB".into(), underline: false },
+                StatusSpan { text: "C".into(), underline: true },
+            ],
+            status_right: String::new(),
+            message: None,
+        };
+        let mut r = Renderer::new(10, 2);
+        let out = r.compose(&scene, None, false);
+        let got = String::from_utf8_lossy(&out);
+        // "AB" drawn with the plain status style (no "4" in the SGR).
+        assert!(got.contains("\x1b[0;30;42mAB"));
+        // "C" (current window, underlined) gets SGR 4 added.
+        assert!(got.contains("\x1b[0;4;30;42mC"));
     }
 }

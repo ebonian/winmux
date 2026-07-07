@@ -63,6 +63,30 @@ unsafe fn apply_restore(
     let _ = SetConsoleCP(input_cp);
 }
 
+/// Shared by `Host::size` and the free-standing `console_size` (used by
+/// `main.rs` to probe the terminal size before a `Host` exists yet, e.g. to
+/// size the initial `Attach` frame).
+fn query_size(stdout: HANDLE) -> io::Result<(u16, u16)> {
+    unsafe {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        GetConsoleScreenBufferInfo(stdout, &mut info).map_err(win_err)?;
+        // Use the visible window rect, not the buffer, so scrollback height
+        // does not inflate the row count.
+        let cols = (info.srWindow.Right - info.srWindow.Left + 1) as u16;
+        let rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as u16;
+        Ok((cols, rows))
+    }
+}
+
+/// Query the current console's size without constructing a `Host` (no mode
+/// changes, no alt-screen entry) — for `main.rs` to size the initial
+/// `Attach` frame before deciding whether to become an attached client at
+/// all.
+pub fn console_size() -> io::Result<(u16, u16)> {
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE).map_err(win_err)? };
+    query_size(stdout)
+}
+
 pub struct Host {
     stdin: HANDLE,
     stdout: HANDLE,
@@ -78,23 +102,41 @@ impl Host {
             let stdin = GetStdHandle(STD_INPUT_HANDLE).map_err(win_err)?;
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE).map_err(win_err)?;
 
-            // Save the current code pages, then force UTF-8 in and out.
-            // Without UTF-8, the console's default (locale-dependent, often
-            // OEM 437) code page mangles every multi-byte UTF-8 byte we write
-            // (e.g. the box-drawing border chars) or read, decoding/encoding
-            // each raw byte individually instead of treating the stream as
-            // UTF-8. Best-effort: a failure here is not fatal to starting
-            // winmux. The saved pages are restored by Drop / the panic hook.
+            // Gather EVERY saved value before mutating anything (follow-up
+            // #3): read the current code pages and console modes first, so
+            // the RESTORE snapshot can be published before the first `Set*`
+            // call below. If something between here and the end of `enter`
+            // panics (or a future change adds a fallible step), Drop / the
+            // panic hook then restores real pre-enter state instead of a mix
+            // of "saved" values alongside mutations that already happened.
             let saved_output_cp = GetConsoleOutputCP();
             let saved_input_cp = GetConsoleCP();
-            let _ = SetConsoleOutputCP(CP_UTF8);
-            let _ = SetConsoleCP(CP_UTF8);
-
-            // Save the current modes so Drop / panic hook can restore them.
             let mut saved_stdin = CONSOLE_MODE::default();
             let mut saved_stdout = CONSOLE_MODE::default();
             GetConsoleMode(stdin, &mut saved_stdin).map_err(win_err)?;
             GetConsoleMode(stdout, &mut saved_stdout).map_err(win_err)?;
+
+            // Publish the restore snapshot for Drop and the panic hook BEFORE
+            // the first mutation. Recover from mutex poisoning: the data is a
+            // plain POD snapshot, still valid even if another thread panicked
+            // while holding the lock.
+            *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(RestoreState {
+                stdin: stdin.0 as isize,
+                stdout: stdout.0 as isize,
+                stdin_mode: saved_stdin.0,
+                stdout_mode: saved_stdout.0,
+                input_cp: saved_input_cp,
+                output_cp: saved_output_cp,
+            });
+
+            // Force UTF-8 in and out. Without UTF-8, the console's default
+            // (locale-dependent, often OEM 437) code page mangles every
+            // multi-byte UTF-8 byte we write (e.g. the box-drawing border
+            // chars) or read, decoding/encoding each raw byte individually
+            // instead of treating the stream as UTF-8. Best-effort: a failure
+            // here is not fatal to starting winmux.
+            let _ = SetConsoleOutputCP(CP_UTF8);
+            let _ = SetConsoleCP(CP_UTF8);
 
             // stdout: keep existing bits, add VT processing + suppress the
             // implicit CR that ConHost inserts when the cursor is at the last
@@ -114,18 +156,6 @@ impl Host {
             let new_stdin = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS;
             SetConsoleMode(stdin, new_stdin).map_err(win_err)?;
 
-            // Publish the restore snapshot for Drop and the panic hook.
-            // Recover from mutex poisoning: the data is a plain POD snapshot,
-            // still valid even if another thread panicked while holding the lock.
-            *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(RestoreState {
-                stdin: stdin.0 as isize,
-                stdout: stdout.0 as isize,
-                stdin_mode: saved_stdin.0,
-                stdout_mode: saved_stdout.0,
-                input_cp: saved_input_cp,
-                output_cp: saved_output_cp,
-            });
-
             let mut host = Host {
                 stdin,
                 stdout,
@@ -141,15 +171,7 @@ impl Host {
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {
-        unsafe {
-            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-            GetConsoleScreenBufferInfo(self.stdout, &mut info).map_err(win_err)?;
-            // Use the visible window rect, not the buffer, so scrollback height
-            // does not inflate the row count.
-            let cols = (info.srWindow.Right - info.srWindow.Left + 1) as u16;
-            let rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as u16;
-            Ok((cols, rows))
-        }
+        query_size(self.stdout)
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {

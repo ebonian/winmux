@@ -1,8 +1,14 @@
-pub mod app;
+pub mod cli;
+pub mod client;
 pub mod geom;
 pub mod grid;
 pub mod host;
 pub mod input;
 pub mod layout;
+pub mod model;
+pub mod pipe;
+pub mod protocol;
 pub mod pty;
 pub mod render;
+pub mod server;
+pub mod status;

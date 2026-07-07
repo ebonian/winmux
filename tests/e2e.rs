@@ -5,111 +5,43 @@
 //! Flow: wait for the status bar → split vertically (Ctrl-b %) → confirm a
 //! border column appears → kill the new pane (Ctrl-b x, y) → confirm the
 //! border disappears → `exit` the last shell → assert winmux exits cleanly.
+//!
+//! Harness helpers (`pump`, `screen_text`, `wait_until`, `has_vertical_border`,
+//! `process_exited`, `spawn_winmux_pty`, `ServerGuard`, ...) live in
+//! `tests/common/mod.rs`, shared with `tests/e2e_sessions.rs` (Task 9).
 
-use std::io::Read;
-use std::sync::mpsc::{channel, Receiver};
-use std::thread;
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{
+    has_vertical_border, pump, process_exited, screen_text, spawn_winmux_pty, wait_until,
+    ServerGuard,
+};
 use winmux::grid::Grid;
-use winmux::pty::Pty;
-
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::WaitForSingleObject;
-
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
-
-/// Join each grid row's cell chars into a `String`, one entry per row.
-fn screen_text(grid: &Grid) -> Vec<String> {
-    let mut out = Vec::with_capacity(grid.rows() as usize);
-    for r in 0..grid.rows() {
-        let mut line = String::with_capacity(grid.cols() as usize);
-        for c in 0..grid.cols() {
-            line.push(grid.cell(c, r).ch);
-        }
-        out.push(line);
-    }
-    out
-}
-
-/// Drain all queued output chunks into the emulator.
-fn pump(grid: &mut Grid, rx: &Receiver<Vec<u8>>) {
-    while let Ok(chunk) = rx.try_recv() {
-        grid.feed(&chunk);
-    }
-}
-
-/// True if some interior column is a full column of `│` across the pane rows
-/// (everything above the bottom status bar) — i.e. a vertical split border.
-fn has_vertical_border(grid: &Grid) -> bool {
-    let pane_rows = grid.rows().saturating_sub(1); // exclude status bar
-    if pane_rows == 0 {
-        return false;
-    }
-    for c in 1..grid.cols().saturating_sub(1) {
-        if (0..pane_rows).all(|r| grid.cell(c, r).ch == '│') {
-            return true;
-        }
-    }
-    false
-}
-
-/// Poll `cond` every 100ms until it is true or the deadline passes.
-fn wait_until<F: FnMut() -> bool>(deadline: Instant, mut cond: F) -> bool {
-    loop {
-        if cond() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Non-blocking check: has the process behind `raw` (an isize HANDLE) exited?
-fn process_exited(raw: isize) -> bool {
-    // SAFETY: `raw` is winmux's live process HANDLE, owned by the still-alive
-    // Pty; WaitForSingleObject with timeout 0 only queries its signaled state.
-    unsafe { WaitForSingleObject(HANDLE(raw as *mut core::ffi::c_void), 0) == WAIT_OBJECT_0 }
-}
 
 #[test]
 fn e2e_split_kill_exit() {
-    // Quote the exe path (it may contain spaces) for the ConPTY command line.
-    let cmdline = format!("\"{}\"", env!("CARGO_BIN_EXE_winmux"));
-    let mut pty = Pty::spawn(&cmdline, COLS, ROWS).expect("spawn winmux under ConPTY");
-    let proc_raw = pty.process_handle_raw();
-    let mut reader = pty.take_reader().expect("take winmux output reader");
+    // Unique -L socket per test run so no server outlives this test and no
+    // two runs collide on the default pipe name.
+    let socket = format!("e2e-mvp-{}", std::process::id());
+    let _guard = ServerGuard { socket: socket.clone() };
 
-    // Reader thread → channel of raw output chunks (fed into the grid below).
-    let (tx, rx) = channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket]);
 
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(common::COLS, common::ROWS);
 
-    // 1. Status bar appears.
+    // 1. Status bar appears. Bare `winmux` now attaches to an auto-named
+    //    session ("0", the lowest unused non-negative integer) instead of
+    //    the MVP's hardcoded "[winmux]" — check for the window tab instead,
+    //    which is stable regardless of the session name.
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
         wait_until(deadline, || {
             pump(&mut grid, &rx);
-            screen_text(&grid).iter().any(|l| l.contains("[winmux]"))
+            screen_text(&grid).iter().any(|l| l.contains("0:powershell*"))
         }),
-        "status-bar marker '[winmux]' never appeared; screen:\n{}",
+        "status-bar window tab '0:powershell*' never appeared; screen:\n{}",
         screen_text(&grid).join("\n")
     );
 

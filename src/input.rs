@@ -14,12 +14,23 @@ use crate::layout::SplitDir;
 pub enum Action {
     Split(SplitDir),
     Focus(Direction),
-    FocusNext,         // prefix o
-    FocusLast,         // prefix ;
-    RequestClose,      // prefix x
-    ToggleZoom,        // prefix z
-    Resize(Direction), // prefix Ctrl-arrow, repeatable
-    Quit,              // internal: not bound to a key in the MVP
+    FocusNext,             // prefix o
+    FocusLast,             // prefix ;
+    RequestClose,          // prefix x
+    ToggleZoom,            // prefix z
+    Resize(Direction),     // prefix Ctrl-arrow, repeatable
+    Quit,                  // internal: not bound to a key in the MVP
+    NewWindow,             // prefix c
+    NextWindow,            // prefix n
+    PrevWindow,            // prefix p
+    LastWindow,            // prefix l
+    SelectWindow(u32),     // prefix 0-9 (digit value, not the ASCII byte)
+    RequestKillWindow,     // prefix &
+    RenameWindow,          // prefix ,
+    RenameSession,         // prefix $
+    Detach,                // prefix d
+    SwitchClientPrev,      // prefix (
+    SwitchClientNext,      // prefix )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +38,10 @@ pub enum InputEvent {
     Forward(Vec<u8>),
     Action(Action),
     ConfirmClose(bool),
+    /// Emitted only while capture mode is on (`set_capture(true)`): raw,
+    /// uninterpreted bytes for a status-line prompt (e.g. rename-window
+    /// line editing), coalesced per `feed()` call like `Forward`.
+    Captured(Vec<u8>),
 }
 
 pub const PREFIX: u8 = 0x02; // Ctrl-b
@@ -47,6 +62,11 @@ pub struct InputMachine {
     /// 0x1b). Used while Prefixed (waiting for an arrow / Ctrl-arrow command)
     /// and while in Repeat (matching a bare Ctrl-arrow). Empty otherwise.
     pending: Vec<u8>,
+    /// Raw capture mode, orthogonal to `state`. Checked first in `feed()`,
+    /// before any `state`-based dispatch, so capture wins even if `state`
+    /// happens to still be `Confirming` underneath (e.g. a caller flips both
+    /// flags) — see `set_capture`.
+    capturing: bool,
 }
 
 /// Map an escape-sequence final byte to a direction.
@@ -79,6 +99,7 @@ impl InputMachine {
         InputMachine {
             state: State::Normal,
             pending: Vec::new(),
+            capturing: false,
         }
     }
 
@@ -87,7 +108,30 @@ impl InputMachine {
         self.state = if on { State::Confirming } else { State::Normal };
     }
 
+    /// Turn raw capture mode on/off. Turning on clears any pending
+    /// escape-sequence buffer and prefix state, mirroring `set_confirming`;
+    /// turning off resumes Normal. While on, `feed()` bypasses all
+    /// state-machine dispatch (see the `capturing` field doc comment).
+    pub fn set_capture(&mut self, on: bool) {
+        self.pending.clear();
+        self.capturing = on;
+        if !on {
+            self.state = State::Normal;
+        }
+    }
+
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<InputEvent> {
+        if self.capturing {
+            // Raw capture mode: every byte — including the prefix byte and
+            // escape sequences — passes through unparsed, coalesced into a
+            // single Captured event per feed() call, exactly like Forward.
+            return if bytes.is_empty() {
+                Vec::new()
+            } else {
+                vec![InputEvent::Captured(bytes.to_vec())]
+            };
+        }
+
         let mut out: Vec<InputEvent> = Vec::new();
         let mut fwd: Vec<u8> = Vec::new();
 
@@ -141,6 +185,62 @@ impl InputMachine {
                             b'z' => {
                                 flush_forward(&mut fwd, &mut out);
                                 out.push(InputEvent::Action(Action::ToggleZoom));
+                                self.state = State::Normal;
+                            }
+                            b'c' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::NewWindow));
+                                self.state = State::Normal;
+                            }
+                            b'n' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::NextWindow));
+                                self.state = State::Normal;
+                            }
+                            b'p' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::PrevWindow));
+                                self.state = State::Normal;
+                            }
+                            b'l' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::LastWindow));
+                                self.state = State::Normal;
+                            }
+                            b'0'..=b'9' => {
+                                flush_forward(&mut fwd, &mut out);
+                                let digit = (b - b'0') as u32;
+                                out.push(InputEvent::Action(Action::SelectWindow(digit)));
+                                self.state = State::Normal;
+                            }
+                            b'&' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::RequestKillWindow));
+                                self.state = State::Normal;
+                            }
+                            b',' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::RenameWindow));
+                                self.state = State::Normal;
+                            }
+                            b'$' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::RenameSession));
+                                self.state = State::Normal;
+                            }
+                            b'd' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::Detach));
+                                self.state = State::Normal;
+                            }
+                            b'(' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::SwitchClientPrev));
+                                self.state = State::Normal;
+                            }
+                            b')' => {
+                                flush_forward(&mut fwd, &mut out);
+                                out.push(InputEvent::Action(Action::SwitchClientNext));
                                 self.state = State::Normal;
                             }
                             PREFIX => {
@@ -562,5 +662,149 @@ mod tests {
         assert_eq!(im.feed(b"\x1b", now), vec![InputEvent::ConfirmClose(false)]);
         // Consumed, not forwarded; machine is Normal again.
         assert_eq!(im.feed(b"z", now), vec![InputEvent::Forward(b"z".to_vec())]);
+    }
+
+    // ---- Window/session bindings (sub-project 2) ----
+
+    #[test]
+    fn prefix_c_is_new_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02c", now), vec![InputEvent::Action(Action::NewWindow)]);
+        // Back to Normal afterwards.
+        assert_eq!(im.feed(b"z", now), vec![InputEvent::Forward(b"z".to_vec())]);
+    }
+
+    #[test]
+    fn prefix_n_is_next_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02n", now), vec![InputEvent::Action(Action::NextWindow)]);
+    }
+
+    #[test]
+    fn prefix_p_is_prev_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02p", now), vec![InputEvent::Action(Action::PrevWindow)]);
+    }
+
+    #[test]
+    fn prefix_l_is_last_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02l", now), vec![InputEvent::Action(Action::LastWindow)]);
+    }
+
+    #[test]
+    fn prefix_digit_selects_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(
+            im.feed(b"\x020", now),
+            vec![InputEvent::Action(Action::SelectWindow(0))]
+        );
+        let mut im = m();
+        assert_eq!(
+            im.feed(b"\x029", now),
+            vec![InputEvent::Action(Action::SelectWindow(9))]
+        );
+    }
+
+    #[test]
+    fn prefix_ampersand_is_request_kill_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(
+            im.feed(b"\x02&", now),
+            vec![InputEvent::Action(Action::RequestKillWindow)]
+        );
+    }
+
+    #[test]
+    fn prefix_comma_is_rename_window() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02,", now), vec![InputEvent::Action(Action::RenameWindow)]);
+    }
+
+    #[test]
+    fn prefix_dollar_is_rename_session() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02$", now), vec![InputEvent::Action(Action::RenameSession)]);
+    }
+
+    #[test]
+    fn prefix_d_is_detach() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(im.feed(b"\x02d", now), vec![InputEvent::Action(Action::Detach)]);
+    }
+
+    #[test]
+    fn prefix_open_paren_is_switch_client_prev() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(
+            im.feed(b"\x02(", now),
+            vec![InputEvent::Action(Action::SwitchClientPrev)]
+        );
+    }
+
+    #[test]
+    fn prefix_close_paren_is_switch_client_next() {
+        let now = Instant::now();
+        let mut im = m();
+        assert_eq!(
+            im.feed(b"\x02)", now),
+            vec![InputEvent::Action(Action::SwitchClientNext)]
+        );
+    }
+
+    // ---- Capture mode (sub-project 2: status-line prompts) ----
+
+    #[test]
+    fn capture_mode_passes_bytes_raw() {
+        let now = Instant::now();
+        let mut im = m();
+        im.set_capture(true);
+        // The prefix byte and an escape sequence both pass through
+        // uninterpreted and coalesced, exactly as fed.
+        assert_eq!(
+            im.feed(b"hi\x02\x1b[Abye", now),
+            vec![InputEvent::Captured(b"hi\x02\x1b[Abye".to_vec())]
+        );
+    }
+
+    #[test]
+    fn capture_mode_clears_pending_prefix_state() {
+        let now = Instant::now();
+        let mut im = m();
+        // Arm Prefixed, then flip into capture mid-sequence.
+        assert_eq!(im.feed(b"\x02", now), vec![]);
+        im.set_capture(true);
+        // The 'x' that would have been RequestClose is now just raw data.
+        assert_eq!(im.feed(b"x", now), vec![InputEvent::Captured(b"x".to_vec())]);
+    }
+
+    #[test]
+    fn capture_off_resumes_normal() {
+        let now = Instant::now();
+        let mut im = m();
+        im.set_capture(true);
+        assert_eq!(im.feed(b"raw", now), vec![InputEvent::Captured(b"raw".to_vec())]);
+        im.set_capture(false);
+        assert_eq!(im.feed(b"\x02x", now), vec![InputEvent::Action(Action::RequestClose)]);
+    }
+
+    #[test]
+    fn capture_takes_precedence_over_confirming() {
+        let now = Instant::now();
+        let mut im = m();
+        im.set_confirming(true);
+        // Capture wins even though Confirming was armed underneath.
+        im.set_capture(true);
+        assert_eq!(im.feed(b"y", now), vec![InputEvent::Captured(b"y".to_vec())]);
     }
 }
