@@ -318,16 +318,36 @@ impl KeyDecoder {
 
     /// Feed more input bytes, returning every key that became complete as a
     /// result (zero or more; an in-progress escape/UTF-8 sequence produces
-    /// none until it completes).
+    /// none until it completes). Buffering is bounded: a sequence that grows
+    /// past [`MAX_PENDING`] bytes without completing has its head byte peeled
+    /// off as a best-effort key and the remainder reprocessed, so a
+    /// misbehaving byte stream can never stall the decoder forever.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<DecodedKey> {
         let mut out = Vec::new();
-        for &b in bytes {
+        // Worklist rather than a plain iterator: a bound-exceeded peel
+        // re-queues the buffered remainder at the FRONT so it is reprocessed
+        // (in order) before any not-yet-consumed new input.
+        let mut queue: std::collections::VecDeque<u8> = bytes.iter().copied().collect();
+        while let Some(b) = queue.pop_front() {
             self.pending.push(b);
             if let Some(key) = classify(&self.pending) {
                 out.push(DecodedKey {
                     key,
                     raw: std::mem::take(&mut self.pending),
                 });
+            } else if self.pending.len() > MAX_PENDING {
+                // Runaway sequence (e.g. a CSI that never gets a final
+                // byte): peel the head byte as a best-effort key and
+                // reprocess the rest as fresh tokens.
+                let mut rest = std::mem::take(&mut self.pending);
+                let first = rest.remove(0);
+                out.push(DecodedKey {
+                    key: peel_byte_key(first),
+                    raw: vec![first],
+                });
+                for &rb in rest.iter().rev() {
+                    queue.push_front(rb);
+                }
             }
         }
         out
@@ -337,30 +357,56 @@ impl KeyDecoder {
     /// when no more input is coming (e.g. end of a read) so a lone `ESC` or
     /// a truncated escape sequence still produces something rather than
     /// silently vanishing.
+    ///
+    /// Works exactly like an incremental re-feed of the leftover bytes: the
+    /// shortest classifiable prefix is emitted as a key (raw = exactly its
+    /// own bytes); when the head byte can make no progress it is peeled
+    /// alone (lone `ESC` -> `Escape`, anything else -> its single-byte
+    /// classification). The concatenation of all emitted `raw`s — across
+    /// `feed` and `flush` — is always exactly the input byte stream.
     pub fn flush(&mut self) -> Vec<DecodedKey> {
         let mut out = Vec::new();
         while !self.pending.is_empty() {
-            if let Some(key) = classify(&self.pending) {
-                out.push(DecodedKey {
-                    key,
-                    raw: std::mem::take(&mut self.pending),
-                });
-                break;
+            // Shortest prefix that classifies == what feed() would have
+            // emitted had these bytes arrived one at a time.
+            let matched = (1..=self.pending.len())
+                .find_map(|end| classify(&self.pending[..end]).map(|k| (k, end)));
+            match matched {
+                Some((key, end)) => {
+                    let rest = self.pending.split_off(end);
+                    out.push(DecodedKey {
+                        key,
+                        raw: std::mem::replace(&mut self.pending, rest),
+                    });
+                }
+                None => {
+                    // Head token can't complete with no more bytes coming:
+                    // peel exactly one byte and keep draining the rest.
+                    let first = self.pending.remove(0);
+                    out.push(DecodedKey {
+                        key: peel_byte_key(first),
+                        raw: vec![first],
+                    });
+                }
             }
-            // Still incomplete with no more bytes coming: peel off the
-            // first byte as a best-effort key and keep draining the rest.
-            let first = self.pending.remove(0);
-            let key = if first == 0x1b {
-                plain(KeyCode::Escape)
-            } else {
-                plain(KeyCode::Char(first as char))
-            };
-            out.push(DecodedKey {
-                key,
-                raw: vec![first],
-            });
         }
         out
+    }
+}
+
+/// Buffering bound for [`KeyDecoder`]: no real key sequence handled here is
+/// anywhere near this long, so exceeding it means the stream is not a key
+/// sequence at all and the buffer is force-drained byte by byte.
+const MAX_PENDING: usize = 32;
+
+/// Best-effort classification of a single peeled byte (bound-exceeded feed,
+/// or flush of an incomplete tail): a lone ESC is the `Escape` key; anything
+/// else gets its ordinary single-byte decoding.
+fn peel_byte_key(b: u8) -> Key {
+    if b == 0x1b {
+        plain(KeyCode::Escape)
+    } else {
+        classify_single_byte(b)
     }
 }
 
@@ -426,9 +472,17 @@ fn classify_escape(buf: &[u8]) -> Option<Key> {
             };
             Some(plain(code))
         }
-        other => {
-            // ESC <byte>: Meta + whatever that single byte alone decodes to.
-            classify(&[other]).map(|mut k| {
+        _ => {
+            // ESC <token>: Meta + whatever the WHOLE remainder decodes to
+            // (tmux applies Meta to the decoded key: ESC ESC [ A = M-Up,
+            // ESC + UTF-8 char = M-<char>). Classifying only the first
+            // remainder byte would return None forever when that byte is
+            // itself a multi-byte introducer (another ESC, a UTF-8 lead) —
+            // permanently stalling the decoder. `None` here means the
+            // remainder is still incomplete: keep buffering; it may
+            // complete on a later feed() or get peeled by flush()/the
+            // MAX_PENDING bound.
+            classify(&buf[1..]).map(|mut k| {
                 k.meta = true;
                 k
             })
@@ -865,6 +919,111 @@ mod tests {
             dec.flush(),
             vec![DecodedKey { key: plain(KeyCode::Escape), raw: vec![0x1b] }]
         );
+    }
+
+    #[test]
+    fn decode_esc_then_arrow_is_meta_up() {
+        // tmux decodes an ESC-prefixed sequence as Meta on the DECODED key:
+        // ESC ESC [ A = M-Up (e.g. vim leave-insert immediately followed by
+        // an arrow key). Must be ONE key with raw = all four bytes.
+        let mut dec = KeyDecoder::new();
+        assert_eq!(
+            dec.feed(b"\x1b\x1b[A"),
+            vec![DecodedKey {
+                key: Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false },
+                raw: b"\x1b\x1b[A".to_vec(),
+            }]
+        );
+        // Decoder must be fully usable afterwards (regression: the old code
+        // stalled forever after ESC ESC).
+        assert_eq!(
+            dec.feed(b"a"),
+            vec![DecodedKey { key: plain(KeyCode::Char('a')), raw: vec![b'a'] }]
+        );
+    }
+
+    #[test]
+    fn decode_esc_then_split_arrow_across_feeds() {
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b\x1b"), vec![]); // incomplete: keep buffering
+        assert_eq!(
+            dec.feed(b"[A"),
+            vec![DecodedKey {
+                key: Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false },
+                raw: b"\x1b\x1b[A".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn decode_esc_then_utf8() {
+        let mut dec = KeyDecoder::new();
+        let mut bytes = vec![0x1b];
+        bytes.extend("é".as_bytes()); // 0xc3 0xa9
+        assert_eq!(dec.feed(&bytes[..2]), vec![]); // ESC + UTF-8 lead: buffer
+        assert_eq!(
+            dec.feed(&bytes[2..]),
+            vec![DecodedKey {
+                key: Key { code: KeyCode::Char('é'), ctrl: false, meta: true, shift: false },
+                raw: bytes.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn flush_truncated_csi_peels_all_bytes() {
+        // A CSI truncated at end of stream must peel EVERY byte as its own
+        // best-effort key — no byte silently swallowed into another key's raw.
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[1;5"), vec![]);
+        assert_eq!(
+            dec.flush(),
+            vec![
+                DecodedKey { key: plain(KeyCode::Escape), raw: vec![0x1b] },
+                DecodedKey { key: plain(KeyCode::Char('[')), raw: vec![b'['] },
+                DecodedKey { key: plain(KeyCode::Char('1')), raw: vec![b'1'] },
+                DecodedKey { key: plain(KeyCode::Char(';')), raw: vec![b';'] },
+                DecodedKey { key: plain(KeyCode::Char('5')), raw: vec![b'5'] },
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_preserves_raw_concatenation() {
+        // Property: for any input, the concatenation of every emitted key's
+        // raw bytes (feed + flush) is exactly the input — nothing dropped.
+        let nasty: &[&[u8]] = &[
+            b"\x1b[1;5",        // truncated modified-CSI
+            b"\x1b\x1b",        // double ESC
+            b"\x1b[",           // bare CSI introducer
+            b"\x1bO",           // bare SS3 introducer
+            &[0x1b, 0xc3],      // ESC + partial UTF-8
+            &[0xc3],            // lone partial UTF-8
+            b"\x1b[1;5A\x1b[2", // complete key then truncated tail
+            b"abc\x1b",         // text then lone ESC
+        ];
+        for input in nasty {
+            let mut dec = KeyDecoder::new();
+            let mut keys = dec.feed(input);
+            keys.extend(dec.flush());
+            let concat: Vec<u8> = keys.iter().flat_map(|k| k.raw.clone()).collect();
+            assert_eq!(&concat, input, "raw bytes dropped for input {input:?}");
+        }
+    }
+
+    #[test]
+    fn decode_runaway_csi_is_bounded() {
+        // A "CSI" that never terminates must not buffer forever: once the
+        // pending buffer exceeds the bound, bytes are peeled as best-effort
+        // keys and nothing is lost.
+        let mut dec = KeyDecoder::new();
+        let mut input = b"\x1b[".to_vec();
+        input.extend(std::iter::repeat_n(b';', 64));
+        let mut keys = dec.feed(&input);
+        keys.extend(dec.flush());
+        assert!(!keys.is_empty(), "runaway CSI produced no keys at all");
+        let concat: Vec<u8> = keys.iter().flat_map(|k| k.raw.clone()).collect();
+        assert_eq!(concat, input, "runaway CSI dropped bytes");
     }
 
     #[test]

@@ -122,12 +122,34 @@ whatever completes is emitted (in order) as a `DecodedKey` with `raw` set
 to the exact consumed bytes, and the buffer is cleared for the next token.
 An in-progress escape sequence (or a partial UTF-8 multibyte sequence)
 produces nothing until it completes — safe to split arbitrarily across
-`feed()` calls. `flush()` is for end-of-input: it decodes whatever it can
-from the leftover buffer, and for anything still ambiguous it peels one
-byte at a time as a best-effort key (a lone `ESC` becomes an `Escape` key;
-this is the only best-effort case exercised by tests, but the same
-byte-peeling rule applies to any other stuck buffer, e.g. an unterminated
-CSI sequence).
+`feed()` calls.
+
+**Bounded buffering** (fix pass, Task 1): the pending buffer is capped at
+`MAX_PENDING` (32, private) bytes. A sequence that grows past the cap
+without completing (e.g. a "CSI" that never receives a final byte) has its
+head byte peeled off as a best-effort key (lone `ESC` -> `Escape`; anything
+else -> its ordinary single-byte decoding) and the remainder reprocessed as
+fresh tokens, in order, ahead of any not-yet-consumed input. A misbehaving
+byte stream can therefore never stall the decoder or grow the buffer
+unboundedly; the bound is also what keeps the CSI scan finite. Regression
+test: `decode_runaway_csi_is_bounded`.
+
+**`flush()` semantics** (fix pass, Task 1): end-of-input drain, equivalent
+to an incremental re-feed of the leftover bytes — the SHORTEST classifiable
+prefix of the buffer is emitted as a key whose `raw` is exactly its own
+bytes; when the head token cannot complete (no more bytes are coming), the
+head byte alone is peeled with the same best-effort rule as above, and
+draining continues on the rest. **Raw-concatenation invariant:** the
+concatenation of every emitted key's `raw` — across all `feed()` and
+`flush()` calls — is exactly the input byte stream; no byte is ever dropped
+or absorbed into a neighboring key's `raw`. (The original Task 1 flush
+classified the whole remaining buffer as one token and stuffed ALL leftover
+bytes into that single key's `raw` — a truncated `ESC [ 1 ; 5` flushed as
+`Escape` + `Char('[')` with raw `[1;5`, mis-attributing three bytes.)
+Regression tests: `flush_truncated_csi_peels_all_bytes` (that exact buffer
+now flushes to five keys: `Escape`, `[`, `1`, `;`, `5`),
+`flush_preserves_raw_concatenation` (property-style: raw concatenation ==
+input over several truncated/hostile buffers).
 
 Decoding table:
 
@@ -142,9 +164,10 @@ Decoding table:
 | UTF-8 multibyte lead (`0xc0`-`0xf7`) + continuation bytes | `Char(<decoded char>)` (buffered across `feed()` calls until the full sequence is present; invalid UTF-8 decodes as `U+FFFD`) |
 | any other single byte (`0x1c`-`0x1f`, stray continuation bytes, `0xf8`-`0xff`) | `Char(<byte value as a Latin-1 code point>)` (fallback, not tmux notation, never produced by `parse_key`/`encode_key`) |
 | `ESC` alone, no more bytes this call | buffered (nothing emitted); `flush()` resolves it to `Escape` |
-| `ESC <byte>` (byte is not `[` or `O`) | Meta + whatever that single byte alone decodes to (`ESC x` → `M-x`) |
+| `ESC <token>` (first remainder byte is not `[` or `O`) | Meta + whatever the WHOLE remainder decodes to (fix pass, Task 1 — tmux applies Meta to the decoded key): `ESC x` → `M-x`; `ESC ESC [ A` → `M-Up` (one key, raw = all four bytes); `ESC` + UTF-8 char → `M-<char>`; nesting stacks onto the same `meta` flag (`ESC ESC [ 1;5 A` → `C-M-Up`). An incomplete remainder keeps buffering across `feed()` calls — it may complete later, or get peeled by `flush()`/the `MAX_PENDING` bound. (The original Task 1 code classified only the FIRST remainder byte, which returned "incomplete" forever when that byte was itself a multi-byte introducer — `ESC ESC [ A`, i.e. Escape-then-arrow, permanently stalled all input.) Regression tests: `decode_esc_then_arrow_is_meta_up`, `decode_esc_then_split_arrow_across_feeds`, `decode_esc_then_utf8`. |
 | `ESC [ <params> <final>` (CSI) | see below |
 | `ESC O P`/`Q`/`R`/`S` (SS3) | `F1`/`F2`/`F3`/`F4` |
+| `ESC O <other byte>` (SS3, unrecognized third byte) | `Char(<that byte>)` (best-effort fallback, mirrors the unrecognized-CSI-final rule below; never blocks) |
 
 CSI parsing buffers `ESC [` plus every subsequent byte until one lands in
 `0x40`-`0x7e` (the final byte); everything between `[` and the final byte is
