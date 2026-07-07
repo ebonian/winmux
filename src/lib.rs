@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod client;
+pub mod cmd;
 pub mod geom;
 pub mod grid;
 pub mod host;

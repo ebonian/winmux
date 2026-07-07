@@ -293,3 +293,216 @@ to match tmux's `strcasecmp` behavior.)
   falls back to `self`'s own value (which may itself be `None`). Used to
   layer e.g. `window-status-current-style` (`over`) on top of `status-style`
   (`self`) before a single `apply_to` call against the render base style.
+
+## `cmd` — tmux command tokenizer, table, and typed commands (Task 3)
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawCmd { pub name: String, pub args: Vec<String> }
+
+pub fn parse_line(line: &str) -> Result<Vec<RawCmd>, String>;
+pub fn join_continuations<'a, I: Iterator<Item = &'a str>>(lines: I) -> Vec<(usize, String)>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParsedCmd {
+    SplitWindow { horizontal: bool, target: Option<String> },
+    SelectPane { dir: Option<crate::geom::Direction>, target: Option<String> },
+    SelectWindow { target: String },
+    NextWindow, PreviousWindow, LastWindow, LastPane,
+    NewWindow { name: Option<String> },
+    KillPane { target: Option<String> },
+    KillWindow { target: Option<String> },
+    ResizePane { dir: Option<crate::geom::Direction>, zoom: bool, count: i32 },
+    RenameWindow { target: Option<String>, name: String },
+    RenameSession { target: Option<String>, name: String },
+    DetachClient { target: String },
+    SendKeys { literal: bool, target: Option<String>, keys: Vec<String> },
+    SendPrefix,
+    DisplayMessage { text: Option<String> },
+    ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
+    CommandPrompt { initial: Option<String> },
+    SetOption { global: bool, window: bool, append: bool, unset: bool, name: String, value: Option<String> },
+    ShowOptions { global: bool, name: Option<String> },
+    BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
+    UnbindKey { all: bool, table: String, key: Option<String> },
+    ListKeys,
+    SourceFile { path: String },
+    // SP2 CLI commands, folded into the same table.
+    NewSession { detached: bool, name: Option<String>, cols: Option<u16>, rows: Option<u16> },
+    AttachSession { target: Option<String>, detach_others: bool },
+    ListSessions,
+    ListWindows { target: Option<String> },
+    HasSession { target: String },
+    KillSession { target: Option<String> },
+    KillServer,
+}
+
+pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String>;
+pub fn usage(name: &str) -> Option<&'static str>;
+```
+
+Pure module: no I/O, `std` only. **Implementation module:** `src/cmd.rs`.
+Depends only on `crate::geom::Direction`. `bind-key`/`confirm-before` are
+"store-don't-resolve": their bound/wrapped command tail is kept as
+unresolved `Vec<RawCmd>` — tmux does late binding too, so the tail is
+re-`resolve()`d against the table at execution time (Task 6), not here.
+
+Unit-tested with exact expected values (mirrors `keys.rs`/`style.rs`'s
+style): tokenizer — `plain_split`, `single_quotes_literal`,
+`double_quotes_escapes`, `double_quotes_other_backslash_is_literal`,
+`comment_strips`, `comment_strips_mid_token`, `semicolon_splits_commands`,
+`escaped_semicolon_is_arg`, `quoted_semicolon_also_splits_tail`,
+`unterminated_quote_err`, `blank_and_comment_only_lines_are_empty`,
+`adjacent_quote_concatenation`; `join_continuations` —
+`join_continuations_passthrough`, `join_continuations_basic`,
+`join_continuations_chain_tracks_first_line_number`,
+`join_continuations_trailing_backslash_at_eof_kept`,
+`join_continuations_strips_crlf`; `resolve`/`usage` — `aliases_resolve`,
+`split_window_flags`, `send_keys_literal_flag`, `send_keys_requires_a_key`,
+`set_option_flags`, `bind_key_full`, `bind_key_dash_n_is_root_table`,
+`bind_key_bad_table_errs`, `unbind_key_table_validation`,
+`confirm_before_tail`, `resize_pane_defaults_and_errors`,
+`unknown_command_err_exact`, `usage_err_on_bad_flag`, `sp2_commands_present`,
+`sp2_usage_strings_match_cli_exec_verbatim`,
+`usage_lookup_by_alias_and_unknown`, `rename_window_requires_name`,
+`show_options_and_display_message` (35 tests total).
+
+### Tokenizer (`parse_line`)
+
+- Whitespace (space/tab, and stray `\r`/`\n`) splits tokens, discarded
+  otherwise.
+- `'...'`: fully literal — no escapes recognized inside, including `#` and
+  `;` (both lose all special meaning between the quotes).
+- `"..."`: recognizes exactly two escapes, `\"` -> `"` and `\\` -> `\`. Any
+  other `\<c>` passes through as BOTH characters verbatim — the backslash is
+  not a general escape inside double quotes either.
+- A quoted segment concatenates with adjacent bare characters or another
+  quoted segment with no intervening whitespace, shell-style:
+  `foo'bar'"baz"` is one token `foobarbaz`.
+- `#` outside any quote starts a comment running to end of line, even
+  mid-token (`foo#bar` tokenizes `foo`, discards `#bar`).
+- An unquoted, unescaped `;` is a command separator: ends the in-progress
+  token and the current command, starts a new one; it is never itself part
+  of a token, and consecutive/leading/trailing `;` never produce empty
+  `RawCmd`s (silently dropped).
+- `\;` outside quotes: the backslash is consumed and a literal `;` is
+  appended to the token being built. This does **not** split the command at
+  `parse_line`'s level — only `resolve()`'s tail-splitting for
+  `bind-key`/`confirm-before` (see below) gives a lone `;` token special
+  meaning.
+- Outside quotes, a bare `\` not followed by `;` is literal (no other
+  top-level escapes).
+- `Err("unterminated quote")` if a `'`/`"` is never closed before the line
+  ends.
+
+**Design resolution — `\;` vs quoted `";"`:** both an escaped `\;` and an
+equivalently-lone quoted token (`'";"'` or `"';'"`) produce the exact same
+`String` content `";"` by the time tokenization is done — `parse_line` has
+no way to (and does not) distinguish "this token happened to equal one
+semicolon character" by origin. `resolve()`'s tail-splitting for
+`bind-key`/`confirm-before` therefore splits on ANY tail token that is
+exactly `";"`, regardless of whether it arrived via `\;` or a quoted form.
+This matches tmux's real behavior for this case and is deliberately
+documented rather than distinguished, per the task's design-decision notes.
+
+### `join_continuations`
+
+A physical line whose last character is `\` (after stripping one optional
+trailing `\r`, so CRLF files work) is joined directly with the next
+physical line — backslash removed, no separator inserted — repeating across
+a chain. Returns `(first_line_number, joined_text)` pairs, 1-based. A
+trailing `\` on the very last physical line has nothing to continue onto, so
+the backslash is put back rather than silently dropped
+(`join_continuations_trailing_backslash_at_eof_kept`).
+
+### Command table: names, aliases, usage lines
+
+`resolve()`/`usage()` accept either the full name or any alias below.
+Usage-error messages are exactly `usage(name).unwrap()` (no extra
+formatting) — the nine marked **verbatim** are copied byte-for-byte from
+`src/server/cli_exec.rs`'s `USAGE_*` constants (SP2 test-parity
+requirement); the rest are new tmux-style lines authored for SP3.
+
+| command | alias(es) | usage string |
+|---|---|---|
+| `split-window` | `splitw` | `usage: split-window [-h] [-v] [-t target]` |
+| `select-pane` | `selectp` | `usage: select-pane [-L] [-R] [-U] [-D] [-t target]` |
+| `select-window` | `selectw` | `usage: select-window -t target` |
+| `next-window` | `next` | `usage: next-window` |
+| `previous-window` | `prev` | `usage: previous-window` |
+| `last-window` | `last` | `usage: last-window` |
+| `last-pane` | `lastp` | `usage: last-pane` |
+| `new-window` | `neww` | `usage: new-window [-n name]` |
+| `kill-pane` | `killp` | `usage: kill-pane [-t target]` |
+| `kill-window` | `killw` | `usage: kill-window [-t target]` |
+| `resize-pane` | `resizep` | `usage: resize-pane [-L] [-R] [-U] [-D] [-Z] [count]` |
+| `rename-window` | `renamew` | `usage: rename-window [-t target] new-name` **(verbatim)** |
+| `rename-session` | `rename` | `usage: rename-session [-t target] new-name` **(verbatim)** |
+| `detach-client` | — | `usage: detach-client -s target` **(verbatim — note: `-s` is REQUIRED, not optional; SP2's actual `cli_exec.rs` behavior overrides the design doc's `[-s target]` bracket notation, per the task brief's verbatim-copy instruction)** |
+| `send-keys` | `send` | `usage: send-keys [-l] [-t target] key ...` |
+| `send-prefix` | — | `usage: send-prefix` |
+| `display-message` | `display` | `usage: display-message [text]` |
+| `confirm-before` | `confirm` | `usage: confirm-before [-p prompt] command ...` |
+| `command-prompt` | — | `usage: command-prompt [-I initial]` |
+| `set-option` | `set` | `usage: set-option [-g] [-w] [-a] [-u] option [value]` |
+| `show-options` | `show` | `usage: show-options [-g] [option]` |
+| `bind-key` | `bind` | `usage: bind-key [-n] [-r] [-T table] key command ...` |
+| `unbind-key` | `unbind` | `usage: unbind-key [-a] [-n] [-T table] [key]` |
+| `list-keys` | `lsk` | `usage: list-keys` |
+| `source-file` | `source` | `usage: source-file path` |
+| `new-session` | `new` | `usage: new-session [-d] [-s name] [-x cols] [-y rows]` **(verbatim)** |
+| `attach-session` | `attach`, `a` | `usage: attach-session [-d] [-t target]` |
+| `list-sessions` | `ls` | `usage: list-sessions` **(verbatim)** |
+| `list-windows` | `lsw` | `usage: list-windows [-t target]` **(verbatim)** |
+| `has-session` | `has` | `usage: has-session -t target` **(verbatim)** |
+| `kill-session` | — | `usage: kill-session [-t target]` **(verbatim)** |
+| `kill-server` | — | `usage: kill-server` **(verbatim)** |
+
+### Flag/argument conventions
+
+- Direction flags (`select-pane`/`resize-pane` `-L`/`-R`/`-U`/`-D`) map onto
+  the existing `geom::Direction`; if more than one is given, the last one
+  scanned wins — no error (documented simplification, matches this module's
+  general last-flag-wins policy for repeated flags).
+- `set-option`'s `value`: remaining tokens after `-g`/`-w`/`-a`/`-u` and the
+  option name are joined with a single space each — a single token (e.g. one
+  quoted string) is returned verbatim (join of one element is a no-op);
+  multiple bare tokens are space-joined. Zero remaining tokens -> `value:
+  None` (flags-only options like `set -g mouse`; on/off semantics are the
+  `options` module's job, not this one's).
+- `bind-key`/`unbind-key` `-T table`: SP3 only recognizes `root` and
+  `prefix` (tmux itself allows arbitrary table names; broader table support
+  is out of SP3 scope). Any other value is
+  `Err(format!("unknown key table: {t}"))` — NOT the generic `usage:` error.
+  `-n` is sugar for `-T root`. Default table (no `-n`/`-T` given) is
+  `"prefix"`, matching tmux's default key table for both commands.
+  `bind-key`'s key stores as a plain `String` (NOT parsed via
+  `keys::parse_key` here) — the server resolves it through the `keys` module
+  at execution/dispatch time, decoupling `cmd` from `keys`.
+  `unbind-key`'s `key` is required unless `-a` is given.
+  `resize-pane`'s optional trailing `count` defaults to `1`; a non-numeric
+  value is a `usage:` error (not a separate "bad value" message).
+- `bind-key`/`confirm-before` tail-splitting: after consuming the command's
+  own flags (and, for `bind-key`, the key token), ALL remaining tokens are
+  the tail; the tail is split into one `RawCmd` per run of tokens separated
+  by an exact `";"` token (see the tokenizer section above). Both commands
+  require a non-empty tail (`Err(usage)` if none).
+- Commands with no positional/flag arguments at all (`next-window`,
+  `previous-window`, `last-window`, `last-pane`, `send-prefix`, `list-keys`,
+  `list-sessions`, `kill-server`) reject ANY leftover token (flag or
+  positional) with the `usage:` error — a deliberate strictness beyond
+  SP2's `cli_exec.rs`, which silently ignores stray positionals on some of
+  these; since `cmd.rs` is a new parsing layer (not yet wired into
+  `cli_exec.rs`'s execution), this does not break any existing SP2 test.
+- `rename-window`/`rename-session` require EXACTLY one positional (the new
+  name) after flags — zero or more-than-one is a `usage:` error (SP2's
+  `cli_exec.rs` takes only the first positional and silently ignores extras;
+  this module is stricter, same rationale as above).
+
+### Command table implementation note
+
+`resolve()` maps every alias to a canonical name via a private `canonical()`
+match, then dispatches on the canonical name; `usage()` shares the same
+`canonical()` lookup, so alias and full-name lookups always agree
+(`usage_lookup_by_alias_and_unknown`). Unknown name -> `Err(format!("unknown
+command: {name}"))` from `resolve()`, `None` from `usage()`.
