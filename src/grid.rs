@@ -83,6 +83,13 @@ struct TermState {
     history: VecDeque<Vec<Cell>>,
     /// 0 = scrollback disabled (nothing is ever captured).
     history_limit: u32,
+    /// Monotonic count of lines EVER pushed into scrollback (never
+    /// decremented by eviction) — the stable "lines-ever-captured"
+    /// coordinate system copy-mode selection anchors are pinned to (Task 3
+    /// review fix): `history_len()` alone can't measure how far content has
+    /// shifted between two moments, because chunked eviction lowers it
+    /// without moving any surviving line's view position.
+    history_total: u64,
     /// Pane title captured from OSC 0/2, if any has ever been set.
     title: Option<String>,
     /// Edge-triggered flag: set whenever `title` changes, cleared by
@@ -111,6 +118,7 @@ impl TermState {
             saved_primary: None,
             history: VecDeque::new(),
             history_limit,
+            history_total: 0,
             title: None,
             title_changed: false,
         }
@@ -130,6 +138,7 @@ impl TermState {
         if self.history_limit == 0 {
             return;
         }
+        self.history_total += 1;
         self.history.push_back(line);
         if self.history.len() as u32 >= self.history_limit {
             let chunk = (self.history_limit / 10).max(1) as usize;
@@ -776,6 +785,17 @@ impl Grid {
         self.state.history.len() as u32
     }
 
+    /// Monotonic count of lines EVER captured into scrollback — never
+    /// decremented by eviction (unlike `history_len()`). The difference
+    /// between two `history_total()` readings is exactly how many view rows
+    /// the pane's content has shifted up between them (each capture shifts
+    /// the view by one; eviction shifts nothing) — the coordinate system
+    /// copy-mode selection anchors are pinned to (Task 3 review fix; see
+    /// the `## grid-v2` contract amendment).
+    pub fn history_total(&self) -> u64 {
+        self.state.history_total
+    }
+
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen, clamped to `history_len()`).
     /// Out-of-range `row`/`col` returns a blank default-style cell.
@@ -1381,6 +1401,30 @@ mod tests {
         // The two oldest lines ("000", "001") are gone; "002" now survives
         // as the oldest entry.
         assert_eq!(g.view_row_text(18, 0), "002");
+    }
+
+    /// Task 3 review fix: `history_total()` counts lines EVER captured,
+    /// monotonically -- eviction lowers `history_len()` but never
+    /// `history_total()`, making the latter a stable coordinate origin for
+    /// copy-mode selection anchors.
+    #[test]
+    fn history_total_monotonic_across_eviction() {
+        // Same setup as scrollback_eviction_chunked: 20 captures against
+        // limit 20 evict a chunk of 2, so len (18) < total (20).
+        let mut g = Grid::new(3, 1, 20);
+        assert_eq!(g.history_total(), 0);
+        for i in 0..20 {
+            g.feed(format!("{i:03}\r\n").as_bytes());
+        }
+        assert_eq!(g.history_len(), 18);
+        assert_eq!(g.history_total(), 20);
+        // Further captures keep counting from 20, never reset by eviction.
+        g.feed(b"x\r\n");
+        assert_eq!(g.history_total(), 21);
+        // history_limit == 0 never captures: total stays 0 too.
+        let mut off = Grid::new(3, 1, 0);
+        off.feed(b"a\r\nb\r\n");
+        assert_eq!(off.history_total(), 0);
     }
 
     #[test]

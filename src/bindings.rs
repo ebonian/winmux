@@ -186,7 +186,14 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(named("C-v"), "copy-page-down", &[]);
     b(named("PPage"), "copy-page-up", &[]);
     b(named("NPage"), "copy-page-down", &[]);
-    b(named("Space"), "copy-page-down", &[]);
+    // Bound under the literal space CHARACTER, not `named("Space")` (Task 3
+    // review fix): a real spacebar press decodes as `Key{Char(' ')}` -- the
+    // decoder only ever produces `KeyCode::Space` for `Ctrl-Space` (byte
+    // 0x00), so Task 2's original `named("Space")` registration was
+    // unreachable by an actual keypress. Same rule as the vi table's
+    // `Space -> copy-begin-selection`; decoder-level `Char(' ')`/`Space`
+    // normalization stays follow-up #34.
+    b(char_key(' '), "copy-page-down", &[]);
 
     b(char_key('q'), "copy-cancel", &[]);
     b(named("Escape"), "copy-cancel", &[]);
@@ -490,7 +497,9 @@ mod tests {
             ("C-v", "copy-page-down", &[]),
             ("PPage", "copy-page-up", &[]),
             ("NPage", "copy-page-down", &[]),
-            ("Space", "copy-page-down", &[]),
+            // The literal space char, NOT the "Space" key-name notation --
+            // Task 3 review fix; see copy_mode_emacs_defaults' comment.
+            (" ", "copy-page-down", &[]),
             ("q", "copy-cancel", &[]),
             ("Escape", "copy-cancel", &[]),
             ("C-Space", "copy-begin-selection", &[]),

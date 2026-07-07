@@ -35,8 +35,8 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate,
-    CopyState, PromptKind, SelState, Server, MONTHS,
+    anchor_key_now, key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState,
+    ConfigCandidate, CopyState, PromptKind, SelState, Server, MONTHS,
 };
 use crate::grid::Grid;
 
@@ -227,19 +227,20 @@ fn trim_trailing_blanks(s: &str) -> String {
     s.trim_end_matches(' ').to_string()
 }
 
-/// Extract one selection's text from `grid` (Task 3, sub-project 4): `sel`'s
-/// anchor and the current cursor (`cx`/`cy`/`scroll`) are converted to
-/// `sel_key`-comparable positions so extraction is independent of
-/// `history_len` drift while selecting. Linear (`sel.rect == false`):
-/// reading-order between the two endpoints — a single row is a plain
-/// substring; multiple rows join the first row's tail, every whole row in
-/// between, and the last row's head with `\n` (tmux-style; NOT `\r\n`),
-/// each trailing-blank-trimmed. Rectangle (`sel.rect == true`): every
-/// spanned row's `[min_col..=max_col]` slice, same per-row trimming, `\n`-
-/// joined.
+/// Extract one selection's text from `grid` (Task 3, sub-project 4): the
+/// stored anchor is converted to its CURRENT view key via `anchor_key_now`
+/// (content-pinned — output captured since the anchor was placed shifts it
+/// up in lockstep; Task 3 review fix) and the live cursor
+/// (`cx`/`cy`/`scroll`) via `sel_key`, so both endpoints are compared in
+/// one coherent frame. Linear (`sel.rect == false`): reading-order between
+/// the two endpoints — a single row is a plain substring; multiple rows
+/// join the first row's tail, every whole row in between, and the last
+/// row's head with `\n` (tmux-style; NOT `\r\n`), each
+/// trailing-blank-trimmed. Rectangle (`sel.rect == true`): every spanned
+/// row's `[min_col..=max_col]` slice, same per-row trimming, `\n`-joined.
 fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll: u32) -> String {
     let rows = grid.rows();
-    let anchor_key = sel_key(sel.anchor_scroll, sel.anchor_y);
+    let anchor_key = anchor_key_now(sel, grid.history_len(), grid.history_total());
     let cursor_key = sel_key(scroll, cy);
 
     let row_text = |key: i64| -> Vec<char> {
@@ -847,7 +848,13 @@ impl Server {
                 }
             }
             CopyAction::BeginSelection => {
-                cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: cs.cx, anchor_y: cs.cy, rect: false });
+                cs.sel = Some(SelState {
+                    anchor_scroll: cs.scroll,
+                    anchor_x: cs.cx,
+                    anchor_y: cs.cy,
+                    anchor_total: p.grid.history_total(),
+                    rect: false,
+                });
             }
             CopyAction::RectangleToggle => {
                 // v1 simplification (documented in the design spec): a
@@ -858,13 +865,38 @@ impl Server {
                 }
             }
             CopyAction::OtherEnd => {
-                // No-op with no active selection.
+                // No-op with no active selection. The old anchor's CURRENT
+                // view position is recomputed content-pinned (Task 3 review
+                // fix, `anchor_key_now`) — new output since the anchor was
+                // placed moved its content up, so the cursor must jump to
+                // where that content is NOW, not to the stale view row the
+                // anchor was originally captured at. The view keeps its
+                // current scroll when the anchor is visible under it, and
+                // scrolls minimally to reveal it otherwise.
                 if let Some(sel) = cs.sel {
-                    let SelState { anchor_scroll, anchor_x, anchor_y, rect } = sel;
-                    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: cs.cx, anchor_y: cs.cy, rect });
-                    cs.scroll = anchor_scroll;
-                    cs.cx = anchor_x;
-                    cs.cy = anchor_y;
+                    let key = anchor_key_now(&sel, history_len, p.grid.history_total());
+                    let anchor_x = sel.anchor_x;
+                    cs.sel = Some(SelState {
+                        anchor_scroll: cs.scroll,
+                        anchor_x: cs.cx,
+                        anchor_y: cs.cy,
+                        anchor_total: p.grid.history_total(),
+                        rect: sel.rect,
+                    });
+                    let row_under_current = key + cs.scroll as i64;
+                    let (new_scroll, new_cy) = if (0..rows as i64).contains(&row_under_current) {
+                        (cs.scroll, row_under_current as u16)
+                    } else if key <= 0 {
+                        // Above the current view: scroll so it lands on row 0.
+                        (((-key) as u32).min(history_len), 0)
+                    } else {
+                        // Below the live view under scroll 0 (only reachable
+                        // after a pane shrink): clamp to the last live row.
+                        (0, (key as u16).min(rows.saturating_sub(1)))
+                    };
+                    cs.scroll = new_scroll;
+                    cs.cy = new_cy;
+                    cs.cx = anchor_x.min(cols.saturating_sub(1));
                 }
             }
             CopyAction::ClearSelection => {

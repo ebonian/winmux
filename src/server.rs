@@ -149,32 +149,62 @@ struct CopyState {
 }
 
 /// A copy-mode selection's anchor + shape (Task 3, sub-project 4). The
-/// anchor is stored with ITS OWN scroll offset (independent of the live
-/// `CopyState::scroll`) so scrolling the view keeps the anchor pinned to the
-/// same absolute grid line rather than drifting with the viewport — the
-/// anchor's and cursor's absolute positions are compared/recomputed via
-/// `sel_key` (below) at use time (render precompute, text extraction),
-/// never cached. `rect` toggles rectangle (column-bounding-box) selection
-/// vs. the default linear (reading-order) selection.
+/// anchor is pinned to CONTENT, not to the view (Task 3 review fix): its
+/// position is captured as a view position (`anchor_scroll`/`anchor_x`/
+/// `anchor_y`) PLUS the grid's monotonic `Grid::history_total()` reading at
+/// capture time (`anchor_total`). At every use site (render precompute,
+/// text extraction, `copy-other-end`) the anchor's CURRENT view position is
+/// recomputed via [`anchor_key_now`], which shifts the capture-time key
+/// down by one per line captured since — so new pane output arriving
+/// mid-selection moves the anchor's highlight/extraction up in lockstep
+/// with the content it was placed on, instead of the anchor staying glued
+/// to a (now wrong) view row. The CURSOR endpoint deliberately stays
+/// view-relative (`CopyState::scroll`/`cx`/`cy` are untouched by new
+/// output — the copy cursor keeps its screen position while content moves
+/// underneath, current behavior kept per the review guidance) and is
+/// converted to the same key coordinate live at each use, so both
+/// endpoints are always compared in one coherent frame. `rect` toggles
+/// rectangle (column-bounding-box) selection vs. the default linear
+/// (reading-order) selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SelState {
     anchor_scroll: u32,
     anchor_x: u16,
     anchor_y: u16,
+    /// `Grid::history_total()` at anchor time (see [`anchor_key_now`]).
+    anchor_total: u64,
     rect: bool,
 }
 
-/// A copy-mode view position's ordering/delta key, independent of
-/// `history_len` (which can drift while scrolled, e.g. new pane output
-/// evicting old scrollback): for a position at view row `row` under scroll
-/// offset `scroll`, `key = row - scroll`. Two positions' keys compare the
-/// same way their absolute grid-line indices would (`history_len` cancels
-/// out of the difference), and `key + new_scroll` gives that same absolute
-/// position's view row under a DIFFERENT scroll offset — exactly what
-/// selection rendering (fixed anchor key, current cursor scroll) and text
-/// extraction (walking every row a selection spans) both need.
+/// A copy-mode view position's ordering/delta key AT ONE INSTANT: for a
+/// position at view row `row` under scroll offset `scroll`, `key = row -
+/// scroll`. Two keys measured against the SAME grid state compare the same
+/// way their absolute grid-line indices would, and `key + scroll` gives
+/// that position's view row under a different scroll offset. NOTE keys are
+/// NOT stable across grid mutations — every line captured into scrollback
+/// since a key was taken shifts that content's current key down by one
+/// (chunked eviction shifts nothing) — so a STORED anchor must go through
+/// [`anchor_key_now`] rather than reusing its capture-time key directly
+/// (Task 3 review fix: the original code did exactly that, and a selection
+/// drifted onto unrelated text whenever the pane produced output
+/// mid-selection).
 fn sel_key(scroll: u32, row: u16) -> i64 {
     row as i64 - scroll as i64
+}
+
+/// The stored anchor's key in the grid's CURRENT frame: its capture-time
+/// key shifted down by one per line captured since (`history_total -
+/// anchor_total` — exact even across eviction, which lowers `history_len`
+/// but never moves a surviving line's view position), then clamped to the
+/// oldest retained history line (`key >= -history_len`): if the anchor's
+/// line has been EVICTED, the endpoint degrades to the oldest content
+/// still available instead of pointing off the buffer (no panic — and no
+/// reliance on `Grid`'s own read-time clamping, which would silently read
+/// the wrong row for keys below the clamp).
+fn anchor_key_now(sel: &SelState, history_len: u32, history_total: u64) -> i64 {
+    let raw = sel_key(sel.anchor_scroll, sel.anchor_y);
+    let shifted = raw - history_total.saturating_sub(sel.anchor_total) as i64;
+    shifted.max(-(history_len as i64))
 }
 
 /// Inverse of [`sel_key`] for `Grid::view_row_text`/`view_cell`-style
@@ -198,9 +228,21 @@ fn key_to_view(key: i64, rows: u16) -> (u32, u16) {
 /// (`## copy-mode` / render contract amendment, Task 3): `(start_col,
 /// start_row, end_col, end_row, rect)`, both endpoints clamped into the
 /// visible `rows`x`cols` view under the CURRENT `scroll`/`cx`/`cy`. `None`
-/// when the selection is wholly scrolled out of view.
-fn compute_sel_view(sel: &SelState, cx: u16, cy: u16, scroll: u32, rows: u16, cols: u16) -> Option<(u16, u16, u16, u16, bool)> {
-    let anchor_key = sel_key(sel.anchor_scroll, sel.anchor_y);
+/// when the selection is wholly scrolled out of view. `history_len`/
+/// `history_total` are the pane grid's CURRENT readings, used to pin the
+/// stored anchor to content via [`anchor_key_now`] (Task 3 review fix).
+#[allow(clippy::too_many_arguments)]
+fn compute_sel_view(
+    sel: &SelState,
+    cx: u16,
+    cy: u16,
+    scroll: u32,
+    rows: u16,
+    cols: u16,
+    history_len: u32,
+    history_total: u64,
+) -> Option<(u16, u16, u16, u16, bool)> {
+    let anchor_key = anchor_key_now(sel, history_len, history_total);
     let cursor_key = sel_key(scroll, cy);
     let (start_key, start_col, end_key, end_col) = if (anchor_key, sel.anchor_x) <= (cursor_key, cx) {
         (anchor_key, sel.anchor_x, cursor_key, cx)
@@ -1397,10 +1439,18 @@ fn render_one(
             // renders live, unaffected by this client's copy mode.
             let copy = match &client.mode {
                 ClientMode::Copy(cs) if cs.pane == *id => {
-                    let sel = cs
-                        .sel
-                        .as_ref()
-                        .and_then(|sel| compute_sel_view(sel, cs.cx, cs.cy, cs.scroll, rect.h, rect.w));
+                    let sel = cs.sel.as_ref().and_then(|sel| {
+                        compute_sel_view(
+                            sel,
+                            cs.cx,
+                            cs.cy,
+                            cs.scroll,
+                            rect.h,
+                            rect.w,
+                            p.grid.history_len(),
+                            p.grid.history_total(),
+                        )
+                    });
                     Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy), sel })
                 }
                 _ => None,

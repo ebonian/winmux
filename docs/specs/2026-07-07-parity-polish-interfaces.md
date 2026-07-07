@@ -37,6 +37,17 @@ impl Grid {
     /// Number of scrollback lines currently captured (<= the `history_limit`
     /// passed to `new`).
     pub fn history_len(&self) -> u32;
+    /// Task 3 review-fix addition: monotonic count of lines EVER captured
+    /// into scrollback — incremented on every actual capture, NEVER
+    /// decremented by eviction (unlike `history_len`). The difference
+    /// between two readings is exactly how many view rows the pane's
+    /// content has shifted up between them (each capture shifts the view by
+    /// one; chunked eviction shifts nothing) — the stable
+    /// "lines-ever-captured" coordinate system copy-mode selection anchors
+    /// are pinned to (see the `## copy-mode` Task 3 selection-math
+    /// amendment). Stays 0 when `history_limit == 0` (nothing is ever
+    /// captured).
+    pub fn history_total(&self) -> u64;
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen), clamped to `history_len()`.
     /// Out-of-range `row` (>= rows) or `col` (>= cols — checked against the
@@ -196,7 +207,7 @@ Default `copy-mode` (emacs) table — movement/scroll/cancel subset only:
 | `M->` | `copy-history-bottom` |
 | `M-v`/`C-v`/`PPage` | `copy-page-up` |
 | `NPage` | `copy-page-down` |
-| `Space` | `copy-page-down` |
+| `Space` (the literal space CHARACTER — see the gotcha below) | `copy-page-down` |
 | `q`/`Escape` | `copy-cancel` |
 
 `H`/`M`/`L` (top/middle/bottom-line) are NOT bound in the emacs table — the
@@ -247,12 +258,14 @@ live decoder (`keys::classify_single_byte`) NEVER produces
 decodes to `Key{code: KeyCode::Char(' ')}`; the `Space` code variant is only
 ever produced for `Ctrl-Space` (byte `0x00`, explicitly special-cased) and
 otherwise exists purely for `parse_key("Space")`/`send-keys Space` notation.
-The vi table's `Space` binding above is therefore registered under
-`Char(' ')`, NOT `named("Space")`, so a real keypress actually reaches it.
-This means the PRE-EXISTING Task 2 emacs default `Space → copy-page-down`
-(registered under `named("Space")`, unchanged by this task) is itself
-unreachable by a literal spacebar press — a latent bug, left as-is here
-(out of this task's scope; flagged in `docs/follow-ups.md`).
+BOTH tables' `Space` defaults are therefore registered under `Char(' ')`,
+NOT `named("Space")`, so a real keypress actually reaches them: the vi
+table's `Space → copy-begin-selection` was written that way from the start,
+and Task 2's emacs `Space → copy-page-down` (originally registered under
+`named("Space")` and thus unreachable) was REBOUND under `Char(' ')` by the
+Task 3 review fix. The deeper decoder-level `Char(' ')`/`Space`
+normalization (which would also cover USER `bind ... Space ...` lines in
+these tables) remains `docs/follow-ups.md` item 34.
 
 ### `cmd` amendment
 
@@ -339,15 +352,18 @@ struct CopyState {
     sel: Option<SelState>, // Task 3: the active selection, if any
 }
 
-/// Task 3 addition. The anchor is stored with ITS OWN scroll offset
-/// (independent of `CopyState::scroll`) so scrolling the view keeps the
-/// anchor pinned to the same absolute grid line; the anchor's and cursor's
-/// absolute positions are compared/recomputed via `sel_key` at use time
-/// (render precompute, text extraction), never cached.
+/// Task 3 addition (amended by the Task 3 review fix). The anchor is
+/// pinned to CONTENT, not to the view: its view position at capture time
+/// (`anchor_scroll`/`anchor_x`/`anchor_y`) is stored together with the
+/// grid's monotonic `Grid::history_total()` reading (`anchor_total`), and
+/// every use site recomputes the anchor's CURRENT view position via
+/// `anchor_key_now` (below) — never reusing the capture-time position
+/// directly.
 struct SelState {
     anchor_scroll: u32,
     anchor_x: u16,
     anchor_y: u16,
+    anchor_total: u64, // Grid::history_total() at anchor time
     rect: bool, // rectangle (column bounding-box) vs. linear (reading-order)
 }
 ```
@@ -432,25 +448,54 @@ Called from the same two sites as `cancel_stale_confirms`: `handle_exited`
   established "read `cs`'s Copy fields into locals before reassigning
   `client.mode`" NLL pattern.
 
-**Task 3 amendment — position/ordering key** (`sel_key`, `key_to_view`,
-`compute_sel_view`, private `fn`s in `src/server.rs`, used by both
-`server::dispatch`'s extraction and `render_one`'s precompute below):
-`sel_key(scroll, row) = row as i64 - scroll as i64` is a `history_len`-
-independent ordering/delta key — for two positions under the SAME (or
-different) scroll offsets, comparing their keys reproduces comparing their
-absolute grid-line indices (the `history_len` term cancels out of the
-difference), and `key + new_scroll` gives that same absolute position's view
-row under a DIFFERENT scroll offset. `key_to_view(key, rows)` is the
-inverse: the `(scroll_back, row)` pair to pass to `Grid::view_row_text`/
-`view_cell` that reproduces `key` in view coordinates (`Grid` clamps
-`scroll_back` to its actual `history_len` internally, so an over-large value
-is harmless).
+**Task 3 amendment — position/ordering key** (`sel_key`, `anchor_key_now`,
+`key_to_view`, `compute_sel_view`, private `fn`s in `src/server.rs`, used by
+both `server::dispatch`'s extraction and `render_one`'s precompute below).
+REWRITTEN by the Task 3 review fix — the original text claimed
+`sel_key(scroll, row) = row - scroll` was history-drift-independent
+("`history_len` cancels out"), which is FALSE: keys are only comparable
+against the SAME grid state, and every line captured into scrollback after
+a key is taken shifts that content's current key down by one. The corrected
+model:
+
+- `sel_key(scroll, row) = row as i64 - scroll as i64` — a view position's
+  ordering/delta key AT ONE INSTANT. Two keys measured against the same
+  grid state compare the way their absolute grid-line indices would, and
+  `key + scroll` converts a current key to a view row under any scroll
+  offset. NOT stable across grid mutations.
+- `anchor_key_now(sel, history_len, history_total) -> i64` — the STORED
+  anchor's key in the grid's CURRENT frame: `sel_key(anchor_scroll,
+  anchor_y) - (history_total - anchor_total)`, then clamped to
+  `>= -(history_len)` (the oldest retained history line). The
+  `history_total` delta is exact even across chunked eviction — eviction
+  lowers `history_len` but never moves a surviving line's view position,
+  which is precisely why a plain `history_len` delta would under-correct
+  and why `Grid::history_total()` (grid-v2 amendment above) exists. If the
+  anchor's line has been EVICTED, the clamp degrades the endpoint to the
+  oldest content still available (no panic, no reliance on `Grid`'s
+  read-time clamping).
+- **Endpoint semantics** (pragmatic resolution, per the review): the ANCHOR
+  is pinned to content — new pane output mid-selection moves its
+  highlight/extraction up in lockstep with the text it was placed on. The
+  CURSOR endpoint stays view-relative (`CopyState::scroll`/`cx`/`cy` are
+  untouched by new output; the copy cursor keeps its screen position while
+  content moves underneath) and is converted to a key live at each use, so
+  both endpoints are always compared in one coherent frame. `copy-other-end`
+  jumps the cursor to the anchor's CURRENT (content-pinned) position,
+  keeping the current scroll when that position is visible under it and
+  scrolling minimally to reveal it otherwise.
+- `key_to_view(key, rows)` — the `(scroll_back, row)` pair to pass to
+  `Grid::view_row_text`/`view_cell` that reproduces a CURRENT key in view
+  coordinates (`Grid` clamps `scroll_back` to its actual `history_len`
+  internally, so an over-large value is harmless).
 
 **Task 3 amendment — text extraction** (`extract_selection_text` in
 `src/server/dispatch.rs`, a free `fn(grid: &Grid, sel: &SelState, cx: u16,
-cy: u16, scroll: u32) -> String`): anchor and cursor positions are converted
-to `sel_key`-comparable values so extraction is independent of `history_len`
-drift while selecting.
+cy: u16, scroll: u32) -> String`): the stored anchor is converted to its
+CURRENT view key via `anchor_key_now(sel, grid.history_len(),
+grid.history_total())` (content-pinned; Task 3 review fix) and the live
+cursor via `sel_key(scroll, cy)`, so both endpoints are compared in one
+coherent frame regardless of output captured mid-selection.
 - Linear (`sel.rect == false`): reading order between the two endpoints
   (whichever of anchor/cursor sorts first by `(key, col)`). A single-row
   selection is a plain `[start_col..=end_col]` substring. A multi-row
@@ -513,11 +558,14 @@ to 0/`cols-1`, so this same shape logic paints it correctly as a full-width
 `server::render_one`: when `client.mode` is `Copy(cs)`, the `PaneView` whose
 `id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, cursor: (cs.cx,
 cs.cy), sel: cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
-cs.cy, cs.scroll, rect.h, rect.w))})` (every other pane, including a
-DIFFERENT client's focused/zoomed pane, renders live as before); the
-terminal cursor is placed at `cs.pane`'s rect origin + `(cs.cx, cs.cy)`
-(clamped into the rect) instead of the focused pane's live cursor, visible
-whenever there's no overlay message.
+cs.cy, cs.scroll, rect.h, rect.w, p.grid.history_len(),
+p.grid.history_total()))})` (the two trailing grid readings are the Task 3
+review fix's content-pinning inputs — see the position/ordering-key
+amendment above; every other pane, including a DIFFERENT client's
+focused/zoomed pane, renders live as before); the terminal cursor is placed
+at `cs.pane`'s rect origin + `(cs.cx, cs.cy)` (clamped into the rect)
+instead of the focused pane's live cursor, visible whenever there's no
+overlay message.
 
 ## `buffers` — tmux paste buffers (Task 3)
 

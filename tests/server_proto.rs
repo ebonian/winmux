@@ -2339,6 +2339,141 @@ fn rectangle_selection() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Task 3 review fix (Critical): a selection's ANCHOR is pinned to CONTENT,
+/// not to its view row — new pane output arriving while a selection is
+/// active scrolls the anchored content up, and both the highlight and the
+/// copied text must follow it (the original implementation kept the anchor
+/// at its capture-time view row, so it drifted onto unrelated text).
+#[test]
+fn selection_survives_concurrent_output() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Fill past the pane height (so scrollback exists and later output
+    // scrolls the screen), then print the line we'll anchor on.
+    c.send(&ClientMsg::Stdin(b"1..30 | ForEach-Object { \"fillmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("fillmark30")));
+    c.send(&ClientMsg::Stdin(b"echo anchor777\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "anchor777"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "anchor777").unwrap() as u16;
+
+    // Copy mode; cursor to (col 0, anchor row); begin selection + extend to
+    // end of line; highlight lands on the anchor row.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    let mut moves = vec![b'0'];
+    moves.extend(std::iter::repeat_n(b'k', (entry_row - target_row) as usize));
+    c.send(&ClientMsg::Stdin(moves));
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, target_row));
+    c.send(&ClientMsg::Stdin(b" $".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cell(0, target_row).style.bg == Color::Idx(3));
+
+    // Concurrent output from a second connection: send-keys into the SAME
+    // pane (headless, no -t = the focused pane) makes the shell echo the
+    // command, print its output, and draw a fresh prompt — scrolling the
+    // screen and capturing more scrollback while our selection is active.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["send-keys".into(), "echo extra999".into(), "Enter".into()]));
+    expect_cli_done(&cli2, 0);
+
+    // (a) The highlight must FOLLOW the anchored content to its new view
+    // row: the row that now holds "anchor777" is highlighted from col 0
+    // (it's the selection's first row), and it moved up from target_row.
+    let find_anchor_row =
+        |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("extra999"))
+            && match find_anchor_row(g) {
+                Some(r) => r < target_row && g.cell(0, r).style.bg == Color::Idx(3),
+                None => false,
+            }
+    });
+    let new_row = find_anchor_row(&grid).unwrap();
+    for x in 0..9u16 {
+        assert_eq!(
+            grid.cell(x, new_row).style.bg,
+            Color::Idx(3),
+            "col {x} of the moved anchor row must stay highlighted"
+        );
+    }
+
+    // (b) The COPY extracts the anchored content, not whatever sits at the
+    // stale view row: the buffer's first line is "anchor777" (the sample
+    // sanitizes the joining \n to '?').
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli3, 0);
+    assert!(out.contains("bytes: \"anchor777?"), "buffer must start with the anchored line: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Lighter variant of `selection_survives_concurrent_output` for
+/// `copy-other-end`: after new output shifts the anchored content up, `o`
+/// must jump the cursor to the anchor's NEW (content-pinned) view row, not
+/// the stale view row it was captured at.
+#[test]
+fn other_end_survives_concurrent_output() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"1..30 | ForEach-Object { \"fillmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("fillmark30")));
+    c.send(&ClientMsg::Stdin(b"echo anchor777\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "anchor777"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "anchor777").unwrap() as u16;
+
+    // Anchor at (0, anchor row), cursor moved 3 right.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    let mut moves = vec![b'0'];
+    moves.extend(std::iter::repeat_n(b'k', (entry_row - target_row) as usize));
+    c.send(&ClientMsg::Stdin(moves));
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, target_row));
+    c.send(&ClientMsg::Stdin(b" lll".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, target_row));
+
+    // Concurrent output scrolls the anchored content up.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["send-keys".into(), "echo extra888".into(), "Enter".into()]));
+    expect_cli_done(&cli2, 0);
+    let find_anchor_row =
+        |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("extra888")) && find_anchor_row(g).is_some_and(|r| r < target_row)
+    });
+    let new_row = find_anchor_row(&grid).unwrap();
+
+    // `o` jumps to the anchor's CURRENT (content-pinned) position — col 0
+    // of the row "anchor777" moved to, not the stale (0, target_row).
+    c.send(&ClientMsg::Stdin(b"o".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, new_row));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn selection_highlight_styled() {
     let name = unique_pipe_name();

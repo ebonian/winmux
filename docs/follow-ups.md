@@ -258,11 +258,15 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     `named("Space")`/`bind ... Space ...` targeting the ROOT, PREFIX, or a
     copy-mode table is unreachable by an actual spacebar press — confirmed
     live via Task 2's pre-existing emacs `copy-mode` default `Space →
-    copy-page-down` (`src/bindings.rs`), which is affected but was left
-    AS-IS (out of Task 3's scope). Task 3's OWN `copy-mode-vi` `Space →
-    copy-begin-selection` default was written around this gap from the
-    start (bound under `Char(' ')`, not `named("Space")`), so it works
-    correctly. A real fix belongs in `keys::classify_single_byte` (making a
+    copy-page-down` (`src/bindings.rs`). BOTH default-table cases are now
+    fixed at the bindings level: Task 3's own `copy-mode-vi` `Space →
+    copy-begin-selection` was written around the gap from the start (bound
+    under `Char(' ')`, not `named("Space")`), and the Task 3 REVIEW FIX
+    rebound the emacs `Space → copy-page-down` default under `Char(' ')`
+    too. What remains open here is only the general decoder-level gap
+    (a USER's `bind ... Space ...` config line still silently produces an
+    unreachable binding). A real fix belongs in `keys::classify_single_byte`
+    (making a
     bare `0x20` decode as `KeyCode::Space` instead of `Char(' ')`, or
     equivalently normalizing `Char(' ')` to `Space` wherever keys are
     looked up) — deferred since it's a decoder-level change with unknown
