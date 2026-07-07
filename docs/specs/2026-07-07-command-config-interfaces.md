@@ -197,3 +197,88 @@ one. `encode_key`/`KeyDecoder` only cover the arrow CSI-modifier form for
 combining modifiers with a named key — other named keys (Home/End/PPage/
 NPage/IC/DC/F-keys) do not support ctrl/meta/shift combinations at all in
 SP3, on either the encode or decode side, beyond what's in the tables above.
+
+## `style` — tmux style-string grammar onto `grid::Style` (Task 2)
+
+```rust
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct PartialStyle { /* opaque: fg, bg, and per-attribute set/clear
+                              state, all private */ }
+
+impl PartialStyle {
+    pub fn apply_to(&self, base: grid::Style) -> grid::Style;
+    pub fn merge(&self, over: &PartialStyle) -> PartialStyle;
+}
+
+pub fn parse_style(input: &str) -> Result<PartialStyle, String>; // Err = "bad style: <input>"
+```
+
+Pure module: no I/O, `std` only. **Implementation module:** `src/style.rs`.
+Depends only on `crate::grid::{Color, Style}`. `PartialStyle` is deliberately
+opaque per the brief (no public fields) — every field is `Option<T>`
+internally: `None` means "this style string didn't mention this", so
+`apply_to`/`merge` can layer explicit overrides onto a base without
+clobbering anything unmentioned.
+
+Unit-tested with exact expected values (mirrors `keys.rs`'s style):
+`named_colors`, `colour_indexed`, `hex_rgb`, `default_color_resets`,
+`attrs_set`, `attr_synonyms`, `attrs_clear`, `accepted_ignored`,
+`apply_layers_over_base`, `merge_precedence`, `bad_style_err_string`,
+`empty_string_ok_noop` (12 tests).
+
+### Grammar (`parse_style`)
+
+- Input is trimmed of surrounding whitespace first; empty after trim → `Ok`
+  with a no-op `PartialStyle` (nothing mentioned, `apply_to` is identity).
+  Otherwise split on `,` (components themselves are NOT individually
+  trimmed — tmux has no internal whitespace tolerance); any empty component
+  (leading/trailing/doubled comma) is a parse failure.
+- `fg=<color>` / `bg=<color>` set the respective field; see the color
+  grammar below.
+- `none` / `noattr` reset all FIVE attribute fields (bold/dim/italic/
+  underline/reverse) back to "unmentioned" for this style — this does
+  **NOT** touch `fg`/`bg`, which are left as already parsed by earlier
+  components in the same string (tmux behavior: `none` resets attributes
+  only, not colors).
+- Attribute set/clear pairs: `bold`/`nobold`, `dim`/`nodim`,
+  `reverse`/`noreverse`; `italics`|`italic` / `noitalics`|`noitalic`
+  (tmux's canonical word is `italics`, `italic` accepted as a synonym);
+  `underscore`|`underline` / `nounderscore`|`nounderline` (tmux's canonical
+  word is `underscore`, `underline` accepted as a synonym). Each maps onto
+  `grid::Style`'s field of the same name (`italic`, `underline` — note NOT
+  `italics`/`underscore`, matching `grid.rs`'s field names).
+- Accepted-but-inert (parse OK, no-op — no corresponding `grid::Style`
+  field): `blink`, `noblink`, `strikethrough`, `nostrikethrough`,
+  `double-underscore`, `curly-underscore`, `dotted-underscore`,
+  `dashed-underscore`.
+- Anything else (unknown word, malformed `fg=`/`bg=` color) is a component
+  failure; the whole call fails with `Err(format!("bad style: {input}"))` —
+  `input` is the exact original (untrimmed) argument, not the trimmed or
+  partially-parsed form.
+
+### Color grammar (`fg=`/`bg=` value)
+
+| form | maps to |
+|---|---|
+| `default` | `Color::Default` |
+| `black` `red` `green` `yellow` `blue` `magenta` `cyan` `white` | `Color::Idx(0..=7)` |
+| `bright<name>` (same 8 names) | `Color::Idx(8..=15)` (`brightred` → `Idx(9)`) |
+| `colour<n>` / `color<n>`, `n` in `0..=255` | `Color::Idx(n)` (`colour256`+ → `Err`, out of `u8` range) |
+| `#rrggbb` (exactly 6 hex digits, case-insensitive) | `Color::Rgb(r, g, b)` (wrong length or non-hex digit → `Err`) |
+
+Named colors, `colour`/`color` prefixes, and `default` are matched
+case-sensitively (lowercase, tmux config convention); hex digits after `#`
+are the only case-insensitive part of the grammar.
+
+### `apply_to` / `merge` semantics
+
+- `apply_to(base)`: for each field, `Some(v)` (color explicitly set, or
+  attribute explicitly set/cleared) overwrites `base`'s corresponding
+  field; `None` (never mentioned) leaves `base`'s value untouched. An
+  explicit `no<attr>` is `Some(false)` — just as "explicit" as setting the
+  attribute — so it forces the base's flag off rather than leaving it
+  alone.
+- `merge(&self, over)`: per-field, `over`'s value wins if `Some`; otherwise
+  falls back to `self`'s own value (which may itself be `None`). Used to
+  layer e.g. `window-status-current-style` (`over`) on top of `status-style`
+  (`self`) before a single `apply_to` call against the render base style.

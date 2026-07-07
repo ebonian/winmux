@@ -13,3 +13,4 @@ pub mod pty;
 pub mod render;
 pub mod server;
 pub mod status;
+pub mod style;
