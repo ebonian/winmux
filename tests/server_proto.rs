@@ -3807,9 +3807,10 @@ fn break_pane_bang() {
     server.join().expect("server exits after last session dies");
 }
 
-/// `!` refuses (`can't break with only one pane`, verbatim per the design
-/// spec's `## 6. Window ops` section) whenever the SOURCE window has only
-/// one pane -- both when it's the session's only window, AND when the
+/// `!` refuses (`can't break with only one pane`, verbatim from the task
+/// brief, itself quoting real tmux -- design spec's `## 6. Window ops`
+/// section doesn't spell out a refusal string) whenever the SOURCE window
+/// has only one pane -- both when it's the session's only window, AND when the
 /// session has a second window (breaking a single-pane window is refused
 /// regardless of how many other windows exist: a window can never be left
 /// with zero panes).
@@ -4019,5 +4020,52 @@ fn quote_prompt_selects_index() {
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task-7 review, Important finding #1: the `'` index prompt must validate
+/// the committed buffer is a well-formed window index (digits only) BEFORE
+/// delegating to `select-window -t :<input>`. Before the fix, a non-numeric
+/// buffer fell into `resolve_window_target`'s bare-token "try session name
+/// first" branch: if the typed text happened to match an unrelated
+/// session's name, the command silently resolved to THAT session's own
+/// already-current window and did nothing visible on the acting client --
+/// no error, no window change, no feedback at all. This test reproduces
+/// exactly that scenario (a second session named `abc`, typed into the `'`
+/// prompt on the main session) and asserts the fixed behavior: a `window
+/// not found: abc` transient error (matching the wording the numeric-miss
+/// case already produces) and the acting client's current window/session
+/// unchanged.
+#[test]
+fn quote_prompt_rejects_non_numeric() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    // Second session, name chosen to be a plausible (but non-numeric)
+    // window-index-prompt token -- this is what the bare-token session-name
+    // fallback would otherwise silently match.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "abc".into()]));
+    expect_cli_done(&cli, 0);
+
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'\'']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index")));
+    c.send(&ClientMsg::Stdin(b"abc\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("window not found: abc")));
+    // The transient error message takes over the status line; clear it and
+    // confirm the acting client's own session/window is still unchanged --
+    // NOT silently switched to (or left alone within) the unrelated `abc`
+    // session.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "abc".into()]));
+    expect_cli_done(&cli, 0);
     server.join().expect("server exits after last session dies");
 }

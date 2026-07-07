@@ -1417,11 +1417,19 @@ Three new `exec_*` helpers, wired into both `execute` (headless) and
   the `no windows matching:` message as `Ok`, not `Err`.
 
 `'`'s dispatch has no dedicated `exec_*` — its `PromptKind::Index` commit
-calls the PRE-EXISTING `exec_select_window(format!(":{buf}"),
-Some(session_name.as_str()))` directly (no new command, no new dispatch
-table entry): `resolve_window`'s existing bare-numeric-index handling
-already produces the exact required `window not found: <n>` wording for a
-miss.
+validates `buf` is empty or all-ASCII-digits BEFORE delegating (Task-7
+review, Important finding #1: `resolve_window_target`'s bare-token "try
+session name first" fallback otherwise mis-resolves a non-numeric `buf`,
+either erroring `can't find session: <buf>` or, worse, silently no-opping
+against an unrelated session whose name happens to match); a non-numeric,
+non-empty `buf` produces `window not found: <buf>` directly (matching
+`resolve_window`'s own miss wording) without calling `exec_select_window`
+at all. An empty or all-digit `buf` calls the PRE-EXISTING
+`exec_select_window(format!(":{buf}"), Some(session_name.as_str()))`
+directly (no new command, no new dispatch table entry): `resolve_window`'s
+existing bare-numeric-index handling already produces the exact required
+`window not found: <n>` wording for a numeric miss, and an empty `buf`
+resolves to the session's current window (a no-op).
 
 ### `bindings` amendment
 

@@ -1173,8 +1173,10 @@ impl Server {
     /// `break-pane|breakp [-d] [-n name]`: the resolved CURRENT pane leaves
     /// its window and becomes a new window (next free index, via
     /// `Session::new_window`'s existing `lowest_unused_index` floor). Errors
-    /// `"can't break with only one pane"` (verbatim, design spec `## 6.
-    /// Window ops`) if the source window has only that one pane -- checked
+    /// `"can't break with only one pane"` (verbatim from the task brief,
+    /// itself quoting real tmux's own message -- design spec `## 6. Window
+    /// ops` doesn't spell out a refusal string) if the source window has
+    /// only that one pane -- checked
     /// BEFORE any mutation, regardless of how many OTHER windows the
     /// session has (a window can never be left with zero panes; matches
     /// `Layout::remove`'s own "the only pane" refusal, which
@@ -2819,8 +2821,21 @@ impl Server {
                 }
                 (true, None)
             }
+            // Task-7 review, Important finding #1: `buf` is raw, unfiltered
+            // prompt text (see `edit_line_buf`) -- without this check, a
+            // non-numeric commit fell through `resolve_window_target`'s
+            // bare-token "try session name first" fallback instead of
+            // producing the informative miss a numeric-index prompt should
+            // always give (silently no-opping against an unrelated session
+            // when `buf` happened to match its name, or showing the wrong
+            // error -- `can't find session: <buf>` -- otherwise). Empty
+            // `buf` is left to `exec_select_window`'s existing "empty spec
+            // -> current window" no-op (matches `PromptKind::Command`'s
+            // empty-commit-is-silent-cancel precedent).
             PromptKind::Index => {
-                if let Err(e) = self.exec_select_window(format!(":{buf}"), Some(session_name.as_str())) {
+                if !buf.is_empty() && !buf.bytes().all(|b| b.is_ascii_digit()) {
+                    client.message = Some((format!("window not found: {buf}"), Instant::now()));
+                } else if let Err(e) = self.exec_select_window(format!(":{buf}"), Some(session_name.as_str())) {
                     client.message = Some((e, Instant::now()));
                 }
                 (true, None)
