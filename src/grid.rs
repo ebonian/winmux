@@ -72,10 +72,11 @@ struct TermState {
     saved: Option<SavedCursor>,
     /// True while the alternate screen (`CSI ?1049h`) is active.
     alt_screen: bool,
-    /// The primary screen's cells + cursor position, saved on entering the
-    /// alt screen and restored (moved back into `cells`/`cursor_*`) on
-    /// leaving it. `None` when not in alt-screen mode.
-    saved_primary: Option<(Vec<Cell>, u16, u16)>,
+    /// The primary screen's cells + cursor state (position, SGR pen,
+    /// autowrap -- DECSC/DECRC scope, per xterm's documentation of 1049),
+    /// saved on entering the alt screen and restored on leaving it.
+    /// `None` when not in alt-screen mode.
+    saved_primary: Option<(Vec<Cell>, SavedCursor)>,
     /// Scrollback: oldest line at the front. Each line is exactly `cols`
     /// wide AT CAPTURE TIME -- width changes since capture are clipped/
     /// padded lazily on read (`view_cell`), not reflowed.
@@ -122,7 +123,9 @@ impl TermState {
     /// Push one scrolled-off line into the scrollback, evicting the oldest
     /// `max(1, history_limit/10)` lines in one chunk once the buffer reaches
     /// capacity (tmux `grid_collect_history`). No-op when scrollback is
-    /// disabled (`history_limit == 0`).
+    /// disabled (`history_limit == 0`). Degenerate `history_limit == 1`:
+    /// every push immediately hits the limit and evicts the line just
+    /// pushed, so `history_len()` stays 0 -- effectively disabled.
     fn push_history(&mut self, line: Vec<Cell>) {
         if self.history_limit == 0 {
             return;
@@ -138,10 +141,12 @@ impl TermState {
 
     /// View-coordinate cell lookup: `scroll_back` lines scrolled up from the
     /// live bottom (0 = live screen), clamped to `history_len()`.
-    /// Out-of-range `row`/`col` (including columns beyond a history line's
-    /// captured width) returns a blank default cell.
+    /// Out-of-range `row`/`col` (against the CURRENT dimensions -- so a
+    /// history line captured wider than the current width is clipped to it,
+    /// and columns beyond a narrower captured line read as blank) returns a
+    /// blank default cell.
     fn view_cell(&self, scroll_back: u32, col: u16, row: u16) -> Cell {
-        if row >= self.rows {
+        if row >= self.rows || col >= self.cols {
             return Cell::default();
         }
         let history_len = self.history.len() as u32;
@@ -153,25 +158,24 @@ impl TermState {
             self.history[combined_index as usize].get(col as usize).copied().unwrap_or_default()
         } else {
             let live_row = (combined_index - history_len) as u16;
-            if live_row >= self.rows || col >= self.cols {
-                return Cell::default();
-            }
             self.cells[self.idx(col, live_row)]
         }
     }
 
     /// Scroll the region [scroll_top, scroll_bottom] up by `n`, blanking the
     /// vacated bottom rows. Lines pushed off the top are captured into
-    /// scrollback, but ONLY when the region starts at the very top of the
-    /// screen (`scroll_top == 0` -- a full-screen or top-anchored scroll,
-    /// covering both LF-at-bottom via `line_feed` and `CSI S`) and the grid
-    /// is not currently showing the alt screen.
+    /// scrollback, but ONLY when the region is the FULL screen
+    /// (`scroll_top == 0 && scroll_bottom == rows - 1` -- covering both
+    /// LF-at-bottom via `line_feed` and `CSI S` with no DECSTBM region set;
+    /// tmux never captures partial-region scrolls, even top-anchored ones)
+    /// and the grid is not currently showing the alt screen.
     fn scroll_up(&mut self, n: u16) {
         let top = self.scroll_top as usize;
         let bottom = self.scroll_bottom as usize;
         let cols = self.cols as usize;
         let n = n as usize;
-        if top == 0 && !self.alt_screen && self.history_limit > 0 {
+        let full_screen = top == 0 && bottom == self.rows as usize - 1;
+        if full_screen && !self.alt_screen && self.history_limit > 0 {
             let capture_n = n.min(bottom - top + 1);
             for row in 0..capture_n {
                 let start = row * cols;
@@ -479,10 +483,10 @@ impl TermState {
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
-        if let Some((primary, saved_col, saved_row)) = &mut self.saved_primary {
+        if let Some((primary, saved)) = &mut self.saved_primary {
             *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
-            *saved_col = (*saved_col).min(cols.saturating_sub(1));
-            *saved_row = (*saved_row).min(rows.saturating_sub(1));
+            saved.col = saved.col.min(cols.saturating_sub(1));
+            saved.row = saved.row.min(rows.saturating_sub(1));
         }
         self.cols = cols;
         self.rows = rows;
@@ -576,7 +580,10 @@ impl Perform for TermState {
     /// (lossy), control characters stripped, capped at 256 chars. OSC 1
     /// (icon-only) and any other OSC are ignored. The terminator (BEL vs
     /// `ESC \`) makes no difference here -- `vte` already normalizes both
-    /// into this single callback.
+    /// into this single callback. `vte` splits the OSC buffer on EVERY
+    /// `;`, so a title containing semicolons arrives as params[1..N] and
+    /// must be re-joined with `;` (tmux and vte's own ansi.rs reference
+    /// consumer both do this), not truncated at params[1].
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.len() < 2 {
             return;
@@ -584,7 +591,8 @@ impl Perform for TermState {
         if params[0] != b"0" && params[0] != b"2" {
             return;
         }
-        let raw = String::from_utf8_lossy(params[1]);
+        let joined: Vec<u8> = params[1..].join(&b';');
+        let raw = String::from_utf8_lossy(&joined);
         let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(256).collect();
         self.title = Some(cleaned);
         self.title_changed = true;
@@ -606,16 +614,25 @@ impl Perform for TermState {
                         Some(1049) => {
                             if set {
                                 // Enter: save the primary screen (cells +
-                                // cursor position) the FIRST time only -- a
-                                // redundant ?1049h while already in alt mode
-                                // must not clobber the saved primary with
-                                // alt-screen content. Either way, entering
-                                // always clears the (now-active) alt buffer
-                                // and homes the cursor (visible behavior
+                                // cursor position, SGR pen, and autowrap --
+                                // DECSC/DECRC scope per xterm's docs for
+                                // 1049) the FIRST time only -- a redundant
+                                // ?1049h while already in alt mode must not
+                                // clobber the saved primary with alt-screen
+                                // content. Either way, entering always
+                                // clears the (now-active) alt buffer and
+                                // homes the cursor (visible behavior
                                 // preserved from the MVP).
                                 if !self.alt_screen {
-                                    self.saved_primary =
-                                        Some((self.cells.clone(), self.cursor_col, self.cursor_row));
+                                    self.saved_primary = Some((
+                                        self.cells.clone(),
+                                        SavedCursor {
+                                            col: self.cursor_col,
+                                            row: self.cursor_row,
+                                            style: self.style,
+                                            autowrap: self.autowrap,
+                                        },
+                                    ));
                                     self.alt_screen = true;
                                 }
                                 self.erase_display(2);
@@ -624,12 +641,15 @@ impl Perform for TermState {
                                 self.wrap_pending = false;
                             } else if self.alt_screen {
                                 // Leave: restore the primary screen exactly
-                                // (cells + cursor), no clearing. A spurious
-                                // ?1049l while not in alt mode is a no-op.
-                                if let Some((primary, saved_col, saved_row)) = self.saved_primary.take() {
+                                // (cells + cursor position/pen/autowrap),
+                                // no clearing. A spurious ?1049l while not
+                                // in alt mode is a no-op.
+                                if let Some((primary, saved)) = self.saved_primary.take() {
                                     self.cells = primary;
-                                    self.cursor_col = saved_col.min(self.cols.saturating_sub(1));
-                                    self.cursor_row = saved_row.min(self.rows.saturating_sub(1));
+                                    self.cursor_col = saved.col.min(self.cols.saturating_sub(1));
+                                    self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
+                                    self.style = saved.style;
+                                    self.autowrap = saved.autowrap;
                                 }
                                 self.alt_screen = false;
                                 self.wrap_pending = false;
@@ -1257,6 +1277,51 @@ mod tests {
         g.feed(b"\x1b]2;world\x07"); // OSC 2 (title) also captured
         assert_eq!(g.title(), Some("world"));
         assert!(g.take_title_changed());
+    }
+
+    #[test]
+    fn osc_title_with_semicolons() {
+        // vte splits the OSC buffer on EVERY ';' -- a title containing
+        // semicolons arrives as params[1..N] and must be re-joined, not
+        // truncated at params[1] (tmux and vte's own ansi.rs reference
+        // consumer both reconstruct the full title).
+        let mut g = Grid::new(5, 1, 0);
+        g.feed(b"\x1b]0;a;b;c\x07");
+        assert_eq!(g.title(), Some("a;b;c"));
+        assert!(g.take_title_changed());
+    }
+
+    #[test]
+    fn region_scroll_top_anchored_not_captured() {
+        // A top-anchored but PARTIAL scroll region (DECSTBM rows 1-10 on a
+        // 24-row grid: top=0, bottom=9 < rows-1) must NOT capture scrolled
+        // lines -- tmux only captures full-screen scrolls into history.
+        let mut g = Grid::new(3, 24, 10);
+        g.feed(b"\x1b[1;10r"); // region indices 0..=9, homes cursor
+        g.feed(b"\x1b[10;1H"); // cursor to index (0,9) = region bottom
+        g.feed(b"top\r\n"); // LF at region bottom scrolls the region only
+        assert_eq!(g.history_len(), 0);
+        // CSI S inside the same partial region: also not captured.
+        g.feed(b"\x1b[S");
+        assert_eq!(g.history_len(), 0);
+        // Restoring the full-screen region re-enables capture.
+        g.feed(b"\x1b[r\x1b[24;1H\n");
+        assert_eq!(g.history_len(), 1);
+    }
+
+    #[test]
+    fn alt_screen_restores_pen_state() {
+        // xterm documents 1049 as save/restore "as in DECSC/DECRC": the SGR
+        // pen and autowrap flag must be restored on leave, not leaked from
+        // the alt-screen app into the primary screen.
+        let mut g = Grid::new(5, 2, 0);
+        g.feed(b"\x1b[?1049h");
+        g.feed(b"\x1b[31m\x1b[?7l"); // alt app: red fg, autowrap off
+        g.feed(b"\x1b[?1049l");
+        g.feed(b"X");
+        assert_eq!(g.cell(0, 0).style, Style::default()); // pen restored
+        g.feed(b"YZAB!"); // 6th char on a 5-col row: wraps only if DECAWM is back on
+        assert_eq!(g.cell(0, 1).ch, '!');
     }
 
     #[test]

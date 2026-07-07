@@ -39,10 +39,12 @@ impl Grid {
     pub fn history_len(&self) -> u32;
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen), clamped to `history_len()`.
-    /// Out-of-range `row` (>= rows) or `col` returns a blank default-style
-    /// cell; a history line's captured width may differ from the current
-    /// `cols` (no reflow — see below), so columns past that line's captured
-    /// width also read as blank.
+    /// Out-of-range `row` (>= rows) or `col` (>= cols — checked against the
+    /// CURRENT dimensions for history and live rows alike) returns a blank
+    /// default-style cell; a history line's captured width may differ from
+    /// the current `cols` (no reflow — see below), so a wider captured line
+    /// is clipped to the current width and columns past a narrower captured
+    /// line's width also read as blank.
     pub fn view_cell(&self, scroll_back: u32, col: u16, row: u16) -> Cell;
     /// Convenience: collect a whole view row into a `String` (e.g. for
     /// copy-mode search).
@@ -57,12 +59,14 @@ impl Grid {
 ```
 
 **Scrollback capture rules:**
-- Captured only from `scroll_up` (full/top-anchored region scrolls: LF at
-  the scroll-region bottom via `line_feed`, and `CSI S`), and only when
-  `scroll_top == 0` (the region starts at the very top of the screen) AND
-  the grid is NOT currently showing the alternate screen. Scrolling in a
-  region that does not start at row 0 (e.g. a `DECSTBM` region with
-  `top > 0`), and all scrolling while in alt-screen mode, is never captured.
+- Captured only from `scroll_up` (LF at the scroll-region bottom via
+  `line_feed`, and `CSI S`), and only when the scroll region is the FULL
+  screen (`scroll_top == 0 && scroll_bottom == rows - 1`, i.e. no partial
+  `DECSTBM` region is in effect) AND the grid is NOT currently showing the
+  alternate screen. Scrolling in ANY partial region — top-anchored
+  (`bottom < rows - 1`) or interior (`top > 0`) — and all scrolling while
+  in alt-screen mode, is never captured (tmux only captures full-screen
+  scrolls into history).
 - Each captured line is a `Vec<Cell>` exactly `cols` cells wide AT CAPTURE
   TIME. `view_cell`/`view_row_text` clip (extra columns read as blank) or
   pad (missing columns read as blank) a captured line lazily on read if the
@@ -75,7 +79,9 @@ impl Grid {
   hit-limit).
 - `history_limit == 0` disables scrollback outright: nothing is ever pushed,
   `history_len()` stays 0, and any `scroll_back` clamps to 0 (always the
-  live screen).
+  live screen). Degenerate `history_limit == 1`: every push immediately
+  hits the limit and evicts the line just pushed, so `history_len()` also
+  stays 0 — effectively disabled (documented, not special-cased).
 
 **View-coordinate mapping:** the combined buffer is history (oldest first)
 followed by the live screen (`history_len` total history lines + `rows` live
@@ -87,15 +93,19 @@ row `index - history_len`.
 **Real alternate screen (`CSI ?1049 h/l`):**
 - Enter (`h`): the FIRST time (a redundant `?1049h` while already in alt
   mode does not re-save, so alt-screen content already drawn can't clobber
-  the saved primary) saves the primary screen's cells AND cursor position
-  (col, row — NOT style/autowrap) into an internal `saved_primary`. Every
-  enter (first or redundant) then clears the now-active alt buffer to blanks
-  and homes the cursor — this is the MVP's original enter behavior,
-  preserved exactly. `wrap_pending` is reset.
-- Leave (`l`): if currently in alt mode, restores `cells` and the cursor
-  position (clamped into the current, possibly-resized, dimensions) from
-  `saved_primary` EXACTLY — no clearing. A spurious `?1049l` while not in
-  alt mode is a no-op. `wrap_pending` is reset.
+  the saved primary) saves the primary screen's cells AND the cursor state
+  in DECSC/DECRC scope — position (col, row), SGR pen (`style`), and the
+  autowrap flag — into an internal `saved_primary` (xterm documents 1049 as
+  saving/restoring the cursor "as in DECSC"). Every enter (first or
+  redundant) then clears the now-active alt buffer to blanks and homes the
+  cursor — this is the MVP's original enter behavior, preserved exactly.
+  `wrap_pending` is reset.
+- Leave (`l`): if currently in alt mode, restores `cells`, the cursor
+  position (clamped into the current, possibly-resized, dimensions), the
+  SGR pen, and the autowrap flag from `saved_primary` EXACTLY — no
+  clearing, and no pen-state leak from the alt-screen app into the primary
+  screen. A spurious `?1049l` while not in alt mode is a no-op.
+  `wrap_pending` is reset.
 - The alt buffer accrues NO scrollback while active (see capture rules
   above). `1047`/`1048` are not separately implemented (documented; `1049`
   is the only alt-screen sequence winmux recognizes, matching what
@@ -106,12 +116,14 @@ row `index - history_len`.
   dimensions.
 
 **OSC title capture (`osc_dispatch`):**
-- OSC `0` (icon + title) and OSC `2` (title) both set the title: the second
-  OSC parameter, UTF-8-decoded (lossy replacement of invalid sequences),
-  with control characters stripped, capped at 256 `char`s. Either BEL or
-  `ESC \` (ST) as the terminator produces identical results — `vte` already
-  normalizes both into one `osc_dispatch` call, so no terminator-specific
-  code is needed.
+- OSC `0` (icon + title) and OSC `2` (title) both set the title: OSC
+  parameters 1..N re-joined with `;` (vte splits the OSC buffer on EVERY
+  `;`, so a title containing semicolons spans multiple params — tmux and
+  vte's own `ansi.rs` reference consumer both reconstruct the full title),
+  UTF-8-decoded (lossy replacement of invalid sequences), with control
+  characters stripped, capped at 256 `char`s. Either BEL or `ESC \` (ST) as
+  the terminator produces identical results — `vte` already normalizes both
+  into one `osc_dispatch` call, so no terminator-specific code is needed.
 - OSC `1` (icon-only) and any other OSC command (or a malformed OSC with
   fewer than 2 parameters) leaves the title untouched and does not set the
   changed flag.
