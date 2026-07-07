@@ -178,6 +178,11 @@ pub enum ParsedCmd {
     DetachClient { target: String },
     SendKeys { literal: bool, target: Option<String>, keys: Vec<String> },
     SendPrefix,
+    /// `switch-client -p`/`-n` (previous/next session). SP3 only supports
+    /// these two flags (documented deviation: tmux's `-l` "last session" is
+    /// not tracked in SP3 -- passing `-l` is a `usage:` error like any other
+    /// unrecognized flag).
+    SwitchClient { next: bool },
     DisplayMessage { text: Option<String> },
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
@@ -217,6 +222,7 @@ fn canonical(name: &str) -> Option<&'static str> {
         "detach-client" => "detach-client",
         "send-keys" | "send" => "send-keys",
         "send-prefix" => "send-prefix",
+        "switch-client" | "switchc" => "switch-client",
         "display-message" | "display" => "display-message",
         "confirm-before" | "confirm" => "confirm-before",
         "command-prompt" => "command-prompt",
@@ -263,6 +269,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "detach-client" => "usage: detach-client -s target",
         "send-keys" => "usage: send-keys [-l] [-t target] key ...",
         "send-prefix" => "usage: send-prefix",
+        "switch-client" => "usage: switch-client [-p] [-n]",
         "display-message" => "usage: display-message [text]",
         "confirm-before" => "usage: confirm-before [-p prompt] command ...",
         "command-prompt" => "usage: command-prompt [-I initial]",
@@ -489,6 +496,19 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 return Err(bad());
             }
             Ok(ParsedCmd::SendPrefix)
+        }
+        "switch-client" => {
+            let Ok((b, _, p)) = scan_flags(&raw.args, &["-p", "-n"], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            let has_p = has(&b, "-p");
+            let has_n = has(&b, "-n");
+            if has_p == has_n {
+                // Neither given, or both given: SP3 requires exactly one.
+                return Err(bad());
+            }
+            Ok(ParsedCmd::SwitchClient { next: has_n })
         }
         "display-message" => {
             if raw.args.is_empty() {
@@ -859,6 +879,25 @@ mod tests {
             resolve(&raw("send-keys", &["-l", "-t", "work", "hello"])).unwrap(),
             ParsedCmd::SendKeys { literal: true, target: Some("work".to_string()), keys: vec!["hello".to_string()] }
         );
+    }
+
+    #[test]
+    fn switch_client_prev_and_next() {
+        assert_eq!(resolve(&raw("switch-client", &["-p"])).unwrap(), ParsedCmd::SwitchClient { next: false });
+        assert_eq!(resolve(&raw("switchc", &["-n"])).unwrap(), ParsedCmd::SwitchClient { next: true });
+    }
+
+    #[test]
+    fn switch_client_requires_exactly_one_of_p_n() {
+        assert_eq!(resolve(&raw("switch-client", &[])), Err(usage("switch-client").unwrap().to_string()));
+        assert_eq!(resolve(&raw("switch-client", &["-p", "-n"])), Err(usage("switch-client").unwrap().to_string()));
+    }
+
+    #[test]
+    fn switch_client_dash_l_is_usage_error() {
+        // SP3 deviation: -l ("last session") is not supported; it hits the
+        // same usage: error as any other unrecognized flag.
+        assert_eq!(resolve(&raw("switch-client", &["-l"])), Err(usage("switch-client").unwrap().to_string()));
     }
 
     #[test]

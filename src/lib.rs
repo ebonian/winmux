@@ -1,3 +1,4 @@
+pub mod bindings;
 pub mod cli;
 pub mod client;
 pub mod cmd;

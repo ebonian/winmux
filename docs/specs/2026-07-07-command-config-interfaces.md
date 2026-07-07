@@ -318,6 +318,7 @@ pub enum ParsedCmd {
     DetachClient { target: String },
     SendKeys { literal: bool, target: Option<String>, keys: Vec<String> },
     SendPrefix,
+    SwitchClient { next: bool },
     DisplayMessage { text: Option<String> },
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
@@ -365,7 +366,10 @@ style): tokenizer — `plain_split`, `single_quotes_literal`,
 `unknown_command_err_exact`, `usage_err_on_bad_flag`, `sp2_commands_present`,
 `sp2_usage_strings_match_cli_exec_verbatim`,
 `usage_lookup_by_alias_and_unknown`, `rename_window_requires_name`,
-`show_options_and_display_message` (35 tests total).
+`show_options_and_display_message`, `switch_client_prev_and_next`,
+`switch_client_requires_exactly_one_of_p_n`,
+`switch_client_dash_l_is_usage_error` (Task 5 cross-module addition: 38
+tests total).
 
 ### Tokenizer (`parse_line`)
 
@@ -441,6 +445,7 @@ requirement); the rest are new tmux-style lines authored for SP3.
 | `detach-client` | — | `usage: detach-client -s target` **(verbatim — note: `-s` is REQUIRED, not optional; SP2's actual `cli_exec.rs` behavior overrides the design doc's `[-s target]` bracket notation, per the task brief's verbatim-copy instruction)** |
 | `send-keys` | `send` | `usage: send-keys [-l] [-t target] key ...` |
 | `send-prefix` | — | `usage: send-prefix` |
+| `switch-client` | `switchc` | `usage: switch-client [-p] [-n]` |
 | `display-message` | `display` | `usage: display-message [text]` |
 | `confirm-before` | `confirm` | `usage: confirm-before [-p prompt] command ...` |
 | `command-prompt` | — | `usage: command-prompt [-I initial]` |
@@ -498,6 +503,14 @@ requirement); the rest are new tmux-style lines authored for SP3.
   name) after flags — zero or more-than-one is a `usage:` error (SP2's
   `cli_exec.rs` takes only the first positional and silently ignores extras;
   this module is stricter, same rationale as above).
+- `switch-client` (Task 5 cross-module addition, sanctioned by the Task 5
+  brief): only `-p` (previous session) and `-n` (next session) are parsed;
+  exactly one of the two must be given — neither, or both, is a `usage:`
+  error. Real tmux's `-l` ("last session") is a **documented deviation**:
+  SP3 does not track a per-client last-session pointer, so `-l` is simply an
+  unrecognized flag and hits the same `usage:` error as any other bad flag
+  (not a special "unsupported" message) — see
+  `switch_client_dash_l_is_usage_error`.
 
 ### Command table implementation note
 
@@ -710,3 +723,204 @@ chosen as `status-right`'s default value (see the design spec deviation
 note). Unknown `#{...}` forms and unrecognized `#<c>` codes are silent
 (empty), matching the design spec's "anything else renders empty"
 directive — `expand_format` never returns an `Err`.
+
+## `input-v2` — table-driven key machine (Task 5)
+
+```rust
+// src/input.rs additions -- land ALONGSIDE the legacy InputMachine/Action/
+// InputEvent above (unmodified; Task 6 deletes the legacy types once
+// src/server.rs is rewired onto this one).
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WhichTable { Root, Prefix }
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum KeyInputEvent {
+    Forward(Vec<u8>),
+    Key { table: WhichTable, key: crate::keys::Key, raw: Vec<u8> },
+    Captured(Vec<u8>),
+}
+
+pub struct KeyMachine { /* opaque: KeyDecoder + prefix + repeat/capture state */ }
+impl KeyMachine {
+    pub fn new(prefix: crate::keys::Key) -> Self;
+    pub fn feed(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<KeyInputEvent>;
+    pub fn set_prefix(&mut self, prefix: crate::keys::Key);
+    pub fn set_repeat_time(&mut self, d: std::time::Duration);
+    pub fn arm_repeat(&mut self, now: std::time::Instant);
+    pub fn set_capture(&mut self, on: bool);
+}
+```
+
+Pure logic, no I/O (same as the legacy machine). **Implementation:** the
+`## input-v2` section of `src/input.rs`, immediately after the legacy
+`impl InputMachine` block. Depends on `crate::keys` (`Key`/`KeyCode`/
+`KeyDecoder`) for decoding; the server resolves `Key` events against a
+mutable `crate::bindings::Bindings` table (Task 6) — `KeyMachine` itself
+knows nothing about bindings or commands.
+
+Unit-tested (`input::key_machine_tests`, mirrors the legacy module's exact-
+value style): `plain_bytes_forward_coalesced`,
+`prefix_then_key_reports_prefix_table`, `prefix_is_consumed_not_forwarded`,
+`root_table_keys_report_root`, `arm_repeat_window`, `capture_bypasses_prefix`,
+`configurable_prefix` (7 tests).
+
+### Semantics
+
+- **Decoding:** every `feed()` call runs `bytes` through an internal
+  `keys::KeyDecoder`, then dispatches each resulting `DecodedKey` in order;
+  incomplete trailing sequences stay buffered in the decoder across `feed()`
+  calls (no timer, same deviation as `keys::KeyDecoder` itself).
+- **Prefix:** a decoded key equal (full `Key` comparison, all fields) to the
+  configured prefix key, while in `Normal` table state, is consumed — no
+  event at all, not even `Forward` — and arms `Prefixed` state for the very
+  next decoded key. That next key is reported as `Key { table: Prefix, .. }`
+  **unconditionally**, even if it is itself the prefix key again (tmux
+  binds the prefix key, in the prefix table, to `send-prefix` — matching the
+  legacy double-Ctrl-b-sends-literal-Ctrl-b behavior, now expressed as an
+  ordinary binding instead of hardcoded logic).
+- **Repeat window:** `arm_repeat(now)` is called by the server immediately
+  after it dispatches a binding with `repeat: true`. Until `now +
+  repeat_time` (`set_repeat_time`, default 500ms via the existing
+  `input::REPEAT_TIME` constant), every decoded key reports `Key { table:
+  Prefix, .. }` **without** requiring a fresh prefix press — this
+  reproduces the legacy `Ctrl-arrow` repeat behavior exactly, just
+  generalized to any repeatable binding. A prefix press arriving inside an
+  active window still arms `Prefixed` fresh (and clears the window) rather
+  than being swallowed by the window check — checked in that order
+  (`key == prefix` before the repeat-window check) so `arm_repeat` never
+  makes the prefix key itself unavailable. Once `now` has passed the
+  window's expiry, the window is cleared and the key falls through to
+  ordinary Normal-state dispatch (Root/Forward) — it does NOT report
+  `Prefix` for a stale, already-expired window.
+- **Root-table throughput simplification (documented deviation):** in
+  `Normal` state, with no repeat window active and not the prefix key, a
+  decoded key that is a **plain, unmodified** (`ctrl == meta == shift ==
+  false`) `Char`/`Enter`/`Tab`/`Space`/`BSpace` key is emitted directly as
+  `Forward(raw)` — coalesced with any adjacent such keys within the same
+  `feed()` call into a single `Forward` event, exactly like the legacy
+  machine's plain-byte passthrough. **Every other** decoded key (any
+  modifier flag set, or a named/special key outside that five-way set, e.g.
+  arrows/F-keys/Escape/BTab/Home/End/PPage/NPage/IC/DC) is emitted as `Key {
+  table: Root, .. }` instead, even though nothing preceded it — the server
+  looks it up in the root table and forwards it raw itself if unbound.
+  **Consequence (documented, matches the design spec's `bind -n`
+  deviation):** `bind -n` on a bare unmodified printable char, Enter, Tab,
+  Space, or BSpace is accepted by `cmd::resolve`/`bindings::Bindings::bind`
+  but can **never fire** in SP3, because `KeyMachine` never emits a `Key`
+  event for such a key in the first place — only keys carrying a modifier,
+  or a named/special key outside this set, can be bound in the root table.
+  Revisit if SP4 needs full `bind -n` coverage (would require dropping the
+  coalescing optimization or making it conditional on whether the root
+  table currently has any such binding).
+- **Capture mode (`set_capture`):** while on, `feed()` bypasses ALL of the
+  above — every byte, including the raw prefix byte and escape sequences,
+  passes through verbatim as `Captured(bytes)`, coalesced per `feed()` call
+  exactly like `Forward` (mirrors the legacy `InputMachine::set_capture`).
+  **Mode-transition cleanup:** every call to `set_capture` (turning it on
+  OR off) first calls `self.decoder.flush()` and **discards** the result —
+  this clears the decoder's internal pending-byte buffer without emitting
+  it as anything, mirroring the legacy machine's `pending.clear()` on its
+  own `set_capture`/`set_confirming` transitions (an in-flight partial
+  escape sequence at the moment of a mode flip is simply dropped, not
+  forwarded or captured). Turning capture OFF additionally resets table
+  state to `Normal` and clears any active repeat window, matching the
+  legacy machine's "resumes Normal" behavior.
+
+## `bindings` — tmux default key bindings table (Task 5)
+
+```rust
+// src/bindings.rs (new module; declared in src/lib.rs)
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding { pub cmds: Vec<crate::cmd::RawCmd>, pub repeat: bool }
+
+pub struct Bindings { /* opaque: HashMap<Key, Binding> per WhichTable */ }
+impl Default for Bindings { fn default() -> Bindings; } // tmux defaults, see table below
+impl Bindings {
+    pub fn bind(&mut self, table: crate::input::WhichTable, key: crate::keys::Key, binding: Binding);
+    pub fn unbind(&mut self, table: crate::input::WhichTable, key: &crate::keys::Key) -> bool;
+    pub fn unbind_all(&mut self, table: crate::input::WhichTable);
+    pub fn lookup(&self, table: crate::input::WhichTable, key: &crate::keys::Key) -> Option<&Binding>;
+    pub fn list(&self) -> String; // list-keys format, see below
+}
+```
+
+Pure module: no I/O, `std` only (`HashMap`). **Implementation module:**
+`src/bindings.rs`. Depends on `crate::keys` (`Key`/`KeyCode`/`parse_key`/
+`key_name`), `crate::cmd::RawCmd`, and `crate::input::WhichTable`. Note the
+call surface is `Bindings::default()` (the standard `Default` trait, not a
+bespoke inherent `default()`) — chosen so `Bindings::default()` reads
+idiomatically and clippy's `should_implement_trait` lint has no complaint.
+`bind`/`unbind`/`unbind_all` mutate in place; there is deliberately no
+"resolve" step here — `Binding.cmds` stays unresolved `RawCmd`s (tmux does
+late binding too; `cmd::resolve` re-parses at dispatch time, Task 6).
+
+Unit-tested (`bindings::tests`, mirrors `cmd.rs`'s exact-value style):
+`defaults_cover_current_behavior`, `bind_unbind_roundtrip`,
+`unbind_all_table`, `list_keys_format_exact` (4 tests).
+
+### `Bindings::default()` — tmux defaults (root table starts empty)
+
+Every entry below lives in the **prefix** table unless noted; each
+reproduces the legacy hardcoded `InputMachine`/`Action` binding exactly, as
+one or more `RawCmd`s:
+
+| key | `Binding.cmds` | repeat |
+|---|---|---|
+| `%` | `split-window -h` | no |
+| `"` | `split-window -v` | no |
+| `Up`/`Down`/`Left`/`Right` | `select-pane -U`/`-D`/`-L`/`-R` | no (matches tmux: plain arrows are NOT repeatable, only `C-`arrows are) |
+| `o` | `select-pane -t :.+` | no |
+| `;` | `last-pane` | no |
+| `x` | `confirm-before -p "kill-pane #P? (y/n)" kill-pane` | no |
+| `z` | `resize-pane -Z` | no |
+| `C-Up`/`C-Down`/`C-Left`/`C-Right` | `resize-pane -U`/`-D`/`-L`/`-R` | **yes** |
+| `c` | `new-window` | no |
+| `n` | `next-window` | no |
+| `p` | `previous-window` | no |
+| `l` | `last-window` | no |
+| `0`-`9` | `select-window -t :=<d>` | no |
+| `&` | `confirm-before -p "kill-window #W? (y/n)" kill-window` | no |
+| `,` | `rename-window` (no name argument — see deviation below) | no |
+| `$` | `rename-session` (no name argument — see deviation below) | no |
+| `d` | `detach-client` | no |
+| `(` | `switch-client -p` | no |
+| `)` | `switch-client -n` | no |
+| `C-b` (the default prefix key itself) | `send-prefix` | no |
+| `:` | `command-prompt` | no |
+
+**`,`/`$` deviation (documented):** real tmux binds these to
+`command-prompt -I'#W' { rename-window '%%' }`-style templating that SP3's
+`cmd`/`command-prompt` do not implement (no `{ }` command blocks, no `%%`
+substitution). Instead `Bindings::default()` binds them directly to
+`rename-window`/`rename-session` with **no name argument** at all (`args:
+[]`) — `cmd::resolve` would itself reject that with a `usage:` error if
+resolved as-is, but Task 6's dispatcher special-cases this: a
+`rename-window`/`rename-session` command with no name argument, executed
+with a live client context, opens the interactive status-line rename
+prompt instead of calling `resolve` (matches sub-project 2's actual rename
+flow, which was never a plain command in the first place).
+
+**`send-prefix` binding note:** `Bindings::default()` hardcodes the prefix
+key as `C-b` (the `options` module's own default), independent of whatever
+prefix `KeyMachine` is separately configured with — if a `.tmux.conf`
+changes `prefix` via `set -g prefix`, Task 6's config loader is responsible
+for re-binding `send-prefix` onto the *new* prefix key (unbinding the old
+one), the same way tmux's own `set -g prefix` handling does. `Bindings`
+itself has no notion of "the current prefix"; it only stores whatever keys
+`bind`/`default()` put in its maps.
+
+### `list()` format (`list-keys`)
+
+One line per binding: `bind-key [-r] -T <table> <keyname> <command...>` —
+`-r ` (trailing space) present only when `binding.repeat` is `true`; table
+is the literal `"root"`/`"prefix"`; `<keyname>` is `crate::keys::key_name`;
+`<command...>` is every `RawCmd` in `Binding.cmds` rendered as `name arg1
+arg2 ...` (a bare arg containing a literal space is re-quoted as `"arg"`)
+and joined across multiple `RawCmd`s with `" ; "`. Lines are sorted by
+table name first (`"prefix"` < `"root"` ASCII-betically), then by
+`key_name` within a table, then joined with `\n` (no trailing newline).
+Example (`list_keys_format_exact`): a `Bindings` with only `C-Up ->
+resize-pane -U` (repeat: true) bound in the prefix table renders to exactly
+`"bind-key -r -T prefix C-Up resize-pane -U"`.
