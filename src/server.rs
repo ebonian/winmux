@@ -750,9 +750,6 @@ impl Server {
     }
 
     /// Route one `Stdin` frame through the client's `KeyMachine` and
-    /// dispatch the resulting events one at a time against live state (see
-    /// module docs re: the confirm race — NOT fixed here).
-    /// Route one `Stdin` frame through the client's `KeyMachine` and
     /// dispatch the resulting events one at a time against live state via
     /// the command dispatcher (`dispatch.rs`) and the mutable `bindings`
     /// table (see module docs re: the confirm race — NOT fixed here, same

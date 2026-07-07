@@ -983,7 +983,22 @@ A target string is `[session:][window][.pane]`:
 - An optional `session:` prefix is resolved via `Registry::find` (exact,
   then unambiguous prefix -- same rule as everywhere else `-t session`
   appears). Absent -> the acting client's own session, or (headlessly, or
-  with no client) the most-recently-created session.
+  with no client) the most-recently-created session. Note this generic
+  fallback means a CLI `rename-session <name>` with no `-t` now targets the
+  most-recently-created session (an intentional, consistent behavior change
+  from SP2's `cli_exec.rs`, which made `-t` mandatory for rename-session;
+  the usage TEXT is unchanged, and a `-t`-less rename was previously just a
+  usage error, so nothing depended on the old behavior).
+- A client-context command's client-mutating side effects
+  (`rename-session` re-syncing `client.session`; `kill-pane`/`kill-window`
+  producing `ExecOutcome::Destroy` when the kill destroyed a whole session)
+  apply ONLY when the RESOLVED target session is the acting client's own
+  session -- determined by comparing resolved names, never by whether `-t`
+  was syntactically present. A foreign session's destruction notifies that
+  session's own clients via `destroy_session` and leaves the acting client
+  attached (Task 6 review fixes; pinned by
+  `rename_session_dash_t_own_session_keeps_client_synced` and
+  `kill_foreign_session_pane_keeps_client_attached`).
 - The window part: empty/absent -> the session's current window; `=N` or a
   bare number -> **exact** index match (`"window not found: <n>"` on miss,
   matching the pre-Task-6 `select-window`/digit-binding message text

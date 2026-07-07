@@ -53,9 +53,11 @@ pub struct Registry {
 /// careless argv and terminal corruption.
 ///
 /// `noun` is `"session"` or `"window"`, shared by both `Registry::
-/// create_session` and `crate::server::cli_exec::validate_target_name` (the
-/// single hardened rule both call sites go through) so the CLI rename paths
-/// and the interactive rename-prompt commit path can never diverge.
+/// create_session` and the server dispatcher's rename paths
+/// (`src/server/dispatch.rs`'s `exec_rename_window`/`exec_rename_session`
+/// and the interactive rename-prompt commit) — the single hardened rule
+/// every call site goes through, so the CLI/command rename paths and the
+/// prompt commit path can never diverge.
 ///
 /// The rejected name is echoed back in the error string (`bad session name:
 /// <n>`) for operator-friendliness, but echoing the RAW name would

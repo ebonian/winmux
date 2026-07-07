@@ -1426,6 +1426,80 @@ fn kill_pane_via_command_targets() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Fix (Task 6 review, Important 1): a client renaming its OWN session via
+/// an explicit `-t <own-session>` (normal tmux idiom) must keep the acting
+/// client's session reference in sync — the old bug only synced the
+/// `target: None` form, so the registry got the new name while the client
+/// kept looking its session up by the old one, and `render_all`'s
+/// find-by-name silently stopped rendering that client forever (appeared
+/// hung).
+#[test]
+fn rename_session_dash_t_own_session_keeps_client_synced() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "work", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"rename-session -t work dev\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[dev]")));
+
+    // The client must still be rendering: a keystroke round-trips through
+    // its (renamed) session's focused pane and back onto its screen.
+    c.send(&ClientMsg::Stdin(b"echo sync-ok\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("sync-ok")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Fix (Task 6 review, Important 2): killing a FOREIGN session's last
+/// window/pane via `-t other:...` destroys that session (its own attached
+/// clients are notified by `destroy_session`) but must NOT exit the acting
+/// client, which is attached to a different session.
+#[test]
+fn kill_foreign_session_pane_keeps_client_attached() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "a", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "b".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Kill session b's only window from client A (attached to "a"): b dies,
+    // A must stay attached.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"kill-window -t b:0\r".to_vec()));
+
+    // Session b eventually disappears from ls (the `:` commit is
+    // asynchronous relative to the CLI connection).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cli.send(&ClientMsg::Cli(vec!["ls".into()]));
+        let (out, _) = expect_cli_done(&cli, 0);
+        if out.starts_with("a: ") && !out.contains("b: ") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "session b never died; ls: {out:?}");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // A must still be attached and rendering end-to-end.
+    c.send(&ClientMsg::Stdin(b"echo still-here\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("still-here")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn source_file_runtime() {
     let name = unique_pipe_name();

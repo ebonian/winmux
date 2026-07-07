@@ -806,8 +806,12 @@ impl Server {
             Err(e) => return ExecOutcome::Err(e),
         };
         match self.kill_pane_by_id(&session_name, pane_id) {
-            Ok(true) => ExecOutcome::Destroy,
-            Ok(false) => ExecOutcome::Ok(String::new()),
+            // `Destroy` only when the ACTING client's own session died — a
+            // foreign session's destruction (`-t other:...`) has already
+            // notified ITS clients via `destroy_session`; the acting client
+            // stays attached (Task 6 review fix).
+            Ok(true) if cs == Some(session_name.as_str()) => ExecOutcome::Destroy,
+            Ok(_) => ExecOutcome::Ok(String::new()),
             Err(e) => ExecOutcome::Err(e),
         }
     }
@@ -824,8 +828,10 @@ impl Server {
             Err(e) => return ExecOutcome::Err(e),
         };
         match self.kill_window_by_id(&session_name, wid) {
-            Ok(true) => ExecOutcome::Destroy,
-            Ok(false) => ExecOutcome::Ok(String::new()),
+            // Same rule as `exec_kill_pane_client`: `Destroy` only for the
+            // acting client's OWN session (Task 6 review fix).
+            Ok(true) if cs == Some(session_name.as_str()) => ExecOutcome::Destroy,
+            Ok(_) => ExecOutcome::Ok(String::new()),
             Err(e) => ExecOutcome::Err(e),
         }
     }
@@ -1014,7 +1020,21 @@ impl Server {
             ResizePane { dir, zoom, count } => wrap(self.exec_resize_pane(dir, zoom, count, &session_name.clone())),
             RenameWindow { target, name } => wrap(self.exec_rename_window(target, name, Some(session_name.as_str()))),
             RenameSession { target, name } => {
-                let renaming_self = target.is_none();
+                // "Renaming self" must be determined from the RESOLVED old
+                // name, not from `target.is_none()` — a client renaming its
+                // OWN session via an explicit `-t <own-session>` (normal
+                // tmux idiom) also needs its session reference re-synced,
+                // or `render_all`'s find-by-name silently stops rendering
+                // it (Task 6 review fix). Other clients on the session are
+                // handled by `rename_session_everywhere` inside
+                // `exec_rename_session`; only THIS client, removed from
+                // `self.clients` for the duration of dispatch, needs the
+                // manual update.
+                let old = match self.resolve_session_name(target.as_deref(), Some(session_name.as_str())) {
+                    Ok(o) => o,
+                    Err(e) => return ExecOutcome::Err(e),
+                };
+                let renaming_self = old == *session_name;
                 match self.exec_rename_session(target, name.clone(), Some(session_name.as_str())) {
                     Ok(s) => {
                         if renaming_self {
