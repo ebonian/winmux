@@ -36,19 +36,20 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 
 use crate::bindings::Bindings;
 use crate::cmd::RawCmd;
 use crate::geom::Rect;
-use crate::grid::Grid;
+use crate::grid::{Grid, Style};
 use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
-use crate::options::Options;
+use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{PaneView, Renderer, Scene};
+use crate::render::{PaneView, Renderer, Scene, StatusRow};
 use crate::status::{status_spans, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
@@ -172,16 +173,66 @@ struct Server {
     /// (`Option::take`) by `finish_attach` the first time ANY client
     /// attaches, so only the first attach ever sees it (Task 7).
     pending_config_message: Option<String>,
+    /// Computer name for the `#H` format code, queried once at startup
+    /// (Task 8; `GetComputerNameW` — a hostname doesn't change under a
+    /// running server).
+    hostname: String,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
-/// from `app.rs` (which dies in Task 8) rather than shared.
+/// from `app.rs` (which dies in Task 8) rather than shared. Since SP3 Task 8
+/// the status bar's right side is rendered via `expand_format` instead, but
+/// this string is still the `Tick` handler's change detector: a re-render is
+/// triggered whenever it changes (minute granularity — matching the default
+/// `status-right`; a custom `%S`-bearing format only refreshes when the
+/// minute flips, documented SP4 refinement alongside the stored-but-unused
+/// `status-interval`).
 fn local_clock() -> String {
     // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
     let st = unsafe { GetLocalTime() };
     let month = MONTHS[(st.wMonth.clamp(1, 12) as usize) - 1];
     let (hh, mm, dd, yy) = (st.wHour, st.wMinute, st.wDay, st.wYear % 100);
     format!("{hh:02}:{mm:02} {dd:02}-{month}-{yy:02}")
+}
+
+/// Plain calendar/time facts for `expand_format`'s strftime subset, from
+/// `GetLocalTime` (shared by `render_one`'s status-left/right expansion and
+/// `dispatch.rs`'s `display-message`/`confirm-before -p` expansion).
+fn system_time_parts() -> SystemTimeParts {
+    // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
+    let st = unsafe { GetLocalTime() };
+    SystemTimeParts {
+        year: st.wYear as i32,
+        month: st.wMonth as u8,
+        day: st.wDay as u8,
+        weekday: st.wDayOfWeek as u8,
+        hour: st.wHour as u8,
+        min: st.wMinute as u8,
+        sec: st.wSecond as u8,
+    }
+}
+
+/// Computer name for the `#H` format code (Task 8), queried once at server
+/// startup via `GetComputerNameW`; falls back to the `COMPUTERNAME` env var
+/// (empty string if neither works).
+fn computer_name() -> String {
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf`/`len` outlive the call; `len` is in/out (chars written).
+    let ok = unsafe { GetComputerNameW(windows::core::PWSTR(buf.as_mut_ptr()), &mut len) };
+    if ok.is_ok() {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+}
+
+/// Truncate to the first `max` chars (tmux `status-left-length` /
+/// `status-right-length`). Applied while BUILDING the status strings; the
+/// renderer's spatial right-truncation (when left + right don't fit the
+/// terminal width) still applies on top of these caps.
+fn truncate_chars(s: &str, max: u16) -> String {
+    s.chars().take(max as usize).collect()
 }
 
 /// Encode and send one `ServerMsg` (small, never chunked: `Exit`/`CliDone`).
@@ -395,6 +446,27 @@ impl Server {
             options: Options::new(),
             bindings: Bindings::default(),
             pending_config_message: None,
+            hostname: computer_name(),
+        }
+    }
+
+    /// How many rows the status bar takes out of a client's contribution to
+    /// its session's shared pane area (`status off` frees the row).
+    fn status_rows(&self) -> u16 {
+        if self.options.status_on() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The y origin of every session's pane area: row 1 when the status bar
+    /// sits on top, else row 0.
+    fn pane_area_y(&self) -> u16 {
+        if self.options.status_on() && self.options.status_position_top() {
+            1
+        } else {
+            0
         }
     }
 
@@ -494,7 +566,7 @@ impl Server {
             Some(tx) => tx,
             None => return, // already attached, or unknown client id
         };
-        let pane_rows = rows.saturating_sub(1).max(1);
+        let pane_rows = rows.saturating_sub(self.status_rows()).max(1);
         let size = (cols.max(1), pane_rows);
 
         match mode {
@@ -686,12 +758,14 @@ impl Server {
     }
 
     /// Session's shared size = min over its attached clients of
-    /// `(cols, rows - 1)` (the status row is not part of the pane area).
+    /// `(cols, rows - status_rows)` (the status row, when on, is not part of
+    /// the pane area; `status off` gives panes the full height — Task 8).
     /// No attached clients: keep the last size.
     fn recompute_session_size(&mut self, name: &str) {
+        let status_rows = self.status_rows();
         let mut min: Option<(u16, u16)> = None;
         for c in self.clients.values().filter(|c| c.session.as_deref() == Some(name)) {
-            let contribution = (c.cols.max(1), c.rows.saturating_sub(1).max(1));
+            let contribution = (c.cols.max(1), c.rows.saturating_sub(status_rows).max(1));
             min = Some(match min {
                 Some(m) => (m.0.min(contribution.0), m.1.min(contribution.1)),
                 None => contribution,
@@ -705,9 +779,10 @@ impl Server {
     }
 
     fn apply_layout_for_session(&mut self, name: &str) {
+        let area_y = self.pane_area_y();
         let Some(session) = self.registry.session_mut(name) else { return };
         let size = session.size;
-        let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
+        let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
         let window = session.current_window_mut();
         apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
     }
@@ -956,19 +1031,33 @@ impl Server {
     /// Render every attached client (see module docs: render-all, not
     /// per-session dirty tracking).
     fn render_all(&mut self) {
-        let clock = self.clock.clone();
+        let area_y = self.pane_area_y();
         for client in self.clients.values_mut() {
             let Some(name) = client.session.clone() else { continue };
             let Some(session) = self.registry.sessions().iter().find(|s| s.name == name) else { continue };
-            render_one(client, session, &self.panes, &clock);
+            render_one(client, session, &self.panes, &self.options, &self.hostname, area_y);
         }
     }
 }
 
-/// Compose and send one client's frame from shared session state.
-fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneId, PaneRuntime>, clock: &str) {
+/// Compose and send one client's frame from shared session state. Styles,
+/// status position/visibility, and the status-left/right strings all come
+/// from the option table (Task 8): the defaults reproduce the SP2 output
+/// byte for byte (`status-left "[#S] "` expands to the old `[<name>] `
+/// prefix; `status-right "%H:%M %d-%b-%y"` expands to the old
+/// `local_clock()` string). `area_y` is `Server::pane_area_y()` — the same
+/// origin `apply_layout_for_session` used, so the drawn rects line up with
+/// the pty/grid sizes.
+fn render_one(
+    client: &mut ClientState,
+    session: &Session,
+    panes: &HashMap<PaneId, PaneRuntime>,
+    options: &Options,
+    hostname: &str,
+    area_y: u16,
+) {
     let window = session.current_window();
-    let area = Rect { x: 0, y: 0, w: session.size.0, h: session.size.1 };
+    let area = Rect { x: 0, y: area_y, w: session.size.0, h: session.size.1 };
     let focused = window.layout.focused();
     let zoomed = window.layout.is_zoomed();
     let rects = window.layout.rects(area);
@@ -983,29 +1072,80 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
     // pane space, so it stays visible even on a too-small terminal.
     // `too_small` only applies in `Normal` mode, where it additionally takes
     // priority over a transient status message.
+    let default_style = Style::default();
+    let msg_style = options.message_style().apply_to(default_style);
     let message = match &client.mode {
         ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
         ClientMode::Normal if too_small => Some("terminal too small".to_string()),
         ClientMode::Normal => client.message.as_ref().map(|(msg, _)| msg.clone()),
+    }
+    .map(|m| (m, msg_style));
+
+    // Status row from the option table. status off -> None (no row painted;
+    // the pane area already includes the freed row via
+    // `recompute_session_size`).
+    let status = if options.status_on() {
+        let base = options.status_style().apply_to(default_style);
+        // Format context from live state: the current window's index/name/
+        // flags and the focused pane's position in `layout.panes()`.
+        let mut window_flags = String::from("*");
+        if window.layout.is_zoomed() {
+            window_flags.push('Z');
+        }
+        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32;
+        let fctx = FormatCtx {
+            session: &session.name,
+            window_index: window.index,
+            window_name: &window.name,
+            window_flags: &window_flags,
+            pane_index,
+            hostname,
+            now: system_time_parts(),
+        };
+        // Option-length caps apply while building the strings (tmux
+        // truncates left/right to status-left/right-length); the renderer's
+        // spatial right-first truncation still applies on top when the
+        // capped strings don't fit the terminal width.
+        let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
+        let right = truncate_chars(&expand_format(options.status_right(), &fctx), options.status_right_length());
+        let entries: Vec<WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| WindowEntry {
+                index: w.index,
+                name: w.name.clone(),
+                current: w.id == session.current,
+                last: Some(w.id) == session.last,
+                zoomed: w.layout.is_zoomed(),
+            })
+            .collect();
+        let spans = status_spans(
+            &left,
+            &entries,
+            base,
+            options.window_status_style(),
+            options.window_status_current_style(),
+        );
+        Some(StatusRow {
+            top: options.status_position_top(),
+            base,
+            spans,
+            right,
+            // status-right styling via `#[]` inline styles is SP4; until
+            // then the right side is drawn with the row's base style.
+            right_style: base,
+        })
+    } else {
+        None
     };
 
-    let entries: Vec<WindowEntry> = session
-        .windows
-        .iter()
-        .map(|w| WindowEntry {
-            index: w.index,
-            name: w.name.clone(),
-            current: w.id == session.current,
-            last: Some(w.id) == session.last,
-            zoomed: w.layout.is_zoomed(),
-        })
-        .collect();
-    let spans = status_spans(&session.name, &entries);
+    let border = options.pane_border_style().apply_to(default_style);
+    let border_active = options.pane_active_border_style().apply_to(default_style);
     let scene_size = (client.cols, client.rows);
 
     if too_small {
-        let scene = Scene { size: scene_size, panes: Vec::new(), zoomed, status_spans: spans, status_right: clock.to_string(), message };
+        let scene = Scene { size: scene_size, panes: Vec::new(), zoomed, status, message, border, border_active };
         let out = client.renderer.compose(&scene, None, false);
         send_output(&client.tx, out);
         return;
@@ -1027,7 +1167,7 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
         _ => (None, false),
     };
 
-    let scene = Scene { size: scene_size, panes: views, zoomed, status_spans: spans, status_right: clock.to_string(), message };
+    let scene = Scene { size: scene_size, panes: views, zoomed, status, message, border, border_active };
     let out = client.renderer.compose(&scene, cursor, cursor_visible);
     send_output(&client.tx, out);
 }

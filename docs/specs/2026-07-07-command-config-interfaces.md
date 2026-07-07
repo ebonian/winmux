@@ -1283,3 +1283,91 @@ attach message, not the log file itself) and manual runs.
   `bare_is_new_session`/`server_role_parse` updated for the new struct
   fields). No e2e coverage in Task 7 (Task 9's `e2e_tmux_conf_roundtrip`
   drives the real `-f`-flagged release binary end to end).
+
+## `render-styles` — option-driven rendering (Task 8)
+
+Locked type changes live in the two sibling contracts (amended in the same
+commit): `render::StatusRow`/the new `Scene` shape in
+`2026-07-06-mvp-interfaces.md`'s `render` section, and `status.rs`'s styled
+`status_spans` signature in `2026-07-07-server-client-interfaces.md`'s
+`## status` section. This section is the SP3-side design record: how the
+server builds a `Scene` from the option table, plus the documented
+simplifications.
+
+### Scene building (`src/server.rs::render_one`, private)
+
+- **status on/off:** `Options::status_on()` gates `Scene::status`
+  (`None` = no row painted). The pane-area computation is status-aware:
+  `recompute_session_size` contributes `(cols, rows - status_rows)` per
+  client where `status_rows` is 1 when `status` is on, 0 when off
+  (`Server::status_rows()`); the initial `Attach` sizing in `handle_attach`
+  uses the same rule (so `set -g status off` in a startup config yields a
+  full-height first session).
+- **status position:** `StatusRow::top = Options::status_position_top()`.
+  The pane area's y origin is `Server::pane_area_y()` — row 1 when the bar
+  is on top, else row 0 — used consistently by `apply_layout_for_session`,
+  `render_one`'s `layout.rects(area)`, and `dispatch.rs`'s layout-mutating
+  areas (`split-window`/`select-pane -LRUD`/`resize-pane`), so drawn rects
+  always line up with the pty/grid sizes.
+- **set-option relayout:** `exec_set_option` on `status` or
+  `status-position` recomputes every session's shared size and reapplies its
+  layout (pty + grid resizes) — options are global, so ALL sessions move,
+  not just the acting client's. The ordinary post-dispatch re-render then
+  repaints. Pinned by `status_position_top_moves_bar` (bar on row 0 AND a
+  subsequent command echoes below row 0) and `status_off_hides_bar` (bar
+  text gone AND the bottom row's bg is Default, i.e. pane area).
+- **Styles:** `base = status_style.apply_to(Style::default())`; message
+  style, border, and active-border resolve the same way from their options.
+  `StatusRow::right_style = base` (status-right `#[]` inline styles are
+  SP4). Window-tab styles are layered by `status::status_spans` (see the
+  amended `## status` section: current tab = `window-status-current-style`
+  over BASE, not over `window-status-style`).
+- **status-left/right:** both are `options::expand_format`-expanded per
+  render against a live `FormatCtx` — session name, current window
+  index/name, the current window's flags string (same chars as its status
+  tab: `*` plus `Z` when zoomed), `pane_index` = the focused pane's position
+  in `layout.panes()`, hostname, and `GetLocalTime` via a shared
+  `system_time_parts()` (moved from `dispatch.rs` to `server.rs`; the
+  dispatcher's `display-message`/`confirm-before -p` expansion now imports
+  it). The defaults reproduce SP2 exactly: `"[#S] "` expands to the old
+  `[<name>] ` prefix and `"%H:%M %d-%b-%y"` to the old `local_clock()`
+  string — **default options => byte-identical output** (e2e suites
+  untouched).
+- **hostname (`#H`):** queried ONCE at server startup via `GetComputerNameW`
+  (`Server::hostname`, private `computer_name()` helper; `COMPUTERNAME` env
+  fallback). Requires no new Cargo feature
+  (`Win32_System_WindowsProgramming`, already enabled for `GetUserNameW`).
+- **Truncation interplay:** `status-left-length`/`status-right-length` cap
+  the BUILT strings (first N chars, `truncate_chars`); the renderer's
+  spatial truncation (right-first when left + right exceed the terminal
+  width) still applies on top. Window tabs are not length-capped in SP3
+  (tmux's per-tab `window-status-format` widths are SP4 territory).
+- **message row placement:** with `status off`, a message/confirm/prompt
+  overlays the BOTTOM row (over pane content), matching tmux's
+  message-on-last-line behavior; with the bar on top, messages replace the
+  TOP row's content.
+
+### Documented simplifications (revisit SP4)
+
+- `status-interval` is stored but unused: the status refresh remains the
+  50ms `Tick`'s `local_clock()` change detector (minute granularity), so a
+  custom `%S`-bearing `status-right` only refreshes when the minute flips.
+- `right_style` is always `base` — no `#[fg=...]` inline style parsing.
+- Window tabs have no length caps or `window-status-format` templating.
+
+### Tests
+
+- `render.rs` units: `status_top_row_zero`, `status_off_no_row`,
+  `span_styles_emitted`, `border_style_applied`, `message_style_applied`;
+  every pre-existing default-styled test updated mechanically to the new
+  `Scene` shape with its expected byte strings UNCHANGED (default-byte
+  equivalence pinned at the unit level).
+- `status.rs` units: the three Task 5 tests re-expressed with styles
+  (defaults = base + underline-on-current) plus `custom_styles_layering`.
+- `tests/server_proto.rs`: `set_status_style_changes_bar`,
+  `set_status_left_format`, `status_position_top_moves_bar`,
+  `status_off_hides_bar`, `pane_active_border_style_runtime`,
+  `window_status_current_style_override`.
+- `tests/e2e.rs` / `tests/e2e_sessions.rs`: untouched and green (they assert
+  default-styled output through the real binary — the visual-stability
+  proof).

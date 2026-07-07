@@ -1718,3 +1718,206 @@ fn two_explicit_configs_later_wins() {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
 }
+
+// ---- Task 8: option-driven rendering ----------------------------------------
+
+/// `set -g status-style bg=blue,fg=white` restyles the status row's cells at
+/// runtime (asserted through the test Grid's per-cell styles).
+#[test]
+fn set_status_style_changes_bar() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Default first: bg green, fg black on the bottom row.
+    c.recv_output_until(&mut grid, |g| {
+        g.cell(0, 23).style.bg == Color::Idx(2) && g.cell(0, 23).style.fg == Color::Idx(0)
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-style".into(), "bg=blue,fg=white".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.recv_output_until(&mut grid, |g| {
+        g.cell(0, 23).style.bg == Color::Idx(4) && g.cell(0, 23).style.fg == Color::Idx(7)
+    });
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// A custom `status-left` format string replaces the default `[#S] ` prefix
+/// and expands its `#S` against live state.
+#[test]
+fn set_status_left_format() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-left".into(), "[cfg-#S] ".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[cfg-0] 0:powershell*"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `set -g status-position top` moves the bar to row 0 AND shifts/resizes
+/// the pane area down: new shell output lands strictly below row 0.
+#[test]
+fn status_position_top_moves_bar() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-position".into(), "top".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Bar now on row 0.
+    c.recv_output_until(&mut grid, |g| screen_text(g)[0].contains("[0] 0:powershell*"));
+
+    // Panes were re-laid-out below the bar: a fresh command's echo shows up
+    // on some row BELOW row 0, and row 0 stays the status bar.
+    c.send(&ClientMsg::Stdin(b"echo top-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().skip(1).any(|l| l.contains("top-marker"))
+    });
+    assert!(
+        screen_text(&grid)[0].contains("0:powershell*"),
+        "row 0 must remain the status bar; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `set -g status off` removes the bar and gives the pane the full height:
+/// the bottom row's cells lose the status background entirely.
+#[test]
+fn status_off_hides_bar() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Bar present first.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status".into(), "off".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Bar text gone AND the bottom row is now pane area (default background,
+    // not the green status fill) — proving the pane grew to the full height.
+    c.recv_output_until(&mut grid, |g| {
+        !screen_text(g).iter().any(|l| l.contains("0:powershell*")) && g.cell(0, 23).style.bg == Color::Default
+    });
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `set -g pane-active-border-style fg=red` restyles the border cells
+/// adjacent to the focused pane at runtime.
+#[test]
+fn pane_active_border_style_runtime() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "pane-active-border-style".into(),
+        "fg=red".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    // The split border column (adjacent to the focused right pane) turns
+    // red (fg Idx(1)) instead of the default green.
+    c.recv_output_until(&mut grid, |g| {
+        let pane_rows = g.rows().saturating_sub(1);
+        (1..g.cols().saturating_sub(1)).any(|col| {
+            (0..pane_rows).all(|r| g.cell(col, r).ch == '│') && g.cell(col, 0).style.fg == Color::Idx(1)
+        })
+    });
+
+    // Exit the focused (right) pane, wait for the border to disappear so the
+    // next exit lands in the surviving pane, then exit it too.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `set -g window-status-current-style fg=red,bold` restyles ONLY the
+/// current window's tab; the non-current tab keeps the base style.
+#[test]
+fn window_status_current_style_override() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Second window: tabs "0:powershell- 1:powershell*".
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "window-status-current-style".into(),
+        "fg=red,bold".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.recv_output_until(&mut grid, |g| {
+        let row: String = (0..g.cols()).map(|x| g.cell(x, 23).ch).collect();
+        match (row.find("1:powershell*"), row.find("0:powershell-")) {
+            (Some(cur), Some(non)) => {
+                let cur_style = g.cell(cur as u16, 23).style;
+                let non_style = g.cell(non as u16, 23).style;
+                // current tab: red + bold (layered over the green base bg);
+                // non-current tab: untouched base (black fg, not bold).
+                cur_style.fg == Color::Idx(1)
+                    && cur_style.bold
+                    && cur_style.bg == Color::Idx(2)
+                    && non_style.fg == Color::Idx(0)
+                    && !non_style.bold
+            }
+            _ => false,
+        }
+    });
+
+    // Clean up: exit the current (window 1) shell — its window dies and
+    // window 0 becomes current — then exit the last shell.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")) && !screen_text(g).iter().any(|l| l.contains("1:powershell"))
+    });
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

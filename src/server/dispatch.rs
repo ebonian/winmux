@@ -23,7 +23,6 @@ use std::time::{Instant, SystemTime};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
-use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use crate::bindings::Binding;
@@ -32,10 +31,13 @@ use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
 use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
-use crate::options::{FormatCtx, SystemTimeParts};
+use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
-use super::{send_msg, spawn_pane, ClientId, ClientMode, ClientState, ConfigCandidate, PromptKind, Server, MONTHS};
+use super::{
+    send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate, PromptKind, Server,
+    MONTHS,
+};
 
 /// Abbreviated C-locale English weekday names, indexed by
 /// `SYSTEMTIME::wDayOfWeek` (0 = Sunday .. 6 = Saturday). Duplicated from the
@@ -173,20 +175,6 @@ fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
     panes.get(idx).copied().ok_or_else(|| format!("pane not found: {s}"))
 }
 
-fn system_time_parts() -> SystemTimeParts {
-    // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
-    let st = unsafe { GetLocalTime() };
-    SystemTimeParts {
-        year: st.wYear as i32,
-        month: st.wMonth as u8,
-        day: st.wDay as u8,
-        weekday: st.wDayOfWeek as u8,
-        hour: st.wHour as u8,
-        min: st.wMinute as u8,
-        sec: st.wSecond as u8,
-    }
-}
-
 /// Convert a `SystemTime` to a local-time `SYSTEMTIME` (carrying
 /// `wDayOfWeek`) for the CLI `ls` command's tmux-style creation-time
 /// formatting. Moved verbatim from the deleted `cli_exec.rs`.
@@ -308,14 +296,13 @@ impl Server {
     fn expand_with_ctx(&mut self, fmt: &str, client_session: Option<&str>) -> String {
         match self.format_values(client_session) {
             Ok((session, window_index, window_name, window_flags, pane_index)) => {
-                let hostname = std::env::var("COMPUTERNAME").unwrap_or_default();
                 let fctx = FormatCtx {
                     session: &session,
                     window_index,
                     window_name: &window_name,
                     window_flags: &window_flags,
                     pane_index,
-                    hostname: &hostname,
+                    hostname: &self.hostname,
                     now: system_time_parts(),
                 };
                 crate::options::expand_format(fmt, &fctx)
@@ -406,7 +393,7 @@ impl Server {
     fn exec_split_window(&mut self, horizontal: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, _wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
-        let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
+        let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
         if let Some(session) = self.registry.session_mut(&session_name) {
             session.current_window_mut().layout.focus_pane(pane_id);
         }
@@ -447,9 +434,10 @@ impl Server {
     fn exec_select_pane(&mut self, dir: Option<Direction>, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
         if let Some(d) = dir {
             let session_name = self.resolve_session_name(None, cs)?;
+            let area_y = self.pane_area_y();
             if let Some(session) = self.registry.session_mut(&session_name) {
                 let size = session.size;
-                let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
+                let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
                 session.current_window_mut().layout.focus_dir(d, area);
             }
             return Ok(String::new());
@@ -537,7 +525,7 @@ impl Server {
         }
         if let Some(d) = dir {
             let size = self.registry.session_mut(session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
-            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
+            let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
             let cells = count.max(1) as u16;
             if let Some(session) = self.registry.session_mut(session_name) {
                 session.current_window_mut().layout.resize_focused(d, area, cells);
@@ -642,6 +630,18 @@ impl Server {
             let rt = self.options.repeat_time();
             for c in self.clients.values_mut() {
                 c.key_machine.set_repeat_time(rt);
+            }
+        } else if matches!(name.as_str(), "status" | "status-position") {
+            // The status row's on/off state and position change every
+            // session's pane area (row count for `status`, y origin for
+            // `status-position`): recompute the shared size and reapply the
+            // layout — resizing ptys/grids — for every session, not just the
+            // acting client's (options are global). The post-dispatch
+            // re-render then draws the moved/removed bar.
+            let names: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+            for n in names {
+                self.recompute_session_size(&n);
+                self.apply_layout_for_session(&n);
             }
         }
         Ok(String::new())

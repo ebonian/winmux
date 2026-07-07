@@ -385,7 +385,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8)
 
 ```rust
 // status.rs
@@ -397,23 +397,41 @@ pub struct WindowEntry {
     pub zoomed: bool,
 }
 
-pub fn status_spans(session_name: &str, windows: &[WindowEntry]) -> Vec<StatusSpan>;
+// SP3 Task 8 signature (styled spans; `StatusSpan`/its underline bool are
+// deleted — see the amended `render` section of 2026-07-06-mvp-interfaces.md
+// and the SP3 contract's `## render-styles` section):
+pub fn status_spans(
+    left: &str,                                     // pre-expanded, pre-length-capped status-left text
+    windows: &[WindowEntry],
+    base: crate::grid::Style,                       // status-style applied to Style::default()
+    win_style: &crate::style::PartialStyle,         // window-status-style
+    win_current_style: &crate::style::PartialStyle, // window-status-current-style
+) -> Vec<(String, crate::grid::Style)>;
 ```
 
-`StatusSpan { text: String, underline: bool }` is defined in `render.rs` (see
-the **LOCKED-CONTRACT AMENDMENT** in `2026-07-06-mvp-interfaces.md`'s `render`
-section: `Scene::status_left: String` → `Scene::status_spans:
-Vec<StatusSpan>`). `status.rs` is pure bookkeeping with no dependency on
-`model.rs`; a caller (future server/client wiring task) maps a `Session`'s
-`Window`s to `WindowEntry`s (`current`/`last` from `Session::current`/`last`,
-`zoomed` from `Window::layout.is_zoomed()`).
+**AMENDMENT (SP3 Task 8):** the original Task 5 signature was
+`status_spans(session_name: &str, windows: &[WindowEntry]) ->
+Vec<StatusSpan>`, hardcoding the `[<session>] ` prefix and an underline-only
+current-window marker. It now takes the ALREADY-EXPANDED `status-left` text
+(the server expands `[#S] ` — the default, which reproduces the old prefix
+exactly — via `options::expand_format` and caps it to `status-left-length`)
+plus the three style inputs, and returns fully resolved styles per span.
+`status.rs` remains pure bookkeeping with no dependency on `model.rs` (it
+now additionally depends on `grid::Style` + `style::PartialStyle`).
 
 **Span composition** (index order as given in `windows`):
-1. One span `"[<session_name>] "` (trailing space included), `underline: false`.
-2. Per window, one span `"<index>:<name><flags>"`, `underline: true` iff
-   `current`, else `false`.
+1. One span with `left`'s text, styled `base`.
+2. Per window, one span `"<index>:<name><flags>"`, styled
+   `win_current_style.apply_to(base)` iff `current`, else
+   `win_style.apply_to(base)`. Note the current style layers over BASE —
+   NOT over `win_style` (tmux layers `window-status-current-style` over
+   `status-style` directly, so an fg set only in `window-status-style` never
+   leaks into the current tab). With default options (`win_style` empty,
+   `win_current_style` = `underscore`) this reproduces the old behavior
+   exactly: every span equals `base` except the current tab = `base` +
+   underline.
 3. Between window spans (not after the last one), a separate single-space
-   span `" "`, `underline: false` — the separator itself is never underlined,
+   span `" "`, styled `base` — the separator never takes a window style,
    even when the window before or after it is current.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
@@ -425,16 +443,18 @@ during design; empty is correct and is what's implemented/tested):
   nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
   all → bare `<index>:<name>` (e.g. `2:logs`).
 
-**Render integration:** `render::compose_back`'s status-bar step draws
-`status_spans` left-to-right from column 0 (each span's cells get the
-status-row style — green bg/black fg, or yellow/black under a `message`
-override — with that span's `underline` flag set on the style), then
-`status_right` right-aligned as before; the "total left length" used for
-right-truncation is the summed char count of all spans' text.
+**Render integration (as amended SP3 Task 8):** the server packs the
+returned spans into `render::StatusRow` (base fill, right text/style, top
+flag from `status-position`) — see the SP3 contract's `## render-styles`
+section; `render::compose_back` draws them left-to-right from column 0 with
+each span's own resolved style, then the right text right-aligned; the
+"total left length" used for right-truncation is the summed char count of
+all spans' text.
 
 **Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
-exact expected `Vec<(String, bool)>` span vectors (mirrors `render.rs`'s
-exact-VT-bytes test style).
+exact expected `Vec<(String, Style)>` span vectors (mirrors `render.rs`'s
+exact-VT-bytes test style), including a `custom_styles_layering` test pinning
+the layered-over-base (not over-win_style) rule.
 
 ## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 
