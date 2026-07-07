@@ -381,13 +381,18 @@ impl Session {
         self.windows.iter_mut().find(|w| w.layout.panes().contains(&pane))
     }
 
-    /// tmux `renumber-windows` support (SP3 Task 6): reassign every window's
-    /// `index` to its position in `self.windows` (0..N), preserving relative
-    /// order. `self.windows` is already kept sorted by index by every
-    /// mutator, so this simply closes any gaps left by `kill_window`.
+    /// tmux `renumber-windows` support (SP3 Task 6; Task 7 review fix):
+    /// reassign every window's `index` to `base_index + position` in
+    /// `self.windows` order, preserving relative order. `self.windows` is
+    /// already kept sorted by index by every mutator, so this simply closes
+    /// any gaps left by `kill_window` — starting FROM the session's
+    /// creation-time `base_index` floor (real tmux renumbers from
+    /// `base-index`; renumbering from a hardcoded 0 would violate the floor
+    /// every window in this session was created under).
     pub fn renumber(&mut self) {
+        let base = self.base_index;
         for (i, w) in self.windows.iter_mut().enumerate() {
-            w.index = i as u32;
+            w.index = base + i as u32;
         }
     }
 }
@@ -542,6 +547,25 @@ mod tests {
         assert!(s.kill_window(first_id));
         let w = s.new_window(3, 20);
         assert_eq!(w.index, 1); // lowest unused >= base_index (1), never 0
+    }
+
+    /// Task 7 review fix (Critical): `renumber()` must close gaps starting
+    /// FROM the session's base index, not from 0 — real tmux renumbers from
+    /// `base-index`, so `base-index 1` + `renumber-windows on` never
+    /// produces a window 0.
+    #[test]
+    fn renumber_respects_base_index() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 1).unwrap(); // idx 1
+        s.new_window(2, 10); // idx 2
+        s.new_window(3, 20); // idx 3
+        let first_id = s.windows[0].id; // the window at index 1
+        assert!(s.kill_window(first_id)); // survivors at 2, 3
+        s.renumber();
+        assert_eq!(
+            s.windows.iter().map(|w| w.index).collect::<Vec<_>>(),
+            vec![1, 2] // NOT 0, 1
+        );
     }
 
     #[test]

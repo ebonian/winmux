@@ -1079,7 +1079,10 @@ initial `Attach`) reads `self.options.default_command()` at spawn time
 (replacing the sub-project 1/2 hardcoded `SHELL` const). `kill-pane`/
 `kill-window`'s shared helpers (`kill_pane_by_id`/`kill_window_by_id`) call
 `Session::renumber()` (new in `model.rs`: reassigns every window's `index`
-to its position in the (index-sorted) `windows` vec) after a successful
+to `base_index + position` in the (index-sorted) `windows` vec — Task 7
+review fix: renumbering starts from the session's creation-time
+`base_index` floor, not 0, matching real tmux; see the `## model`
+amendment in the sibling SP2 contract) after a successful
 `kill_window` IF `options.renumber_windows()` is on at that moment.
 `set-option prefix`: on an actual value change, unbinds the OLD prefix
 key's `send-prefix` entry in the prefix table and rebinds `send-prefix`
@@ -1140,20 +1143,33 @@ pub fn log_line(msg: &str); // best-effort append to %LOCALAPPDATA%\winmux\serve
 - `explicit` non-empty (server `--config <path>`, repeatable, forwarded from
   the CLI's `-f`) REPLACES the default chain entirely, in the order given,
   each `required: true`.
-- Otherwise, the default chain: first `$XDG_CONFIG_HOME/tmux/tmux.conf`
-  (only when the env var is `Some` AND non-empty) else
-  `%USERPROFILE%\.tmux.conf`, loaded FIRST (`required: false`); then
-  `%USERPROFILE%\.winmux.conf`, loaded SECOND (`required: false`) - so a
-  ported tmux config's settings can be overridden by winmux-specific
-  tweaks. Neither candidate is pushed if `userprofile` (for the `.tmux.conf`
-  fallback / the `.winmux.conf` entry) is `None`.
+- **`-` sentinel (Task 7 review fix, Important):** the special explicit
+  value `-` (i.e. `winmux -f -` / `__server --config -`) is DROPPED from
+  the candidate list but still counts as "explicit was given" — so
+  `--config -` alone yields an empty candidate list: no default chain, no
+  files, no errors (the tmux `-f /dev/null` idiom). A mixed
+  `--config - --config real.conf` loads only `real.conf`. This doubles as
+  the test suite's isolation seam: `tests/server_proto.rs`'s `start_server`
+  helper passes `["-"]` (NOT `[]`) so a real `%USERPROFILE%\.tmux.conf` on
+  a dev/CI machine can never contaminate a test's server through the
+  default chain; only `start_server_with_config` with explicit temp-file
+  paths loads anything. `usage_text()` mentions it (`-f - disables
+  config`).
+- Otherwise (`explicit` empty), the default chain: first
+  `$XDG_CONFIG_HOME/tmux/tmux.conf` (only when the env var is `Some` AND
+  non-empty) else `%USERPROFILE%\.tmux.conf`, loaded FIRST (`required:
+  false`); then `%USERPROFILE%\.winmux.conf`, loaded SECOND (`required:
+  false`) - so a ported tmux config's settings can be overridden by
+  winmux-specific tweaks. Neither candidate is pushed if `userprofile` (for
+  the `.tmux.conf` fallback / the `.winmux.conf` entry) is `None`.
 - Existence is NOT checked here - deliberately pure and file-system-free so
   it's unit-testable without touching `std::env`/the filesystem (mutating
   process env in parallel tests is racy; see `server::config_discovery_tests`:
   `explicit_replaces_default_chain`, `xdg_wins_over_userprofile_tmux_conf`,
   `empty_xdg_falls_back_to_userprofile_tmux_conf`,
   `no_xdg_falls_back_to_userprofile_tmux_conf`,
-  `no_userprofile_no_xdg_yields_no_candidates`).
+  `no_userprofile_no_xdg_yields_no_candidates`,
+  `dash_config_disables_defaults`).
 
 ### Loading (`Server::load_config_files`)
 

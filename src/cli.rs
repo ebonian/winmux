@@ -67,7 +67,7 @@ Supported commands:\n\
   kill-server\n\
   rename-session [-t target] new-name\n\
   rename-window [-t target] new-name\n\
-Global: -L socket-name, -f config-file (server startup only)\n\
+Global: -L socket-name, -f config-file (server startup only; -f - disables config)\n\
 Bare `winmux` (no command) is `new-session`.\n";
 
 /// Usage text for `Help` (printed by `main.rs`, exit 0).

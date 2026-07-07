@@ -267,11 +267,22 @@ impl Session {
   `NewAuto`/`NewNamed` attach paths, `server/dispatch.rs`'s
   `exec_new_session`) pass `self.options.base_index()`. `lowest_unused_index`
   (private free fn) gained a matching `base: u32` parameter (search starts
-  at `base` instead of `0`). Test: `model.rs`'s
-  `base_index_offsets_window_numbering`; end to end,
-  `tests/server_proto.rs::config_file_applies_at_startup` (`set -g
-  base-index 1` at server startup -> the auto session's first window renders
-  `1:powershell*`, not `0:powershell*`).
+  at `base` instead of `0`). **`Session::renumber()` (Task 7 review fix,
+  Critical)** also respects the same floor: it reassigns every window's
+  `index` to `base_index + position` (in the already-index-sorted `windows`
+  order), NOT `0 + position` — real tmux renumbers from `base-index`, so
+  `base-index 1` + `renumber-windows on` never produces a window 0. The
+  session's own stored `base_index` is used (no parameter needed at the
+  `renumber` call sites in `server/dispatch.rs`, which is why storing the
+  base on `Session` — rather than passing it through every call — was the
+  cleaner wiring). Tests: `model.rs`'s
+  `base_index_offsets_window_numbering` / `renumber_respects_base_index`;
+  end to end, `tests/server_proto.rs::config_file_applies_at_startup`
+  (`set -g base-index 1` at server startup -> the auto session's first
+  window renders `1:powershell*`, not `0:powershell*`) and
+  `renumber_windows_with_base_index` (base-index 1 + renumber-windows on
+  from a config file; killing window 1 renumbers the survivor to 1, never
+  0).
 - Session/window name validation: reject empty names, names containing `:`
   or `.` (tmux's target separators), and — final-review fix, 2026-07-07 —
   any control character (C0 incl. `\n`/`\r`/ESC, plus 0x7f DEL) →
@@ -750,8 +761,13 @@ own multi-`-f` behavior, which SP3 doesn't need). `-f` is accepted as a
 GLOBAL flag regardless of `cmd` variant, but only has any effect via
 `main.rs`'s routing when `cmd` is `NewSession` (the only autostart-capable
 entry point — see the `## client`/`## config` amendments); it is silently
-inert for `Attach`/`Control`/`Help`/`ServerRole`. `usage_text()`'s first line
-gained `[-f config-file]`; the `Global:` line documents both flags.
+inert for `Attach`/`Control`/`Help`/`ServerRole`. The special value `-f -`
+disables config loading entirely (Task 7 review fix; tmux `-f /dev/null`
+idiom — the sentinel is interpreted by the server's discovery function, not
+by `cli.rs`, which passes it through like any other value; see the `##
+config` section of the sibling SP3 contract). `usage_text()`'s first line
+gained `[-f config-file]`; the `Global:` line documents both flags and the
+`-f -` sentinel.
 `__server`'s hidden role (`parse_server_role`) now also accepts `--config
 <path>`, repeatable, in any order relative to `--pipe` (still exactly one
 `--pipe`, still required) — collected into `Command::ServerRole`'s new

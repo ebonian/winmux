@@ -30,13 +30,17 @@ fn unique_pipe_name() -> String {
 }
 
 fn start_server(name: &str) -> JoinHandle<()> {
-    start_server_with_config(name, &[])
+    // `["-"]` = "no config at all" (Task 7 review fix): an EMPTY slice would
+    // make the server load the default `.tmux.conf`/`.winmux.conf` chain
+    // from the REAL process environment, so a dev/CI machine with a real
+    // `%USERPROFILE%\.tmux.conf` would silently contaminate every test.
+    start_server_with_config(name, &["-".to_string()])
 }
 
 /// Like `start_server`, but forwarding explicit `--config <path>` files
-/// (Task 7) — an empty slice is identical to `start_server` (the server
-/// falls back to its own default `.tmux.conf`/`.winmux.conf` discovery
-/// chain, which resolves to nothing interesting in a test's environment).
+/// (Task 7). `"-"` entries are dropped (disable-config sentinel); an empty
+/// slice means the server's own default discovery chain (never wanted in a
+/// test — use `start_server` for isolation).
 fn start_server_with_config(name: &str, config_files: &[String]) -> JoinHandle<()> {
     let name = name.to_string();
     let config_files = config_files.to_vec();
@@ -1400,6 +1404,40 @@ fn renumber_windows_on() {
     assert!(!out.contains("2: "), "out: {out:?}");
 
     cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "rnum".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task 7 review fix (Critical): with `base-index 1` + `renumber-windows on`
+/// loaded from a startup config file, killing a window renumbers the
+/// survivors starting from 1 (the base), never producing a window 0.
+#[test]
+fn renumber_windows_with_base_index() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("rnum-base");
+    std::fs::write(&conf_path, "set -g base-index 1\nset -g renumber-windows on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let server = start_server_with_config(&name, &config_files);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "rnumb".into()]));
+    expect_cli_done(&cli, 0);
+    // base-index 1: first window is 1; new-window appends 2.
+    cli.send(&ClientMsg::Cli(vec!["new-window".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Kill window 1 -> the survivor (2) renumbers to 1, NOT 0.
+    cli.send(&ClientMsg::Cli(vec!["kill-window".into(), "-t".into(), "rnumb:1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "rnumb".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.starts_with("1: "), "out: {out:?}");
+    assert!(!out.contains("0: "), "out: {out:?}");
+
+    let _ = std::fs::remove_file(&conf_path);
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "rnumb".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after last session dies");
 }

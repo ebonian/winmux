@@ -344,7 +344,13 @@ struct ConfigCandidate {
 ///
 /// - `explicit` non-empty (server `--config <path>`, repeatable, forwarded
 ///   from the CLI's `-f`) REPLACES the default chain entirely, in the order
-///   given, each `required: true`.
+///   given, each `required: true`. The special value `-` (Task 7 review
+///   fix; the tmux `-f /dev/null` idiom) is dropped from the candidate
+///   list but still counts as "explicit was given" — so `--config -` alone
+///   means NO config at all (no default chain, no candidates, no errors);
+///   this is also the test suite's isolation seam (`tests/server_proto.rs`'s
+///   `start_server` passes `["-"]` so a real `%USERPROFILE%\.tmux.conf` on
+///   a dev/CI machine can never contaminate a test's server).
 /// - Otherwise, the default chain: the first existing of
 ///   `$XDG_CONFIG_HOME/tmux/tmux.conf` (only when `xdg` is `Some` and
 ///   non-empty) or `%USERPROFILE%\.tmux.conf`, loaded FIRST; then
@@ -355,6 +361,7 @@ fn discover_config_files(xdg: Option<&str>, userprofile: Option<&str>, explicit:
     if !explicit.is_empty() {
         return explicit
             .iter()
+            .filter(|p| p.as_str() != "-")
             .map(|p| ConfigCandidate { path: std::path::PathBuf::from(p), required: true })
             .collect();
     }
@@ -1135,5 +1142,21 @@ mod config_discovery_tests {
     fn no_userprofile_no_xdg_yields_no_candidates() {
         let got = discover_config_files(None, None, &[]);
         assert!(got.is_empty());
+    }
+
+    /// Task 7 review fix (Important): `--config -` (the tmux `-f /dev/null`
+    /// idiom) disables config loading entirely — no default chain, no
+    /// candidates, no errors. `-` entries are dropped but still count as
+    /// "explicit was given" (the default chain stays replaced), so
+    /// `--config - --config real.conf` loads only `real.conf`.
+    #[test]
+    fn dash_config_disables_defaults() {
+        let got = discover_config_files(Some(r"C:\xdg"), Some(r"C:\Users\x"), &["-".to_string()]);
+        assert!(got.is_empty());
+
+        let got = discover_config_files(None, Some(r"C:\Users\x"), &["-".to_string(), "real.conf".to_string()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, PathBuf::from("real.conf"));
+        assert!(got[0].required);
     }
 }
