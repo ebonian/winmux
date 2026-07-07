@@ -224,7 +224,7 @@ Unit-tested with exact expected values (mirrors `keys.rs`'s style):
 `named_colors`, `colour_indexed`, `hex_rgb`, `default_color_resets`,
 `attrs_set`, `attr_synonyms`, `attrs_clear`, `accepted_ignored`,
 `apply_layers_over_base`, `merge_precedence`, `bad_style_err_string`,
-`empty_string_ok_noop` (12 tests).
+`empty_string_ok_noop`, `color_names_case_insensitive` (13 tests).
 
 ### Grammar (`parse_style`)
 
@@ -233,6 +233,11 @@ Unit-tested with exact expected values (mirrors `keys.rs`'s style):
   Otherwise split on `,` (components themselves are NOT individually
   trimmed — tmux has no internal whitespace tolerance); any empty component
   (leading/trailing/doubled comma) is a parse failure.
+- Matching is **case-insensitive** throughout (fix pass, Task 2): each
+  component is ASCII-lowercased before matching, so `FG=Red`, `BOLD`,
+  `NONE`, `Bg=BrightRed` are all valid — tmux's `style_parse` and
+  `colour_fromstring` are `strcasecmp`-based. The error string is built
+  from the ORIGINAL input, so it echoes the user's own casing.
 - `fg=<color>` / `bg=<color>` set the respective field; see the color
   grammar below.
 - `none` / `noattr` reset all FIVE attribute fields (bold/dim/italic/
@@ -248,9 +253,13 @@ Unit-tested with exact expected values (mirrors `keys.rs`'s style):
   `grid::Style`'s field of the same name (`italic`, `underline` — note NOT
   `italics`/`underscore`, matching `grid.rs`'s field names).
 - Accepted-but-inert (parse OK, no-op — no corresponding `grid::Style`
-  field): `blink`, `noblink`, `strikethrough`, `nostrikethrough`,
-  `double-underscore`, `curly-underscore`, `dotted-underscore`,
-  `dashed-underscore`.
+  field): `blink`/`noblink`, `strikethrough`/`nostrikethrough`,
+  `double-underscore`/`nodouble-underscore`,
+  `curly-underscore`/`nocurly-underscore`,
+  `dotted-underscore`/`nodotted-underscore`,
+  `dashed-underscore`/`nodashed-underscore` (negated forms added in the
+  Task 2 fix pass — a valid tmux config line using one must not abort the
+  style parse).
 - Anything else (unknown word, malformed `fg=`/`bg=` color) is a component
   failure; the whole call fails with `Err(format!("bad style: {input}"))` —
   `input` is the exact original (untrimmed) argument, not the trimmed or
@@ -266,9 +275,11 @@ Unit-tested with exact expected values (mirrors `keys.rs`'s style):
 | `colour<n>` / `color<n>`, `n` in `0..=255` | `Color::Idx(n)` (`colour256`+ → `Err`, out of `u8` range) |
 | `#rrggbb` (exactly 6 hex digits, case-insensitive) | `Color::Rgb(r, g, b)` (wrong length or non-hex digit → `Err`) |
 
-Named colors, `colour`/`color` prefixes, and `default` are matched
-case-sensitively (lowercase, tmux config convention); hex digits after `#`
-are the only case-insensitive part of the grammar.
+Every color form is case-insensitive (`fg=RED`, `fg=Colour208`,
+`fg=DEFAULT`), like the rest of the grammar — the whole component is
+lowercased before matching. (The original Task 2 code matched named
+colors/`colour`/`default` case-sensitively; fixed in the Task 2 fix pass
+to match tmux's `strcasecmp` behavior.)
 
 ### `apply_to` / `merge` semantics
 

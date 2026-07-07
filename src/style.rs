@@ -94,15 +94,20 @@ impl PartialStyle {
 /// - `underscore` or `underline` / `nounderscore` or `nounderline` — set/clear
 ///   (tmux's canonical word is `underscore`; `underline` is accepted as a
 ///   synonym).
-/// - `blink`, `noblink`, `strikethrough`, `nostrikethrough`,
+/// - `blink`/`noblink`, `strikethrough`/`nostrikethrough`, and
 ///   `double-underscore`, `curly-underscore`, `dotted-underscore`,
-///   `dashed-underscore` — accepted but inert: they parse successfully and
-///   are otherwise no-ops (no field in `grid::Style` represents them).
+///   `dashed-underscore` plus their `no*` forms — accepted but inert: they
+///   parse successfully and are otherwise no-ops (no field in `grid::Style`
+///   represents them).
+///
+/// Matching is **case-insensitive** throughout (`FG=Red`, `BOLD`, `NONE`),
+/// mirroring tmux's `strcasecmp`-based style and color parsing.
 ///
 /// Any other component (unknown attribute word, malformed color, an empty
 /// component from a stray/leading/trailing/doubled comma) is a parse
 /// failure; the whole call then fails with `Err("bad style: <input>")`
-/// where `<input>` is the exact original (untrimmed) input string.
+/// where `<input>` is the exact original (untrimmed, original-case) input
+/// string.
 pub fn parse_style(input: &str) -> Result<PartialStyle, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -110,7 +115,12 @@ pub fn parse_style(input: &str) -> Result<PartialStyle, String> {
     }
     let mut style = PartialStyle::default();
     for part in trimmed.split(',') {
-        apply_component(&mut style, part).map_err(|()| format!("bad style: {input}"))?;
+        // tmux matches style keys, attribute words, and color names via
+        // strcasecmp — lowercase the whole component before matching. (Hex
+        // digits after `#` are unaffected: they are case-insensitive anyway.)
+        // The error string below still echoes the ORIGINAL input case.
+        apply_component(&mut style, &part.to_ascii_lowercase())
+            .map_err(|()| format!("bad style: {input}"))?;
     }
     Ok(style)
 }
@@ -166,7 +176,9 @@ fn apply_component(style: &mut PartialStyle, part: &str) -> Result<(), ()> {
             return Ok(());
         }
         "blink" | "noblink" | "strikethrough" | "nostrikethrough" | "double-underscore"
-        | "curly-underscore" | "dotted-underscore" | "dashed-underscore" => {
+        | "nodouble-underscore" | "curly-underscore" | "nocurly-underscore"
+        | "dotted-underscore" | "nodotted-underscore" | "dashed-underscore"
+        | "nodashed-underscore" => {
             return Ok(());
         }
         _ => {}
@@ -186,8 +198,9 @@ fn apply_component(style: &mut PartialStyle, part: &str) -> Result<(), ()> {
 /// `green` `yellow` `blue` `magenta` `cyan` `white`, indices 0-7) or its
 /// `bright<name>` variant (indices 8-15); `colour<n>` / `color<n>` for `n` in
 /// `0..=255` (`colour256`+ is out of range: `Err`); or `#rrggbb` hex (exactly
-/// 6 hex digits after the `#`, case-insensitive; any other length or a
-/// non-hex digit is `Err`).
+/// 6 hex digits after the `#`; any other length or a non-hex digit is `Err`).
+/// The caller has already lowercased the token, making every form
+/// case-insensitive (tmux `colour_fromstring` uses `strcasecmp`).
 fn parse_color(s: &str) -> Result<Color, ()> {
     if s == "default" {
         return Ok(Color::Default);
@@ -375,6 +388,59 @@ mod tests {
     fn accepted_ignored() {
         let s = parse_style("blink,strikethrough,double-underscore,dashed-underscore").unwrap();
         assert_eq!(s.apply_to(Style::default()), Style::default());
+        // negated forms of the inert words are equally accepted-and-inert
+        let n = parse_style(
+            "noblink,nostrikethrough,nodouble-underscore,nocurly-underscore,\
+             nodotted-underscore,nodashed-underscore",
+        )
+        .unwrap();
+        assert_eq!(n.apply_to(Style::default()), Style::default());
+    }
+
+    #[test]
+    fn color_names_case_insensitive() {
+        // tmux matches style keys, attribute words, and color names via
+        // strcasecmp — any case mix is valid tmux config.
+        assert_eq!(
+            parse_style("fg=Red").unwrap().apply_to(Style::default()).fg,
+            Color::Idx(1)
+        );
+        assert_eq!(
+            parse_style("fg=RED").unwrap().apply_to(Style::default()).fg,
+            Color::Idx(1)
+        );
+        assert_eq!(
+            parse_style("FG=red").unwrap().apply_to(Style::default()).fg,
+            Color::Idx(1)
+        );
+        assert_eq!(
+            parse_style("Bg=BrightRed")
+                .unwrap()
+                .apply_to(Style::default())
+                .bg,
+            Color::Idx(9)
+        );
+        assert_eq!(
+            parse_style("fg=Colour208")
+                .unwrap()
+                .apply_to(Style::default())
+                .fg,
+            Color::Idx(208)
+        );
+        let base = Style {
+            fg: Color::Idx(2),
+            bold: true,
+            ..Style::default()
+        };
+        assert_eq!(
+            parse_style("fg=DEFAULT").unwrap().apply_to(base).fg,
+            Color::Default
+        );
+        assert!(parse_style("BOLD").unwrap().apply_to(Style::default()).bold);
+        assert!(!parse_style("NoBold").unwrap().apply_to(base).bold);
+        assert_eq!(parse_style("bold,NONE").unwrap().apply_to(base), base);
+        // the error string still echoes the ORIGINAL case of the input
+        assert_eq!(parse_style("FG=zzz"), Err("bad style: FG=zzz".to_string()));
     }
 
     // ---- layering ----
