@@ -841,6 +841,46 @@ fn cli_rename_session() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Pins the Task 8 empty-target rule on the CLI path: an EXPLICITLY empty
+/// flag value (`-t ""` / `-s ""`) reaches `Registry::find("")` and resolves
+/// to the most recently created session — the same resolution as the
+/// documented no-`-t` defaults of `kill-session`/`list-windows` — rather
+/// than matching as an always-true (ambiguous) empty prefix. Omitted flags
+/// are unaffected: `has-session` (no `-t`) is still a usage error.
+#[test]
+fn cli_empty_target_resolves_most_recent() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    // No sessions yet: empty target is "no sessions", not a usage error.
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "no sessions");
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "et1".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "et2".into()]));
+    expect_cli_done(&cli, 0);
+
+    // With sessions present, an empty -t matches (the most recent one).
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+
+    // kill-session -t "" kills et2 (most recent), leaving only et1 — the
+    // same session an omitted -t would have targeted.
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["list-sessions".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.starts_with("et1: "), "unexpected ls output: {out:?}");
+    assert!(!out.contains("et2"), "et2 should be gone: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "et1".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn cli_list_windows_format() {
     let name = unique_pipe_name();

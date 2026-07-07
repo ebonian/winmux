@@ -390,6 +390,12 @@ mod tests {
         let mut r = Registry::new();
         r.create_session(Some("foo"), 1, SZ).unwrap();
         r.create_session(Some("bar"), 2, SZ).unwrap();
+        r.create_session(Some("qux"), 3, SZ).unwrap();
+        // Multiple sessions: "" is NOT an (always-matching, ambiguous)
+        // empty prefix — it picks the most recently CREATED session.
+        assert_eq!(r.find("").unwrap().name, "qux");
+        // Still creation-recency (not name order) after the newest dies.
+        assert!(r.kill_session("qux"));
         assert_eq!(r.find("").unwrap().name, "bar");
     }
 

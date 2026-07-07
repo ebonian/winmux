@@ -76,12 +76,21 @@ pub fn autostart_server(socket: &str) -> io::Result<()> {
 /// clean way to cancel it. That's fine: every return path out of this
 /// function is followed by `main.rs` calling `std::process::exit`, which
 /// tears down the whole process (and that thread with it) immediately.
+///
+/// Ordering: `Host::enter()` runs BEFORE the pipe connect and the `Attach`
+/// frame (Task 8 review fix). If the terminal can't be entered at all (e.g.
+/// stdio is redirected — no console), no `Attach` ever reaches the server,
+/// so no server-side session is created for a client that can never use it.
+/// (Previously the frame went out first; a failed `enter` then stranded a
+/// session — and, with exit-empty, kept an autostarted server alive
+/// forever.) Every `?` after `enter` drops `host` (a local) on the way out,
+/// restoring the console before `main.rs` prints the error.
 pub fn attach(pipe_full_name: &str, first: ClientMsg) -> Result<i32, Box<dyn Error>> {
-    let mut conn = PipeConn::connect(pipe_full_name)?;
-    protocol::write_client_msg(&mut conn, &first)?;
-
     let mut host = Host::enter()?;
     let (mut cols, mut rows) = host.size().unwrap_or((80, 24));
+
+    let mut conn = PipeConn::connect(pipe_full_name)?;
+    protocol::write_client_msg(&mut conn, &first)?;
 
     // Stdin thread: forwards raw console input as Stdin frames over its own
     // cloned connection. On read failure/EOF (console closing), it sends a

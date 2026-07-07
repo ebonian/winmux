@@ -116,12 +116,30 @@ impl std::io::Write for PipeConn { ... }
   `<socket_name>` are sanitized by keeping `[A-Za-z0-9_-]` and replacing every
   other character with `_`.
 - `PipeListener::bind` calls `CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX |
-  FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-  PIPE_UNLIMITED_INSTANCES, 64*1024, 64*1024, 0, None)` and **holds** the
-  resulting instance — this proves the name is creatable before `bind`
-  returns. The first `accept` consumes that held instance; every subsequent
-  `accept` creates a fresh instance via the same `CreateNamedPipeW` call
-  before waiting on it. Each `accept` blocks in `ConnectNamedPipe` (issued
+  FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE |
+  PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES, 64*1024,
+  64*1024, 0, None)` and **holds** the resulting instance — this proves the
+  name is creatable before `bind` returns.
+  **`FILE_FLAG_FIRST_PIPE_INSTANCE` (Task 8 amendment; bind-time call
+  ONLY):** if ANY instance of the name already exists (another server owns
+  it), the create fails with `ERROR_ACCESS_DENIED`, surfaced as
+  `io::ErrorKind::PermissionDenied` (the natural raw-Win32-code mapping;
+  chosen over remapping to `AlreadyExists` so `pipe.rs` keeps its uniform
+  "raw code straight through `from_raw_os_error`" rule). Without the flag,
+  `PIPE_UNLIMITED_INSTANCES` lets a SECOND process's `CreateNamedPipeW` on
+  the same name succeed, silently joining the first server's instance pool
+  — two servers would round-robin accepts on one name (split-brain). That
+  is exactly the double-autostart race two concurrent cold-start clients
+  produce (both find no pipe, both spawn a server): the loser's `bind` now
+  fails, `server::run` returns `Err`, `main.rs`'s ServerRole logs it and
+  exits 1, and the losing client's autostart connect-poll simply finds the
+  winner's pipe. Regression coverage:
+  `tests/pipe_smoke.rs::second_bind_same_name_fails` (second `bind` errors
+  `PermissionDenied`; the first listener still accepts and serves).
+  The first `accept` consumes the instance `bind` held; every subsequent
+  `accept` creates a fresh instance via the same `CreateNamedPipeW` call —
+  WITHOUT `FILE_FLAG_FIRST_PIPE_INSTANCE` (the name legitimately exists by
+  then; it's the same server adding instances) — before waiting on it. Each `accept` blocks in `ConnectNamedPipe` (issued
   with an `OVERLAPPED` and waited out via `GetOverlappedResult(..., bWait:
   TRUE)` when it doesn't complete synchronously — required because the
   handle is overlapped, see below); a client that connects in the race
@@ -246,10 +264,25 @@ impl Session {
   `-t`/target: the CLI has no "current client" context to fall back on
   (unlike the interactive prefix-key bindings), so the server picks the
   newest session instead. Test: `Registry`'s own
-  `find_empty_target_picks_most_recent` /
+  `find_empty_target_picks_most_recent` (multiple sessions; asserts
+  creation-recency, not name order or ambiguity) /
   `find_empty_target_no_sessions_is_error` (`src/model.rs`), plus
   `tests/server_proto.rs::attach_empty_target_picks_most_recent` exercising
   it end-to-end over the wire.
+  **Blast-radius audit (Task 8 review):** every other `find()` caller is a
+  `cli_*` handler in `src/server/cli_exec.rs`, and an OMITTED flag never
+  produces an empty-string call — `has-session`/`rename-session`/
+  `rename-window`/`detach-client` require the flag (usage error before
+  `find` is reached), and `kill-session`/`list-windows` default via
+  `sessions().last()` directly. The only way `""` reaches `find` on the
+  CLI path is an EXPLICITLY empty flag value (`-t ""`, `-s ""`, or the
+  session part of `rename-window -t ":idx"`), which now resolves to the
+  most recently created session — intentionally the SAME resolution as
+  `kill-session`/`list-windows`'s documented no-`-t` default, giving one
+  uniform rule: an empty target anywhere means "the most recently created
+  session" (`"no sessions"` if none). Pinned by
+  `tests/server_proto.rs::cli_empty_target_resolves_most_recent`
+  (`has-session -t ""` and `kill-session -t ""` against two sessions).
 - `kill_session`/`session_mut` are exact-name-only (no prefix rules, no `=`
   handling) — `find` is the only tmux-target-resolving entry point.
 - `Session::kill_window` on the only remaining window is a no-op returning
@@ -676,9 +709,17 @@ pub fn attach(pipe_full_name: &str, first: protocol::ClientMsg) -> Result<i32, B
 pub fn autostart_server(socket: &str) -> std::io::Result<()>;
 ```
 
-**`attach`:** connects to `pipe_full_name`, sends `first` (an `Attach`
-frame, already built by the caller with the right `AttachMode`/size/name),
-then `Host::enter()`s and runs until the server sends a terminal message:
+**`attach`:** `Host::enter()`s FIRST, then connects to `pipe_full_name` and
+sends `first` (an `Attach` frame, already built by the caller with the
+right `AttachMode`/size/name), and runs until the server sends a terminal
+message. The enter-before-connect ordering is a Task 8 review fix: if the
+terminal can't be entered at all (e.g. stdio is redirected — no console),
+no `Attach` frame ever reaches the server, so no server-side session is
+created for a client that can never use it (previously the frame went out
+first; a failed `enter` then stranded a session — and, with exit-empty,
+kept an autostarted server alive forever). A connect/write failure after
+`enter` drops `host` (a local) on the `?` path, restoring the console
+before `main.rs` prints the error. Loop behavior:
 
 - A stdin-reader thread (its own `PipeConn::try_clone`) blocks in
   `host::read_stdin`, forwarding each chunk as a `Stdin` frame; on read

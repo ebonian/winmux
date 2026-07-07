@@ -99,6 +99,44 @@ fn connect_absent_pipe_is_not_found() {
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
+/// Double-autostart guard (Task 8 review fix): a SECOND `bind` on a name a
+/// first listener already owns must fail (`FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// makes `CreateNamedPipeW` fail with `ERROR_ACCESS_DENIED`, surfacing as
+/// `PermissionDenied`), and the first listener must remain fully usable —
+/// this is what turns two racing cold-start clients into exactly one
+/// surviving server instead of a split-brain pair sharing one pipe name.
+#[test]
+fn second_bind_same_name_fails() {
+    let name = unique_pipe_name("double-bind");
+    let listener = PipeListener::bind(&name).expect("first bind");
+
+    let err = match PipeListener::bind(&name) {
+        Ok(_) => panic!("second bind on an owned name must fail"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    // The winner still accepts and serves a connection normally.
+    let server = thread::spawn(move || {
+        let mut conn = listener.accept().expect("accept after failed second bind");
+        let msg = read_client_msg(&mut conn).expect("read client msg");
+        match msg {
+            ClientMsg::Stdin(bytes) => {
+                write_server_msg(&mut conn, &ServerMsg::Output(bytes)).expect("write reply");
+            }
+            _ => panic!("unexpected message"),
+        }
+    });
+
+    let mut client = PipeConn::connect(&name).expect("client connect");
+    write_client_msg(&mut client, &ClientMsg::Stdin(vec![9, 9])).expect("client write");
+    let reply = read_server_msg(&mut client).expect("client read");
+    assert_eq!(reply, ServerMsg::Output(vec![9, 9]));
+
+    drop(client);
+    server.join().expect("server thread panicked");
+}
+
 /// The accept loop must serve one connection after another over the same
 /// listener (first instance, then a freshly created instance).
 #[test]

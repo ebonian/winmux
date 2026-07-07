@@ -44,8 +44,8 @@ use windows::Win32::Foundation::{
     ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
-    FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -162,11 +162,28 @@ impl Drop for OwnedEvent {
 
 /// Create one named-pipe server instance (duplex, byte mode, blocking from
 /// the caller's point of view, overlapped-capable underneath).
-fn create_instance(wide_name: &[u16]) -> io::Result<HANDLE> {
+///
+/// `first` adds `FILE_FLAG_FIRST_PIPE_INSTANCE` — set ONLY by `bind`'s
+/// initial instance. It makes the create fail with `ERROR_ACCESS_DENIED`
+/// (surfacing as `io::ErrorKind::PermissionDenied`) if ANY instance of the
+/// name already exists, i.e. if another server already owns the name.
+/// Without it, `PIPE_UNLIMITED_INSTANCES` lets a second process's
+/// `CreateNamedPipeW` on the same name SUCCEED, silently joining the first
+/// server's instance pool — two servers would then round-robin accepts on
+/// one name (split-brain). That is exactly the double-autostart race two
+/// concurrent cold-start clients can produce: both spawn a server; the
+/// loser's `bind` must FAIL so its process exits and the winner alone owns
+/// the pipe. Subsequent `accept`-time instances must NOT set the flag (the
+/// name legitimately exists then — it's the same server adding instances).
+fn create_instance(wide_name: &[u16], first: bool) -> io::Result<HANDLE> {
+    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if first {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
     unsafe {
         let handle = CreateNamedPipeW(
             PCWSTR(wide_name.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
             BUFFER_SIZE,
@@ -196,9 +213,12 @@ pub struct PipeListener {
 impl PipeListener {
     /// Create and hold the first named-pipe instance for `full_name`
     /// (`\\.\pipe\...`), proving the name is bindable before returning.
+    /// Fails with `io::ErrorKind::PermissionDenied` (`ERROR_ACCESS_DENIED`,
+    /// via `FILE_FLAG_FIRST_PIPE_INSTANCE`) if another process already owns
+    /// the name — the losing side of a double-autostart race.
     pub fn bind(full_name: &str) -> io::Result<PipeListener> {
         let wide_name = to_wide(full_name);
-        let handle = create_instance(&wide_name)?;
+        let handle = create_instance(&wide_name, true)?;
         let first = unsafe { File::from_raw_handle(handle.0 as RawHandle) };
         Ok(PipeListener {
             wide_name,
@@ -215,7 +235,9 @@ impl PipeListener {
             match guard.take() {
                 Some(file) => file,
                 None => {
-                    let handle = create_instance(&self.wide_name)?;
+                    // NOT `first`: the name already exists (we own it) —
+                    // this is the same server adding another instance.
+                    let handle = create_instance(&self.wide_name, false)?;
                     unsafe { File::from_raw_handle(handle.0 as RawHandle) }
                 }
             }
