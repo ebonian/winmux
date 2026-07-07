@@ -1,6 +1,7 @@
 # Sub-project 3 — Command layer + `.tmux.conf` configuration
 
-Status: **Active design spec.** Companion contract:
+Status: **Delivered** (2026-07-07, branch `feature/command-config`, Tasks
+1-9, 339 tests passing / 1 ignored manual smoke test). Companion contract:
 [`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md)
 (created/extended task-by-task, same lock rules as before).
 
