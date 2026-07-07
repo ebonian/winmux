@@ -737,24 +737,90 @@ fn spawn_pane(
     Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new() })
 }
 
+/// Recognized Windows executable/script suffixes stripped from an
+/// automatic-rename candidate before it becomes a window name (fix round,
+/// review finding 2) -- see `derive_auto_name`'s doc comment for why.
+const KNOWN_TITLE_EXTENSIONS: [&str; 4] = [".exe", ".cmd", ".bat", ".ps1"];
+
+/// Strip ONE trailing recognized extension (case-insensitive) if present;
+/// otherwise return `token` unchanged. Never strips a token down to empty
+/// (a token that's nothing BUT the extension, e.g. a literal `.exe`, is
+/// left alone -- `derive_auto_name`'s later empty check then correctly
+/// falls back to "keep the existing name" instead of manufacturing an
+/// empty one from a pathological title).
+fn strip_known_extension(token: &str) -> &str {
+    for ext in KNOWN_TITLE_EXTENSIONS {
+        if token.len() > ext.len() && token[token.len() - ext.len()..].eq_ignore_ascii_case(ext) {
+            return &token[..token.len() - ext.len()];
+        }
+    }
+    token
+}
+
 /// Derive an automatic-rename candidate from a pane's OSC title (Task 9,
 /// sub-project 4; design spec `## 9. automatic-rename`): strip a path prefix
 /// down to its basename (last component split on either `\` or `/`), cut at
 /// the first space (tmux's automatic-rename takes just the leading
-/// "command" token, not the whole title), cap at 20 chars, and re-strip
-/// control characters defensively (`grid::Grid`'s own OSC handler already
-/// does this for the title it hands out, but this function doesn't assume
-/// its caller is always that one guaranteed-clean source). Returns `None`
-/// if the result is empty (caller keeps the window's existing name) OR
-/// fails `model::validate_name` -- a title containing a `:` or `.` (a full
-/// file path, or a bare `foo.exe` basename) can't become a window name at
-/// all, since window names double as `session:window`/`session.window`
-/// target syntax; skipping the rename is safer than mangling the name
-/// further to force it through.
+/// "command" token, not the whole title), strip one recognized trailing
+/// extension (`.exe`/`.cmd`/`.bat`/`.ps1`, case-insensitive), cap at 20
+/// chars, and re-strip control characters defensively (`grid::Grid`'s own
+/// OSC handler already does this for the title it hands out, but this
+/// function doesn't assume its caller is always that one guaranteed-clean
+/// source).
+///
+/// **Fix round, review finding 2**: the original implementation rejected
+/// the WHOLE candidate via `model::validate_name` the instant it contained
+/// a `:` or `.` -- but a bare Windows executable's stock, un-customized
+/// console title is commonly its own exe name or full path, extension and
+/// all (`cmd.exe`, `C:\Windows\system32\cmd.exe`; Windows defaults a fresh
+/// console's title to the launched executable's path whenever the program
+/// never calls `SetConsoleTitle` itself), so that gate silently no-op'd
+/// automatic-rename for a large, common class of default titles --
+/// including, concretely, the very first title `powershell.exe` itself
+/// emits on pane startup.
+///
+/// The fix is EXTENSION-STRIPPING, not blanket character substitution:
+/// `cmd.exe` -> `cmd`; `C:\Windows\system32\cmd.exe` -> `cmd` (path already
+/// stripped by the basename step). Substituting `:`/`.` with `-` instead
+/// (tried first, then reverted) technically also "worked" (`cmd.exe` ->
+/// `cmd-exe`) but regressed several pre-existing tests
+/// (`pane_title_updates_window_name` et al.): `powershell.exe` ->
+/// `powershell-exe`, which does NOT equal the window's existing default
+/// name `powershell`, so `maybe_auto_rename` treats it as a genuine change
+/// and fires a VISIBLE rename on literally every fresh pane the instant it
+/// attaches -- not what any test (or user) expects, and further from real
+/// tmux's extension-less naming (`bash`/`zsh`) than stripping is.
+/// Extension-stripping makes `powershell.exe` -> `powershell`, which DOES
+/// equal the existing default, so that no-op check
+/// (`window.name == name`) absorbs the startup title silently: no spurious
+/// rename, no regression, and closer tmux parity for the common case. Any
+/// OTHER residual `:`/`.` that survives extension-stripping (an
+/// unrecognized extension, or a literal colon like `server:8080`) is still
+/// sanitized -- replaced with `-` -- rather than rejected outright, so the
+/// candidate stays useful instead of vanishing. Character substitution
+/// (rather than simply widening `validate_name` to allow `:`/`.` for every
+/// manually-typed name too) is deliberate: window names double as
+/// `session:window`/`session.window` target syntax
+/// (`split_session_prefix`/`resolve_window`'s window.pane split in
+/// `src/server/dispatch.rs` both split on the FIRST occurrence of the
+/// separator), so an embedded `:`/`.` in the name itself would be
+/// ambiguous with the separator -- a materially larger, riskier change
+/// than this fix round's scope.
+///
+/// Returns `None` only if the result is empty (caller keeps the window's
+/// existing name) -- with `:`/`.` no longer able to trigger outright
+/// rejection, `validate_name` here is now a defensive double-check (control
+/// chars are already stripped above) rather than the primary gate.
 fn derive_auto_name(title: &str) -> Option<String> {
     let basename = title.rsplit(['\\', '/']).next().unwrap_or(title);
     let first_token = basename.split(' ').next().unwrap_or("");
-    let cleaned: String = first_token.chars().filter(|c| !c.is_control()).take(20).collect();
+    let stripped = strip_known_extension(first_token);
+    let cleaned: String = stripped
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == ':' || c == '.' { '-' } else { c })
+        .take(20)
+        .collect();
     if cleaned.is_empty() {
         return None;
     }

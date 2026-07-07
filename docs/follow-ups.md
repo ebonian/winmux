@@ -21,6 +21,14 @@ None ever blocked a merge.
    rather than eliminating the underlying class of race in the abstract —
    see `src/server.rs` module docs for the exact reasoning before assuming
    it's closed for good.
+   **Update (sub-project 4, Task 9 fix round):** the `Tick` handler now
+   batches every ready client's escape-time flush into one
+   `handle_event(Tick)` call (previously each `ServerEvent` touched exactly
+   one client's `Stdin`). This slightly widens this same accepted race's
+   blast radius: a session/window dying mid-batch from one client's flushed
+   event can now affect a second, already-collected-but-not-yet-processed
+   client's flush in the same tick. Not a new class of bug, same accepted
+   limitation, just a marginally larger surface — no behavior change made.
 3. **RESOLVED** (sub-project 2, Task 8, commit `09a274a`). `Host::enter()`
    had a partial-failure gap: code pages/stdout mode were mutated before the
    `RESTORE` snapshot was published. Fixed by publishing `RESTORE` before the

@@ -2799,13 +2799,17 @@ impl Server {
         }
         match kind {
             PromptKind::RenameWindow => {
-                match crate::model::validate_name(&buf, "window") {
-                    Ok(()) => {
-                        if let Some(session) = self.registry.session_mut(session_name) {
-                            session.current_window_mut().name = buf;
-                        }
-                    }
-                    Err(e) => client.message = Some((e, Instant::now())),
+                // Route through `exec_rename_window` -- the SAME function the
+                // CLI/config `rename-window` command calls -- rather than
+                // duplicating the rename inline, so this arm can't drift out
+                // of sync with that path's semantics again (it previously
+                // did: it skipped `auto_rename = false`, so a `,`-renamed
+                // window would silently revert on the next OSC title change;
+                // fixed by unifying on this one call). `target: None` means
+                // "the client's own session's current window", matching this
+                // prompt's prior direct-`current_window_mut()` behavior.
+                if let Err(e) = self.exec_rename_window(None, buf, Some(session_name.as_str())) {
+                    client.message = Some((e, Instant::now()));
                 }
                 (true, None)
             }

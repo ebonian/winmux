@@ -1828,6 +1828,11 @@ pub struct FormatCtx<'a> {
     /// (`server::PaneRuntime::title`), empty until ever set. Already
     /// control-char-clean and length-capped by `grid::Grid`'s OSC handler
     /// (Task 1) -- no further sanitizing needed in `expand_format`.
+    /// Documented divergence (fix round, review minor 1): real tmux falls
+    /// back to the pane's running command name when no title was ever set;
+    /// here it falls back to empty -- same root cause (no foreground-process
+    /// tracking) as the `automatic-rename` divergence (`docs/follow-ups.md`
+    /// #28).
     pub pane_title: &'a str,
 }
 ```
@@ -1853,13 +1858,34 @@ comment) — a plain cached `String` rather than re-deriving `Option<&str>` ->
 const AUTO_RENAME_THROTTLE: std::time::Duration = /* 500ms, tmux NAME_INTERVAL */;
 
 /// Basename (strip path, split on `\`/`/`) -> first token (cut at first
-/// space) -> cap 20 chars -> control-strip (defensive; Grid's OSC handler
-/// already does this for its own output) -> `model::validate_name` gate.
-/// `None` if empty after derivation OR the candidate fails validation (a
-/// title containing `:`/`.` -- a full path, or a bare `foo.exe` basename --
-/// can't become a window name at all, since window names double as
-/// `session:window`/`session.window` target syntax; skipping the rename is
-/// safer than mangling it further to force it through).
+/// space) -> strip ONE recognized trailing extension (`.exe`/`.cmd`/`.bat`/
+/// `.ps1`, case-insensitive) -> cap 20 chars -> control-strip (defensive;
+/// Grid's OSC handler already does this for its own output) -> sanitize any
+/// REMAINING `:`/`.` by replacing with `-` -> `model::validate_name` gate
+/// (now a defensive double-check, not the primary gate). `None` only if the
+/// result is empty after derivation.
+///
+/// **Amended, fix round (review finding 2):** originally the candidate was
+/// rejected outright (`None`) if it contained `:`/`.` after the
+/// cap/control-strip step -- but a bare Windows executable's stock,
+/// un-customized console title is commonly its own exe name or full path,
+/// extension and all (`cmd.exe`, `C:\Windows\system32\cmd.exe`; this
+/// includes `powershell.exe` itself, the title every fresh pane starts
+/// with), so that gate silently no-op'd automatic-rename for a large,
+/// common class of default titles. Fixed by stripping a recognized
+/// extension (`cmd.exe` -> `cmd`) rather than substituting `:`/`.` with `-`
+/// project-wide: extension-stripping makes the pane-startup title
+/// (`powershell.exe` -> `powershell`) equal the window's existing default
+/// name, so `maybe_auto_rename`'s `window.name == name` no-op check absorbs
+/// it silently instead of firing a visible rename on every fresh window.
+/// Character substitution is still applied as a fallback for any residual
+/// `:`/`.` that survives extension-stripping (an unrecognized extension, or
+/// a literal colon in the title), so the candidate stays useful instead of
+/// vanishing, without widening `validate_name` itself to accept `:`/`.` for
+/// every manually-typed name (which would reopen `session:window`/
+/// `session.window` target-syntax ambiguity project-wide -- `split_session_
+/// prefix`/`resolve_window`'s window.pane split both split on the FIRST
+/// occurrence of the separator).
 fn derive_auto_name(title: &str) -> Option<String>;
 
 impl Server {

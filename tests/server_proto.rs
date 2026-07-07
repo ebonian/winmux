@@ -4519,6 +4519,72 @@ fn manual_rename_disables_auto() {
     server.join().expect("server exits after last session dies");
 }
 
+/// automatic-rename precedence via the `,` PROMPT path (Task 9 fix round):
+/// mirrors `manual_rename_disables_auto` exactly, except the rename is
+/// committed via the interactive `,` status-line prompt (keystrokes lifted
+/// from `rename_window_prompt_flow`) instead of the CLI. Regression test for
+/// the review finding that `feed_prompt_byte`'s `PromptKind::RenameWindow`
+/// arm was a separate, un-synced inline implementation that never cleared
+/// `Window::auto_rename` -- a `,`-renamed window would silently revert to
+/// the title-derived name on the pane's next OSC title change.
+#[test]
+fn comma_prompt_rename_disables_auto() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b',']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) powershell")));
+    // "powershell" is 10 chars; wipe it, then type the new name.
+    c.send(&ClientMsg::Stdin(vec![0x7f; 10]));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) ") && !l.contains("powershell")));
+    c.send(&ClientMsg::Stdin(b"manual".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) manual")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:manual*")));
+
+    c.send(&ClientMsg::Stdin(b"$Host.UI.RawUI.WindowTitle='mytool'; echo done-manual-check\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-manual-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:manual*")),
+        "comma-prompt rename must survive a later title change; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// automatic-rename must produce a USEFUL name for the extremely common
+/// Windows default console title shape -- a bare exe path, dot and all
+/// (Task 9 fix round finding 2). Before the fix, `derive_auto_name` routed
+/// the candidate through `model::validate_name`, which rejects any name
+/// containing `:`/`.` (reserved for `session:window.pane` target syntax) --
+/// so a title like `C:\Windows\system32\cmd.exe` silently no-op'd the
+/// rename entirely, leaving the window stuck at its old name. The shipped
+/// fix strips a recognized trailing extension (`.exe` here) instead of
+/// rejecting: basename `cmd.exe` -> `cmd` (see `derive_auto_name`'s doc
+/// comment for the full mapping, and why this was chosen over sanitizing
+/// `:`/`.` to `-`, which would have produced `cmd-exe` but regressed the
+/// pane-startup-title case in several other Task 9 tests).
+#[test]
+fn auto_rename_handles_exe_titles() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"$Host.UI.RawUI.WindowTitle='C:\\Windows\\system32\\cmd.exe'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:cmd*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `#T`/`display-message` (Task 9): the pane's FULL OSC title (not the
 /// derived-and-truncated window name automatic-rename applies) is available
 /// via the new `#T` format code. Using a multi-word title distinguishes the

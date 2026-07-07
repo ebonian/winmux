@@ -625,6 +625,12 @@ pub struct FormatCtx<'a> {
     /// 0/2 title (`server::PaneRuntime::title`), empty until the pane's
     /// program ever sets one. Already control-char-clean and length-capped
     /// by `grid::Grid`'s OSC handler — no further sanitizing needed here.
+    /// Documented divergence from real tmux (fix round, review minor 1):
+    /// tmux's `#T`/`#{pane_title}` falls back to the pane's running command
+    /// name when no title has ever been set; here it falls back to an empty
+    /// string, same root cause as the `automatic-rename` divergence
+    /// (`docs/follow-ups.md` #28) — no foreground-process tracking exists in
+    /// this codebase, only the ConPTY-surfaced console title.
     pub pane_title: &'a str,
 }
 
