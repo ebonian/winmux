@@ -167,6 +167,11 @@ struct Server {
     /// Mutable key-bindings table (`bind-key`/`unbind-key`/`list-keys`).
     /// `Bindings::default()` reproduces every legacy hardcoded binding.
     bindings: Bindings,
+    /// Set by `run` after startup config loading IF at least one config
+    /// error was collected (`config: N error(s), see server.log`); consumed
+    /// (`Option::take`) by `finish_attach` the first time ANY client
+    /// attaches, so only the first attach ever sees it (Task 7).
+    pending_config_message: Option<String>,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
@@ -317,6 +322,56 @@ fn switch_client_session(
     Some((old, neighbor))
 }
 
+/// One config file to attempt loading at server startup (Task 7):
+/// `required` distinguishes an explicitly-requested file (`-f`/`--config`)
+/// from a default-chain candidate. See `discover_config_files`.
+struct ConfigCandidate {
+    path: std::path::PathBuf,
+    /// `true` for an explicit `--config`/`-f` file: a missing file is a
+    /// collected error. `false` for a default-chain candidate (`.tmux.conf`/
+    /// `.winmux.conf`): a MISSING file is silently skipped (tmux behavior —
+    /// most users have no config at all); any OTHER open error (e.g.
+    /// permissions) is still collected even for a non-required candidate.
+    required: bool,
+}
+
+/// Pure discovery of which config file(s) `run` should try loading, in
+/// order, and whether each is required. Existence is NOT checked here
+/// (`Server::load_config_files` does that) — this only decides the
+/// candidate list and the required/optional distinction, so it can be unit
+/// tested without touching the filesystem or process environment (see the
+/// task brief: mutating `std::env` in parallel tests is racy).
+///
+/// - `explicit` non-empty (server `--config <path>`, repeatable, forwarded
+///   from the CLI's `-f`) REPLACES the default chain entirely, in the order
+///   given, each `required: true`.
+/// - Otherwise, the default chain: the first existing of
+///   `$XDG_CONFIG_HOME/tmux/tmux.conf` (only when `xdg` is `Some` and
+///   non-empty) or `%USERPROFILE%\.tmux.conf`, loaded FIRST; then
+///   `%USERPROFILE%\.winmux.conf`, loaded SECOND (so winmux-specific
+///   tweaks in a ported tmux config can be overridden by winmux-only
+///   settings) — both `required: false`.
+fn discover_config_files(xdg: Option<&str>, userprofile: Option<&str>, explicit: &[String]) -> Vec<ConfigCandidate> {
+    if !explicit.is_empty() {
+        return explicit
+            .iter()
+            .map(|p| ConfigCandidate { path: std::path::PathBuf::from(p), required: true })
+            .collect();
+    }
+    let mut out = Vec::new();
+    let tmux_conf = match xdg.filter(|s| !s.is_empty()) {
+        Some(x) => Some(std::path::PathBuf::from(x).join("tmux").join("tmux.conf")),
+        None => userprofile.map(|u| std::path::PathBuf::from(u).join(".tmux.conf")),
+    };
+    if let Some(p) = tmux_conf {
+        out.push(ConfigCandidate { path: p, required: false });
+    }
+    if let Some(u) = userprofile {
+        out.push(ConfigCandidate { path: std::path::PathBuf::from(u).join(".winmux.conf"), required: false });
+    }
+    out
+}
+
 impl Server {
     fn new(tx: Sender<ServerEvent>) -> Self {
         Server {
@@ -332,6 +387,7 @@ impl Server {
             tx,
             options: Options::new(),
             bindings: Bindings::default(),
+            pending_config_message: None,
         }
     }
 
@@ -441,9 +497,10 @@ impl Server {
                 match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
+                        let base_index = self.options.base_index();
                         let session_name = self
                             .registry
-                            .create_session(None, pane_id, size)
+                            .create_session(None, pane_id, size, base_index)
                             .expect("auto-assigned name never duplicates")
                             .name
                             .clone();
@@ -464,7 +521,8 @@ impl Server {
                 match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
-                        match self.registry.create_session(Some(&name), pane_id, size) {
+                        let base_index = self.options.base_index();
+                        match self.registry.create_session(Some(&name), pane_id, size, base_index) {
                             Ok(session) => {
                                 let n = session.name.clone();
                                 self.finish_attach(id, writer_tx, n, cols, rows);
@@ -501,6 +559,9 @@ impl Server {
         // Force a full repaint on the very first compose (see module docs /
         // task brief: "use a fresh Renderer (or resize) at attach").
         renderer.resize(cols.max(1), rows.max(1));
+        // First-attach-only config-error notice (Task 7): `take()` so a
+        // SECOND client attaching later never sees it again.
+        let message = self.pending_config_message.take().map(|m| (m, Instant::now()));
         let client = ClientState {
             session: Some(session_name.clone()),
             cols,
@@ -508,7 +569,7 @@ impl Server {
             renderer,
             key_machine: KeyMachine::new(self.options.prefix()),
             mode: ClientMode::Normal,
-            message: None,
+            message,
             tx,
         };
         self.clients.insert(id, client);
@@ -964,10 +1025,15 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
     send_output(&client.tx, out);
 }
 
-/// Run the multiplexer server: bind `pipe_full_name`, accept clients, and
-/// loop until every session has died (exit-empty). Does not touch the
-/// console and installs no panic hook (both are `main.rs`'s job, Task 8).
-pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the multiplexer server: bind `pipe_full_name`, load startup config,
+/// accept clients, and loop until every session has died (exit-empty). Does
+/// not touch the console and installs no panic hook (both are `main.rs`'s
+/// job, Task 8). `config_files` is the server role's `--config <path>` args
+/// (repeatable, in order; forwarded from the CLI's `-f`, Task 7) — empty
+/// means "use the default `.tmux.conf`/`.winmux.conf` discovery chain", a
+/// non-empty slice REPLACES that chain entirely (see
+/// `discover_config_files`).
+pub fn run(pipe_full_name: &str, config_files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let listener = PipeListener::bind(pipe_full_name)?;
     let (tx, rx) = channel::<ServerEvent>();
 
@@ -983,6 +1049,24 @@ pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut server = Server::new(tx);
+
+    // Startup config loading (Task 7): after the pipe is bound (so a client
+    // racing to connect never sees "not found"), before any client attach is
+    // served (the loop below). Errors don't stop the server from coming up
+    // (tmux behavior) — they're logged AND surfaced to the first attach.
+    {
+        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let userprofile = std::env::var("USERPROFILE").ok();
+        let candidates = discover_config_files(xdg.as_deref(), userprofile.as_deref(), config_files);
+        let errors = server.load_config_files(&candidates);
+        if !errors.is_empty() {
+            crate::logging::log_line(&format!("config: {} error(s)", errors.len()));
+            for e in &errors {
+                crate::logging::log_line(&format!("  {e}"));
+            }
+            server.pending_config_message = Some(format!("config: {} error(s), see server.log", errors.len()));
+        }
+    }
 
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -1005,4 +1089,51 @@ pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_discovery_tests {
+    use super::discover_config_files;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_replaces_default_chain() {
+        let explicit = vec!["a.conf".to_string(), "b.conf".to_string()];
+        let got = discover_config_files(Some("ignored"), Some(r"C:\Users\x"), &explicit);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, PathBuf::from("a.conf"));
+        assert!(got[0].required);
+        assert_eq!(got[1].path, PathBuf::from("b.conf"));
+        assert!(got[1].required);
+    }
+
+    #[test]
+    fn xdg_wins_over_userprofile_tmux_conf() {
+        let got = discover_config_files(Some(r"C:\xdg"), Some(r"C:\Users\x"), &[]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\xdg").join("tmux").join("tmux.conf"));
+        assert!(!got[0].required);
+        assert_eq!(got[1].path, PathBuf::from(r"C:\Users\x").join(".winmux.conf"));
+        assert!(!got[1].required);
+    }
+
+    #[test]
+    fn empty_xdg_falls_back_to_userprofile_tmux_conf() {
+        let got = discover_config_files(Some(""), Some(r"C:\Users\x"), &[]);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\Users\x").join(".tmux.conf"));
+        assert!(!got[0].required);
+    }
+
+    #[test]
+    fn no_xdg_falls_back_to_userprofile_tmux_conf() {
+        let got = discover_config_files(None, Some(r"C:\Users\x"), &[]);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\Users\x").join(".tmux.conf"));
+        assert_eq!(got[1].path, PathBuf::from(r"C:\Users\x").join(".winmux.conf"));
+    }
+
+    #[test]
+    fn no_userprofile_no_xdg_yields_no_candidates() {
+        let got = discover_config_files(None, None, &[]);
+        assert!(got.is_empty());
+    }
 }

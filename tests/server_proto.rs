@@ -30,10 +30,28 @@ fn unique_pipe_name() -> String {
 }
 
 fn start_server(name: &str) -> JoinHandle<()> {
+    start_server_with_config(name, &[])
+}
+
+/// Like `start_server`, but forwarding explicit `--config <path>` files
+/// (Task 7) — an empty slice is identical to `start_server` (the server
+/// falls back to its own default `.tmux.conf`/`.winmux.conf` discovery
+/// chain, which resolves to nothing interesting in a test's environment).
+fn start_server_with_config(name: &str, config_files: &[String]) -> JoinHandle<()> {
     let name = name.to_string();
+    let config_files = config_files.to_vec();
     thread::spawn(move || {
-        winmux::server::run(&name).expect("server run");
+        winmux::server::run(&name, &config_files).expect("server run");
     })
+}
+
+/// A unique temp-file path for a test's throwaway `.tmux.conf`-style fixture:
+/// `<tmpdir>/winmux-test-<tag>-<pid>-<n>.conf`. Never created by this helper
+/// — callers `std::fs::write` (or deliberately don't, to test a missing
+/// file) and `std::fs::remove_file` (best effort) during teardown.
+fn temp_conf_path(tag: &str) -> std::path::PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("winmux-test-{tag}-{}-{}.conf", std::process::id(), n))
 }
 
 /// Join each grid row's cell chars into a `String`, one entry per row
@@ -1524,4 +1542,141 @@ fn source_file_runtime() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+// ---- Task 7: startup config loading (`## config` contract section) ----
+
+/// A `.tmux.conf`-style fixture loaded at STARTUP (via `--config`, the
+/// server-role equivalent of the CLI's `-f`) applies before any client ever
+/// attaches: a custom `prefix`, a custom prefix-table binding, and
+/// `base-index` are all live from the very first attach.
+#[test]
+fn config_file_applies_at_startup() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("startup");
+    std::fs::write(&conf_path, "set -g prefix C-a\nbind V split-window -h\nset -g base-index 1\n")
+        .expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut client = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut client, 80, 24);
+    // base-index 1: the auto session's first window is index 1, not 0.
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 1:powershell*")));
+
+    // Custom prefix (C-a, 0x01) + the custom `V` binding splits vertically.
+    // The DEFAULT prefix (C-b, 0x02) no longer means anything special here.
+    client.send(&ClientMsg::Stdin(vec![0x01, b'V']));
+    client.recv_output_until(&mut grid, has_vertical_border);
+
+    let _ = std::fs::remove_file(&conf_path);
+    // Two panes now (both real shells) — leave the server thread running
+    // rather than juggling both exits, matching this file's convention for
+    // tests that don't need to prove clean exit-empty shutdown.
+}
+
+/// A bad line between two good ones does not stop the good ones from
+/// applying (tmux behavior: loading continues past an error), and the
+/// FIRST client to attach gets a transient `config: N error(s)` notice.
+#[test]
+fn config_errors_collected_and_continue() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("errors");
+    std::fs::write(&conf_path, "set -g base-index 5\nset -g nonsense on\nbind V split-window -h\n")
+        .expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut client = Client::connect(&name);
+    attach(&mut client, AttachMode::NewAuto, "", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    // Check the transient config-error message FIRST, before waiting on
+    // anything else: real ConPTY/shell spawn latency can easily exceed the
+    // message's 750ms lifetime, so `attach_auto_and_wait_prompt` (which
+    // consumes every frame up to the shell prompt) would race it away.
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("config: 1 error(s)")));
+    // Both good lines applied despite the bad one in between.
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 5:powershell*")));
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // The default prefix (C-b) is unaffected by the bad line; the good
+    // `bind V split-window -h` still works.
+    client.send(&ClientMsg::Stdin(vec![0x02, b'V']));
+    client.recv_output_until(&mut grid, has_vertical_border);
+
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// The first-attach config-error notice is a ONE-TIME slot: a second client
+/// attaching afterward never sees it.
+#[test]
+fn second_attach_no_config_message() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("second-attach");
+    std::fs::write(&conf_path, "set -g base-index 3\nset -g bogus-option x\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+
+    let mut c1 = Client::connect(&name);
+    attach(&mut c1, AttachMode::NewAuto, "", 80, 24);
+    let mut grid1 = Grid::new(80, 24);
+    // Checked immediately after attach, before waiting on the shell prompt
+    // (see `config_errors_collected_and_continue`'s comment: the message's
+    // 750ms lifetime can race real shell-spawn latency).
+    c1.recv_output_until(&mut grid1, |g| screen_text(g).iter().any(|l| l.contains("config: 1 error(s)")));
+
+    let mut c2 = Client::connect(&name);
+    attach(&mut c2, AttachMode::NewAuto, "", 80, 24);
+    let mut grid2 = Grid::new(80, 24);
+    // base-index 3 (this test's only GOOD line) applies to c2's session too
+    // — config loads once, before either client attaches.
+    c2.recv_output_until(&mut grid2, |g| screen_text(g).iter().any(|l| l.contains("[1] 3:powershell*")));
+    assert!(
+        !screen_text(&grid2).iter().any(|l| l.contains("config:")),
+        "second attach should not see the config-error notice; screen:\n{}",
+        screen_text(&grid2).join("\n")
+    );
+
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// An explicitly-requested config file (`--config`/`-f`) that doesn't exist
+/// is a collected error (unlike a missing DEFAULT-chain file, which is
+/// silently skipped) — the server still comes up and serves attaches.
+#[test]
+fn explicit_missing_config_is_error() {
+    let name = unique_pipe_name();
+    let missing_path = temp_conf_path("missing"); // deliberately never written
+    let config_files = vec![missing_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut client = Client::connect(&name);
+    attach(&mut client, AttachMode::NewAuto, "", 80, 24);
+    let mut grid = Grid::new(80, 24);
+    // Checked immediately after attach (see `config_errors_collected_and_continue`'s
+    // comment: don't wait on the shell prompt first — the message's 750ms
+    // lifetime can race real shell-spawn latency).
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("config: 1 error(s)")));
+}
+
+/// Multiple explicit `--config` files are loaded in order; a later file
+/// re-setting the same option wins (plain dispatch-order override, not any
+/// special merge logic).
+#[test]
+fn two_explicit_configs_later_wins() {
+    let name = unique_pipe_name();
+    let a = temp_conf_path("two-a");
+    let b = temp_conf_path("two-b");
+    std::fs::write(&a, "set -g base-index 2\n").expect("write temp conf a");
+    std::fs::write(&b, "set -g base-index 7\n").expect("write temp conf b");
+    let config_files = vec![a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut client = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut client, 80, 24);
+    client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 7:powershell*")));
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
 }

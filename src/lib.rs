@@ -8,6 +8,7 @@ pub mod host;
 pub mod input;
 pub mod keys;
 pub mod layout;
+pub mod logging;
 pub mod model;
 pub mod options;
 pub mod pipe;

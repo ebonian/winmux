@@ -1,9 +1,10 @@
 use std::env;
-use std::io::{self, Write};
+use std::io;
 
 use winmux::cli::{self, Command};
 use winmux::client;
 use winmux::host;
+use winmux::logging::log_line;
 use winmux::pipe::{self, PipeConn};
 use winmux::protocol::{self, AttachMode, ClientMsg, ServerMsg};
 use winmux::server;
@@ -41,9 +42,9 @@ fn main() {
             print!("{}", cli::usage_text());
             0
         }
-        Command::ServerRole { pipe } => run_server_role(&pipe),
+        Command::ServerRole { pipe, config } => run_server_role(&pipe, &config),
         Command::NewSession { name, detached, cols, rows } => {
-            run_new_session(&invocation.socket, name, detached, cols, rows)
+            run_new_session(&invocation.socket, invocation.config.as_deref(), name, detached, cols, rows)
         }
         Command::Attach { target, detach_others } => {
             run_attach(&invocation.socket, target, detach_others)
@@ -55,11 +56,15 @@ fn main() {
 
 /// Connect to `pipe`; if nothing is bound there yet (`NotFound`), autostart
 /// the server on `socket` and wait for it to come up. Any other connect
-/// error is propagated as-is.
-fn ensure_server(pipe: &str, socket: &str) -> io::Result<()> {
+/// error is propagated as-is. `config` is this invocation's `-f <file>`
+/// (Task 7) — forwarded to the autostarted server's `--config` ONLY when
+/// THIS invocation is the one actually starting it (tmux semantics: `-f`
+/// against an already-running server is ignored, since config is read once
+/// at server start).
+fn ensure_server(pipe: &str, socket: &str, config: Option<&str>) -> io::Result<()> {
     match PipeConn::connect(pipe) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => client::autostart_server(socket),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => client::autostart_server(socket, config),
         Err(e) => Err(e),
     }
 }
@@ -70,6 +75,7 @@ const NO_CONSOLE_MSG: &str = "open terminal failed: not a console";
 
 fn run_new_session(
     socket: &str,
+    config: Option<&str>,
     name: Option<String>,
     detached: bool,
     cols: u16,
@@ -97,7 +103,7 @@ fn run_new_session(
         }
     };
 
-    if let Err(e) = ensure_server(&pipe_full_name, socket) {
+    if let Err(e) = ensure_server(&pipe_full_name, socket, config) {
         eprintln!("winmux: failed to start server: {e}");
         return 1;
     }
@@ -225,27 +231,6 @@ fn send_cli(pipe_full_name: &str, argv: Vec<String>) -> i32 {
 
 // ---- server role: headless, logs to a file instead of a console ----------
 
-fn server_log_dir() -> Option<std::path::PathBuf> {
-    let base = env::var_os("LOCALAPPDATA")?;
-    let mut p = std::path::PathBuf::from(base);
-    p.push("winmux");
-    Some(p)
-}
-
-/// Best-effort append of one line to `%LOCALAPPDATA%\winmux\server.log`. The
-/// server has no console to print to, so this is its only diagnostic output.
-fn log_line(msg: &str) {
-    let Some(dir) = server_log_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    if let Ok(mut f) =
-        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log"))
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
 /// Chain a file-logging panic hook in front of whatever's already installed
 /// (`host::install_panic_hook`, from `main`) — the server is headless, so
 /// the console-restoration hook underneath is harmless but the panic must
@@ -258,10 +243,14 @@ fn install_server_log_panic_hook() {
     }));
 }
 
-fn run_server_role(pipe: &str) -> i32 {
+/// `config` is the `__server --config <path>` args (repeatable, Task 7) —
+/// forwarded verbatim to `server::run`, which treats an empty slice as "use
+/// the default `.tmux.conf`/`.winmux.conf` discovery chain" and a non-empty
+/// one as replacing that chain entirely.
+fn run_server_role(pipe: &str, config: &[String]) -> i32 {
     log_line("server starting");
     install_server_log_panic_hook();
-    match server::run(pipe) {
+    match server::run(pipe, config) {
         Ok(()) => {
             log_line("server exited cleanly (exit-empty)");
             0

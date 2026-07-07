@@ -32,6 +32,15 @@ pub struct Session {
     pub last: Option<WindowId>,
     /// Current window size (smallest attached client).
     pub size: (u16, u16),
+    /// tmux `base-index` in effect for THIS session at creation time (Task 7,
+    /// SP3 config-loading): the floor `new_window`'s "lowest unused index"
+    /// search starts from, so a window killed later never reuses an index
+    /// below it. Not `pub` — no consumer outside `model.rs` needs to read it
+    /// directly (it's baked into every `Window::index` this session ever
+    /// produces); `set -g base-index` only takes effect for sessions created
+    /// AFTER the `set`, matching tmux (existing sessions keep their
+    /// original numbering).
+    base_index: u32,
 }
 
 #[derive(Default)]
@@ -74,9 +83,10 @@ pub(crate) fn validate_name(name: &str, noun: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Lowest index >= 0 not already used by `windows`.
-fn lowest_unused_index(windows: &[Window]) -> u32 {
-    let mut i = 0u32;
+/// Lowest index >= `base` not already used by `windows` (tmux `base-index`;
+/// `base` is 0 for the pre-Task-7 default).
+fn lowest_unused_index(windows: &[Window], base: u32) -> u32 {
+    let mut i = base;
     loop {
         if !windows.iter().any(|w| w.index == i) {
             return i;
@@ -91,13 +101,17 @@ impl Registry {
     }
 
     /// `name = None` auto-assigns the lowest unused non-negative integer.
-    /// The new session gets one window (index 0, default name
+    /// The new session gets one window (index `base_index`, default name
     /// "powershell") wrapping `first_pane`; that window becomes current.
+    /// `base_index` is tmux's `base-index` option, sampled by the caller at
+    /// creation time (Task 7) — every window this session EVER creates
+    /// (including later `new_window` calls) numbers from this floor.
     pub fn create_session(
         &mut self,
         name: Option<&str>,
         first_pane: PaneId,
         size: (u16, u16),
+        base_index: u32,
     ) -> Result<&mut Session, String> {
         let name = match name {
             Some(n) => {
@@ -114,7 +128,7 @@ impl Registry {
         self.next_window_id += 1;
         let window = Window {
             id,
-            index: 0,
+            index: base_index,
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
         };
@@ -125,6 +139,7 @@ impl Registry {
             current: id,
             last: None,
             size,
+            base_index,
         };
         self.sessions.push(session);
         Ok(self.sessions.last_mut().expect("just pushed"))
@@ -229,10 +244,10 @@ impl Registry {
 }
 
 impl Session {
-    /// Index = lowest unused >= 0. The new window becomes current
-    /// (`last` <- previous current).
+    /// Index = lowest unused >= this session's `base_index`. The new window
+    /// becomes current (`last` <- previous current).
     pub fn new_window(&mut self, id: WindowId, first_pane: PaneId) -> &mut Window {
-        let index = lowest_unused_index(&self.windows);
+        let index = lowest_unused_index(&self.windows, self.base_index);
         let window = Window {
             id,
             index,
@@ -387,20 +402,20 @@ mod tests {
     fn auto_name_fills_gaps() {
         let mut r = Registry::new();
         assert_eq!(r.auto_name(), "0");
-        assert_eq!(r.create_session(None, 1, SZ).unwrap().name, "0");
+        assert_eq!(r.create_session(None, 1, SZ, 0).unwrap().name, "0");
         assert_eq!(r.auto_name(), "1");
-        assert_eq!(r.create_session(None, 2, SZ).unwrap().name, "1");
+        assert_eq!(r.create_session(None, 2, SZ, 0).unwrap().name, "1");
         assert!(r.kill_session("0"));
         assert_eq!(r.auto_name(), "0");
-        assert_eq!(r.create_session(None, 3, SZ).unwrap().name, "0");
+        assert_eq!(r.create_session(None, 3, SZ, 0).unwrap().name, "0");
     }
 
     #[test]
     fn duplicate_session_err_string() {
         let mut r = Registry::new();
-        r.create_session(Some("x"), 1, SZ).unwrap();
+        r.create_session(Some("x"), 1, SZ, 0).unwrap();
         assert_eq!(
-            r.create_session(Some("x"), 2, SZ).err().unwrap(),
+            r.create_session(Some("x"), 2, SZ, 0).err().unwrap(),
             "duplicate session: x"
         );
     }
@@ -408,8 +423,8 @@ mod tests {
     #[test]
     fn find_exact_then_prefix() {
         let mut r = Registry::new();
-        r.create_session(Some("foo"), 1, SZ).unwrap();
-        r.create_session(Some("foobar"), 2, SZ).unwrap();
+        r.create_session(Some("foo"), 1, SZ, 0).unwrap();
+        r.create_session(Some("foobar"), 2, SZ, 0).unwrap();
         // Exact match wins even though "foo" is also a prefix of "foobar".
         assert_eq!(r.find("foo").unwrap().name, "foo");
         // Unambiguous prefix match.
@@ -423,9 +438,9 @@ mod tests {
     #[test]
     fn find_empty_target_picks_most_recent() {
         let mut r = Registry::new();
-        r.create_session(Some("foo"), 1, SZ).unwrap();
-        r.create_session(Some("bar"), 2, SZ).unwrap();
-        r.create_session(Some("qux"), 3, SZ).unwrap();
+        r.create_session(Some("foo"), 1, SZ, 0).unwrap();
+        r.create_session(Some("bar"), 2, SZ, 0).unwrap();
+        r.create_session(Some("qux"), 3, SZ, 0).unwrap();
         // Multiple sessions: "" is NOT an (always-matching, ambiguous)
         // empty prefix — it picks the most recently CREATED session.
         assert_eq!(r.find("").unwrap().name, "qux");
@@ -443,8 +458,8 @@ mod tests {
     #[test]
     fn find_eq_forces_exact() {
         let mut r = Registry::new();
-        r.create_session(Some("foo"), 1, SZ).unwrap();
-        r.create_session(Some("foobar"), 2, SZ).unwrap();
+        r.create_session(Some("foo"), 1, SZ, 0).unwrap();
+        r.create_session(Some("foobar"), 2, SZ, 0).unwrap();
         assert_eq!(r.find("=foo").unwrap().name, "foo");
         // Would be an unambiguous prefix match for "foobar" without the `=`
         // sigil; `=` forces exact-only, so it's not found.
@@ -455,15 +470,15 @@ mod tests {
     fn bad_names_rejected() {
         let mut r = Registry::new();
         assert_eq!(
-            r.create_session(Some(""), 1, SZ).err().unwrap(),
+            r.create_session(Some(""), 1, SZ, 0).err().unwrap(),
             "bad session name: "
         );
         assert_eq!(
-            r.create_session(Some("a:b"), 1, SZ).err().unwrap(),
+            r.create_session(Some("a:b"), 1, SZ, 0).err().unwrap(),
             "bad session name: a:b"
         );
         assert_eq!(
-            r.create_session(Some("a.b"), 1, SZ).err().unwrap(),
+            r.create_session(Some("a.b"), 1, SZ, 0).err().unwrap(),
             "bad session name: a.b"
         );
     }
@@ -478,15 +493,15 @@ mod tests {
     fn names_with_control_chars_rejected() {
         let mut r = Registry::new();
         assert_eq!(
-            r.create_session(Some("foo\nbar"), 1, SZ).err().unwrap(),
+            r.create_session(Some("foo\nbar"), 1, SZ, 0).err().unwrap(),
             "bad session name: foo?bar"
         );
         assert_eq!(
-            r.create_session(Some("a\x1b[31mred"), 1, SZ).err().unwrap(),
+            r.create_session(Some("a\x1b[31mred"), 1, SZ, 0).err().unwrap(),
             "bad session name: a?[31mred"
         );
         assert_eq!(
-            r.create_session(Some("del\x7f"), 1, SZ).err().unwrap(),
+            r.create_session(Some("del\x7f"), 1, SZ, 0).err().unwrap(),
             "bad session name: del?"
         );
     }
@@ -494,7 +509,7 @@ mod tests {
     #[test]
     fn window_index_lowest_unused() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         assert_eq!(s.windows[0].index, 0);
         s.new_window(2, 10); // index 1
         s.new_window(3, 20); // index 2
@@ -512,10 +527,27 @@ mod tests {
         assert_eq!(w.index, 1); // lowest unused
     }
 
+    /// tmux `base-index` (SP3 Task 7, wired through `set -g base-index`):
+    /// the FIRST window is created at `base_index`, not 0, and every later
+    /// `new_window` respects the same floor (killing the first window and
+    /// creating a new one must not renumber back down to 0).
+    #[test]
+    fn base_index_offsets_window_numbering() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 1).unwrap();
+        assert_eq!(s.windows[0].index, 1);
+        s.new_window(2, 10);
+        assert_eq!(s.windows.iter().map(|w| w.index).collect::<Vec<_>>(), vec![1, 2]);
+        let first_id = s.windows[0].id;
+        assert!(s.kill_window(first_id));
+        let w = s.new_window(3, 20);
+        assert_eq!(w.index, 1); // lowest unused >= base_index (1), never 0
+    }
+
     #[test]
     fn kill_current_window_falls_back_to_last() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         let w0 = s.current;
         s.new_window(2, 10); // current=2, last=w0
         s.new_window(3, 20); // current=3, last=2
@@ -530,7 +562,7 @@ mod tests {
     #[test]
     fn kill_window_falls_back_to_nearest_when_last_dead() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap(); // id0 idx0
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
         s.new_window(2, 10); // idx1, current=2, last=0
         s.new_window(3, 20); // idx2, current=3, last=2
         s.new_window(4, 30); // idx3, current=4, last=3
@@ -550,7 +582,7 @@ mod tests {
     #[test]
     fn kill_window_only_window_returns_false() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         let only = s.current;
         assert!(!s.kill_window(only));
         assert_eq!(s.windows.len(), 1);
@@ -559,7 +591,7 @@ mod tests {
     #[test]
     fn last_window_toggles() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         assert!(!s.last_window()); // no last yet
         let w0 = s.current;
         s.new_window(2, 10); // current=2, last=w0
@@ -574,7 +606,7 @@ mod tests {
     #[test]
     fn next_prev_wrap() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap(); // id0 idx0
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
         s.new_window(2, 10); // idx1
         s.new_window(3, 20); // idx2, current=3
         assert_eq!(s.current, 3);
@@ -589,7 +621,7 @@ mod tests {
     #[test]
     fn next_prev_noop_with_single_window() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         let only = s.current;
         s.next_window();
         assert_eq!(s.current, only);
@@ -601,7 +633,7 @@ mod tests {
     fn mint_window_id_does_not_collide_with_create_session() {
         let mut r = Registry::new();
         // create_session mints id 0 internally for the session's first window.
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         assert_eq!(s.current, 0);
         // mint_window_id continues the SAME counter, so the next id is 1 —
         // never re-minting an id already claimed by an existing window.
@@ -618,9 +650,9 @@ mod tests {
     #[test]
     fn neighbor_session_wraps() {
         let mut r = Registry::new();
-        r.create_session(Some("0"), 1, SZ).unwrap();
-        r.create_session(Some("1"), 2, SZ).unwrap();
-        r.create_session(Some("2"), 3, SZ).unwrap();
+        r.create_session(Some("0"), 1, SZ, 0).unwrap();
+        r.create_session(Some("1"), 2, SZ, 0).unwrap();
+        r.create_session(Some("2"), 3, SZ, 0).unwrap();
         assert_eq!(r.neighbor_session("0", true), Some("1"));
         assert_eq!(r.neighbor_session("2", true), Some("0")); // wraps forward
         assert_eq!(r.neighbor_session("0", false), Some("2")); // wraps backward
@@ -630,7 +662,7 @@ mod tests {
     #[test]
     fn select_window_exact_index() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         let w0 = s.current;
         s.new_window(2, 10); // idx1, current=2, last=w0
         s.new_window(3, 20); // idx2, current=3, last=2
@@ -644,7 +676,7 @@ mod tests {
     #[test]
     fn current_and_window_by_pane() {
         let mut r = Registry::new();
-        let s = r.create_session(Some("s"), 1, SZ).unwrap();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap();
         assert_eq!(s.current_window().layout.panes(), vec![1]);
         s.new_window(2, 10);
         assert_eq!(s.current_window_mut().id, 2);
@@ -657,7 +689,7 @@ mod tests {
     fn registry_bookkeeping() {
         let mut r = Registry::new();
         assert!(r.is_empty());
-        r.create_session(Some("a"), 1, SZ).unwrap();
+        r.create_session(Some("a"), 1, SZ, 0).unwrap();
         assert!(!r.is_empty());
         assert_eq!(r.sessions().len(), 1);
         assert_eq!(r.sessions()[0].size, SZ);

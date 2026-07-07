@@ -36,16 +36,24 @@ const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// while otherwise waiting on server messages.
 const TICK: Duration = Duration::from_millis(50);
 
-/// Spawn `current_exe() __server --pipe <full-name>` detached, then poll
-/// `PipeConn::connect` on that same pipe up to `AUTOSTART_TIMEOUT` until it
-/// succeeds. Returns `Ok(())` once the server is accepting connections —
-/// callers do their own real `PipeConn::connect` afterward.
-pub fn autostart_server(socket: &str) -> io::Result<()> {
+/// Spawn `current_exe() __server --pipe <full-name> [--config <file>]`
+/// detached, then poll `PipeConn::connect` on that same pipe up to
+/// `AUTOSTART_TIMEOUT` until it succeeds. Returns `Ok(())` once the server is
+/// accepting connections — callers do their own real `PipeConn::connect`
+/// afterward. `config` is the invocation's `-f <file>` (Task 7), forwarded
+/// as `--config <file>` ONLY when `Some` — omitted entirely means the
+/// spawned server falls back to its own default `.tmux.conf`/`.winmux.conf`
+/// discovery chain.
+pub fn autostart_server(socket: &str, config: Option<&str>) -> io::Result<()> {
     let full_name = pipe::pipe_name(socket);
     let exe = std::env::current_exe()?;
 
-    std::process::Command::new(exe)
-        .args(["__server", "--pipe", &full_name])
+    let mut command = std::process::Command::new(exe);
+    command.args(["__server", "--pipe", &full_name]);
+    if let Some(c) = config {
+        command.args(["--config", c]);
+    }
+    command
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()?;
 

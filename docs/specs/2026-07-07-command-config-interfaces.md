@@ -1112,3 +1112,158 @@ hi"` as literal text while still letting `Enter`/`C-c`/etc. resolve as key
 presses in the same command. `-l`: every argument is joined with single
 spaces and sent as one literal run (no key parsing at all, no trailing
 Enter).
+
+## `config` - startup `.tmux.conf`/`.winmux.conf` loading, `source-file`, and `-f` (Task 7)
+
+No new public module: this section documents private additions to
+`src/server.rs`/`src/server/dispatch.rs`, plus the amended public surface of
+`server::run`, `cli::{Invocation, Command::ServerRole}`, and
+`client::autostart_server` (full signatures/diffs are in the sibling
+`2026-07-07-server-client-interfaces.md` contract's `## server`/`## cli`/
+`## client`/`## model` sections - this section is the design writeup; that
+one is the exact-signature source of truth).
+
+```rust
+// src/server.rs (private)
+struct ConfigCandidate { path: std::path::PathBuf, required: bool }
+fn discover_config_files(xdg: Option<&str>, userprofile: Option<&str>, explicit: &[String]) -> Vec<ConfigCandidate>;
+
+// src/server/dispatch.rs, impl Server (pub(super): called from server.rs::run)
+pub(super) fn load_config_files(&mut self, candidates: &[ConfigCandidate]) -> Vec<String>; // returns collected error strings
+
+// src/logging.rs (new lib module)
+pub fn log_line(msg: &str); // best-effort append to %LOCALAPPDATA%\winmux\server.log
+```
+
+### Discovery (`discover_config_files`, pure)
+
+- `explicit` non-empty (server `--config <path>`, repeatable, forwarded from
+  the CLI's `-f`) REPLACES the default chain entirely, in the order given,
+  each `required: true`.
+- Otherwise, the default chain: first `$XDG_CONFIG_HOME/tmux/tmux.conf`
+  (only when the env var is `Some` AND non-empty) else
+  `%USERPROFILE%\.tmux.conf`, loaded FIRST (`required: false`); then
+  `%USERPROFILE%\.winmux.conf`, loaded SECOND (`required: false`) - so a
+  ported tmux config's settings can be overridden by winmux-specific
+  tweaks. Neither candidate is pushed if `userprofile` (for the `.tmux.conf`
+  fallback / the `.winmux.conf` entry) is `None`.
+- Existence is NOT checked here - deliberately pure and file-system-free so
+  it's unit-testable without touching `std::env`/the filesystem (mutating
+  process env in parallel tests is racy; see `server::config_discovery_tests`:
+  `explicit_replaces_default_chain`, `xdg_wins_over_userprofile_tmux_conf`,
+  `empty_xdg_falls_back_to_userprofile_tmux_conf`,
+  `no_xdg_falls_back_to_userprofile_tmux_conf`,
+  `no_userprofile_no_xdg_yields_no_candidates`).
+
+### Loading (`Server::load_config_files`)
+
+Shared by BOTH startup config loading (`run`) and runtime `source-file`
+(`execute_source_file_headless`, now a thin wrapper: one `required: true`
+candidate, `Ok(String::new())`/`Err(errors.join("\n"))` from the returned
+error list - preserves its pre-Task-7 external behavior/error text exactly).
+For each candidate, in order:
+
+- File opens: `cmd::join_continuations` joins backslash-continued lines,
+  then each logical line goes through `cmd::parse_line` -> `cmd::resolve` ->
+  `Server::execute_headless` (the SAME headless dispatch path a CLI frame
+  uses) - a failure at ANY of those three steps is collected as
+  `"<path>:<lineno>: <err>"`; loading CONTINUES to the next line (tmux
+  behavior: one bad line doesn't stop the rest of the file).
+- File fails to open: a `required` candidate collects `"<path>: <io error>"`
+  regardless of the error kind. A NON-required candidate collects nothing
+  (silently skipped) IF the error is `NotFound` - a user with no config
+  files at all is normal, not an error; any OTHER open failure (permissions,
+  etc.) is still collected even for a non-required candidate, since that's
+  not "the file doesn't exist," it's something worth surfacing.
+- Loading NEVER stops at the first error, file or line - every candidate is
+  attempted, and every error from every candidate is collected into one
+  `Vec<String>` returned to the caller.
+
+### Startup wiring (`server::run`)
+
+After `PipeListener::bind` and spawning the accept thread, but BEFORE the
+event loop's first iteration (so no attach is ever served against a
+not-yet-configured `Options`/`Bindings`): `run` reads `XDG_CONFIG_HOME`/
+`USERPROFILE` from the process environment, calls `discover_config_files`
+with the server role's `config_files` argument as `explicit`, and calls
+`server.load_config_files(&candidates)`. If the returned error list is
+non-empty: `crate::logging::log_line` writes a `config: N error(s)` summary
+line plus one indented line per error, and `Server::pending_config_message`
+(`Option<String>`, new field) is set to the exact text `"config: N
+error(s), see server.log"`.
+
+### First-attach transient message
+
+`Server::finish_attach` (shared tail of every successful `Attach`, all three
+`AttachMode`s) does `self.pending_config_message.take().map(|m| (m,
+Instant::now()))` and uses that as the new `ClientState`'s initial
+`message` (same `(String, Instant)` transient-message slot `display-message`/
+`window not found: <n>` etc. already use - same 750ms `MESSAGE_LIFETIME`
+expiry, same "any Stdin frame from that client clears it" rule). Because
+`Option::take` consumes it, this can only ever fire once, for whichever
+client happens to attach first - REGARDLESS of session/mode (`NewAuto`,
+`NewNamed`, or `Existing` all funnel through `finish_attach`). A second (or
+later) attach - even to a brand new session - never sees it. Tests:
+`config_file_applies_at_startup` (no errors: no message, but `base-index`/
+custom `prefix`/custom binding are all live from the very first attach -
+proving config loaded before that attach was served),
+`config_errors_collected_and_continue` (one bad line between two good ones:
+both good lines still applied, first attach sees the exact message text),
+`second_attach_no_config_message`, `explicit_missing_config_is_error`
+(a `--config` file that doesn't exist is 1 collected error, server still
+comes up and serves attaches), `two_explicit_configs_later_wins` (plain
+dispatch-order override: two `--config` files re-setting the same option,
+the second wins - no special merge logic).
+
+**Test timing note:** the transient message's 750ms lifetime can race real
+ConPTY/shell-spawn latency if a test waits for the shell prompt (`"PS "`)
+BEFORE checking for the message - `attach_auto_and_wait_prompt` drains every
+intermediate frame into the test's `Grid`, and if shell boot takes longer
+than 750ms the message has already been cleared (and overwritten in a later
+frame's cell-diff) by the time `"PS "` appears. All four config-error tests
+above attach directly (`attach()`, not `attach_auto_and_wait_prompt`) and
+check the message FIRST, before waiting on anything else.
+
+### `logging` - shared server-process log file (new lib module)
+
+`src/logging.rs`: `server_log_dir()` (private, `%LOCALAPPDATA%\winmux`) and
+`pub fn log_line(msg: &str)` (best-effort append-newline to `server.log`,
+silently swallowing any failure - the server has no console to report a
+logging failure to). Moved out of `main.rs` (previously private
+`server_log_dir`/`log_line` functions, used only by the panic hook and
+startup/exit lines) because `server.rs`'s startup config loading now ALSO
+needs to log, and `main.rs` (a bin crate target) cannot be `use`d from
+`server.rs` (a lib module) - `logging` is the shared home for the one thing
+both sides of that boundary need. `main.rs` now calls
+`winmux::logging::log_line` instead of a private duplicate. No unit tests
+(thin I/O glue over a real file); covered indirectly by every
+`tests/server_proto.rs` config-error test (which assert on the transient
+attach message, not the log file itself) and manual runs.
+
+### `-f` / `--config` CLI plumbing
+
+- `cli::Invocation` gains `pub config: Option<String>`; `parse` extracts
+  `-f <file>` from anywhere in `args` exactly like `-L` (last occurrence
+  wins if repeated). `usage_text()`'s first line gained `[-f config-file]`.
+- `cli::Command::ServerRole` gains `config: Vec<String>`; the hidden
+  `__server` role parser now accepts `--config <path>`, repeatable, in any
+  order relative to the still-required-exactly-once `--pipe`.
+- `main.rs`: `Command::ServerRole { pipe, config } => run_server_role(&pipe,
+  &config)` forwards straight to `server::run(pipe, config)`.
+  `Command::NewSession { .. } => run_new_session(&invocation.socket,
+  invocation.config.as_deref(), ...)` - `run_new_session`'s new `config:
+  Option<&str>` parameter flows into `ensure_server(pipe, socket, config)`,
+  which forwards to `client::autostart_server(socket, config)` ONLY on the
+  `NotFound` (need-to-autostart) path. `Attach`/`Control`/`Help` never
+  autostart, so `invocation.config` is simply unused there - matching tmux
+  semantics: `-f` only matters when THIS invocation is the one starting the
+  server; against an already-running server it's silently ignored (config is
+  read once, at server start).
+- `client::autostart_server(socket: &str, config: Option<&str>)`: appends
+  `--config <file>` to the spawned `__server --pipe <name>` argv only when
+  `config` is `Some`.
+- Tests: `cli.rs`'s `dash_f_parses`, `dash_f_anywhere`,
+  `dash_f_repeated_last_wins`, `server_role_config_args` (plus
+  `bare_is_new_session`/`server_role_parse` updated for the new struct
+  fields). No e2e coverage in Task 7 (Task 9's `e2e_tmux_conf_roundtrip`
+  drives the real `-f`-flagged release binary end to end).

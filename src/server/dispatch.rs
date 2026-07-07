@@ -35,7 +35,7 @@ use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::{FormatCtx, SystemTimeParts};
 use crate::protocol::ServerMsg;
 
-use super::{send_msg, spawn_pane, ClientId, ClientMode, ClientState, PromptKind, Server, MONTHS};
+use super::{send_msg, spawn_pane, ClientId, ClientMode, ClientState, ConfigCandidate, PromptKind, Server, MONTHS};
 
 /// Abbreviated C-locale English weekday names, indexed by
 /// `SYSTEMTIME::wDayOfWeek` (0 = Sunday .. 6 = Saturday). Duplicated from the
@@ -674,27 +674,56 @@ impl Server {
         Ok(String::new())
     }
 
-    fn execute_source_file_headless(&mut self, path: &str) -> Result<String, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        let joined = cmd::join_continuations(content.lines());
+    /// Load and dispatch every config candidate in order, joining line
+    /// continuations and collecting (not stopping at) every error — tmux
+    /// behavior: a bad line, or an unreadable required file, doesn't stop
+    /// the REST of that file, or any later file, from being applied. Shared
+    /// by runtime `source-file` (one `required: true` candidate, below) and
+    /// `run`'s startup config loading (`## config` contract section).
+    pub(super) fn load_config_files(&mut self, candidates: &[ConfigCandidate]) -> Vec<String> {
         let mut errors = Vec::new();
-        for (lineno, line) in joined {
-            match cmd::parse_line(&line) {
-                Ok(cmds) => {
-                    for raw in cmds {
-                        match cmd::resolve(&raw) {
-                            Ok(parsed) => {
-                                if let Err(e) = self.execute_headless(parsed) {
-                                    errors.push(format!("{path}:{lineno}: {e}"));
+        for c in candidates {
+            let path = c.path.to_string_lossy().into_owned();
+            match std::fs::read_to_string(&c.path) {
+                Ok(content) => {
+                    let joined = cmd::join_continuations(content.lines());
+                    for (lineno, line) in joined {
+                        match cmd::parse_line(&line) {
+                            Ok(cmds) => {
+                                for raw in cmds {
+                                    match cmd::resolve(&raw) {
+                                        Ok(parsed) => {
+                                            if let Err(e) = self.execute_headless(parsed) {
+                                                errors.push(format!("{path}:{lineno}: {e}"));
+                                            }
+                                        }
+                                        Err(e) => errors.push(format!("{path}:{lineno}: {e}")),
+                                    }
                                 }
                             }
                             Err(e) => errors.push(format!("{path}:{lineno}: {e}")),
                         }
                     }
                 }
-                Err(e) => errors.push(format!("{path}:{lineno}: {e}")),
+                Err(e) => {
+                    // A missing NON-required (default-chain) candidate is
+                    // normal (most users have no config at all) and silently
+                    // skipped; a required candidate (`-f`/`--config`, or
+                    // runtime `source-file`'s single always-required entry)
+                    // missing is an error, and so is ANY other open failure
+                    // (permissions etc.) even on a non-required candidate.
+                    if c.required || e.kind() != std::io::ErrorKind::NotFound {
+                        errors.push(format!("{path}: {e}"));
+                    }
+                }
             }
         }
+        errors
+    }
+
+    fn execute_source_file_headless(&mut self, path: &str) -> Result<String, String> {
+        let candidate = ConfigCandidate { path: std::path::PathBuf::from(path), required: true };
+        let errors = self.load_config_files(std::slice::from_ref(&candidate));
         if errors.is_empty() {
             Ok(String::new())
         } else {
@@ -711,7 +740,8 @@ impl Server {
         match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
             Ok(pr) => {
                 self.panes.insert(pane_id, pr);
-                match self.registry.create_session(name.as_deref(), pane_id, size) {
+                let base_index = self.options.base_index();
+                match self.registry.create_session(name.as_deref(), pane_id, size, base_index) {
                     Ok(_) => {
                         self.had_session = true;
                         Ok(String::new())
