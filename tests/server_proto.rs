@@ -2825,6 +2825,60 @@ fn copy_search_next_wraps() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Review regression (task-4 review, Critical finding #1): `n` (repeat, same
+/// direction) after a BACKWARD search landed the cursor at view column 0
+/// must still advance to the OLDER match, not silently re-find the same
+/// position. Every match in this test harness lands at column 0 (see
+/// `cursor_on_line`'s doc comment), which is exactly the condition that
+/// tripped `find_last_in`'s `to_excl.saturating_sub(1)` bug: `to_excl == 0`
+/// clamped to `0` (checking column 0 anyway) instead of signaling an empty
+/// range, so a backward repeat from column 0 returned the SAME position.
+#[test]
+fn copy_search_backward_repeat_advances_from_col0() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Two occurrences of "dupmark", the older pushed well into history by
+    // filler output before the newer one is printed live. Both land at
+    // column 0 (string-concatenation trick, same as the other search tests,
+    // so the typed command echo never itself contains "dupmark").
+    c.send(&ClientMsg::Stdin(b"'dup'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "dupmark"));
+    c.send(&ClientMsg::Stdin(b"1..35 | ForEach-Object { \"fillmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "fillmark35"));
+    c.send(&ClientMsg::Stdin(b"'dup'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "dupmark"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // `?`: backward from the bottom finds the NEARER (live) occurrence --
+    // column 0, scroll == 0.
+    c.send(&ClientMsg::Stdin(b"?".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Up: ")));
+    c.send(&ClientMsg::Stdin(b"dupmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "dupmark") && has_indicator(g, "[0/"));
+
+    // `n`: same direction (backward) again, repeating from a cursor sitting
+    // at column 0. Must advance to the OLDER, scrolled-into-history
+    // occurrence (scroll != 0) -- the buggy code left the cursor and
+    // `[scroll/history]` indicator completely unchanged instead.
+    c.send(&ClientMsg::Stdin(b"n".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "dupmark") && !has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `N` repeats the last search in the OPPOSITE direction: backward first
 /// finds the nearer (live) occurrence directly, then `N` reverses to
 /// forward and must wrap to the farther (history) one.

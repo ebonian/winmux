@@ -300,6 +300,24 @@ fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll:
 
 // ---- copy-mode search (Task 4, sub-project 4) ----
 
+/// Case-fold one char to lowercase for copy-mode search, taking only the
+/// FIRST char of its full Unicode lowercase mapping instead of the whole
+/// (possibly multi-char) expansion `char::to_lowercase()` produces (task-4
+/// review, Important finding #2). Some code points lowercase to MORE than
+/// one char -- e.g. Turkish `İ` (U+0130) -> `"i\u{307}"` (`i` + combining dot
+/// above, two chars) -- and `Grid::view_row_text` emits exactly one char per
+/// screen cell, so folding a row with `.chars().flat_map(|c|
+/// c.to_lowercase())` can make the folded `Vec<char>` LONGER than the row's
+/// true cell count. Every char after such an expansion then sits one (or
+/// more) index right of its true column, silently desyncing a match's
+/// reported column from the actual screen position. Taking just the first
+/// folded char keeps a strict 1:1 char-index<->column correspondence (a
+/// simplified fold, not full Unicode case folding) while still matching
+/// literal ASCII and the vast majority of real-world case pairs correctly.
+fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 /// Repeat the stored search (`cs.search`) in the SAME direction (`n`,
 /// `reverse == false`) or the OPPOSITE direction (`N`, `reverse == true`).
 /// `None` (silent no-op) when no search has ever been committed in this
@@ -334,7 +352,7 @@ fn do_search(grid: &Grid, cs: &mut CopyState, pattern: &str, backward: bool) -> 
     let rows = grid.rows();
     let cur_key = sel_key(cs.scroll, cs.cy);
     let cur_col = cs.cx as usize;
-    let pat: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
+    let pat: Vec<char> = pattern.chars().map(fold_char).collect();
     match find_search_match(grid, &pat, cur_key, cur_col, backward) {
         Some((key, col)) => {
             let (scroll, cy) = key_to_view(key, rows);
@@ -368,23 +386,23 @@ fn find_search_match(grid: &Grid, pat: &[char], cur_key: i64, cur_col: usize, ba
 
     let row_at = |key: i64| -> Vec<char> {
         let (sb, r) = key_to_view(key, rows);
-        grid.view_row_text(sb, r).chars().flat_map(|c| c.to_lowercase()).collect()
+        grid.view_row_text(sb, r).chars().map(fold_char).collect()
     };
     let wrap = |k: i64| -> i64 { min_key + (k - min_key).rem_euclid(total) };
     let cur_row = row_at(cur_key);
 
     if backward {
-        if let Some(c) = find_last_in(&cur_row, pat, None, cur_col) {
+        if let Some(c) = find_last_in(&cur_row, pat, None, Some(cur_col)) {
             return Some((cur_key, c as u16));
         }
         for off in 1..total {
             let key = wrap(cur_key - off);
             let row = row_at(key);
-            if let Some(c) = find_last_in(&row, pat, None, usize::MAX) {
+            if let Some(c) = find_last_in(&row, pat, None, None) {
                 return Some((key, c as u16));
             }
         }
-        if let Some(c) = find_last_in(&cur_row, pat, Some(cur_col + 1), usize::MAX) {
+        if let Some(c) = find_last_in(&cur_row, pat, Some(cur_col + 1), None) {
             return Some((cur_key, c as u16));
         }
     } else {
@@ -425,18 +443,70 @@ fn find_first_in(row: &[char], pat: &[char], from: usize, to_excl: Option<usize>
 }
 
 /// Rightmost match start column `< to_excl` (and `>= from` if given) in one
-/// row. `None` if `pat` is empty, longer than `row`, or absent in range.
-fn find_last_in(row: &[char], pat: &[char], from: Option<usize>, to_excl: usize) -> Option<usize> {
+/// row. `None` if `pat` is empty, longer than `row`, or absent in range --
+/// including `to_excl == Some(0)`, which has NO valid start position (there
+/// is no column `< 0`) and so must yield an empty range, not "check column 0
+/// anyway" (task-4 review, Critical finding #1: the previous `usize`-typed
+/// `to_excl` used `saturating_sub(1)`, which silently clamped `0 - 1` back to
+/// `0` instead of signaling "empty"). `to_excl: Option<usize>` mirrors
+/// `find_first_in`'s `Some(t) => t.checked_sub(1)?` shape so the same class
+/// of off-by-one can't recur asymmetrically between the two functions.
+fn find_last_in(row: &[char], pat: &[char], from: Option<usize>, to_excl: Option<usize>) -> Option<usize> {
     if pat.is_empty() || pat.len() > row.len() {
         return None;
     }
     let last_start = row.len() - pat.len();
-    let hi = to_excl.saturating_sub(1).min(last_start);
+    let hi = match to_excl {
+        Some(t) => t.checked_sub(1)?.min(last_start),
+        None => last_start,
+    };
     let lo = from.unwrap_or(0);
     if lo > hi {
         return None;
     }
     (lo..=hi).rev().find(|&s| &row[s..s + pat.len()] == pat)
+}
+
+// ---- shared line-editor byte rules (status-line prompts + copy-mode search) ----
+
+/// Outcome of feeding one raw byte to a captured line editor.
+enum LineEdit {
+    /// The byte was consumed as a printable-append/backspace edit (or
+    /// silently ignored, for anything else); the buffer is still open.
+    Editing,
+    /// Enter/Ctrl+J: the line should be committed using `buf`'s current
+    /// contents.
+    Commit,
+    /// Esc/Ctrl+C/Ctrl+G: the line should be discarded.
+    Cancel,
+}
+
+/// Apply the byte-editing rules shared by every "capture raw bytes into a
+/// line, then commit/cancel" input in this file -- the status-line prompt
+/// (`Server::feed_prompt_byte`) and the copy-mode search prompt
+/// (`Server::feed_copy_search_byte`). Printable ASCII (`0x20..=0x7e`)
+/// appends to `buf`; Backspace/DEL (`0x7f`/`0x08`) removes the last char;
+/// CR/LF commits; Esc/Ctrl+C/Ctrl+G cancels; anything else is ignored.
+/// `buf` is mutated only for the `Editing` case -- callers read `buf`
+/// themselves once `Commit` is returned. Extracted (task-4 review, Important
+/// finding #3) so the two call sites' previously hand-duplicated rules can't
+/// drift apart; both are limited to single-byte ASCII printable input
+/// (neither handles true multibyte UTF-8 continuation bytes), which this
+/// preserves unchanged.
+fn edit_line_buf(buf: &mut String, b: u8) -> LineEdit {
+    match b {
+        b'\r' | b'\n' => LineEdit::Commit,
+        0x1b | 0x03 | 0x07 => LineEdit::Cancel,
+        0x20..=0x7e => {
+            buf.push(b as char);
+            LineEdit::Editing
+        }
+        0x7f | 0x08 => {
+            buf.pop();
+            LineEdit::Editing
+        }
+        _ => LineEdit::Editing,
+    }
 }
 
 impl Server {
@@ -1733,23 +1803,21 @@ impl Server {
 
     /// Route one byte of a copy-mode search prompt's (Task 4) line edit:
     /// same commit/cancel/printable/backspace rules as `feed_prompt_byte`
-    /// (the task brief's "reuse the existing capture machinery" instruction)
-    /// — only the STORAGE differs, see `SearchPrompt`'s doc comment.
+    /// (the task brief's "reuse the existing capture machinery" instruction),
+    /// via the shared `edit_line_buf` helper — only the STORAGE differs, see
+    /// `SearchPrompt`'s doc comment.
     fn feed_copy_search_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>) {
-        let commit = matches!(b, b'\r' | b'\n');
-        let cancel = matches!(b, 0x1b | 0x03 | 0x07);
-        if !commit && !cancel {
-            if let ClientMode::Copy(cs) = &mut client.mode {
-                if let Some(sp) = &mut cs.search_prompt {
-                    match b {
-                        0x20..=0x7e => sp.buf.push(b as char),
-                        0x7f | 0x08 => {
-                            sp.buf.pop();
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        // No live search-prompt buffer to edit (defensive; `feed_mode_byte`
+        // only calls this when one exists): fold into a throwaway scratch
+        // buffer just to classify the byte, same as `edit_line_buf`'s only
+        // other caller does for its own defensive case.
+        let mut scratch = String::new();
+        let buf = match &mut client.mode {
+            ClientMode::Copy(cs) => cs.search_prompt.as_mut().map(|sp| &mut sp.buf).unwrap_or(&mut scratch),
+            _ => &mut scratch,
+        };
+        let edit = edit_line_buf(buf, b);
+        if matches!(edit, LineEdit::Editing) {
             return (false, None);
         }
 
@@ -1768,7 +1836,7 @@ impl Server {
         let Some(sp) = cs.search_prompt.take() else {
             return (true, None);
         };
-        if cancel {
+        if matches!(edit, LineEdit::Cancel) {
             return (true, None);
         }
         let Some(p) = self.panes.get(&cs.pane) else {
@@ -1821,18 +1889,13 @@ impl Server {
     }
 
     fn feed_prompt_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) -> (bool, Option<ExecOutcome>) {
-        let commit = matches!(b, b'\r' | b'\n');
-        let cancel = matches!(b, 0x1b | 0x03 | 0x07);
-        if !commit && !cancel {
-            if let ClientMode::Prompt { buf, .. } = &mut client.mode {
-                match b {
-                    0x20..=0x7e => buf.push(b as char),
-                    0x7f | 0x08 => {
-                        buf.pop();
-                    }
-                    _ => {}
-                }
-            }
+        let mut scratch = String::new();
+        let buf = match &mut client.mode {
+            ClientMode::Prompt { buf, .. } => buf,
+            _ => &mut scratch,
+        };
+        let edit = edit_line_buf(buf, b);
+        if matches!(edit, LineEdit::Editing) {
             return (false, None);
         }
 
@@ -1841,7 +1904,7 @@ impl Server {
         let ClientMode::Prompt { buf, kind, .. } = mode else {
             return (true, None);
         };
-        if cancel {
+        if matches!(edit, LineEdit::Cancel) {
             return (true, None);
         }
         match kind {
@@ -1884,5 +1947,51 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_search_tests {
+    use super::*;
+    use crate::grid::Grid;
+
+    /// Task-4 review, Critical finding #1 (unit-level regression, mirrors
+    /// the reviewer's own probe): `to_excl == Some(0)` has no valid start
+    /// position (there is no column `< 0`), so it must be an empty range,
+    /// not "check column 0 anyway". Before the fix (`to_excl:
+    /// usize` + `saturating_sub(1)`), this returned `Some(0)`.
+    #[test]
+    fn find_last_in_to_excl_zero_is_empty_range() {
+        let row: Vec<char> = "needlexxxx".chars().collect();
+        let pat: Vec<char> = "needle".chars().collect();
+        assert_eq!(find_last_in(&row, &pat, None, Some(0)), None);
+    }
+
+    /// `find_last_in` still finds a real match when `to_excl` legitimately
+    /// permits it (sanity check alongside the `Some(0)` regression above).
+    #[test]
+    fn find_last_in_finds_within_range() {
+        let row: Vec<char> = "needlexxxx".chars().collect();
+        let pat: Vec<char> = "needle".chars().collect();
+        assert_eq!(find_last_in(&row, &pat, None, Some(1)), Some(0));
+        assert_eq!(find_last_in(&row, &pat, None, None), Some(0));
+    }
+
+    /// Task-4 review, Important finding #2: a char earlier in the row whose
+    /// full Unicode lowercase mapping expands to more than one char (Turkish
+    /// `İ`, U+0130 -> `i` + combining dot above, two chars) must not shift
+    /// the reported column of a LATER ASCII match. `fold_char` takes only
+    /// the first folded char per original char, preserving a strict 1:1
+    /// index<->column mapping; the old `.chars().flat_map(|c|
+    /// c.to_lowercase())` fold would have found "hello" at column 2 here
+    /// (the naive lowered `Vec<char>` is one char longer than the row), not
+    /// its true screen column, 1.
+    #[test]
+    fn unicode_lowercase_fold_preserves_column() {
+        let mut grid = Grid::new(20, 1, 0);
+        grid.feed("İhello".as_bytes());
+        let pat: Vec<char> = "hello".chars().map(fold_char).collect();
+        let got = find_search_match(&grid, &pat, 0, 0, false);
+        assert_eq!(got, Some((0, 1)), "match column must equal the true screen column (1), not a naive-fold-shifted index");
     }
 }
