@@ -4,6 +4,7 @@ pub mod geom;
 pub mod grid;
 pub mod host;
 pub mod input;
+pub mod keys;
 pub mod layout;
 pub mod model;
 pub mod pipe;
