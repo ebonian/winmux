@@ -461,9 +461,9 @@ requirement); the rest are new tmux-style lines authored for SP3.
 ### Flag/argument conventions
 
 - Direction flags (`select-pane`/`resize-pane` `-L`/`-R`/`-U`/`-D`) map onto
-  the existing `geom::Direction`; if more than one is given, the last one
-  scanned wins — no error (documented simplification, matches this module's
-  general last-flag-wins policy for repeated flags).
+  the existing `geom::Direction`; if more than one is given, a fixed priority
+  `-L > -R > -U > -D` picks the winner — no error (documented simplification;
+  no realistic config passes two direction flags to one command).
 - `set-option`'s `value`: remaining tokens after `-g`/`-w`/`-a`/`-u` and the
   option name are joined with a single space each — a single token (e.g. one
   quoted string) is returned verbatim (join of one element is a no-op);
