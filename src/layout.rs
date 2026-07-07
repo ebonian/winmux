@@ -319,9 +319,13 @@ impl Layout {
             }
             // Adjacency accounts for the single border cell between siblings.
             let adjacent = match dir {
-                Direction::Right => r.x == f.x + f.w + 1,
+                // saturating_add: `f.x + f.w + 1` (and the symmetric Down
+                // case below) is theoretically reachable near u16::MAX;
+                // saturating keeps this a total comparison instead of a
+                // debug-mode overflow panic (follow-up #5).
+                Direction::Right => r.x == f.x.saturating_add(f.w).saturating_add(1),
                 Direction::Left => f.x > 0 && r.x + r.w == f.x - 1,
-                Direction::Down => r.y == f.y + f.h + 1,
+                Direction::Down => r.y == f.y.saturating_add(f.h).saturating_add(1),
                 Direction::Up => f.y > 0 && r.y + r.h == f.y - 1,
             };
             if !adjacent {
@@ -978,6 +982,31 @@ mod tests {
                 (3, Rect { x: 40, y: 12, w: 40, h: 12 }),
             ]
         );
+    }
+
+    #[test]
+    fn focus_dir_right_near_u16_max_does_not_overflow() {
+        // Follow-up #5: the Right/Down adjacency checks in `focus_dir` compute
+        // `f.x + f.w + 1`. Construct an area near u16::MAX so that sum
+        // overflows a u16 (65500 + 36 = 65536 > 65535) — a Vertical split
+        // keeps both panes at the same x/w (only y/h differ), so the
+        // comparison against the sibling pane hits the overflowing add
+        // without needing the split geometry itself to overflow.
+        let area = Rect { x: 65500, y: 0, w: 36, h: 24 };
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Vertical, 2, area).unwrap(); // focus 2 (bottom)
+        // Must not panic ("attempt to add with overflow" in debug builds).
+        l.focus_dir(Direction::Right, area);
+    }
+
+    #[test]
+    fn focus_dir_down_near_u16_max_does_not_overflow() {
+        // Symmetric case for the Down check `f.y + f.h + 1`: a Horizontal
+        // split keeps both panes at the same y/h (only x/w differ).
+        let area = Rect { x: 0, y: 65500, w: 24, h: 36 };
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, area).unwrap(); // focus 2 (right)
+        l.focus_dir(Direction::Down, area);
     }
 
     #[test]

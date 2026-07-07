@@ -49,9 +49,18 @@ Like tmux, winmux separates a background **server** from thin **clients**:
   the already-running server. SSH drops → client dies → server + shells keep
   running → reconnect and reattach.
 
-The MVP (sub-project 1) runs in a single in-process form (no separate server yet)
-so we can prove the hard rendering/ConPTY problems first; the server/client split
-is introduced in sub-project 2.
+The MVP (sub-project 1) proved the hard rendering/ConPTY problems in a single
+in-process form (no separate server). **Sub-project 2 has since delivered the
+real server/client split**: one binary, `winmux.exe`, plays three roles
+selected by argv — CLI (parse args, connect or autostart), attached client
+(thin: forwards stdin, writes server-composed VT bytes to stdout), and hidden
+`__server` (the background event loop, spawned detached so it survives the
+launching console closing). Client and server talk over a Windows named pipe,
+`\\.\pipe\winmux-<username>-<socket-name>`, where `<socket-name>` defaults to
+`default` and is overridden by tmux's own `-L <name>` flag. This is the
+Windows analogue of tmux's Unix domain socket, and gives the same SSH story:
+SSH drops → client dies → server + shells keep running → reconnect and
+reattach.
 
 ## Decomposition into sub-projects
 
@@ -61,8 +70,8 @@ previous and is independently useful.
 
 | # | Sub-project | Delivers |
 |---|---|---|
-| **1** | **Multiplexing MVP** | ConPTY-spawned PowerShell panes, VT parsing, a split-tree layout, panes + borders + status bar drawn into the host terminal, prefix-key handling, split/switch/resize/close panes. **One session, one window, one attached client, no detach.** |
-| **2** | **Server/client split + sessions + detach** | Daemonize the engine as a background server, named-pipe client↔server protocol, multiple sessions and windows, detach/attach, survives SSH disconnect. |
+| **1** | **Multiplexing MVP** — DELIVERED | ConPTY-spawned PowerShell panes, VT parsing, a split-tree layout, panes + borders + status bar drawn into the host terminal, prefix-key handling, split/switch/resize/close panes. **One session, one window, one attached client, no detach.** |
+| **2** | **Server/client split + sessions + detach** — DELIVERED | Daemonized background server, named-pipe client↔server protocol, multiple sessions and windows, detach/attach, tmux CLI subset, survives SSH disconnect. |
 | **3** | **Command layer + config compatibility** | The tmux command dispatcher (`split-window`, `select-pane`, …) powering keybindings, the `winmux <cmd>` CLI, and the `.tmux.conf` parser (prefix, `bind-key`, `set-option`, styles/colors). |
 | **4** | **Parity polish** | Copy mode, mouse support, more options, status-bar format strings, the long tail. |
 
@@ -71,4 +80,5 @@ rendering/ConPTY problems), then 2 → 3 → 4.
 
 ## Specs
 
-- [`specs/2026-07-06-multiplexing-mvp-design.md`](specs/2026-07-06-multiplexing-mvp-design.md) — sub-project 1 (in progress)
+- [`specs/2026-07-06-multiplexing-mvp-design.md`](specs/2026-07-06-multiplexing-mvp-design.md) — sub-project 1 (delivered); companion interface contract [`specs/2026-07-06-mvp-interfaces.md`](specs/2026-07-06-mvp-interfaces.md)
+- [`specs/2026-07-07-server-client-design.md`](specs/2026-07-07-server-client-design.md) — sub-project 2 (delivered); companion interface contract [`specs/2026-07-07-server-client-interfaces.md`](specs/2026-07-07-server-client-interfaces.md)

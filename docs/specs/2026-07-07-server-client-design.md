@@ -1,6 +1,7 @@
 # Sub-project 2 — Server/client split, sessions, windows, detach/attach
 
-Status: **Active design spec.** Companion interface contract:
+Status: **Delivered** (2026-07-07, branch `feature/server-client-sessions`, 10
+tasks, 208+ tests). Companion interface contract:
 [`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md)
 (created and extended task-by-task; same lock rules as the MVP contract).
 
@@ -154,18 +155,24 @@ absent; pure queries (`ls`, `has`, `attach`, `kill-*`) error with
 
 ## Testing strategy
 
+Realized as planned:
+
 1. Pure units as before: protocol codec roundtrips, model bookkeeping, status
    builder, input additions — TDD with exact expected values.
-2. **Headless server integration** (`tests/server_proto.rs`): start the server
-   in-process or as `__server` child on a unique `-L`, speak raw protocol over
-   the pipe (no console, no ConPTY host needed): attach, expect `Output`
-   containing the status bar; `Stdin`, `Resize`, detach, kill-session, ls.
-   This is the main behavioral test seam.
-3. **Full e2e** (`tests/e2e.rs` extended): drive `winmux.exe` (client role)
-   under the test ConPTY exactly as today, with unique `-L` per test and
-   `kill-server` teardown: new → split → detach → `[detached]` → `ls` shows
-   `(attached)`→`` → reattach → screen state persisted → new window → status
-   bar flags → kill-session → server gone.
+2. **Headless server integration** (`tests/server_proto.rs`, 33 tests): starts
+   the server in-process on a unique `-L`, speaks raw protocol over the pipe
+   (no console, no ConPTY host needed): attach, expect `Output` containing the
+   status bar; `Stdin`, `Resize`, detach, kill-session, ls, prompts/confirms,
+   window/session switching. This is the main behavioral test seam and where
+   most of sub-project 2's coverage lives.
+3. **Full e2e** (`tests/e2e.rs` + the new `tests/e2e_sessions.rs`, 6 tests
+   total): drives `winmux.exe` (client role) under the test ConPTY exactly as
+   the MVP did, with a unique `-L` per test and `kill-server` teardown: new →
+   split → detach → `[detached]` → `ls` shows `(attached)`→`` → reattach →
+   screen state persisted → new window → status bar flags → kill-session →
+   server gone. Serialize with `-- --test-threads=1` when running e2e tests
+   alongside each other — they spawn real detached server processes and bind
+   real named pipes, so parallel runs can interfere.
 
 ## Follow-ups folded in (from docs/follow-ups.md)
 

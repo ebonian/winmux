@@ -128,6 +128,11 @@ impl Layout {
     pub fn toggle_zoom(&mut self);
     pub fn is_zoomed(&self) -> bool;
 
+    // Hardening note (follow-up #5, resolved sub-project-2 Task 10):
+    // `focus_dir`'s Right/Down adjacency checks use `saturating_add` instead
+    // of `+` so extreme-coordinate areas (near u16::MAX) can't overflow-panic
+    // in debug builds. Behavior-preserving for all reachable terminal sizes.
+
     /// Compute pane rectangles within `area`. Exactly ONE border row/column
     /// separates siblings; rects EXCLUDE border cells. When zoomed, returns
     /// only [(focused, area)]. Split arithmetic: along the split axis with
@@ -176,6 +181,9 @@ impl Grid {
     pub fn cols(&self) -> u16;
     pub fn rows(&self) -> u16;
     pub fn cell(&self, col: u16, row: u16) -> Cell;   // panics out of range
+    // Hardening note (follow-up #6, resolved sub-project-2 Task 10): the
+    // panic message is `"cell({col}, {row}) out of bounds {cols}x{rows}"`,
+    // including both the requested coordinates and the grid's dimensions.
     pub fn cursor(&self) -> (u16, u16);               // (col, row)
     pub fn cursor_visible(&self) -> bool;             // DECTCEM state, default true
 }

@@ -1,24 +1,109 @@
 # Follow-ups from the MVP final review (2026-07-07)
 
-Non-blocking items ticketed by the final whole-branch review of the
-multiplexing MVP (branch `feature/multiplexing-mvp`). None affect the merge.
+Ticketed by the final whole-branch review of the multiplexing MVP (branch
+`feature/multiplexing-mvp`), then resolved or refined across the
+server/client split (sub-project 2, branch `feature/server-client-sessions`).
+None ever blocked a merge.
 
-1. **Dead panes retain their `Pty` until closed.** `app.rs` `Event::Exited`
-   only sets `dead = true`; the contract says the Pty should be dropped there
-   (freeing the pseudoconsole/conhost and unblocking the reader thread).
-   Bounded, harmless; reconcile code or contract.
-2. **Confirm race when `Ctrl-b x y` arrive in one stdin read.** The `y` is
-   forwarded to the shell because confirm mode arms only after the batch is
-   processed. Rare interactively; benign. Would need feed-time arming or a
-   two-pass protocol.
-3. **`Host::enter()` partial-failure gap.** Code pages/stdout mode are mutated
-   before the `RESTORE` snapshot is published; a failure in between (near
-   impossible) would leave them unrestored. Publish `RESTORE` before the first
-   mutation.
-4. **Unbounded event-channel growth under pane output flood.** One render per
-   4 KB `Output` chunk; coalesce drained events before rendering to bound the
-   queue.
-5. **`layout` Right/Down adjacency `u16` overflow (theoretical).** Harden
-   `f.x + f.w + 1` with `saturating_add` for consistency.
-6. **`grid::cell()` panic message lacks coordinates.** Trivial debuggability
-   improvement.
+1. **RESOLVED** (sub-project 2, Task 6). Dead panes retained their `Pty`
+   until closed. Fixed: the server drops `Pty` at `Event::Exited`
+   (`PaneRuntime.pty = None`), and a natural pane exit now auto-removes the
+   pane entirely (tmux `remain-on-exit off` default, wired up in Task 7).
+2. **STILL OPEN** — deliberate choice. Confirm race when `Ctrl-b x y` arrive
+   in one stdin read: without care the `y` could be forwarded to the shell
+   before confirm mode arms. The server/client design fixes this
+   *structurally* rather than closing the race in the MVP's single-batch
+   sense: server-side input is dispatched **one event at a time** against
+   live confirm state (see the `## server contract` discussion and the
+   module docs in `src/server.rs`), so a batch of stdin bytes can no longer
+   race arming. This is intentionally left listed as open rather than
+   "resolved" because it changes the mechanism (event-at-a-time dispatch)
+   rather than eliminating the underlying class of race in the abstract —
+   see `src/server.rs` module docs for the exact reasoning before assuming
+   it's closed for good.
+3. **RESOLVED** (sub-project 2, Task 8, commit `09a274a`). `Host::enter()`
+   had a partial-failure gap: code pages/stdout mode were mutated before the
+   `RESTORE` snapshot was published. Fixed by publishing `RESTORE` before the
+   first mutation.
+4. **PARTIALLY RESOLVED** (sub-project 2, Task 6). Unbounded event-channel
+   growth under pane output flood: events are now drained and coalesced once
+   per main-loop turn before a single render, instead of one render per 4 KB
+   `Output` chunk. The underlying `mpsc` channel itself is still unbounded —
+   a sufficiently fast, never-drained producer can still grow the queue
+   without limit. Residual risk, not eliminated.
+5. **RESOLVED** (sub-project 2, Task 10). `layout`'s Right/Down adjacency
+   checks in `focus_dir` computed `f.x + f.w + 1` / `f.y + f.h + 1` with
+   plain `+`, which is a theoretical `u16` overflow (debug-mode panic) for
+   areas near `u16::MAX`. Fixed with `saturating_add`; TDD tests
+   `focus_dir_right_near_u16_max_does_not_overflow` and
+   `focus_dir_down_near_u16_max_does_not_overflow` in `src/layout.rs`
+   construct such areas and assert no panic.
+6. **RESOLVED** (sub-project 2, Task 10). `grid::cell()`'s panic message
+   lacked coordinates, hurting debuggability. Fixed: message is now
+   `cell(<col>, <row>) out of bounds <cols>x<rows>`, e.g. `cell(90, 5) out of
+   bounds 80x24`; TDD test `cell_panic_message_includes_coordinates_and_dimensions`
+   in `src/grid.rs` pins the exact text with `#[should_panic(expected = ...)]`.
+
+## New follow-ups from the server/client split (sub-project 2 reviews)
+
+Non-blocking minor debt accumulated across the sub-project 2 plan's task
+reviews. None affect the sub-project 2 merge.
+
+7. **`pty::win_err` doesn't unmask the HRESULT.** `src/pty.rs`'s `win_err`
+   does `io::Error::from_raw_os_error(e.code().0)`, passing the raw
+   (negative, HRESULT-shaped) `i32` through. `src/pipe.rs`'s `win_err` goes
+   through `raw_win32_code`, which unmasks HRESULTs built from Win32 codes
+   (`FACILITY_WIN32`) back to the plain Win32 error number before wrapping,
+   so `.kind()` classification (e.g. `ErrorKind::NotFound`) works correctly.
+   `pty.rs` currently never branches on `.kind()`, so this is latent, not
+   active — but if `pty` code ever starts matching on error kind, backport
+   `pipe.rs`'s unmasking for consistency.
+8. **`pipe.rs` username buffer is 256 `u16`s, not `UNLEN + 1`.**
+   `current_username()` uses a fixed `[0u16; 256]` buffer with `GetUserNameW`.
+   Windows' documented `UNLEN` is 256, so the correct buffer size is
+   `UNLEN + 1` (257, for the trailing NUL) — the current buffer is one
+   `u16` short of the documented worst case for a maximum-length username.
+   Practically unreachable (real usernames are far shorter), but worth
+   sizing to the documented constant instead of a round number.
+9. **`protocol::write_frame` doesn't itself enforce `MAX_FRAME`** — only
+   `read_frame` rejects an oversized declared length on decode. Verified the
+   actual bound on the write side: `src/server.rs`'s `send_output` chunks
+   pane `Output` bytes via `bytes.chunks(protocol::MAX_FRAME as usize)`
+   before calling `write_frame`, and the pane reader in `src/server.rs`
+   reads at most 4096 bytes (`[0u8; 4096]`) per `ReadFile`, i.e. every
+   `Output` frame today is bounded by the 4 KiB pane read buffer, far under
+   the 1 MiB `MAX_FRAME`. There is currently no other producer that could
+   hand `write_frame` an oversized payload, so this is latent: a future
+   caller passing a payload over `MAX_FRAME` would silently write a
+   wire-format-violating frame (the receiver's `read_frame` would then
+   correctly reject it, but only after the sender has already written
+   invalid bytes to the pipe). Consider an assert or defensive chunk/error in
+   `write_frame` itself.
+10. **Trailing payload bytes are silently ignored by protocol decoders.**
+    `read_client_msg`/`read_server_msg` parse known fields out of the
+    frame's payload slice via sequential `read_*` helpers but never check
+    that the slice is fully consumed afterward. A frame with correct known
+    fields plus extra trailing bytes (e.g. a newer client talking to an
+    older server, or a corrupted length) decodes successfully today instead
+    of erroring. Low risk while client/server ship from the same binary, but
+    would matter for any future wire compatibility story.
+11. **Kill-last-pane-of-window-via-`x` cascade in a multi-window session is
+    untested.** `server_proto.rs` covers `kill_only_pane_confirm_destroys_session`
+    (single-window session) and window-kill via `&` (`kill_window_confirm_text`),
+    but there is no test that kills the last pane of a *non-last* window (via
+    `Ctrl-b x` confirm) in a session that has other windows, to confirm the
+    window is destroyed and focus/selection lands correctly on a remaining
+    window without disturbing the rest of the session.
+12. **`drain_after_exit`'s 10×50 ms poll heuristic** (`tests/common/mod.rs`)
+    is a fixed-iteration sleep loop rather than a condition-based wait. It
+    has been reliable in practice but is inherently a timing guess; a
+    genuinely slow CI box could still flake it. Consider a bounded
+    `wait_until`-style predicate loop instead if it ever becomes flaky.
+13. **Unbounded per-client writer channel.** Per the server/client design
+    (`docs/specs/2026-07-07-server-client-design.md`, "Server architecture"),
+    each client's writer thread drains an unbounded `mpsc<Vec<u8>>` by
+    design, so a slow/stalled client can never block the main loop — but the
+    same unboundedness means a client that reads slower than the server
+    produces output (e.g. a frozen SSH session that hasn't dropped yet) can
+    grow that queue's memory without limit. Bounded per the same tradeoff
+    reasoning as follow-up #4; not addressed here.
