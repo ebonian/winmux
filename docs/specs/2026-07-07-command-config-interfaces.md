@@ -597,12 +597,33 @@ deviation, matches the design spec).
 
 Unit-tested with exact expected values (mirrors `keys.rs`/`style.rs`'s
 style): `defaults_match_tmux`, `set_prefix_key`, `set_style_validates`,
-`append_string`, `unset_restores_default`, `on_off_parsing`,
-`flag_toggle_on_missing_value`, `number_parsing`, `choice_parsing`,
-`unknown_option_err_exact`, `accepted_inert_options_store`,
-`show_quotes_when_needed`, `show_all_sorted`, `expand_basic`,
-`expand_hash_escape`, `expand_unknown_long_empty`, `expand_strftime` (17
-tests total).
+`append_string`, `str_options_reject_control_chars`, `unset_restores_default`,
+`on_off_parsing`, `flag_toggle_on_missing_value`, `number_parsing`,
+`choice_parsing`, `unknown_option_err_exact`, `specs_and_defaults_stay_in_sync`,
+`accepted_inert_options_store`, `show_quotes_when_needed`, `show_all_sorted`,
+`expand_basic`, `expand_hash_escape`, `expand_unknown_long_empty`,
+`expand_strftime` (19 tests total).
+
+**Control-char rejection (final whole-branch review, 2026-07-07):**
+`status-left`/`status-right` are settable at runtime by ANY attached client
+(`:set -g status-left ...`), and the composited status row is written to
+EVERY attached client's terminal — an embedded ESC/OSC/CSI sequence (title
+spoofing, OSC 52 clipboard injection) or bare `\r\n` could corrupt other
+clients' terminals. `Options::set` on a `Str`-kind option (`status-left`,
+`status-right`, `default-command`, `default-terminal`) therefore rejects any
+value containing a control character (`char::is_control`, the same rule
+`model::validate_name` already applies to session/window names) with
+`Err("bad value: <v>")`, where `<v>` sanitizes control chars to `?` (same
+echo rule as `model::validate_name`) — this is checked BEFORE the value is
+stored, `-a` append included (validated against the appended RESULT, i.e.
+existing + addition, not the addition alone, since a clean fragment can
+still complete a control sequence split across two `set -a` calls).
+`expand_format`'s OUTPUT needs no matching second guard: its only live
+inputs are already control-char-clean by construction — `#S`/`#W` come from
+`model::validate_name`-guarded session/window names, and every strftime-style
+`%`-code produces fixed-format digits or a month/weekday abbreviation from
+the `MONTHS`/`WEEKDAYS` tables — so a clean `status-left`/`status-right`
+template can only ever expand to a clean result.
 
 ### Supported options (exactly this table; anything else -> `unknown option: <name>`)
 
@@ -610,7 +631,6 @@ tests total).
 |---|---|---|
 | `prefix` | key | `C-b` |
 | `base-index` | number | 0 |
-| `pane-base-index` | number | 0 |
 | `status` | on/off | on |
 | `status-position` | choice (`top`/`bottom`) | bottom |
 | `status-interval` | number (seconds) | 15 |
@@ -637,9 +657,14 @@ tests total).
 | `default-terminal` | string (inert) | `screen` |
 | `exit-empty` | on/off (inert) | on |
 | `aggressive-resize` | on/off (inert) | off |
+| `pane-base-index` | number (inert) | 0 |
 
 "Inert" options are typed, validated, stored, and shown, but have no getter
-beyond `show` — nothing reads them yet (SP4 functionality).
+beyond `show` — nothing reads them yet (SP4 functionality). Exception:
+`pane-base-index` DOES have a typed getter (`Options::pane_base_index`), but
+the getter itself is unused — pane indexes in kill-pane prompts/targets are
+position-based from 0 regardless of this option (final review, 2026-07-07;
+tracked in `docs/follow-ups.md`'s SP3-deferred list).
 
 ### `set` semantics
 
@@ -649,9 +674,11 @@ beyond `show` — nothing reads them yet (SP4 functionality).
 - `append` (`-a`): valid ONLY on `Str`-kind options (`status-left`,
   `status-right`, `default-command`, `default-terminal`) — concatenates
   `value` (or empty string if `value` is `None`) onto the current stored
-  string. Any other option kind -> `Err("bad value: -a requires a string
-  option")` (a deliberate SP3 simplification over tmux's real per-type
-  append behavior, documented here rather than in-code only).
+  string, THEN validates the RESULT for control characters (see below) —
+  not just the appended fragment in isolation — before storing. Any other
+  option kind -> `Err("bad value: -a requires a string option")` (a
+  deliberate SP3 simplification over tmux's real per-type append behavior,
+  documented here rather than in-code only).
 - `value: None` (no value token, e.g. `set -g mouse`):
   - On a `Flag`-kind option: **toggles** the current flag (tmux's real
     `set -g mouse` with no value flips it).
@@ -668,7 +695,11 @@ beyond `show` — nothing reads them yet (SP4 functionality).
   - `Choice`: value ASCII-lowercased, matched against the option's fixed
     choice list (`status-position`: `top`/`bottom`; `mode-keys`:
     `emacs`/`vi`); no match -> `Err(format!("bad value: {v}"))`.
-  - `Str`: stored verbatim, no validation possible.
+  - `Str`: rejected if it contains a control character (`char::is_control`,
+    final whole-branch review, 2026-07-07 — see the control-char rejection
+    note above) -> `Err(format!("bad value: {sanitized}"))`, where
+    `sanitized` replaces every control char with `?` (same echo rule as
+    `model::validate_name`); otherwise stored verbatim.
   - `Style`: `crate::style::parse_style(v)` — its own `Err("bad style:
     {v}")` is propagated as-is (NOT rewrapped into a `bad value:` message);
     the ORIGINAL source string `v` is stored alongside the parsed

@@ -223,3 +223,23 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     the code comment at `src/server.rs`'s status-row assembly, "status-right
     styling via `#[]` inline styles is SP4; until then the right side is
     drawn with the row's base style."
+32. **`pane-base-index` is accepted + stored but inert.** The design spec
+    lists it as a real option (default 0) alongside `base-index`, but
+    nothing consumes it: pane indexes in kill-pane prompts/targets are
+    position-based from 0 regardless of this option's value. Unlike the
+    other inert options, it DOES have a typed getter
+    (`Options::pane_base_index`) — the getter itself is simply never called.
+    Reclassified as accepted-inert (final whole-branch review, 2026-07-07);
+    no code change, since it is already stored/validated exactly like the
+    other inert options.
+33. **Config errors surface via `server.log` + a first-attach transient
+    message, not tmux's interactive error view.** Real tmux reports a
+    `.tmux.conf` parse/apply error interactively (an in-place message in the
+    client that loaded it, with `set -g @tmux_error` style follow-up
+    tooling in some configs); winmux instead logs the error to
+    `%LOCALAPPDATA%\winmux\server.log` and surfaces a one-shot transient
+    message to the first client that attaches after the failed load. This is
+    one of the design spec's explicit documented deviations from tmux
+    (`docs/specs/2026-07-07-command-config-design.md`'s "Explicit
+    deviations from tmux" section) that had not yet been cross-referenced
+    here.

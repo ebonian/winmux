@@ -12,6 +12,16 @@
 //! print values back in tmux style; typed getters (`prefix()`,
 //! `status_style()`, ...) are used by the server (Task 6) and renderer.
 //!
+//! `Str`-kind values (`status-left`/`status-right`/`default-command`/
+//! `default-terminal`) reject control characters on `set` (including `-a`
+//! append, validated against the appended RESULT) — see the review note on
+//! the contract's `## options` section for why [`expand_format`]'s OUTPUT
+//! needs no matching guard: its only live inputs are already
+//! control-char-clean (`#S`/`#W` come from `model::validate_name`-guarded
+//! session/window names, strftime output is fixed-format digits/month/
+//! weekday abbreviations), so a clean `status-left`/`status-right` template
+//! can only ever expand to a clean result.
+//!
 //! [`expand_format`] evaluates the SP3 format-string subset (`#S`, `#I`,
 //! `#{session_name}`, `%H:%M`, ...) used by `status-left`/`status-right`/
 //! `display-message`.
@@ -92,6 +102,24 @@ const SPECS: &[Spec] = &[
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
+}
+
+/// Which [`Kind`] a concrete [`Value`] actually is -- used only by the
+/// `specs_and_defaults_stay_in_sync` test to catch a `SPECS`/`default_value`
+/// desync (a `Spec.kind` that doesn't match the `Value` variant
+/// `default_value` builds for that name) at test time rather than as a
+/// runtime `unreachable!` panic the first time a mismatched typed getter
+/// (e.g. `str_ref` expecting `Value::Str`) is called against it.
+#[cfg(test)]
+fn value_kind(v: &Value) -> Kind {
+    match v {
+        Value::Flag(_) => Kind::Flag,
+        Value::Number(_) => Kind::Number,
+        Value::Key(_) => Kind::Key,
+        Value::Choice(_) => Kind::Choice,
+        Value::Str(_) => Kind::Str,
+        Value::Style(_, _) => Kind::Style,
+    }
 }
 
 /// Build the tmux-default `Value` for one option by name (must be a name
@@ -193,6 +221,14 @@ impl Options {
                 _ => String::new(),
             };
             current.push_str(addition);
+            // Validate the RESULT (existing + addition), not just the
+            // addition alone -- an appended fragment that is clean on its
+            // own could still complete a control sequence split across two
+            // `set -a` calls. See the control-char rejection note on the
+            // `Kind::Str` arm below.
+            if has_control_chars(&current) {
+                return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+            }
             self.values.insert(spec.name, Value::Str(current));
             return Ok(());
         }
@@ -222,7 +258,25 @@ impl Options {
                     .ok_or_else(|| format!("bad value: {value}"))?;
                 Value::Choice(matched)
             }
-            Kind::Str => Value::Str(value.to_string()),
+            Kind::Str => {
+                // `status-left`/`status-right` are settable at runtime by ANY
+                // attached client (`:set -g status-left ...`) and the
+                // composited status row goes to EVERY attached client's
+                // terminal -- embedded ESC/OSC/CSI (title spoofing, OSC 52
+                // clipboard) or bare \r\n could corrupt other clients'
+                // terminals. Reject the same way `model::validate_name`
+                // rejects control chars in session/window names: sanitize
+                // control chars to `?` in the echoed error text so the
+                // rejection message itself can never smuggle a control
+                // sequence back to the caller's terminal. Covers
+                // status-left/status-right/default-command/default-terminal
+                // uniformly -- a control character in any of them is equally
+                // bogus, not just the two status-bar options.
+                if has_control_chars(value) {
+                    return Err(format!("bad value: {}", sanitize_control_chars(value)));
+                }
+                Value::Str(value.to_string())
+            }
             Kind::Style => {
                 let parsed = style::parse_style(value)?;
                 Value::Style(value.to_string(), parsed)
@@ -370,6 +424,19 @@ impl Default for Options {
     fn default() -> Options {
         Options::new()
     }
+}
+
+/// True if `s` contains any control character (mirrors
+/// `model::validate_name`'s rule via `char::is_control`).
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
+}
+
+/// Replace every control character with `?` for safe echo in an error
+/// message (mirrors `model::validate_name`'s sanitized-echo approach) --
+/// never echo raw ESC/OSC/CSI bytes back to a client's terminal.
+fn sanitize_control_chars(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
 fn parse_on_off(s: &str) -> Option<bool> {
@@ -659,6 +726,49 @@ mod tests {
         );
     }
 
+    /// `status-left`/`status-right` are settable at runtime by ANY attached
+    /// client, and the composited status row is written to EVERY attached
+    /// client's terminal -- a control character (ESC/OSC/CSI for title
+    /// spoofing or OSC 52 clipboard injection, bare \r\n for line
+    /// corruption) must be rejected rather than stored. Covers `set` on a
+    /// plain `Str` value and `-a` append (validated against the appended
+    /// RESULT, not just the addition in isolation).
+    #[test]
+    fn str_options_reject_control_chars() {
+        let mut o = Options::new();
+        assert_eq!(
+            o.set("status-left", Some("a\x1bb"), false, false),
+            Err("bad value: a?b".to_string())
+        );
+        // Rejected -- value left at its default, untouched.
+        assert_eq!(o.status_left(), "[#S] ");
+
+        // Append producing a CLEAN result is fine.
+        o.set("status-right", Some(" clean"), true, false).unwrap();
+        assert_eq!(o.status_right(), "%H:%M %d-%b-%y clean");
+
+        // Append whose RESULT contains a control char is rejected, echoing
+        // the sanitized RESULT (existing + addition), and the option is left
+        // at its pre-append value.
+        let before = o.status_right().to_string();
+        assert_eq!(
+            o.set("status-right", Some("\r\ninjected"), true, false),
+            Err(format!("bad value: {before}??injected"))
+        );
+        assert_eq!(o.status_right(), before);
+
+        // Same rule applies uniformly to every Str-kind option, not just the
+        // two status-bar ones.
+        assert_eq!(
+            o.set("default-command", Some("evil\x1b]0;pwned\x07"), false, false),
+            Err("bad value: evil?]0;pwned?".to_string())
+        );
+        assert_eq!(
+            o.set("default-terminal", Some("scr\teen"), false, false),
+            Err("bad value: scr?een".to_string())
+        );
+    }
+
     #[test]
     fn unset_restores_default() {
         let mut o = Options::new();
@@ -720,6 +830,28 @@ mod tests {
             Err("unknown option: not-a-real-option".to_string())
         );
         assert_eq!(o.show("not-a-real-option"), None);
+    }
+
+    /// `SPECS` and `default_value` are two independent string-keyed tables;
+    /// a desync between them (a `Spec.kind` that doesn't match the `Value`
+    /// variant `default_value` actually builds for that name) is a
+    /// server-wide panic waiting to happen the first time a typed getter is
+    /// called against the mismatched option (every getter -- `number`,
+    /// `flag`, `str_ref`, `style_ref` -- `unreachable!`s if the stored
+    /// `Value` isn't the variant it expects). `Options::new()` iterating
+    /// `SPECS` already guarantees every `SPECS` name HAS a `default_value`
+    /// entry (a missing one is its own `unreachable!` in `default_value`);
+    /// this test closes the other half -- that the entry's KIND agrees.
+    #[test]
+    fn specs_and_defaults_stay_in_sync() {
+        for spec in SPECS {
+            let kind = value_kind(&default_value(spec.name));
+            assert_eq!(
+                kind, spec.kind,
+                "default_value(\"{}\") returned a {:?}-kind value but SPECS declares {:?}",
+                spec.name, kind, spec.kind
+            );
+        }
     }
 
     #[test]

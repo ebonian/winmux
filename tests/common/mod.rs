@@ -117,14 +117,38 @@ pub fn drain_after_exit(grid: &mut Grid, rx: &Receiver<Vec<u8>>, raw: &mut Vec<u
     }
 }
 
+/// Appends `-f -` (disable config loading) to `args` unless the caller
+/// already passed an explicit `-f` -- a real `%USERPROFILE%\.tmux.conf` on a
+/// dev/CI machine would otherwise contaminate every e2e test that doesn't
+/// itself test config loading (custom prefix, styles, etc. from that file
+/// would silently apply). Mirrors `tests/server_proto.rs`'s `start_server`,
+/// which does the same isolation for its in-process server (Task 7 review
+/// fix, commit bc04d45) -- this closes the same gap for the real-binary e2e
+/// suites (`tests/e2e.rs`, `tests/e2e_sessions.rs`), which spawn
+/// `winmux.exe` directly and never passed `-f` at all. Tests that DO want
+/// config loading (`tests/e2e_config.rs`) already pass their own explicit
+/// `-f <path>`/`-f -`, so they are left untouched by this default.
+fn isolate_config<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    if args.contains(&"-f") {
+        return args.to_vec();
+    }
+    let mut v = args.to_vec();
+    v.push("-f");
+    v.push("-");
+    v
+}
+
 /// Spawn `winmux.exe` (`CARGO_BIN_EXE_winmux`) with `args` under a
 /// `COLS`x`ROWS` ConPTY, plus a background reader thread pumping its output
 /// into an mpsc channel -- ConPTY pipes don't reliably EOF (the original
 /// `tests/e2e.rs` gotcha), so a blocking `read` loop on its own thread is
-/// required rather than reading directly on the test thread.
+/// required rather than reading directly on the test thread. Config loading
+/// is disabled by default (`-f -`, see `isolate_config`) unless `args`
+/// already specifies `-f`.
 pub fn spawn_winmux_pty(args: &[&str]) -> (Pty, isize, Receiver<Vec<u8>>) {
+    let args = isolate_config(args);
     let mut cmdline = format!("\"{}\"", env!("CARGO_BIN_EXE_winmux"));
-    for a in args {
+    for a in &args {
         cmdline.push(' ');
         cmdline.push_str(a);
     }
@@ -181,10 +205,16 @@ impl Drop for ServerGuard {
 /// ConPTY. Commands like `ls`/`kill-session`/`kill-server` never call
 /// `Host::enter`, so a plain `std::process::Command` with captured
 /// stdout/stderr is sufficient and much cheaper than a ConPTY round trip.
+/// Config loading is disabled by default (`-f -`, see `isolate_config`)
+/// unless `args` already specifies `-f` -- most callers target an
+/// already-running server (started via `spawn_winmux_pty`, itself isolated),
+/// but some commands (`new-session`) autostart one, so this stays isolated
+/// too rather than relying on caller discipline.
 pub fn run_cli(socket: &str, args: &[&str]) -> std::process::Output {
+    let args = isolate_config(args);
     std::process::Command::new(env!("CARGO_BIN_EXE_winmux"))
         .args(["-L", socket])
-        .args(args)
+        .args(&args)
         .output()
         .expect("run winmux CLI one-shot")
 }

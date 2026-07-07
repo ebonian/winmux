@@ -117,7 +117,7 @@ the global table — documented deviation).
 |---|---|---|
 | `prefix` | key | `C-b` |
 | `base-index` | number | 0 |
-| `pane-base-index` | number | 0 |
+| `pane-base-index` | number | 0 — **accepted + stored, functionality deferred (SP4, inert-until-SP4)**: nothing reads it back; pane indexes in kill-pane prompts/targets are position-based from 0 regardless of this option's value (final review, 2026-07-07) |
 | `status` | on/off | on |
 | `status-position` | top/bottom | bottom |
 | `status-interval` | seconds | 15 (clock redraw stays 1s-tick; interval gates strftime re-eval) |
@@ -131,7 +131,7 @@ the global table — documented deviation).
 | `repeat-time` | ms | 500 |
 | `default-command` | string | `powershell.exe -NoLogo` (winmux default; lets users set pwsh) |
 | `renumber-windows` | on/off | off (implemented) |
-| `mouse`, `history-limit`, `escape-time`, `automatic-rename`, `allow-rename`, `mode-keys`, `default-terminal`, `exit-empty`, `aggressive-resize` | accepted + stored, functionality deferred (SP4) — setting them is NOT an error (config portability) |
+| `mouse`, `history-limit`, `escape-time`, `automatic-rename`, `allow-rename`, `mode-keys`, `default-terminal`, `exit-empty`, `aggressive-resize`, `pane-base-index` | accepted + stored, functionality deferred (SP4) — setting them is NOT an error (config portability) |
 
 Unknown option → `unknown option: <name>` (error, tmux behavior). Values
 validated per type (`bad value: <v>` style errors).

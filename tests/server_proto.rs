@@ -1770,6 +1770,41 @@ fn set_status_left_format() {
     server.join().expect("server exits after last session dies");
 }
 
+/// A `set -g status-left` value containing a control character (title
+/// spoofing / OSC 52 clipboard injection / \r\n corruption -- the composited
+/// status row reaches EVERY attached client's terminal) is rejected by the
+/// CLI with `bad value: <sanitized>`, and the status bar is left showing the
+/// untouched default rather than any partially-applied value.
+#[test]
+fn set_status_left_rejects_control_chars() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Default status-left ("[#S] ", session "0") is showing.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "status-left".into(),
+        "a\x1bb".into(),
+    ]));
+    let (out, err) = expect_cli_done(&cli, 1);
+    assert_eq!(out, "");
+    assert_eq!(err, "bad value: a?b");
+
+    // Status bar unchanged: still the default "[0] " prefix, never corrupted
+    // by the rejected value.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `set -g status-position top` moves the bar to row 0 AND shifts/resizes
 /// the pane area down: new shell output lands strictly below row 0.
 #[test]
