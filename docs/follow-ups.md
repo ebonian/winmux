@@ -373,3 +373,35 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     acceptable for now (documented deviation, not a bug); doc gap closed by
     this same fix round (see `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
     `layout-presets` section).
+
+44. **`break-pane` has no `-s`/`-t` pane-selector flag** (Task 7, window
+    ops). Real tmux's `break-pane` can target any pane via `-s`; winmux's
+    always acts on the resolved CURRENT pane (matches the design spec's
+    `## 6. Window ops` signature, which itself omits a pane selector —
+    smaller, honest scope, same pattern as `swap-pane`'s own documented
+    `-s`/`-t` deviations, follow-ups #41/#42). One-line fix framing: add an
+    optional pane target parsed the same way `kill-pane -t`/`swap-pane -t`
+    already are, threading it through `resolve_pane_target` instead of the
+    current hardcoded `None`.
+
+45. **`move-window` cannot move a window to a DIFFERENT session** (Task 7).
+    Real tmux's `move-window -t <session:index>` can relocate a window
+    across sessions; winmux's `move_window` (`model.rs`) is same-session
+    re-indexing only, and `exec_move_window` explicitly discards any
+    `session:` prefix on the `-t` value. Matches the design spec's `## 6.
+    Window ops` framing ("re-index current window"). One-line fix framing:
+    would need a cross-session variant of `Session::move_window` that lifts
+    the `Window` out of one `Session.windows` and into another's, re-minting
+    nothing (the `WindowId` stays valid — ids are global) but re-running the
+    destination session's `lowest_unused_index` floor if no explicit index
+    is given.
+
+46. **`find-window` always jumps to the first match — no choose-list for
+    multiple matches** (Task 7). The design spec's `## 6. Window ops`
+    section is explicit about this ("jump to first match"), so this is NOT
+    a shortfall against the spec of record, but it IS a real simplification
+    relative to actual tmux (which shows a `choose-tree`-style picker when
+    more than one window matches). Once Task 8's choose-tree overlay lands
+    (design spec `## 7. Overlays`), `find-window` could route multi-match
+    results through it instead of the deterministic first-match jump —
+    tracked here so that follow-up wiring has a home.

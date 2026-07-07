@@ -3772,3 +3772,252 @@ fn swap_pane_updown_with_target() {
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
 }
+
+// ---- Task 7 (sub-project 4): window ops -- break-pane, move-window,
+// find-window, `'` index prompt ------------------------------------------
+
+/// `!` (break-pane): the focused (right) pane of a 2-pane window leaves and
+/// becomes a new window, which becomes current; both windows are back down
+/// to a single pane (no vertical border in either).
+#[test]
+fn break_pane_bang() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'!']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")) && !has_vertical_border(g)
+    });
+
+    // Window 0 (the source) is also back to a single pane -- switch to it
+    // and confirm no border survived there either.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+    assert!(!has_vertical_border(&grid), "source window must be back to a single pane");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `!` refuses (`can't break with only one pane`, verbatim per the design
+/// spec's `## 6. Window ops` section) whenever the SOURCE window has only
+/// one pane -- both when it's the session's only window, AND when the
+/// session has a second window (breaking a single-pane window is refused
+/// regardless of how many other windows exist: a window can never be left
+/// with zero panes).
+#[test]
+fn break_pane_last_pane_refused() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Case A: the only pane of the only window.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'!']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("can't break with only one pane")));
+    assert!(!has_vertical_border(&grid));
+
+    // Case B: a second window now exists, but the CURRENT window (1) still
+    // has only its own single pane -- still refused.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'!']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("can't break with only one pane")));
+    // The transient message takes over the status line (message has
+    // priority over the window list there); clear it with a keystroke and
+    // confirm the window list is exactly as it was before the refused break.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\rexit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `.` opens the `(move-window) ` prompt; committing an index moves the
+/// current window there.
+#[test]
+fn move_window_dot_prompt() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'.']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(move-window) ")));
+    c.send(&ClientMsg::Stdin(b"5".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(move-window) 5")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 5:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `move-window -t <occupied index>` (without `-k`) errors `index in use:
+/// <n>` verbatim and changes nothing.
+#[test]
+fn move_window_occupied_errors() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    // Switch back to window 0, then try to move it onto window 1's index.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'.']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(move-window) ")));
+    c.send(&ClientMsg::Stdin(b"1\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index in use: 1")));
+    // The transient error message takes over the status line; clear it and
+    // confirm the window list is exactly as it was before the refused move.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    c.send(&ClientMsg::Stdin(b"\rexit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `move-window -k -t <occupied index>` (only reachable via the explicit
+/// CLI form -- the `.` prompt never supplies `-k`) kills the occupant and
+/// takes its place.
+#[test]
+fn move_window_dash_k_kills() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 1 exists with a distinct marker, to prove it's really GONE
+    // (not just renumbered) after the kill.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo w1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w1mark").is_some());
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"move-window -k -t 1\r".to_vec()));
+    // Window 0 (current) now occupies index 1; the old window 1 (and its
+    // "w1mark" pane) is gone -- only one window remains, at index 1.
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("[0] 1:powershell*")) && !lines.iter().any(|l| l.contains("0:powershell"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `f` (find-window): matches by window NAME, matches by visible pane
+/// CONTENT, and shows a transient `no windows matching: <p>` message (and
+/// switches nothing) when neither matches.
+#[test]
+fn find_window_f_prompt() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 0: rename to "webby" (the NAME-match target).
+    c.send(&ClientMsg::Stdin(vec![0x02, b',']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) powershell")));
+    c.send(&ClientMsg::Stdin(vec![0x7f; 10]));
+    c.send(&ClientMsg::Stdin(b"webby\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:webby*")));
+
+    // Window 1: the CONTENT-match target ("findme123" echoed into its pane).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo findme123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "findme123").is_some());
+
+    // Currently on window 1: find-window by NAME jumps back to window 0.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
+    c.send(&ClientMsg::Stdin(b"webby\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby* 1:powershell-")));
+
+    // Now on window 0: find-window by CONTENT jumps to window 1.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
+    c.send(&ClientMsg::Stdin(b"findme123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby- 1:powershell*")));
+
+    // No match: transient message, nothing moves.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
+    c.send(&ClientMsg::Stdin(b"zzznomatch\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("no windows matching: zzznomatch")));
+    // The transient message takes over the status line; clear it and
+    // confirm the no-match search didn't switch windows.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\rexit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:webby*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `'` opens the `index` prompt (label verbatim per the design spec, no
+/// parens/trailing space, unlike `.`/`f`'s "(name) " labels); committing an
+/// existing index switches to it, and a nonexistent index errors `window
+/// not found: <n>` (the same wording `resolve_window` already produces for
+/// digit-key selection -- `'` reuses `select-window -t :<input>` verbatim).
+#[test]
+fn quote_prompt_selects_index() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'\'']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index")));
+    c.send(&ClientMsg::Stdin(b"0".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index0")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    // Nonexistent index -> tmux-style error; selection unchanged.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'\'']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index")));
+    c.send(&ClientMsg::Stdin(b"9\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("window not found: 9")));
+    // The transient error message takes over the status line; clear it and
+    // confirm the selection didn't change.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    c.send(&ClientMsg::Stdin(b"\rexit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

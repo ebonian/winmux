@@ -94,12 +94,22 @@ struct PaneRuntime {
 }
 
 /// Which status-line prompt is in progress (`,` rename-window, `$`
-/// rename-session, or `:` command-prompt) — determines the label text and
-/// what a commit does with the buffer.
+/// rename-session, `.` move-window, `f` find-window, `'` index, or `:`
+/// command-prompt) — determines the label text and what a commit does with
+/// the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     RenameWindow,
     RenameSession,
+    /// `.` prompt (Task 7, sub-project 4): commit dispatches `move-window -t
+    /// <input>` (`-k` is never supplied by the prompt -- matches real
+    /// tmux's own `.` binding, which has no way to type `-k` interactively
+    /// either; use the `:` command-prompt for `move-window -k`).
+    MoveWindow,
+    /// `f` prompt (Task 7): commit dispatches `find-window <input>`.
+    FindWindow,
+    /// `'` prompt (Task 7): commit dispatches `select-window -t :<input>`.
+    Index,
     /// `:` command-prompt (Task 6): commit parses the buffer as a command
     /// line and dispatches it instead of renaming anything.
     Command,

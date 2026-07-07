@@ -222,6 +222,24 @@ fn is_bare(raw: &RawCmd, names: &[&str]) -> bool {
     raw.args.is_empty() && names.contains(&raw.name.as_str())
 }
 
+/// `find-window` (Task 7, sub-project 4) content-search predicate:
+/// case-insensitive substring match against a pane's CURRENTLY VISIBLE
+/// screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever cover
+/// the live viewport. `needle` must already be lowercased by the caller
+/// (avoids re-lowering it once per pane/row).
+fn grid_contains(grid: &Grid, needle: &str) -> bool {
+    for row in 0..grid.rows() {
+        let mut line = String::with_capacity(grid.cols() as usize);
+        for col in 0..grid.cols() {
+            line.push(grid.cell(col, row).ch);
+        }
+        if line.to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Trim a trailing run of blank (space) characters — tmux copy-mode's "don't
 /// carry trailing pad cells into the copied text" rule, applied per extracted
 /// line.
@@ -1147,6 +1165,151 @@ impl Server {
         }
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
+    }
+
+    // ---- window ops (Task 7, sub-project 4): break-pane, move-window,
+    // find-window ----
+
+    /// `break-pane|breakp [-d] [-n name]`: the resolved CURRENT pane leaves
+    /// its window and becomes a new window (next free index, via
+    /// `Session::new_window`'s existing `lowest_unused_index` floor). Errors
+    /// `"can't break with only one pane"` (verbatim, design spec `## 6.
+    /// Window ops`) if the source window has only that one pane -- checked
+    /// BEFORE any mutation, regardless of how many OTHER windows the
+    /// session has (a window can never be left with zero panes; matches
+    /// `Layout::remove`'s own "the only pane" refusal, which
+    /// `kill_pane_by_id` relies on the same way). Focus follows the pane
+    /// into the new window (`Session::new_window` makes it current) unless
+    /// `-d`, which restores the source window as current and only updates
+    /// `last`.
+    fn exec_break_pane(&mut self, detached: bool, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
+        let (session_name, wid, pane_id) = self.resolve_pane_target(cs, None)?;
+        let pane_count = self
+            .registry
+            .session_mut(&session_name)
+            .and_then(|s| s.windows.iter().find(|w| w.id == wid))
+            .map(|w| w.layout.len())
+            .unwrap_or(0);
+        if pane_count <= 1 {
+            return Err("can't break with only one pane".to_string());
+        }
+        if let Some(n) = &name {
+            crate::model::validate_name(n, "window")?;
+        }
+        let removed = self
+            .registry
+            .session_mut(&session_name)
+            .and_then(|s| s.windows.iter_mut().find(|w| w.id == wid))
+            .map(|w| w.layout.remove(pane_id))
+            .unwrap_or(false);
+        if !removed {
+            // Defensive: `pane_count <= 1` above already guarantees
+            // `Layout::remove` succeeds (it only ever refuses a
+            // single-pane layout); unreachable in practice.
+            return Err("can't break with only one pane".to_string());
+        }
+        let new_wid = self.registry.mint_window_id();
+        if let Some(session) = self.registry.session_mut(&session_name) {
+            let w = session.new_window(new_wid, pane_id);
+            if let Some(n) = name {
+                w.name = n;
+            }
+            // `new_window` always makes the new window current -- `-d`
+            // (`detached`) means focus should stay in the SOURCE window
+            // instead (tmux: the pane still moves, but the client's
+            // displayed window doesn't follow it).
+            if detached {
+                session.current = wid;
+                session.last = Some(new_wid);
+            }
+        }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    /// `move-window|movew [-k] -t index`: re-index the target session's
+    /// CURRENT window to `target` (parsed as a bare/`:`-prefixed index --
+    /// any `session:` prefix is accepted but IGNORED, since winmux's
+    /// `move-window` only re-indexes within the SAME session, per the
+    /// design spec). Occupied index -> `index in use: <n>` unless `kill`.
+    fn exec_move_window(&mut self, kill: bool, target: String, cs: Option<&str>) -> Result<String, String> {
+        let session_name = self.resolve_session_name(None, cs)?;
+        let (_, win_spec) = split_session_prefix(&target);
+        let idx: u32 = win_spec
+            .strip_prefix('=')
+            .unwrap_or(win_spec)
+            .parse()
+            .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?;
+        let Some(session) = self.registry.session_mut(&session_name) else {
+            return Err(format!("can't find session: {session_name}"));
+        };
+        let wid = session.current;
+        // Snapshot the occupant's panes (if any) BEFORE the move, so a
+        // killed occupant's pane runtimes/rects can be cleaned up after --
+        // once `Session::move_window` kills it, its `Window`/`Layout` is
+        // gone from the registry.
+        let occupant_panes: Vec<PaneId> = session
+            .windows
+            .iter()
+            .find(|w| w.index == idx && w.id != wid)
+            .map(|w| w.layout.panes())
+            .unwrap_or_default();
+        if !session.move_window(wid, idx, kill) {
+            return Err(format!("index in use: {idx}"));
+        }
+        if self.options.renumber_windows() {
+            if let Some(s) = self.registry.session_mut(&session_name) {
+                s.renumber();
+            }
+        }
+        for pid in occupant_panes {
+            self.panes.remove(&pid);
+            self.last_rects.remove(&pid);
+        }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    /// `find-window|findw <pattern>`: case-insensitive substring search
+    /// (v1, no regex) over the target session's window NAMES first, then
+    /// every pane's CURRENTLY VISIBLE content, in window-index order (the
+    /// current window is a normal candidate, not excluded); jumps to the
+    /// FIRST match. No match -> `Ok` carrying a transient `no windows
+    /// matching: <p>` message (not an `Err` -- "nothing found" is not a
+    /// command failure in tmux).
+    fn exec_find_window(&mut self, pattern: String, cs: Option<&str>) -> Result<String, String> {
+        let session_name = self.resolve_session_name(None, cs)?;
+        let needle = pattern.to_lowercase();
+        let snapshot: Vec<(WindowId, String, Vec<PaneId>)> = self
+            .registry
+            .session_mut(&session_name)
+            .map(|s| s.windows.iter().map(|w| (w.id, w.name.clone(), w.layout.panes())).collect())
+            .ok_or_else(|| format!("can't find session: {session_name}"))?;
+        let mut found: Option<WindowId> = None;
+        for (wid, wname, panes) in &snapshot {
+            if wname.to_lowercase().contains(&needle) {
+                found = Some(*wid);
+                break;
+            }
+            let content_match = panes.iter().any(|pid| self.panes.get(pid).map(|pr| grid_contains(&pr.grid, &needle)).unwrap_or(false));
+            if content_match {
+                found = Some(*wid);
+                break;
+            }
+        }
+        match found {
+            Some(wid) => {
+                if let Some(session) = self.registry.session_mut(&session_name) {
+                    if wid != session.current {
+                        session.last = Some(session.current);
+                        session.current = wid;
+                    }
+                }
+                self.apply_layout_for_session(&session_name);
+                Ok(String::new())
+            }
+            None => Ok(format!("no windows matching: {pattern}")),
+        }
     }
 
     fn exec_send_prefix(&mut self, cs: Option<&str>) -> Result<String, String> {
@@ -2258,6 +2421,9 @@ impl Server {
             NextLayout { target } => self.exec_next_layout(target, None),
             SwapPane { dir, src, dst } => self.exec_swap_pane(dir, src, dst, None),
             RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
+            BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
+            MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
+            FindWindow { pattern } => self.exec_find_window(pattern, None),
         }
     }
 
@@ -2277,10 +2443,29 @@ impl Server {
             // `cmd::resolve`'s usage error (see `Bindings::default`'s doc
             // comment and the `## bindings` contract section).
             if is_bare(raw, &["rename-window", "renamew"]) {
-                return self.open_rename_prompt(client, session_name, PromptKind::RenameWindow);
+                return self.open_prompt(client, session_name, PromptKind::RenameWindow);
             }
             if is_bare(raw, &["rename-session", "rename"]) {
-                return self.open_rename_prompt(client, session_name, PromptKind::RenameSession);
+                return self.open_prompt(client, session_name, PromptKind::RenameSession);
+            }
+            // `.`/`f`/`'` (Task 7, sub-project 4): same "no-args means open
+            // the interactive prompt" rule as the rename bindings above --
+            // `.`/`f` bind bare to their REAL tmux command names
+            // (move-window/find-window); `'` bares onto `select-window`
+            // (there is no distinct "index-window" tmux command -- a bare
+            // `select-window`, which would otherwise always be a usage
+            // error since `-t` is normally required, is repurposed as the
+            // trigger for the `'` binding's interactive index prompt, the
+            // same "client-context bare form gets a special meaning" idiom
+            // as the two rename commands above).
+            if is_bare(raw, &["move-window", "movew"]) {
+                return self.open_prompt(client, session_name, PromptKind::MoveWindow);
+            }
+            if is_bare(raw, &["find-window", "findw"]) {
+                return self.open_prompt(client, session_name, PromptKind::FindWindow);
+            }
+            if is_bare(raw, &["select-window", "selectw"]) {
+                return self.open_prompt(client, session_name, PromptKind::Index);
             }
             match cmd::resolve(raw) {
                 Ok(parsed) => match self.execute_for_client(parsed, client, session_name) {
@@ -2300,15 +2485,37 @@ impl Server {
         ExecOutcome::Ok(acc)
     }
 
-    fn open_rename_prompt(&mut self, client: &mut ClientState, session_name: &str, kind: PromptKind) -> ExecOutcome {
+    /// Open one of the interactive status-line prompts with a client
+    /// context: `,`/`$` (rename, pre-filled with the current name) and, as
+    /// of Task 7 (sub-project 4), `.`/`f`/`'` (move-window/find-window/
+    /// index, all pre-filled EMPTY -- matching real tmux, which never
+    /// pre-fills these three). `PromptKind::Command` (`:`) does NOT go
+    /// through here -- it's opened inline by `ParsedCmd::CommandPrompt`'s
+    /// arm in `execute_for_client`, since it also handles the `-I initial`
+    /// pre-fill text that `command-prompt` itself supports.
+    fn open_prompt(&mut self, client: &mut ClientState, session_name: &str, kind: PromptKind) -> ExecOutcome {
         let current = match kind {
             PromptKind::RenameWindow => self.registry.session_mut(session_name).map(|s| s.current_window().name.clone()).unwrap_or_default(),
             PromptKind::RenameSession => session_name.to_string(),
-            PromptKind::Command => unreachable!("open_rename_prompt only called for the two rename kinds"),
+            PromptKind::MoveWindow | PromptKind::FindWindow | PromptKind::Index => String::new(),
+            PromptKind::Command => unreachable!("open_prompt is never called for PromptKind::Command"),
         };
         let label = match kind {
             PromptKind::RenameWindow => "(rename-window) ",
             PromptKind::RenameSession => "(rename-session) ",
+            PromptKind::MoveWindow => "(move-window) ",
+            PromptKind::FindWindow => "(find-window) ",
+            // Verbatim per the design spec's `## 6. Window ops` section
+            // (label `index`, no parens/trailing space unlike the two
+            // above) -- deliberately kept exactly as specified rather than
+            // "fixed up" to match the other two's "(name) " convention;
+            // see the task report for the divergence-from-tmux note (real
+            // tmux's own `'` binding supplies an explicit `-p index`,
+            // which tmux itself likely renders as "index: " -- winmux's
+            // `command-prompt` doesn't support `-p` labels at all yet, so
+            // there's no established rendering convention to match against
+            // beyond the spec's literal string).
+            PromptKind::Index => "index",
             PromptKind::Command => ":",
         };
         client.mode = ClientMode::Prompt { label: label.to_string(), buf: current, kind };
@@ -2395,6 +2602,9 @@ impl Server {
             NextLayout { target } => wrap(self.exec_next_layout(target, Some(session_name.as_str()))),
             SwapPane { dir, src, dst } => wrap(self.exec_swap_pane(dir, src, dst, Some(session_name.as_str()))),
             RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
+            BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
+            MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
+            FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
         }
     }
 
@@ -2588,6 +2798,32 @@ impl Server {
                         (true, None)
                     }
                 }
+            }
+            // `-k` is never supplied here -- see `PromptKind::MoveWindow`'s
+            // doc comment; only the explicit `move-window -k ...` command
+            // (via the `:` prompt or CLI) can kill an occupant.
+            PromptKind::MoveWindow => {
+                if let Err(e) = self.exec_move_window(false, buf, Some(session_name.as_str())) {
+                    client.message = Some((e, Instant::now()));
+                }
+                (true, None)
+            }
+            PromptKind::FindWindow => {
+                match self.exec_find_window(buf, Some(session_name.as_str())) {
+                    Ok(msg) => {
+                        if !msg.is_empty() {
+                            client.message = Some((msg, Instant::now()));
+                        }
+                    }
+                    Err(e) => client.message = Some((e, Instant::now())),
+                }
+                (true, None)
+            }
+            PromptKind::Index => {
+                if let Err(e) = self.exec_select_window(format!(":{buf}"), Some(session_name.as_str())) {
+                    client.message = Some((e, Instant::now()));
+                }
+                (true, None)
             }
         }
     }

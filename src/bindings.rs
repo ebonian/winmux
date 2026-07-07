@@ -166,6 +166,20 @@ impl Default for Bindings {
         b(named("C-o"), vec![cmd1("rotate-window", &[])], false);
         b(named("M-o"), vec![cmd1("rotate-window", &["-D"])], false);
 
+        // Window ops (Task 7, sub-project 4): break-pane, and three
+        // prompt-opening bindings. `!` dispatches `break-pane` directly (no
+        // prompt, matches real tmux). `.`/`f`/`'` bind BARE to their real
+        // tmux command names (`.`/`f`) or, for `'` (no distinct
+        // "index-window" tmux command exists), to `select-window` bare --
+        // `dispatch_client`'s `is_bare` special-casing (same established
+        // "no-args-with-a-client-context opens the interactive prompt"
+        // pattern as `,`/`$`'s rename bindings) intercepts all three before
+        // `cmd::resolve` would otherwise error on a missing required arg.
+        b(char_key('!'), vec![cmd1("break-pane", &[])], false);
+        b(char_key('.'), vec![cmd1("move-window", &[])], false);
+        b(char_key('f'), vec![cmd1("find-window", &[])], false);
+        b(char_key('\''), vec![cmd1("select-window", &[])], false);
+
         Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
@@ -455,6 +469,10 @@ mod tests {
             ("}", "swap-pane", &["-D"], false),
             ("C-o", "rotate-window", &[], false),
             ("M-o", "rotate-window", &["-D"], false),
+            ("!", "break-pane", &[], false),
+            (".", "move-window", &[], false),
+            ("f", "find-window", &[], false),
+            ("'", "select-window", &[], false),
         ];
 
         for (k, name, args, repeat) in expected {

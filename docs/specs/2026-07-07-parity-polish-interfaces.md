@@ -1296,3 +1296,140 @@ All four call `apply_layout_for_session` unconditionally at the end (same
 established pattern as `kill_window_by_id` etc.) — harmless even when the
 target window wasn't the session's current one; the geometry change is
 picked up whenever that window next becomes current.
+
+## `window-ops` — break-pane, move-window, find-window, `'` index prompt (Task 7)
+
+Implements the design spec's `## 6. Window ops` section (`D` choose-client
+stays deferred, documented there). Covers `model`, `cmd`, `server` (the
+`PromptKind` enum), and `server::dispatch`.
+
+### `model` amendment
+
+`Session` gains one method:
+
+```rust
+impl Session {
+    /// Reassign window `id`'s index to `new_index` WITHIN this session
+    /// (winmux's `move-window` is same-session re-indexing only -- no
+    /// `-s`-to-a-different-session support). `new_index` occupied by a
+    /// DIFFERENT window: `kill == false` -> `false` (caller formats `index
+    /// in use: <n>`); `kill == true` -> the occupant is removed via
+    /// `Self::kill_window` first, then `id` takes `new_index`. Moving a
+    /// window to the index it ALREADY occupies is a no-op success (no
+    /// "occupant" in the way -- judgment call, the design spec doesn't pin
+    /// this case down). `self.windows` stays sorted by index (re-sorted
+    /// here too).
+    pub fn move_window(&mut self, id: WindowId, new_index: u32, kill: bool) -> bool;
+}
+```
+
+### `cmd` amendment
+
+`ParsedCmd` gains three variants:
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `break-pane|breakp [-d] [-n name]`: the resolved CURRENT pane
+    /// leaves its window and becomes a new window (next free index),
+    /// which becomes current unless `-d`. `-n` names the new window. No
+    /// pane-target flag -- winmux's break-pane always acts on the
+    /// resolved current pane (the design spec's signature has no `-s`/`-t`
+    /// pane selector either -- smaller, honest scope, same pattern as
+    /// `swap-pane`'s own documented deviations).
+    BreakPane { detached: bool, name: Option<String> },
+    /// `move-window|movew [-k] -t index`: re-index the CURRENT window (of
+    /// the target session) to `target` (REQUIRED -- there is nothing to do
+    /// without one). Occupied index -> `index in use: <n>` unless `-k`
+    /// (`kill`) kills the occupant first. `target` is resolved at dispatch
+    /// time as a bare/`:`-prefixed index within the SAME session; any
+    /// `session:` prefix is accepted but ignored (no cross-session move).
+    MoveWindow { kill: bool, target: String },
+    /// `find-window|findw <pattern>`: case-insensitive substring search
+    /// (v1, no regex) over window NAMES and every pane's CURRENTLY VISIBLE
+    /// content (not scrollback) in the target session, in window-index
+    /// order (the current window counts too); jumps to the FIRST match.
+    /// No match -> `Ok` carrying a transient `no windows matching: <p>`
+    /// message (not an `Err`).
+    FindWindow { pattern: String },
+}
+```
+
+Canonical names/aliases: `break-pane`/`breakp`, `move-window`/`movew`,
+`find-window`/`findw`. Usage strings: `usage: break-pane [-d] [-n name]`,
+`usage: move-window [-k] -t index`, `usage: find-window pattern`.
+
+### `server` (`PromptKind`) amendment
+
+Three new variants, alongside the existing `RenameWindow`/`RenameSession`/
+`Command`:
+
+```rust
+enum PromptKind {
+    // ...
+    /// `.` prompt: commit dispatches `move-window -t <input>` (`-k` is
+    /// never supplied by the prompt -- only the explicit CLI/`:`-prompt
+    /// form of `move-window -k` can kill an occupant).
+    MoveWindow,
+    /// `f` prompt: commit dispatches `find-window <input>`.
+    FindWindow,
+    /// `'` prompt: commit dispatches `select-window -t :<input>`.
+    Index,
+}
+```
+
+All three are pre-filled EMPTY (unlike `RenameWindow`/`RenameSession`,
+which pre-fill the current name) and opened via the renamed
+`Server::open_prompt` (was `open_rename_prompt` through Task 6 — private
+helper, no contract impact from the rename). Labels: `"(move-window) "`,
+`"(find-window) "`, and, verbatim per the design spec's `## 6. Window ops`
+section, `"index"` (no parens/trailing space, unlike the other two —
+deliberately kept exactly as the spec's literal string; see the Task 7
+report for the tmux-rendering divergence this likely represents).
+
+### `server::dispatch` amendment
+
+Three new `exec_*` helpers, wired into both `execute` (headless) and
+`execute_for_client`, same shared-helper pattern as every Task 6/7 command:
+
+- `exec_break_pane`: resolves the current pane (`resolve_pane_target(cs,
+  None)` — no pane-target flag), errors `"can't break with only one pane"`
+  if the source window's `layout.len() <= 1` (checked BEFORE any mutation,
+  independent of how many other windows the session has — a window can
+  never be left with zero panes), then `layout.remove` + `mint_window_id` +
+  `Session::new_window` (which makes the new window current); `-d`
+  reverses that back onto the source window (`session.current = wid;
+  session.last = Some(new_wid)`). Zoom-clearing and "focus falls back to
+  the sibling subtree's first leaf" both come for free from
+  `Layout::remove`, already exercised by `kill_pane_by_id`.
+- `exec_move_window`: parses `target` (stripping any `session:` prefix and
+  a leading `=`) as a `u32`, snapshots the occupant's pane ids (if any)
+  BEFORE calling `Session::move_window` (needed for `self.panes`/
+  `last_rects` cleanup if `-k` kills it — the occupant's `Window`/`Layout`
+  is gone from the registry afterward), then respects
+  `Options::renumber_windows()` same as every other structural op.
+- `exec_find_window`: snapshots `(WindowId, name, pane_ids)` for every
+  window in the target session, then for each in index order checks the
+  name (case-insensitive substring) then every listed pane's grid via the
+  new free function `grid_contains(grid: &Grid, needle_lowercased: &str) ->
+  bool` (walks `0..grid.rows()` × `0..grid.cols()`, i.e. the CURRENTLY
+  VISIBLE screen only, not scrollback); first match wins, `None` returns
+  the `no windows matching:` message as `Ok`, not `Err`.
+
+`'`'s dispatch has no dedicated `exec_*` — its `PromptKind::Index` commit
+calls the PRE-EXISTING `exec_select_window(format!(":{buf}"),
+Some(session_name.as_str()))` directly (no new command, no new dispatch
+table entry): `resolve_window`'s existing bare-numeric-index handling
+already produces the exact required `window not found: <n>` wording for a
+miss.
+
+### `bindings` amendment
+
+Four new prefix-table defaults:
+
+| Key | Command |
+|---|---|
+| `!` | `break-pane` (bare — direct dispatch, no prompt) |
+| `.` | `move-window` (bare — `dispatch_client`'s `is_bare` special-casing opens the `(move-window) ` prompt with a client context, same "no-args-means-open-the-prompt" idiom as `,`/`$`) |
+| `f` | `find-window` (bare — same idiom, opens the `(find-window) ` prompt) |
+| `'` | `select-window` (bare — no distinct "index-window" tmux command exists, so the `'` binding repurposes a bare `select-window`, which would otherwise always be a usage error since `-t` is normally required, as the trigger for the `index` prompt) |

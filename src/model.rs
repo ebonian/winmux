@@ -404,6 +404,46 @@ impl Session {
             w.index = base + i as u32;
         }
     }
+
+    /// tmux `move-window` (Task 7, sub-project 4): reassign window `id`'s
+    /// index to `new_index` within THIS session (winmux's `move-window`
+    /// simplification, per the design spec's `## 6. Window ops` section, is
+    /// same-session re-indexing only -- no `-s`-to-a-different-session
+    /// support). If `new_index` is already occupied by a DIFFERENT window:
+    /// `kill == false` refuses, `false` (the caller already knows the index
+    /// it tried, so it formats `index in use: <n>` itself -- matches
+    /// `Session::kill_window`'s own bool-not-Result convention for a
+    /// caller-formats-the-message refusal); `kill == true` removes the
+    /// occupant first via [`Self::kill_window`] (so if the occupant
+    /// happened to be `current`/`last` -- not possible for `move-window`'s
+    /// sole caller, which always moves `current` itself, but this stays
+    /// correct for any future caller -- that bookkeeping stays consistent)
+    /// and then `id` takes `new_index`. Moving a window to the index it
+    /// ALREADY occupies is a harmless no-op success: there is no "occupant"
+    /// in the way (judgment call, undocumented by the design spec -- real
+    /// tmux's own move-to-self-index behavior wasn't pinned down; a
+    /// same-index move being anything other than a no-op would be a
+    /// strange surprise for a command whose entire point is re-indexing).
+    ///
+    /// `self.windows` is kept sorted by index (the invariant every other
+    /// mutator maintains) -- re-sorted here too.
+    pub fn move_window(&mut self, id: WindowId, new_index: u32, kill: bool) -> bool {
+        if self.windows.iter().any(|w| w.id == id && w.index == new_index) {
+            return true;
+        }
+        let occupant = self.windows.iter().find(|w| w.index == new_index).map(|w| w.id);
+        if let Some(occ) = occupant {
+            if !kill {
+                return false;
+            }
+            self.kill_window(occ);
+        }
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.index = new_index;
+        }
+        self.windows.sort_by_key(|w| w.index);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -716,6 +756,58 @@ mod tests {
         assert_eq!(s.window_by_pane(1).unwrap().id, 0);
         assert_eq!(s.window_by_pane(10).unwrap().id, 2);
         assert!(s.window_by_pane(999).is_none());
+    }
+
+    /// `move_window` (Task 7): reassigns the index and keeps `windows`
+    /// sorted; moving onto a free index is a plain success.
+    #[test]
+    fn move_window_reindexes() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1
+        assert!(s.move_window(0, 5, false));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(2, 1), (0, 5)] // re-sorted by index
+        );
+    }
+
+    /// Moving onto an OCCUPIED index without `kill` refuses and changes
+    /// nothing.
+    #[test]
+    fn move_window_occupied_errors_without_kill() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1
+        assert!(!s.move_window(0, 1, false));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(0, 0), (2, 1)] // unchanged
+        );
+    }
+
+    /// `kill == true` removes the occupant and the mover takes its index.
+    #[test]
+    fn move_window_kill_occupant() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1
+        assert!(s.move_window(0, 1, true));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(0, 1)] // id2 (the occupant) is gone
+        );
+    }
+
+    /// Moving a window to the index it already occupies is a harmless
+    /// no-op success, not an "occupied" error (there is no OTHER window in
+    /// the way).
+    #[test]
+    fn move_window_to_own_index_is_noop() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        assert!(s.move_window(0, 0, false));
+        assert_eq!(s.windows[0].index, 0);
     }
 
     #[test]
