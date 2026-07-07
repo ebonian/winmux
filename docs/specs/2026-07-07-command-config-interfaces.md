@@ -506,3 +506,207 @@ match, then dispatches on the canonical name; `usage()` shares the same
 `canonical()` lookup, so alias and full-name lookups always agree
 (`usage_lookup_by_alias_and_unknown`). Unknown name -> `Err(format!("unknown
 command: {name}"))` from `resolve()`, `None` from `usage()`.
+
+## `options` — typed tmux option registry + format subset (Task 4)
+
+```rust
+pub struct Options { /* opaque: private BTreeMap<&'static str, Value> */ }
+
+impl Options {
+    pub fn new() -> Options; // tmux defaults, see table below
+    pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String>;
+    pub fn show(&self, name: &str) -> Option<String>;
+    pub fn show_all(&self) -> String; // sorted `name value` lines, ALL known options
+
+    pub fn prefix(&self) -> crate::keys::Key;
+    pub fn base_index(&self) -> u32;
+    pub fn pane_base_index(&self) -> u32;
+    pub fn status_on(&self) -> bool;
+    pub fn status_position_top(&self) -> bool;
+    pub fn status_interval(&self) -> std::time::Duration;
+    pub fn status_left(&self) -> &str;
+    pub fn status_right(&self) -> &str;
+    pub fn status_left_length(&self) -> u16;
+    pub fn status_right_length(&self) -> u16;
+    pub fn status_style(&self) -> &crate::style::PartialStyle;
+    pub fn message_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_current_style(&self) -> &crate::style::PartialStyle;
+    pub fn pane_border_style(&self) -> &crate::style::PartialStyle;
+    pub fn pane_active_border_style(&self) -> &crate::style::PartialStyle;
+    pub fn display_time(&self) -> std::time::Duration;
+    pub fn repeat_time(&self) -> std::time::Duration;
+    pub fn default_command(&self) -> &str;
+    pub fn renumber_windows(&self) -> bool;
+}
+
+impl Default for Options { fn default() -> Options; } // == Options::new()
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemTimeParts {
+    pub year: i32,   // full year, e.g. 2026
+    pub month: u8,   // 1-12
+    pub day: u8,
+    pub weekday: u8, // 0 = Sunday, matches Win32 SYSTEMTIME.wDayOfWeek
+    pub hour: u8,
+    pub min: u8,
+    pub sec: u8,
+}
+
+pub struct FormatCtx<'a> {
+    pub session: &'a str,
+    pub window_index: u32,
+    pub window_name: &'a str,
+    pub window_flags: &'a str,
+    pub pane_index: u32,
+    pub hostname: &'a str,
+    pub now: SystemTimeParts,
+}
+
+pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String;
+```
+
+Pure module: no I/O, `std` only. **Implementation module:** `src/options.rs`.
+Depends on `crate::keys` (`Key`/`parse_key`/`key_name`, the `prefix` option's
+type) and `crate::style` (`PartialStyle`/`parse_style`, every `*-style`
+option's type). SP3 scope: one global `Options` instance — `-g`/`-w` on
+`set-option`/`show-options` (from `cmd::ParsedCmd::SetOption`/`ShowOptions`)
+both hit this same table; per-session/window overlays are SP4 (documented
+deviation, matches the design spec).
+
+Unit-tested with exact expected values (mirrors `keys.rs`/`style.rs`'s
+style): `defaults_match_tmux`, `set_prefix_key`, `set_style_validates`,
+`append_string`, `unset_restores_default`, `on_off_parsing`,
+`flag_toggle_on_missing_value`, `number_parsing`, `choice_parsing`,
+`unknown_option_err_exact`, `accepted_inert_options_store`,
+`show_quotes_when_needed`, `show_all_sorted`, `expand_basic`,
+`expand_hash_escape`, `expand_unknown_long_empty`, `expand_strftime` (17
+tests total).
+
+### Supported options (exactly this table; anything else -> `unknown option: <name>`)
+
+| option | type | default |
+|---|---|---|
+| `prefix` | key | `C-b` |
+| `base-index` | number | 0 |
+| `pane-base-index` | number | 0 |
+| `status` | on/off | on |
+| `status-position` | choice (`top`/`bottom`) | bottom |
+| `status-interval` | number (seconds) | 15 |
+| `status-left` | string | `[#S] ` |
+| `status-right` | string | `%H:%M %d-%b-%y` — **deviation from tmux**: real tmux embeds `#{=21:pane_title}`, outside the SP3 format subset; this default reproduces SP2's `local_clock()` string exactly (documented in the design spec) |
+| `status-left-length` | number | 10 |
+| `status-right-length` | number | 40 |
+| `status-style` | style | `bg=green,fg=black` |
+| `window-status-style` | style | (no-op default: nothing mentioned) |
+| `window-status-current-style` | style | `underscore` |
+| `message-style` | style | `bg=yellow,fg=black` |
+| `pane-border-style` | style | (no-op default: nothing mentioned) |
+| `pane-active-border-style` | style | `fg=green` |
+| `display-time` | number (ms) | 750 |
+| `repeat-time` | number (ms) | 500 |
+| `default-command` | string | `powershell.exe -NoLogo` |
+| `renumber-windows` | on/off | off |
+| `mouse` | on/off (inert) | off |
+| `history-limit` | number (inert) | 2000 |
+| `escape-time` | number (inert) | 500 |
+| `automatic-rename` | on/off (inert) | on |
+| `allow-rename` | on/off (inert) | on |
+| `mode-keys` | choice (`emacs`/`vi`, inert) | emacs |
+| `default-terminal` | string (inert) | `screen` |
+| `exit-empty` | on/off (inert) | on |
+| `aggressive-resize` | on/off (inert) | off |
+
+"Inert" options are typed, validated, stored, and shown, but have no getter
+beyond `show` — nothing reads them yet (SP4 functionality).
+
+### `set` semantics
+
+- `unset` (`-u`): restores the option's tmux default; `value` is ignored.
+  Checked before `append`/`value` (an unset always wins over any other flag
+  combination passed alongside it).
+- `append` (`-a`): valid ONLY on `Str`-kind options (`status-left`,
+  `status-right`, `default-command`, `default-terminal`) — concatenates
+  `value` (or empty string if `value` is `None`) onto the current stored
+  string. Any other option kind -> `Err("bad value: -a requires a string
+  option")` (a deliberate SP3 simplification over tmux's real per-type
+  append behavior, documented here rather than in-code only).
+- `value: None` (no value token, e.g. `set -g mouse`):
+  - On a `Flag`-kind option: **toggles** the current flag (tmux's real
+    `set -g mouse` with no value flips it).
+  - On any other kind: `Err(format!("bad value: {name} requires a value"))`.
+- Unknown `name` -> `Err(format!("unknown option: {name}"))` (checked first,
+  before unset/append/value handling).
+- Per-kind value parsing (all applied case-sensitively to `name`, the value
+  itself where noted is matched case-insensitively/leniently):
+  - `Flag`: accepts exactly `on`, `off`, `1`, `0` (case-sensitive as
+    written); anything else -> `Err(format!("bad value: {v}"))`.
+  - `Number`: `str::parse::<u32>`; failure -> `Err(format!("bad value: {v}"))`.
+  - `Key`: `crate::keys::parse_key(v)`; `None` -> `Err(format!("bad value:
+    {v}"))`.
+  - `Choice`: value ASCII-lowercased, matched against the option's fixed
+    choice list (`status-position`: `top`/`bottom`; `mode-keys`:
+    `emacs`/`vi`); no match -> `Err(format!("bad value: {v}"))`.
+  - `Str`: stored verbatim, no validation possible.
+  - `Style`: `crate::style::parse_style(v)` — its own `Err("bad style:
+    {v}")` is propagated as-is (NOT rewrapped into a `bad value:` message);
+    the ORIGINAL source string `v` is stored alongside the parsed
+    `PartialStyle` so `show`/`show_all` round-trip the user's exact text.
+
+### `show` / `show_all` formatting
+
+- `Flag` -> `on`/`off`. `Number` -> bare digits. `Key` ->
+  `crate::keys::key_name`. `Choice` -> the bare matched word. `Str` and
+  `Style` -> the stored string (for `Style`, the ORIGINAL source string, not
+  a re-serialization of the parsed `PartialStyle`), quoted with `"..."` if
+  it is empty or contains a literal space character, else printed bare
+  (mirrors tmux's `show-options` quoting a value like `status-left "[#S] "`
+  because of its trailing space).
+- `show(name)` -> `None` for an unknown name (no panic).
+- `show_all()` -> **every** known option (not just non-default overrides —
+  a documented SP3 simplification vs. real tmux, which only lists
+  non-default options unless `-g` is given), one `"{name} {value}"` line
+  per option, sorted alphabetically by name, joined with `\n` (no trailing
+  newline).
+
+### `expand_format` (format-string subset)
+
+Evaluated left-to-right over the input string, `#` and `%` are the only
+two meta characters (everything else copies through verbatim):
+
+| sequence | expands to |
+|---|---|
+| `##` | literal `#` |
+| `#S` | `ctx.session` |
+| `#I` | `ctx.window_index` (decimal) |
+| `#W` | `ctx.window_name` |
+| `#F` | `ctx.window_flags` |
+| `#P` | `ctx.pane_index` (decimal) |
+| `#H` | `ctx.hostname` |
+| `#{session_name}` | `ctx.session` |
+| `#{window_index}` | `ctx.window_index` (decimal) |
+| `#{window_name}` | `ctx.window_name` |
+| `#{<anything else>}` | empty (documented SP3 simplification — no
+  conditionals/modifiers, full tmux format-expression engine is SP4) |
+| `#<any other char>`, trailing lone `#` | empty (unrecognized short code
+  consumes the one following character; a `#` with nothing after it is
+  dropped) |
+| `%%` | literal `%` |
+| `%H` `%M` `%S` `%d` `%m` | zero-padded 2-digit hour/min/sec/day/month
+  from `ctx.now` |
+| `%Y` | full 4-digit year (`ctx.now.year`, not zero-padded/truncated) |
+| `%y` | 2-digit year (`ctx.now.year.rem_euclid(100)`, zero-padded) |
+| `%b` | 3-letter English month abbreviation (`Jan`..`Dec`) |
+| `%a` | 3-letter English weekday abbreviation (`Sun`..`Sat`, `ctx.now.weekday % 7` indexes the table) |
+| `%p` | `AM` if `hour < 12` else `PM` |
+| `%I` | 12-hour zero-padded hour (`0` hour -> `12`, otherwise `hour % 12`) |
+| `%<any other char>` | literal passthrough, BOTH characters kept (`%x`
+  stays `%x` — not an error, not expanded) |
+| trailing lone `%` | literal `%` |
+
+`%H:%M %d-%b-%y` reproduces `src/server.rs`'s `local_clock()` string exactly
+for equivalent inputs (verified by `expand_strftime`), which is why it was
+chosen as `status-right`'s default value (see the design spec deviation
+note). Unknown `#{...}` forms and unrecognized `#<c>` codes are silent
+(empty), matching the design spec's "anything else renders empty"
+directive — `expand_format` never returns an `Err`.

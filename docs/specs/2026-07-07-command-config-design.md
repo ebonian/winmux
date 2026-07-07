@@ -120,7 +120,7 @@ the global table — documented deviation).
 | `status` | on/off | on |
 | `status-position` | top/bottom | bottom |
 | `status-interval` | seconds | 15 (clock redraw stays 1s-tick; interval gates strftime re-eval) |
-| `status-left` / `status-right` | string | `"[#S] "` / `"#{=21:pane_title}" %H:%M %d-%b-%y` → SP3 renders our existing right (clock) when unset; custom values support the SP3 format subset |
+| `status-left` / `status-right` | string | `"[#S] "` / `%H:%M %d-%b-%y` — **deviation from tmux** (revisit SP4): tmux's real default embeds `#{=21:pane_title}`, which is outside the SP3 format subset (would render as an empty-quoted prefix); winmux's default is just the clock half, reproducing SP2's `local_clock()` string exactly. Custom values support the SP3 format subset. |
 | `status-left-length` / `status-right-length` | number | 10 / 40 |
 | `status-style` | style | `bg=green,fg=black` |
 | `window-status-style` / `window-status-current-style` | style | default / `underscore` |
@@ -216,3 +216,5 @@ the plan: `-f` flag, forwarded through autostart) driving the release binary.
 - escape-time not honored (no ESC-disambiguation timer); ticketed.
 - automatic-rename accepted but inert (no fg-process tracking on Windows yet).
 - Config errors surface via log + transient message, not tmux's error view.
+- `status-right`'s default value omits tmux's `#{=21:pane_title}` prefix
+  (outside the SP3 format subset); winmux's default is the clock half only.

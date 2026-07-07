@@ -8,6 +8,7 @@ pub mod input;
 pub mod keys;
 pub mod layout;
 pub mod model;
+pub mod options;
 pub mod pipe;
 pub mod protocol;
 pub mod pty;
