@@ -78,6 +78,26 @@ pub(super) fn validate_target_name(name: &str, noun: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Per-command usage lines, returned as the `err` of a `CliDone{1, ...}`
+/// for BOTH a missing required argument and an unrecognized `-` flag
+/// (an unknown flag is never silently treated as a positional —
+/// `rename-session -t foo -q bar` must not rename the session to `-q`).
+/// Recorded verbatim in the contract's CLI section.
+const USAGE_LS: &str = "usage: list-sessions";
+const USAGE_HAS: &str = "usage: has-session -t target";
+const USAGE_KILL_SESSION: &str = "usage: kill-session [-t target]";
+const USAGE_KILL_SERVER: &str = "usage: kill-server";
+const USAGE_NEW: &str = "usage: new-session [-d] [-s name] [-x cols] [-y rows]";
+const USAGE_RENAME_SESSION: &str = "usage: rename-session [-t target] new-name";
+const USAGE_RENAME_WINDOW: &str = "usage: rename-window [-t target] new-name";
+const USAGE_LSW: &str = "usage: list-windows [-t target]";
+const USAGE_DETACH: &str = "usage: detach-client -s target";
+
+/// The `(1, "", usage)` reply shape shared by every argv error.
+fn usage_err(usage: &str) -> (u8, String, String) {
+    (1, String::new(), usage.to_string())
+}
+
 /// Minimal hand-rolled flag parser for the CLI subset: `-t`/`-s` (string),
 /// `-x`/`-y` (u16), `-d` (bare flag), everything else collected in order as
 /// `positional` (e.g. `rename-*`'s trailing new-name).
@@ -91,41 +111,47 @@ struct CliArgs {
 }
 
 impl CliArgs {
-    fn parse(args: &[String]) -> CliArgs {
+    /// `allowed` lists the flags the calling command recognizes (a subset
+    /// of `-t -s -x -y -d`). Any other `-`-prefixed token (length > 1, so
+    /// a bare `-` still counts as a positional) is `Err(())`; the caller
+    /// converts that into its usage line via [`usage_err`].
+    fn parse(args: &[String], allowed: &[&str]) -> Result<CliArgs, ()> {
         let mut p = CliArgs::default();
         let mut i = 0;
         while i < args.len() {
-            match args[i].as_str() {
-                "-t" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        p.t = Some(v.clone());
-                    }
+            let tok = args[i].as_str();
+            if tok.starts_with('-') && tok.len() > 1 {
+                if !allowed.contains(&tok) {
+                    return Err(());
                 }
-                "-s" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        p.s = Some(v.clone());
+                match tok {
+                    "-t" => {
+                        i += 1;
+                        p.t = args.get(i).cloned();
                     }
-                }
-                "-x" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        p.x = v.parse().ok();
+                    "-s" => {
+                        i += 1;
+                        p.s = args.get(i).cloned();
                     }
-                }
-                "-y" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        p.y = v.parse().ok();
+                    "-x" => {
+                        i += 1;
+                        p.x = args.get(i).and_then(|v| v.parse().ok());
                     }
+                    "-y" => {
+                        i += 1;
+                        p.y = args.get(i).and_then(|v| v.parse().ok());
+                    }
+                    "-d" => {}
+                    // Unreachable: `allowed` only ever names the five flags
+                    // above, but keep the parser total over its input.
+                    _ => return Err(()),
                 }
-                "-d" => {}
-                other => p.positional.push(other.to_string()),
+            } else {
+                p.positional.push(tok.to_string());
             }
             i += 1;
         }
-        p
+        Ok(p)
     }
 }
 
@@ -139,10 +165,10 @@ impl Server {
         };
         let rest = &argv[1..];
         match cmd.as_str() {
-            "list-sessions" | "ls" => self.cli_list_sessions(),
+            "list-sessions" | "ls" => self.cli_list_sessions(rest),
             "has-session" | "has" => self.cli_has_session(rest),
             "kill-session" => self.cli_kill_session(rest),
-            "kill-server" => self.cli_kill_server(),
+            "kill-server" => self.cli_kill_server(rest),
             "new-session" | "new" => self.cli_new_session(rest),
             "rename-session" => self.cli_rename_session(rest),
             "rename-window" => self.cli_rename_window(rest),
@@ -152,7 +178,10 @@ impl Server {
         }
     }
 
-    fn cli_list_sessions(&mut self) -> (u8, String, String) {
+    fn cli_list_sessions(&mut self, args: &[String]) -> (u8, String, String) {
+        if CliArgs::parse(args, &[]).is_err() {
+            return usage_err(USAGE_LS);
+        }
         if self.registry.is_empty() {
             return (1, String::new(), "no sessions".to_string());
         }
@@ -175,9 +204,11 @@ impl Server {
     }
 
     fn cli_has_session(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-t"]) else {
+            return usage_err(USAGE_HAS);
+        };
         let Some(target) = p.t else {
-            return (1, String::new(), "usage: has-session -t target".to_string());
+            return usage_err(USAGE_HAS);
         };
         match self.registry.find(&target) {
             Ok(_) => (0, String::new(), String::new()),
@@ -186,7 +217,9 @@ impl Server {
     }
 
     fn cli_kill_session(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-t"]) else {
+            return usage_err(USAGE_KILL_SESSION);
+        };
         let name = match p.t {
             Some(t) => match self.registry.find(&t) {
                 Ok(s) => s.name.clone(),
@@ -204,7 +237,10 @@ impl Server {
     /// Tear the whole server down: every attached client gets
     /// `Exit{0, "[server exited]"}`, every pane's ConPTY is dropped, and the
     /// registry is cleared so `run`'s exit-empty check fires this turn.
-    fn cli_kill_server(&mut self) -> (u8, String, String) {
+    fn cli_kill_server(&mut self, args: &[String]) -> (u8, String, String) {
+        if CliArgs::parse(args, &[]).is_err() {
+            return usage_err(USAGE_KILL_SERVER);
+        }
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for id in ids {
             if let Some(c) = self.clients.remove(&id) {
@@ -219,7 +255,9 @@ impl Server {
     }
 
     fn cli_new_session(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-d", "-s", "-x", "-y"]) else {
+            return usage_err(USAGE_NEW);
+        };
         let size = (p.x.unwrap_or(80).max(1), p.y.unwrap_or(24).max(1));
         let pane_id = self.mint_pane_id();
         match spawn_pane(pane_id, size.0, size.1, &self.tx) {
@@ -241,9 +279,11 @@ impl Server {
     }
 
     fn cli_rename_session(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-t"]) else {
+            return usage_err(USAGE_RENAME_SESSION);
+        };
         let (Some(target), Some(new_name)) = (p.t, p.positional.into_iter().next()) else {
-            return (1, String::new(), "usage: rename-session [-t target] new-name".to_string());
+            return usage_err(USAGE_RENAME_SESSION);
         };
         let old_name = match self.registry.find(&target) {
             Ok(s) => s.name.clone(),
@@ -263,9 +303,11 @@ impl Server {
     }
 
     fn cli_rename_window(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-t"]) else {
+            return usage_err(USAGE_RENAME_WINDOW);
+        };
         let (Some(target), Some(new_name)) = (p.t, p.positional.into_iter().next()) else {
-            return (1, String::new(), "usage: rename-window [-t target] new-name".to_string());
+            return usage_err(USAGE_RENAME_WINDOW);
         };
         let (sess_part, idx_part) = match target.split_once(':') {
             Some((s, i)) => (s.to_string(), Some(i.to_string())),
@@ -297,7 +339,9 @@ impl Server {
     }
 
     fn cli_list_windows(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-t"]) else {
+            return usage_err(USAGE_LSW);
+        };
         let name = match p.t {
             Some(t) => match self.registry.find(&t) {
                 Ok(s) => s.name.clone(),
@@ -329,9 +373,11 @@ impl Server {
     }
 
     fn cli_detach_client(&mut self, args: &[String]) -> (u8, String, String) {
-        let p = CliArgs::parse(args);
+        let Ok(p) = CliArgs::parse(args, &["-s"]) else {
+            return usage_err(USAGE_DETACH);
+        };
         let Some(target) = p.s else {
-            return (1, String::new(), "usage: detach-client -s target".to_string());
+            return usage_err(USAGE_DETACH);
         };
         let name = match self.registry.find(&target) {
             Ok(s) => s.name.clone(),

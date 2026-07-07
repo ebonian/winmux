@@ -438,7 +438,13 @@ various free helper functions) is private to the module.
   appends to `buf`; Backspace (0x7f or 0x08) removes the last char;
   Enter (`\r`/`\n`) commits; Esc/Ctrl-c/Ctrl-g (0x1b/0x03/0x07) cancels
   outright (discards `buf`, no validation). Either way, `set_capture(false)`
-  and `mode` returns to `Normal`. On commit: `PromptKind::RenameWindow`
+  and `mode` returns to `Normal`; any REMAINING bytes of the same captured
+  chunk after the commit/cancel byte are then re-fed through
+  `InputMachine::feed` and dispatched normally (capture is already off), so
+  pasted input like `web\recho hi\r` commits the rename AND forwards the
+  trailing `echo hi\r` to the pane instead of silently dropping it
+  (post-review fix; test `prompt_commit_forwards_trailing_bytes`).
+  On commit: `PromptKind::RenameWindow`
   validates `buf` (reject empty or containing `:`/`.`, mirroring
   `model.rs`'s session-name rule) and renames `session.current_window_mut()
   .name` directly (`Window::name` is a public field; the model has no
@@ -474,6 +480,16 @@ various free helper functions) is private to the module.
   `client.mode` rather than a single `if let`) and `Prompt { label: String,
   buf: String, kind: PromptKind }` where `PromptKind::{RenameWindow,
   RenameSession}` (both server-private types).
+- **Stale-confirm invalidation** (post-review fix): whenever a pane or
+  window is removed by ANY path (natural exit in `handle_exited`, confirmed
+  kill, window/session teardown), `cancel_stale_confirms` resets every
+  client whose pending `ConfirmKillPane`/`ConfirmKillWindow` targets an id
+  that no longer exists (mode → `Normal`, `set_confirming(false)`, message
+  cleared, re-render). Independently, the confirm handlers re-verify their
+  target still exists before acting and treat a missing target as a no-op
+  cancel — NEVER as "last one → destroy session" (that mis-read previously
+  let a stale `y` tear down a live session). Test:
+  `stale_confirm_after_pane_exit_is_canceled`.
 - **Confirm race (follow-up #2): left open, by design choice.** `Ctrl-b x`
   immediately followed by `y` in the SAME `Stdin` frame still races exactly
   as in the MVP — `InputMachine::feed` tokenizes the whole frame before this
@@ -503,9 +519,15 @@ writer channel (attached or still-`pending_writers`, i.e. never attached —
 a bare CLI connection sends exactly one `Cli` frame and disconnects after
 its `CliDone` reply) and replies with `execute_cli`'s `(code, out, err)`.
 Argv parsing is a small hand-rolled `CliArgs` (`-t`/`-s` string, `-x`/`-y`
-`u16`, `-d` bare flag, everything else collected as `positional` in order)
-— no external arg-parsing crate. Unrecognized/empty argv:
-`CliDone{1, "", "unknown command"}`.
+`u16`, `-d` bare flag, non-flag tokens collected as `positional` in order)
+— no external arg-parsing crate. Unrecognized/empty command name:
+`CliDone{1, "", "unknown command"}`. Any token starting with `-` that is
+not a recognized flag FOR THAT COMMAND (each command declares its accepted
+flag set) → `CliDone{1, "", "<usage line>"}` using that command's usage
+constant (`usage: rename-session [-t target] new-name`, etc. — the same
+usage strings listed per-command in the table below); flags are never
+silently demoted to positionals (post-review fix; test
+`cli_unknown_flag_is_usage_error`).
 
 | command | args | success | failure |
 |---|---|---|---|

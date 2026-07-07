@@ -28,7 +28,7 @@
 mod cli_exec;
 use cli_exec::validate_target_name;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::thread;
@@ -571,7 +571,13 @@ impl Server {
     /// `mode` returns to `Normal`. A no-op if `client.mode` isn't `Prompt`
     /// (defensive; shouldn't happen since capture mode is only armed
     /// alongside `Prompt`).
-    fn feed_prompt_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) {
+    ///
+    /// Returns `true` when this byte ENDED the prompt (commit or cancel) —
+    /// the caller must then re-feed any remaining bytes of the same
+    /// `Captured` chunk through the `InputMachine` as normal input (capture
+    /// is off again), so pasted input like `web\rls\r` doesn't silently
+    /// drop the tail after the commit.
+    fn feed_prompt_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) -> bool {
         let commit = matches!(b, b'\r' | b'\n');
         let cancel = matches!(b, 0x1b | 0x03 | 0x07);
         if !commit && !cancel {
@@ -584,16 +590,16 @@ impl Server {
                     _ => {}
                 }
             }
-            return;
+            return false;
         }
 
         client.input.set_capture(false);
         let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
         let ClientMode::Prompt { buf, kind, .. } = mode else {
-            return;
+            return true;
         };
         if cancel {
-            return;
+            return true;
         }
         match kind {
             PromptKind::RenameWindow => match validate_target_name(&buf, "window") {
@@ -617,6 +623,40 @@ impl Server {
                     client.session = Some(buf.clone());
                     *session_name = buf;
                 }
+            }
+        }
+        true
+    }
+
+    /// Cancel any attached client's pending kill confirm whose target pane/
+    /// window no longer exists (it exited naturally, or another client
+    /// killed it, while the `(y/n)` prompt was up): reset the mode to
+    /// `Normal`, drop the `InputMachine` out of confirming (so the next key
+    /// is normal input again, e.g. a `y` gets FORWARDED to the pane instead
+    /// of confirming), and clear any transient message. The confirm
+    /// handlers in `handle_stdin` ALSO re-validate their target before
+    /// acting (belt and braces — this method can't reach a client currently
+    /// removed from the map mid-`handle_stdin`), but only this path clears
+    /// a stale on-screen prompt without waiting for a keypress.
+    fn cancel_stale_confirms(&mut self) {
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        let mut live_windows: HashSet<WindowId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_windows.insert(w.id);
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        for client in self.clients.values_mut() {
+            let stale = match client.mode {
+                ClientMode::ConfirmKillPane(p) => !live_panes.contains(&p),
+                ClientMode::ConfirmKillWindow(w) => !live_windows.contains(&w),
+                _ => false,
+            };
+            if stale {
+                client.mode = ClientMode::Normal;
+                client.input.set_confirming(false);
+                client.message = None;
             }
         }
     }
@@ -723,6 +763,9 @@ impl Server {
                 self.apply_layout_for_session(&session_name);
             }
         }
+        // TEMP-RED-CHECK
+        // confirm on it must be reset, or its `y` would act on stale state.
+        self.cancel_stale_confirms();
         true
     }
 
@@ -771,13 +814,17 @@ impl Server {
         client.message = None;
 
         let now = Instant::now();
-        let events = client.input.feed(&bytes, now);
+        // A queue (not a plain iterator) because a prompt commit/cancel
+        // mid-`Captured`-chunk re-feeds the chunk's REMAINING bytes through
+        // the InputMachine and splices the resulting events in at the front
+        // (they logically precede everything after the Captured event).
+        let mut queue: VecDeque<InputEvent> = client.input.feed(&bytes, now).into();
 
         let mut detach = false;
         let mut destroy = false;
         let mut session_switched: Option<(String, String)> = None;
 
-        'events: for ev in events {
+        'events: while let Some(ev) = queue.pop_front() {
             match ev {
                 InputEvent::Forward(data) => {
                     if let Some(session) = self.registry.session_mut(&session_name) {
@@ -952,53 +999,114 @@ impl Server {
                     }
                 },
                 InputEvent::Captured(chunk) => {
-                    for b in chunk {
-                        self.feed_prompt_byte(&mut client, &mut session_name, b);
+                    let mut i = 0;
+                    while i < chunk.len() {
+                        let ended = self.feed_prompt_byte(&mut client, &mut session_name, chunk[i]);
+                        i += 1;
+                        if ended {
+                            // Commit/cancel mid-chunk: the rest of the chunk
+                            // is normal input again (capture is off) — run it
+                            // through the InputMachine and process its events
+                            // next, ahead of anything already queued.
+                            if i < chunk.len() {
+                                let more = client.input.feed(&chunk[i..], now);
+                                for e in more.into_iter().rev() {
+                                    queue.push_front(e);
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 InputEvent::ConfirmClose(confirmed) => {
                     client.input.set_confirming(false);
                     let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
+                    // Both kill confirms RE-VALIDATE their target against
+                    // live state before acting: the target may have vanished
+                    // (natural exit, another client's kill) between arming
+                    // and the `y`, and `cancel_stale_confirms` can't reach
+                    // THIS client mid-`handle_stdin` (it's removed from the
+                    // map). A missing target is a no-op cancel — NEVER
+                    // destroy-session; a `false` from `layout.remove`/
+                    // `kill_window` may only be trusted to mean "was the
+                    // only one" once existence has been established.
                     match mode {
                         ClientMode::ConfirmKillPane(target) => {
                             if confirmed {
-                                let removed = self
+                                // The pane's OWNING window, not blindly the
+                                // current one (another client may have
+                                // switched the session's current window
+                                // while this confirm was up).
+                                let owner_wid = self
                                     .registry
                                     .session_mut(&session_name)
-                                    .map(|s| s.current_window_mut().layout.remove(target))
-                                    .unwrap_or(false);
-                                if removed {
-                                    self.panes.remove(&target);
-                                    self.last_rects.remove(&target);
-                                    self.apply_layout_for_session(&session_name);
-                                } else {
-                                    // Only pane in the window: the session ends.
-                                    destroy = true;
-                                    break 'events;
+                                    .and_then(|s| s.window_by_pane(target).map(|w| w.id));
+                                if let Some(wid) = owner_wid {
+                                    let removed = self
+                                        .registry
+                                        .session_mut(&session_name)
+                                        .and_then(|s| s.windows.iter_mut().find(|w| w.id == wid))
+                                        .map(|w| w.layout.remove(target))
+                                        .unwrap_or(false);
+                                    if removed {
+                                        self.panes.remove(&target);
+                                        self.last_rects.remove(&target);
+                                        self.apply_layout_for_session(&session_name);
+                                    } else {
+                                        // The window's only pane: the window
+                                        // dies; the session only dies with it
+                                        // if it was also the only window.
+                                        let only_window = self
+                                            .registry
+                                            .session_mut(&session_name)
+                                            .map(|s| s.windows.len() == 1)
+                                            .unwrap_or(false);
+                                        if only_window {
+                                            destroy = true;
+                                            break 'events;
+                                        }
+                                        if let Some(s) = self.registry.session_mut(&session_name) {
+                                            s.kill_window(wid);
+                                        }
+                                        self.panes.remove(&target);
+                                        self.last_rects.remove(&target);
+                                        self.apply_layout_for_session(&session_name);
+                                    }
                                 }
+                                // else: stale target — no-op cancel.
                             }
                         }
                         ClientMode::ConfirmKillWindow(wid) => {
                             if confirmed {
-                                let pane_ids: Option<Vec<PaneId>> = self
+                                let exists = self
                                     .registry
                                     .session_mut(&session_name)
-                                    .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()));
-                                let killed =
-                                    self.registry.session_mut(&session_name).map(|s| s.kill_window(wid)).unwrap_or(false);
-                                if killed {
-                                    if let Some(pane_ids) = pane_ids {
+                                    .map(|s| s.windows.iter().any(|w| w.id == wid))
+                                    .unwrap_or(false);
+                                if exists {
+                                    let only_window = self
+                                        .registry
+                                        .session_mut(&session_name)
+                                        .map(|s| s.windows.len() == 1)
+                                        .unwrap_or(false);
+                                    if only_window {
+                                        destroy = true;
+                                        break 'events;
+                                    }
+                                    let pane_ids: Vec<PaneId> = self
+                                        .registry
+                                        .session_mut(&session_name)
+                                        .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()))
+                                        .unwrap_or_default();
+                                    if self.registry.session_mut(&session_name).map(|s| s.kill_window(wid)).unwrap_or(false) {
                                         for pid in pane_ids {
                                             self.panes.remove(&pid);
                                             self.last_rects.remove(&pid);
                                         }
+                                        self.apply_layout_for_session(&session_name);
                                     }
-                                    self.apply_layout_for_session(&session_name);
-                                } else {
-                                    // Only window in the session: it dies too.
-                                    destroy = true;
-                                    break 'events;
                                 }
+                                // else: stale target — no-op cancel.
                             }
                         }
                         ClientMode::Normal | ClientMode::Prompt { .. } => {}
@@ -1029,6 +1137,9 @@ impl Server {
             self.recompute_session_size(&new);
             self.apply_layout_for_session(&new);
         }
+        // This client may have just removed a pane/window that ANOTHER
+        // client (same session) had a pending kill confirm armed on.
+        self.cancel_stale_confirms();
     }
 
     /// Render every attached client (see module docs: render-all, not

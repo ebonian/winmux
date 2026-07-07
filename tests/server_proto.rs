@@ -846,3 +846,120 @@ fn cli_unknown_command_err() {
     assert_eq!(out, "");
     assert_eq!(err, "unknown command");
 }
+
+#[test]
+fn stale_confirm_after_pane_exit_is_canceled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    // Two clients on the same session: A will arm a kill-pane confirm; B
+    // (still in Normal mode, same shared layout/focus) will exit that
+    // pane's shell out from under the pending prompt.
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "stale", 80, 24);
+    let mut grid_a = Grid::new(80, 24);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::Existing, "stale", 80, 24);
+    let mut grid_b = Grid::new(80, 24);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // A splits; the new (right) pane takes focus for the whole session.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    a.recv_output_until(&mut grid_a, has_vertical_border);
+
+    // A arms the kill-pane confirm on the focused (new) pane.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("kill-pane 1? (y/n)")));
+
+    // B's input is forwarded to that same focused pane: exiting its shell
+    // makes the pane die NATURALLY while A's confirm is still up. The
+    // server must cancel A's now-stale confirm (prompt disappears along
+    // with the border) instead of leaving a live trigger on a dead target.
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| {
+        !has_vertical_border(g) && !screen_text(g).iter().any(|l| l.contains("kill-pane"))
+    });
+
+    // A's `y` must now be FORWARDED to the surviving pane, not interpreted
+    // as a confirm: erase it again (backspace), then prove the session (and
+    // its surviving shell) is still alive end-to-end by running a command.
+    // If the stale confirm had fired (the old bug destroyed the whole
+    // session), an Exit frame would arrive here and recv_output_until
+    // would panic on the unexpected message.
+    a.send(&ClientMsg::Stdin(b"y".to_vec()));
+    a.send(&ClientMsg::Stdin(b"\x08echo alive-42\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("alive-42")));
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn prompt_commit_forwards_trailing_bytes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b',']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(rename-window) powershell")));
+
+    // One single frame: wipe the pre-filled "powershell" (10 backspaces),
+    // type the new name, COMMIT, and then trailing bytes that must be
+    // re-fed through the normal input path (not silently dropped): a shell
+    // command whose echo proves it reached the pane.
+    let mut frame = vec![0x7f; 10];
+    frame.extend_from_slice(b"web\recho trailing-ok\r");
+    c.send(&ClientMsg::Stdin(frame));
+
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:web*")));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("trailing-ok")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_unknown_flag_is_usage_error() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "uf1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Unknown flag: usage error, and CRITICALLY the `-q` is not treated as
+    // the positional new-name.
+    cli.send(&ClientMsg::Cli(vec![
+        "rename-session".into(),
+        "-t".into(),
+        "uf1".into(),
+        "-q".into(),
+        "bar".into(),
+    ]));
+    let (out, err) = expect_cli_done(&cli, 1);
+    assert_eq!(out, "");
+    assert_eq!(err, "usage: rename-session [-t target] new-name");
+
+    // Session name unchanged (neither renamed to "-q" nor to "bar").
+    cli.send(&ClientMsg::Cli(vec!["has-session".into(), "-t".into(), "uf1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // A couple more commands' unknown-flag paths (a flag that exists for
+    // OTHER commands, like `-t` on new-session, is also unknown here).
+    cli.send(&ClientMsg::Cli(vec!["list-sessions".into(), "-z".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "usage: list-sessions");
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-t".into(), "x".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "usage: new-session [-d] [-s name] [-x cols] [-y rows]");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "uf1".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
