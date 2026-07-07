@@ -260,7 +260,14 @@ fn send_output(tx: &Sender<Vec<u8>>, bytes: Vec<u8>) {
 /// the `default-command` option's current value (SP3 Task 6: configurable
 /// per `set -g default-command`, replacing the old hardcoded `SHELL`
 /// const).
-fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>, shell: &str) -> std::io::Result<PaneRuntime> {
+fn spawn_pane(
+    id: PaneId,
+    cols: u16,
+    rows: u16,
+    tx: &Sender<ServerEvent>,
+    shell: &str,
+    history_limit: u32,
+) -> std::io::Result<PaneRuntime> {
     let mut pty = Pty::spawn(shell, cols.max(1), rows.max(1))?;
     let mut reader = pty.take_reader()?;
 
@@ -289,7 +296,7 @@ fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>, shell:
         let _ = wait_tx.send(ServerEvent::Exited(id));
     });
 
-    let grid = Grid::new(cols.max(1), rows.max(1));
+    let grid = Grid::new(cols.max(1), rows.max(1), history_limit);
     Ok(PaneRuntime { pty: Some(pty), grid, dead: false })
 }
 
@@ -573,7 +580,8 @@ impl Server {
             AttachMode::NewAuto => {
                 let pane_id = self.mint_pane_id();
                 let shell = self.options.default_command().to_string();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
+                let history_limit = self.options.history_limit();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell, history_limit) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
                         let base_index = self.options.base_index();
@@ -597,7 +605,8 @@ impl Server {
                 }
                 let pane_id = self.mint_pane_id();
                 let shell = self.options.default_command().to_string();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
+                let history_limit = self.options.history_limit();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell, history_limit) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
                         let base_index = self.options.base_index();

@@ -218,7 +218,7 @@ fn attach(client: &mut Client, mode: AttachMode, name: &str, cols: u16, rows: u1
 /// dies — used by tests that just need a throwaway auto-named session.
 fn attach_auto_and_wait_prompt(client: &mut Client, cols: u16, rows: u16) -> Grid {
     attach(client, AttachMode::NewAuto, "", cols, rows);
-    let mut grid = Grid::new(cols, rows);
+    let mut grid = Grid::new(cols, rows, 0);
     client.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
     grid
 }
@@ -291,18 +291,18 @@ fn attach_empty_target_picks_most_recent() {
 
     let mut c1 = Client::connect(&name);
     attach(&mut c1, AttachMode::NewNamed, "e1", 80, 24);
-    let mut g1 = Grid::new(80, 24);
+    let mut g1 = Grid::new(80, 24, 0);
     c1.recv_output_until(&mut g1, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut c2 = Client::connect(&name);
     attach(&mut c2, AttachMode::NewNamed, "e2", 80, 24);
-    let mut g2 = Grid::new(80, 24);
+    let mut g2 = Grid::new(80, 24, 0);
     c2.recv_output_until(&mut g2, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     // Empty target attaches to "e2" (most recently created), not "e1".
     let mut c3 = Client::connect(&name);
     attach(&mut c3, AttachMode::Existing, "", 80, 24);
-    let mut g3 = Grid::new(80, 24);
+    let mut g3 = Grid::new(80, 24, 0);
     c3.recv_output_until(&mut g3, |g| screen_text(g).iter().any(|l| l.contains("[e2] ")));
 
     // Clean up via a one-shot CLI kill-server so the server thread exits.
@@ -335,7 +335,7 @@ fn detach_frame_returns_message() {
     // Session s1 survives the detach; reattach and kill it so the server exits.
     let mut c2 = Client::connect(&name);
     attach(&mut c2, AttachMode::Existing, "s1", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c2.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
     c2.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c2.expect_exit(0, "[exited]");
@@ -349,7 +349,7 @@ fn session_survives_detach_and_reattaches() {
 
     let mut c1 = Client::connect(&name);
     attach(&mut c1, AttachMode::NewNamed, "s2", 80, 24);
-    let mut grid1 = Grid::new(80, 24);
+    let mut grid1 = Grid::new(80, 24, 0);
     c1.recv_output_until(&mut grid1, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     c1.send(&ClientMsg::Stdin(b"echo marker-123\r".to_vec()));
@@ -365,7 +365,7 @@ fn session_survives_detach_and_reattaches() {
 
     let mut c2 = Client::connect(&name);
     attach(&mut c2, AttachMode::Existing, "s2", 80, 24);
-    let mut grid2 = Grid::new(80, 24);
+    let mut grid2 = Grid::new(80, 24, 0);
     c2.recv_output_until(&mut grid2, |g| {
         screen_text(g).iter().any(|l| l.contains("marker-123"))
     });
@@ -395,7 +395,7 @@ fn prefix_d_detaches() {
     // Auto-named session "0" survives; reattach and kill it so the server exits.
     let mut c2 = Client::connect(&name);
     attach(&mut c2, AttachMode::Existing, "0", 80, 24);
-    grid = Grid::new(80, 24);
+    grid = Grid::new(80, 24, 0);
     c2.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
     c2.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c2.expect_exit(0, "[exited]");
@@ -446,12 +446,12 @@ fn two_clients_smallest_size_wins() {
 
     let mut a = Client::connect(&name);
     attach(&mut a, AttachMode::NewNamed, "shared", 100, 40);
-    let mut grid_a = Grid::new(100, 40);
+    let mut grid_a = Grid::new(100, 40, 0);
     a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut b = Client::connect(&name);
     attach(&mut b, AttachMode::Existing, "shared", 80, 24);
-    let mut grid_b = Grid::new(80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
     b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     // Once B (80x24) attaches, the shared session shrinks to the smaller
@@ -673,7 +673,7 @@ fn rename_session_prompt_flow() {
     let server = start_server(&name);
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::NewNamed, "s1", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     c.send(&ClientMsg::Stdin(vec![0x02, b'$']));
@@ -718,12 +718,12 @@ fn switch_client_next_cycles_sessions() {
 
     let mut a = Client::connect(&name);
     attach(&mut a, AttachMode::NewNamed, "sA", 80, 24);
-    let mut grid_a = Grid::new(80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
     a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut b = Client::connect(&name);
     attach(&mut b, AttachMode::NewNamed, "sB", 80, 24);
-    let mut grid_b = Grid::new(80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
     b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     // Creation order is [sA, sB]; `)` from sA moves client A to sB.
@@ -809,7 +809,7 @@ fn cli_kill_session_notifies_attached() {
 
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::NewNamed, "ks1", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut cli = cli_client(&name);
@@ -831,7 +831,7 @@ fn cli_new_detached_then_attach() {
 
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::Existing, "nd1", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
@@ -988,12 +988,12 @@ fn stale_confirm_after_pane_exit_is_canceled() {
     // pane's shell out from under the pending prompt.
     let mut a = Client::connect(&name);
     attach(&mut a, AttachMode::NewNamed, "stale", 80, 24);
-    let mut grid_a = Grid::new(80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
     a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut b = Client::connect(&name);
     attach(&mut b, AttachMode::Existing, "stale", 80, 24);
-    let mut grid_b = Grid::new(80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
     b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     // A splits; the new (right) pane takes focus for the whole session.
@@ -1187,7 +1187,7 @@ fn send_keys_bare_session_target() {
 
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::Existing, "demo", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("bare-ok")));
 
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
@@ -1557,7 +1557,7 @@ fn rename_session_dash_t_own_session_keeps_client_synced() {
     let server = start_server(&name);
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::NewNamed, "work", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     c.send(&ClientMsg::Stdin(vec![0x02, b':']));
@@ -1584,7 +1584,7 @@ fn kill_foreign_session_pane_keeps_client_attached() {
     let server = start_server(&name);
     let mut c = Client::connect(&name);
     attach(&mut c, AttachMode::NewNamed, "a", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
 
     let mut cli = cli_client(&name);
@@ -1689,7 +1689,7 @@ fn config_errors_collected_and_continue() {
     let _server = start_server_with_config(&name, &config_files);
     let mut client = Client::connect(&name);
     attach(&mut client, AttachMode::NewAuto, "", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     // Check the transient config-error message FIRST, before waiting on
     // anything else: real ConPTY/shell spawn latency can easily exceed the
     // message's 750ms lifetime, so `attach_auto_and_wait_prompt` (which
@@ -1720,7 +1720,7 @@ fn second_attach_no_config_message() {
 
     let mut c1 = Client::connect(&name);
     attach(&mut c1, AttachMode::NewAuto, "", 80, 24);
-    let mut grid1 = Grid::new(80, 24);
+    let mut grid1 = Grid::new(80, 24, 0);
     // Checked immediately after attach, before waiting on the shell prompt
     // (see `config_errors_collected_and_continue`'s comment: the message's
     // 750ms lifetime can race real shell-spawn latency).
@@ -1728,7 +1728,7 @@ fn second_attach_no_config_message() {
 
     let mut c2 = Client::connect(&name);
     attach(&mut c2, AttachMode::NewAuto, "", 80, 24);
-    let mut grid2 = Grid::new(80, 24);
+    let mut grid2 = Grid::new(80, 24, 0);
     // base-index 3 (this test's only GOOD line) applies to c2's session too
     // — config loads once, before either client attaches.
     c2.recv_output_until(&mut grid2, |g| screen_text(g).iter().any(|l| l.contains("[1] 3:powershell*")));
@@ -1753,7 +1753,7 @@ fn explicit_missing_config_is_error() {
     let _server = start_server_with_config(&name, &config_files);
     let mut client = Client::connect(&name);
     attach(&mut client, AttachMode::NewAuto, "", 80, 24);
-    let mut grid = Grid::new(80, 24);
+    let mut grid = Grid::new(80, 24, 0);
     // Checked immediately after attach (see `config_errors_collected_and_continue`'s
     // comment: don't wait on the shell prompt first — the message's 750ms
     // lifetime can race real shell-spawn latency).

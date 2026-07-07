@@ -419,7 +419,7 @@ mod tests {
     use crate::grid::{Color, Grid};
 
     fn grid_with(cols: u16, rows: u16, bytes: &[u8]) -> Grid {
-        let mut g = Grid::new(cols, rows);
+        let mut g = Grid::new(cols, rows, 0);
         g.feed(bytes);
         g
     }

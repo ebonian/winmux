@@ -391,6 +391,10 @@ impl Options {
         self.flag("renumber-windows")
     }
 
+    pub fn history_limit(&self) -> u32 {
+        self.number("history-limit")
+    }
+
     fn number(&self, name: &str) -> u32 {
         match self.values.get(name) {
             Some(Value::Number(n)) => *n,

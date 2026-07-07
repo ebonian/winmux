@@ -453,7 +453,8 @@ impl Server {
             .map(|(_, r)| r)
             .unwrap_or(area);
         let shell = self.options.default_command().to_string();
-        match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx, &shell) {
+        let history_limit = self.options.history_limit();
+        match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(new_id, pr);
                 self.apply_layout_for_session(&session_name);
@@ -535,7 +536,8 @@ impl Server {
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let pane_id = self.mint_pane_id();
         let shell = self.options.default_command().to_string();
-        match spawn_pane(pane_id, size.0.max(1), size.1.max(1), &self.tx, &shell) {
+        let history_limit = self.options.history_limit();
+        match spawn_pane(pane_id, size.0.max(1), size.1.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(pane_id, pr);
                 let wid = self.registry.mint_window_id();
@@ -774,7 +776,8 @@ impl Server {
         let size = (cols.unwrap_or(80).max(1), rows.unwrap_or(24).max(1));
         let pane_id = self.mint_pane_id();
         let shell = self.options.default_command().to_string();
-        match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
+        let history_limit = self.options.history_limit();
+        match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(pane_id, pr);
                 let base_index = self.options.base_index();

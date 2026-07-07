@@ -149,6 +149,17 @@ impl Layout {
 
 ## `grid` — per-pane terminal emulator
 
+**SUPERSEDED (sub-project 4, Task 1):** `Grid::new` gained a third
+`history_limit: u32` parameter, and `Grid` gained `history_len`, `view_cell`,
+`view_row_text`, `title`, and `take_title_changed`. Real scrollback capture
+and a real (save/restore) alternate screen replaced the MVP's "no scrollback,
+alt screen just clears" behavior; OSC 0/2 now capture the pane title instead
+of being ignored. See the `## grid-v2` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
+for the full current contract. This section is kept for historical reference
+only; everything below it describing scrollback-free/OSC-ignored MVP behavior
+is superseded.
+
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color { Default, Idx(u8), Rgb(u8, u8, u8) }
