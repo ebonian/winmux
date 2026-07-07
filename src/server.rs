@@ -12,10 +12,10 @@
 //! - **Confirm race** (follow-ups #2): NOT fixed here. `Ctrl-b x` and a
 //!   following `y` arriving in the SAME `Stdin` frame still race exactly as
 //!   in the MVP (the `y` gets forwarded to the pane instead of confirming),
-//!   because `InputMachine::feed` tokenizes the whole frame before the
-//!   caller (this module) gets a chance to call `set_confirming`. This is
-//!   one of the two sanctioned options in the task brief; documented here
-//!   as still-open rather than half-fixed.
+//!   because `KeyMachine::feed` decodes the whole frame before the caller
+//!   (this module) gets a chance to call `set_capture` to arm the confirm.
+//!   This is one of the two sanctioned options in the task brief; documented
+//!   here as still-open rather than half-fixed.
 //! - **Render strategy**: every dirty turn (i.e. any event at all, after
 //!   coalescing) re-renders ALL attached clients, not just those whose
 //!   session actually changed. Simpler and correct at this scale; a
@@ -25,8 +25,7 @@
 //!   unique pipe name and, where the test's flow naturally destroys every
 //!   session, joins the server thread to prove clean exit-empty shutdown.
 
-mod cli_exec;
-use cli_exec::validate_target_name;
+mod dispatch;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -37,21 +36,21 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 
+use crate::bindings::Bindings;
+use crate::cmd::RawCmd;
 use crate::geom::Rect;
-use crate::grid::Grid;
-use crate::input::{Action, InputEvent, InputMachine};
+use crate::grid::{Grid, Style};
+use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
+use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{PaneView, Renderer, Scene};
+use crate::render::{PaneView, Renderer, Scene, StatusRow};
 use crate::status::{status_spans, WindowEntry};
-
-/// Shell launched in every pane (matches the MVP; sub-project 3 makes this
-/// configurable).
-const SHELL: &str = "powershell.exe -NoLogo";
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -93,22 +92,35 @@ struct PaneRuntime {
     dead: bool,
 }
 
-/// Which status-line prompt is in progress (`,` rename-window vs `$`
-/// rename-session) — determines the label text and what a commit renames.
+/// Which status-line prompt is in progress (`,` rename-window, `$`
+/// rename-session, or `:` command-prompt) — determines the label text and
+/// what a commit does with the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     RenameWindow,
     RenameSession,
+    /// `:` command-prompt (Task 6): commit parses the buffer as a command
+    /// line and dispatches it instead of renaming anything.
+    Command,
 }
 
-/// Per-client confirm/prompt state.
+/// Per-client confirm/prompt state. `ConfirmCmd` (Task 6) generalizes the
+/// legacy `ConfirmKillPane`/`ConfirmKillWindow` variants into a single
+/// "confirm-before"-shaped mode: the wrapped command(s) to dispatch on
+/// y/Y/Enter, plus a snapshot of the pane/window that was live when the
+/// confirm was armed (staleness check — see `cancel_stale_confirms` and
+/// `dispatch::Server::feed_confirm_byte`).
 enum ClientMode {
     Normal,
-    ConfirmKillPane(PaneId),
-    ConfirmKillWindow(WindowId),
-    /// Status-line line editor (rename-window / rename-session). `buf` is the
-    /// live-edited text (pre-filled with the current name); `label` is the
-    /// fixed prefix (`"(rename-window) "` / `"(rename-session) "`).
+    ConfirmCmd {
+        prompt: String,
+        cmds: Vec<RawCmd>,
+        pane_snapshot: Option<PaneId>,
+        window_snapshot: Option<WindowId>,
+    },
+    /// Status-line line editor (rename-window / rename-session / `:`
+    /// command-prompt). `buf` is the live-edited text (pre-filled with the
+    /// current name, or empty/initial for `:`); `label` is the fixed prefix.
     Prompt { label: String, buf: String, kind: PromptKind },
 }
 
@@ -118,7 +130,7 @@ struct ClientState {
     cols: u16,
     rows: u16,
     renderer: Renderer,
-    input: InputMachine,
+    key_machine: KeyMachine,
     mode: ClientMode,
     /// A transient status-line message (e.g. `window not found: 5`) and when
     /// it was set; cleared on the next `Stdin` frame from this client OR
@@ -149,16 +161,78 @@ struct Server {
     had_session: bool,
     clock: String,
     tx: Sender<ServerEvent>,
+    /// Typed tmux option registry (Task 6): `prefix`, `default-command`,
+    /// `renumber-windows`, styles, etc. One global instance (SP3 scope, no
+    /// per-session/window overlays — documented deviation).
+    options: Options,
+    /// Mutable key-bindings table (`bind-key`/`unbind-key`/`list-keys`).
+    /// `Bindings::default()` reproduces every legacy hardcoded binding.
+    bindings: Bindings,
+    /// Set by `run` after startup config loading IF at least one config
+    /// error was collected (`config: N error(s), see server.log`); consumed
+    /// (`Option::take`) by `finish_attach` the first time ANY client
+    /// attaches, so only the first attach ever sees it (Task 7).
+    pending_config_message: Option<String>,
+    /// Computer name for the `#H` format code, queried once at startup
+    /// (Task 8; `GetComputerNameW` — a hostname doesn't change under a
+    /// running server).
+    hostname: String,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
-/// from `app.rs` (which dies in Task 8) rather than shared.
+/// from `app.rs` (which dies in Task 8) rather than shared. Since SP3 Task 8
+/// the status bar's right side is rendered via `expand_format` instead, but
+/// this string is still the `Tick` handler's change detector: a re-render is
+/// triggered whenever it changes (minute granularity — matching the default
+/// `status-right`; a custom `%S`-bearing format only refreshes when the
+/// minute flips, documented SP4 refinement alongside the stored-but-unused
+/// `status-interval`).
 fn local_clock() -> String {
     // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
     let st = unsafe { GetLocalTime() };
     let month = MONTHS[(st.wMonth.clamp(1, 12) as usize) - 1];
     let (hh, mm, dd, yy) = (st.wHour, st.wMinute, st.wDay, st.wYear % 100);
     format!("{hh:02}:{mm:02} {dd:02}-{month}-{yy:02}")
+}
+
+/// Plain calendar/time facts for `expand_format`'s strftime subset, from
+/// `GetLocalTime` (shared by `render_one`'s status-left/right expansion and
+/// `dispatch.rs`'s `display-message`/`confirm-before -p` expansion).
+fn system_time_parts() -> SystemTimeParts {
+    // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
+    let st = unsafe { GetLocalTime() };
+    SystemTimeParts {
+        year: st.wYear as i32,
+        month: st.wMonth as u8,
+        day: st.wDay as u8,
+        weekday: st.wDayOfWeek as u8,
+        hour: st.wHour as u8,
+        min: st.wMinute as u8,
+        sec: st.wSecond as u8,
+    }
+}
+
+/// Computer name for the `#H` format code (Task 8), queried once at server
+/// startup via `GetComputerNameW`; falls back to the `COMPUTERNAME` env var
+/// (empty string if neither works).
+fn computer_name() -> String {
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf`/`len` outlive the call; `len` is in/out (chars written).
+    let ok = unsafe { GetComputerNameW(windows::core::PWSTR(buf.as_mut_ptr()), &mut len) };
+    if ok.is_ok() {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+}
+
+/// Truncate to the first `max` chars (tmux `status-left-length` /
+/// `status-right-length`). Applied while BUILDING the status strings; the
+/// renderer's spatial right-truncation (when left + right don't fit the
+/// terminal width) still applies on top of these caps.
+fn truncate_chars(s: &str, max: u16) -> String {
+    s.chars().take(max as usize).collect()
 }
 
 /// Encode and send one `ServerMsg` (small, never chunked: `Exit`/`CliDone`).
@@ -182,11 +256,12 @@ fn send_output(tx: &Sender<Vec<u8>>, bytes: Vec<u8>) {
 }
 
 /// Spawn a shell in a fresh ConPTY and wire its two worker threads (output
-/// reader + process-exit waiter) into the shared event channel. Copied from
-/// `app.rs`'s `spawn_pane` (see module docs / CLAUDE.md: `app.rs` remains
-/// the reference implementation for pane plumbing until Task 8).
-fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>) -> std::io::Result<PaneRuntime> {
-    let mut pty = Pty::spawn(SHELL, cols.max(1), rows.max(1))?;
+/// reader + process-exit waiter) into the shared event channel. `shell` is
+/// the `default-command` option's current value (SP3 Task 6: configurable
+/// per `set -g default-command`, replacing the old hardcoded `SHELL`
+/// const).
+fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>, shell: &str) -> std::io::Result<PaneRuntime> {
+    let mut pty = Pty::spawn(shell, cols.max(1), rows.max(1))?;
     let mut reader = pty.take_reader()?;
 
     let out_tx = tx.clone();
@@ -298,6 +373,63 @@ fn switch_client_session(
     Some((old, neighbor))
 }
 
+/// One config file to attempt loading at server startup (Task 7):
+/// `required` distinguishes an explicitly-requested file (`-f`/`--config`)
+/// from a default-chain candidate. See `discover_config_files`.
+struct ConfigCandidate {
+    path: std::path::PathBuf,
+    /// `true` for an explicit `--config`/`-f` file: a missing file is a
+    /// collected error. `false` for a default-chain candidate (`.tmux.conf`/
+    /// `.winmux.conf`): a MISSING file is silently skipped (tmux behavior —
+    /// most users have no config at all); any OTHER open error (e.g.
+    /// permissions) is still collected even for a non-required candidate.
+    required: bool,
+}
+
+/// Pure discovery of which config file(s) `run` should try loading, in
+/// order, and whether each is required. Existence is NOT checked here
+/// (`Server::load_config_files` does that) — this only decides the
+/// candidate list and the required/optional distinction, so it can be unit
+/// tested without touching the filesystem or process environment (see the
+/// task brief: mutating `std::env` in parallel tests is racy).
+///
+/// - `explicit` non-empty (server `--config <path>`, repeatable, forwarded
+///   from the CLI's `-f`) REPLACES the default chain entirely, in the order
+///   given, each `required: true`. The special value `-` (Task 7 review
+///   fix; the tmux `-f /dev/null` idiom) is dropped from the candidate
+///   list but still counts as "explicit was given" — so `--config -` alone
+///   means NO config at all (no default chain, no candidates, no errors);
+///   this is also the test suite's isolation seam (`tests/server_proto.rs`'s
+///   `start_server` passes `["-"]` so a real `%USERPROFILE%\.tmux.conf` on
+///   a dev/CI machine can never contaminate a test's server).
+/// - Otherwise, the default chain: the first existing of
+///   `$XDG_CONFIG_HOME/tmux/tmux.conf` (only when `xdg` is `Some` and
+///   non-empty) or `%USERPROFILE%\.tmux.conf`, loaded FIRST; then
+///   `%USERPROFILE%\.winmux.conf`, loaded SECOND (so winmux-specific
+///   tweaks in a ported tmux config can be overridden by winmux-only
+///   settings) — both `required: false`.
+fn discover_config_files(xdg: Option<&str>, userprofile: Option<&str>, explicit: &[String]) -> Vec<ConfigCandidate> {
+    if !explicit.is_empty() {
+        return explicit
+            .iter()
+            .filter(|p| p.as_str() != "-")
+            .map(|p| ConfigCandidate { path: std::path::PathBuf::from(p), required: true })
+            .collect();
+    }
+    let mut out = Vec::new();
+    let tmux_conf = match xdg.filter(|s| !s.is_empty()) {
+        Some(x) => Some(std::path::PathBuf::from(x).join("tmux").join("tmux.conf")),
+        None => userprofile.map(|u| std::path::PathBuf::from(u).join(".tmux.conf")),
+    };
+    if let Some(p) = tmux_conf {
+        out.push(ConfigCandidate { path: p, required: false });
+    }
+    if let Some(u) = userprofile {
+        out.push(ConfigCandidate { path: std::path::PathBuf::from(u).join(".winmux.conf"), required: false });
+    }
+    out
+}
+
 impl Server {
     fn new(tx: Sender<ServerEvent>) -> Self {
         Server {
@@ -311,6 +443,30 @@ impl Server {
             had_session: false,
             clock: local_clock(),
             tx,
+            options: Options::new(),
+            bindings: Bindings::default(),
+            pending_config_message: None,
+            hostname: computer_name(),
+        }
+    }
+
+    /// How many rows the status bar takes out of a client's contribution to
+    /// its session's shared pane area (`status off` frees the row).
+    fn status_rows(&self) -> u16 {
+        if self.options.status_on() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The y origin of every session's pane area: row 1 when the status bar
+    /// sits on top, else row 0.
+    fn pane_area_y(&self) -> u16 {
+        if self.options.status_on() && self.options.status_position_top() {
+            1
+        } else {
+            0
         }
     }
 
@@ -410,18 +566,20 @@ impl Server {
             Some(tx) => tx,
             None => return, // already attached, or unknown client id
         };
-        let pane_rows = rows.saturating_sub(1).max(1);
+        let pane_rows = rows.saturating_sub(self.status_rows()).max(1);
         let size = (cols.max(1), pane_rows);
 
         match mode {
             AttachMode::NewAuto => {
                 let pane_id = self.mint_pane_id();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx) {
+                let shell = self.options.default_command().to_string();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
+                        let base_index = self.options.base_index();
                         let session_name = self
                             .registry
-                            .create_session(None, pane_id, size)
+                            .create_session(None, pane_id, size, base_index)
                             .expect("auto-assigned name never duplicates")
                             .name
                             .clone();
@@ -438,10 +596,12 @@ impl Server {
                     return;
                 }
                 let pane_id = self.mint_pane_id();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx) {
+                let shell = self.options.default_command().to_string();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
-                        match self.registry.create_session(Some(&name), pane_id, size) {
+                        let base_index = self.options.base_index();
+                        match self.registry.create_session(Some(&name), pane_id, size, base_index) {
                             Ok(session) => {
                                 let n = session.name.clone();
                                 self.finish_attach(id, writer_tx, n, cols, rows);
@@ -478,14 +638,17 @@ impl Server {
         // Force a full repaint on the very first compose (see module docs /
         // task brief: "use a fresh Renderer (or resize) at attach").
         renderer.resize(cols.max(1), rows.max(1));
+        // First-attach-only config-error notice (Task 7): `take()` so a
+        // SECOND client attaching later never sees it again.
+        let message = self.pending_config_message.take().map(|m| (m, Instant::now()));
         let client = ClientState {
             session: Some(session_name.clone()),
             cols,
             rows,
             renderer,
-            input: InputMachine::new(),
+            key_machine: KeyMachine::new(self.options.prefix()),
             mode: ClientMode::Normal,
-            message: None,
+            message,
             tx,
         };
         self.clients.insert(id, client);
@@ -544,7 +707,7 @@ impl Server {
         } else {
             return;
         };
-        let (code, out, err) = self.execute_cli(&argv);
+        let (code, out, err) = self.execute_cli_argv(&argv);
         send_msg(&tx, &ServerMsg::CliDone { code, out, err });
     }
 
@@ -559,85 +722,16 @@ impl Server {
         }
     }
 
-    /// Process one raw byte of an `InputEvent::Captured` chunk against
-    /// `client`'s status-line prompt line editor (rename-window /
-    /// rename-session, armed by `Action::RenameWindow`/`RenameSession`):
-    /// printable ASCII (0x20-0x7e) appends, Backspace (0x7f/0x08) deletes the
-    /// last char, Enter (`\r`/`\n`) commits (validated via
-    /// `validate_target_name`, and for session rename, a duplicate-name
-    /// check — either failure becomes a transient status message and the
-    /// prompt is discarded exactly like a cancel), Esc/Ctrl-c/Ctrl-g
-    /// (0x1b/0x03/0x07) cancels outright. Either way capture mode ends and
-    /// `mode` returns to `Normal`. A no-op if `client.mode` isn't `Prompt`
-    /// (defensive; shouldn't happen since capture mode is only armed
-    /// alongside `Prompt`).
-    ///
-    /// Returns `true` when this byte ENDED the prompt (commit or cancel) —
-    /// the caller must then re-feed any remaining bytes of the same
-    /// `Captured` chunk through the `InputMachine` as normal input (capture
-    /// is off again), so pasted input like `web\rls\r` doesn't silently
-    /// drop the tail after the commit.
-    fn feed_prompt_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) -> bool {
-        let commit = matches!(b, b'\r' | b'\n');
-        let cancel = matches!(b, 0x1b | 0x03 | 0x07);
-        if !commit && !cancel {
-            if let ClientMode::Prompt { buf, .. } = &mut client.mode {
-                match b {
-                    0x20..=0x7e => buf.push(b as char),
-                    0x7f | 0x08 => {
-                        buf.pop();
-                    }
-                    _ => {}
-                }
-            }
-            return false;
-        }
-
-        client.input.set_capture(false);
-        let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
-        let ClientMode::Prompt { buf, kind, .. } = mode else {
-            return true;
-        };
-        if cancel {
-            return true;
-        }
-        match kind {
-            PromptKind::RenameWindow => match validate_target_name(&buf, "window") {
-                Ok(()) => {
-                    if let Some(session) = self.registry.session_mut(session_name) {
-                        session.current_window_mut().name = buf;
-                    }
-                }
-                Err(e) => client.message = Some((e, Instant::now())),
-            },
-            PromptKind::RenameSession => {
-                if let Err(e) = validate_target_name(&buf, "session") {
-                    client.message = Some((e, Instant::now()));
-                } else if buf != *session_name && self.registry.sessions().iter().any(|s| s.name == buf) {
-                    client.message = Some((format!("duplicate session: {buf}"), Instant::now()));
-                } else {
-                    if let Some(session) = self.registry.session_mut(session_name) {
-                        session.name = buf.clone();
-                    }
-                    self.rename_session_everywhere(session_name, &buf);
-                    client.session = Some(buf.clone());
-                    *session_name = buf;
-                }
-            }
-        }
-        true
-    }
-
-    /// Cancel any attached client's pending kill confirm whose target pane/
-    /// window no longer exists (it exited naturally, or another client
+    /// Cancel any attached client's pending confirm-before whose snapshotted
+    /// pane/window no longer exists (it exited naturally, or another client
     /// killed it, while the `(y/n)` prompt was up): reset the mode to
-    /// `Normal`, drop the `InputMachine` out of confirming (so the next key
-    /// is normal input again, e.g. a `y` gets FORWARDED to the pane instead
-    /// of confirming), and clear any transient message. The confirm
-    /// handlers in `handle_stdin` ALSO re-validate their target before
-    /// acting (belt and braces — this method can't reach a client currently
-    /// removed from the map mid-`handle_stdin`), but only this path clears
-    /// a stale on-screen prompt without waiting for a keypress.
+    /// `Normal`, drop capture (so the next key is normal input again, e.g. a
+    /// `y` gets FORWARDED to the pane instead of confirming), and clear any
+    /// transient message. `dispatch::Server::feed_confirm_byte` ALSO
+    /// re-validates its target before acting (belt and braces — this method
+    /// can't reach a client currently removed from the map mid-
+    /// `handle_stdin`), but only this path clears a stale on-screen prompt
+    /// without waiting for a keypress.
     fn cancel_stale_confirms(&mut self) {
         let mut live_panes: HashSet<PaneId> = HashSet::new();
         let mut live_windows: HashSet<WindowId> = HashSet::new();
@@ -648,26 +742,30 @@ impl Server {
             }
         }
         for client in self.clients.values_mut() {
-            let stale = match client.mode {
-                ClientMode::ConfirmKillPane(p) => !live_panes.contains(&p),
-                ClientMode::ConfirmKillWindow(w) => !live_windows.contains(&w),
+            let stale = match &client.mode {
+                ClientMode::ConfirmCmd { pane_snapshot, window_snapshot, .. } => {
+                    pane_snapshot.is_some_and(|p| !live_panes.contains(&p))
+                        || window_snapshot.is_some_and(|w| !live_windows.contains(&w))
+                }
                 _ => false,
             };
             if stale {
                 client.mode = ClientMode::Normal;
-                client.input.set_confirming(false);
+                client.key_machine.set_capture(false);
                 client.message = None;
             }
         }
     }
 
     /// Session's shared size = min over its attached clients of
-    /// `(cols, rows - 1)` (the status row is not part of the pane area).
+    /// `(cols, rows - status_rows)` (the status row, when on, is not part of
+    /// the pane area; `status off` gives panes the full height — Task 8).
     /// No attached clients: keep the last size.
     fn recompute_session_size(&mut self, name: &str) {
+        let status_rows = self.status_rows();
         let mut min: Option<(u16, u16)> = None;
         for c in self.clients.values().filter(|c| c.session.as_deref() == Some(name)) {
-            let contribution = (c.cols.max(1), c.rows.saturating_sub(1).max(1));
+            let contribution = (c.cols.max(1), c.rows.saturating_sub(status_rows).max(1));
             min = Some(match min {
                 Some(m) => (m.0.min(contribution.0), m.1.min(contribution.1)),
                 None => contribution,
@@ -681,9 +779,10 @@ impl Server {
     }
 
     fn apply_layout_for_session(&mut self, name: &str) {
+        let area_y = self.pane_area_y();
         let Some(session) = self.registry.session_mut(name) else { return };
         let size = session.size;
-        let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
+        let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
         let window = session.current_window_mut();
         apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
     }
@@ -793,9 +892,11 @@ impl Server {
         }
     }
 
-    /// Route one `Stdin` frame through the client's `InputMachine` and
-    /// dispatch the resulting events one at a time against live state (see
-    /// module docs re: the confirm race — NOT fixed here).
+    /// Route one `Stdin` frame through the client's `KeyMachine` and
+    /// dispatch the resulting events one at a time against live state via
+    /// the command dispatcher (`dispatch.rs`) and the mutable `bindings`
+    /// table (see module docs re: the confirm race — NOT fixed here, same
+    /// as before Task 6).
     fn handle_stdin(&mut self, id: ClientId, bytes: Vec<u8>) {
         let mut client = match self.clients.remove(&id) {
             Some(c) => c,
@@ -814,11 +915,11 @@ impl Server {
         client.message = None;
 
         let now = Instant::now();
-        // A queue (not a plain iterator) because a prompt commit/cancel
+        // A queue (not a plain iterator) because a prompt/confirm commit
         // mid-`Captured`-chunk re-feeds the chunk's REMAINING bytes through
-        // the InputMachine and splices the resulting events in at the front
+        // the KeyMachine and splices the resulting events in at the front
         // (they logically precede everything after the Captured event).
-        let mut queue: VecDeque<InputEvent> = client.input.feed(&bytes, now).into();
+        let mut queue: VecDeque<KeyInputEvent> = client.key_machine.feed(&bytes, now).into();
 
         let mut detach = false;
         let mut destroy = false;
@@ -826,7 +927,7 @@ impl Server {
 
         'events: while let Some(ev) = queue.pop_front() {
             match ev {
-                InputEvent::Forward(data) => {
+                KeyInputEvent::Forward(data) => {
                     if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
@@ -836,280 +937,61 @@ impl Server {
                         }
                     }
                 }
-                InputEvent::Action(action) => match action {
-                    Action::Split(dir) => {
-                        let size = self.registry.session_mut(&session_name).map(|s| s.size);
-                        if let Some(size) = size {
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            let new_id = self.mint_pane_id();
-                            let split_ok = self
-                                .registry
-                                .session_mut(&session_name)
-                                .map(|s| s.current_window_mut().layout.split(dir, new_id, area).is_ok())
-                                .unwrap_or(false);
-                            if split_ok {
-                                let rect = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .and_then(|s| {
-                                        s.current_window().layout.rects(area).into_iter().find(|(pid, _)| *pid == new_id)
-                                    })
-                                    .map(|(_, r)| r)
-                                    .unwrap_or(area);
-                                match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx) {
-                                    Ok(pr) => {
-                                        self.panes.insert(new_id, pr);
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                    Err(_) => {
-                                        if let Some(s) = self.registry.session_mut(&session_name) {
-                                            s.current_window_mut().layout.remove(new_id);
+                KeyInputEvent::Key { table, key, raw } => {
+                    let binding = self.bindings.lookup(table, &key).cloned();
+                    match binding {
+                        Some(b) => {
+                            let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
+                            if b.repeat {
+                                client.key_machine.arm_repeat(now);
+                            }
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
+                            }
+                        }
+                        None => match table {
+                            // Unbound in the root table: forward raw bytes
+                            // (tmux behavior for `bind -n`-less keys).
+                            WhichTable::Root => {
+                                if let Some(session) = self.registry.session_mut(&session_name) {
+                                    let fid = session.current_window().layout.focused();
+                                    if let Some(pane) = self.panes.get_mut(&fid) {
+                                        if let Some(pty) = pane.pty.as_mut() {
+                                            let _ = pty.write_input(&raw);
                                         }
-                                        self.apply_layout_for_session(&session_name);
                                     }
                                 }
                             }
-                        }
+                            // Unbound in the prefix table: swallowed (tmux).
+                            WhichTable::Prefix => {}
+                        },
                     }
-                    Action::Focus(dir) => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let size = session.size;
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            session.current_window_mut().layout.focus_dir(dir, area);
-                        }
-                    }
-                    Action::FocusNext => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.focus_next();
-                        }
-                    }
-                    Action::FocusLast => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.focus_last();
-                        }
-                    }
-                    Action::RequestClose => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let focused = session.current_window().layout.focused();
-                            client.mode = ClientMode::ConfirmKillPane(focused);
-                            client.input.set_confirming(true);
-                        }
-                    }
-                    Action::ToggleZoom => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.toggle_zoom();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::Resize(dir) => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let size = session.size;
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            session.current_window_mut().layout.resize_focused(dir, area, 1);
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::Detach => {
-                        detach = true;
-                        break 'events;
-                    }
-                    Action::NewWindow => {
-                        let size = self.registry.session_mut(&session_name).map(|s| s.size);
-                        if let Some(size) = size {
-                            let pane_id = self.mint_pane_id();
-                            match spawn_pane(pane_id, size.0, size.1, &self.tx) {
-                                Ok(pr) => {
-                                    self.panes.insert(pane_id, pr);
-                                    let wid = self.registry.mint_window_id();
-                                    if let Some(session) = self.registry.session_mut(&session_name) {
-                                        session.new_window(wid, pane_id);
-                                    }
-                                    self.apply_layout_for_session(&session_name);
-                                }
-                                Err(e) => {
-                                    client.message = Some((format!("open terminal failed: {e}"), Instant::now()));
-                                }
-                            }
-                        }
-                    }
-                    Action::NextWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.next_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::PrevWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.prev_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::LastWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.last_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::SelectWindow(n) => {
-                        let ok = self.registry.session_mut(&session_name).map(|s| s.select_window(n)).unwrap_or(false);
-                        if ok {
-                            self.apply_layout_for_session(&session_name);
-                        } else {
-                            client.message = Some((format!("window not found: {n}"), Instant::now()));
-                        }
-                    }
-                    Action::RequestKillWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let wid = session.current;
-                            client.mode = ClientMode::ConfirmKillWindow(wid);
-                            client.input.set_confirming(true);
-                        }
-                    }
-                    Action::RenameWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let current = session.current_window().name.clone();
-                            client.mode = ClientMode::Prompt {
-                                label: "(rename-window) ".to_string(),
-                                buf: current,
-                                kind: PromptKind::RenameWindow,
-                            };
-                            client.input.set_capture(true);
-                        }
-                    }
-                    Action::RenameSession => {
-                        client.mode = ClientMode::Prompt {
-                            label: "(rename-session) ".to_string(),
-                            buf: session_name.clone(),
-                            kind: PromptKind::RenameSession,
-                        };
-                        client.input.set_capture(true);
-                    }
-                    Action::SwitchClientPrev => {
-                        if let Some(pair) = switch_client_session(&mut self.registry, &mut client, &mut session_name, false) {
-                            session_switched = Some(pair);
-                        }
-                    }
-                    Action::SwitchClientNext => {
-                        if let Some(pair) = switch_client_session(&mut self.registry, &mut client, &mut session_name, true) {
-                            session_switched = Some(pair);
-                        }
-                    }
-                    Action::Quit => {
-                        // Never emitted by `InputMachine::feed` (MVP-only hook).
-                    }
-                },
-                InputEvent::Captured(chunk) => {
+                }
+                KeyInputEvent::Captured(chunk) => {
                     let mut i = 0;
                     while i < chunk.len() {
-                        let ended = self.feed_prompt_byte(&mut client, &mut session_name, chunk[i]);
+                        let (ended, outcome) = self.feed_mode_byte(&mut client, &mut session_name, chunk[i]);
                         i += 1;
+                        if let Some(outcome) = outcome {
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        }
+                        if detach || destroy {
+                            break 'events;
+                        }
                         if ended {
                             // Commit/cancel mid-chunk: the rest of the chunk
                             // is normal input again (capture is off) — run it
-                            // through the InputMachine and process its events
+                            // through the KeyMachine and process its events
                             // next, ahead of anything already queued.
                             if i < chunk.len() {
-                                let more = client.input.feed(&chunk[i..], now);
+                                let more = client.key_machine.feed(&chunk[i..], now);
                                 for e in more.into_iter().rev() {
                                     queue.push_front(e);
                                 }
                             }
                             break;
                         }
-                    }
-                }
-                InputEvent::ConfirmClose(confirmed) => {
-                    client.input.set_confirming(false);
-                    let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
-                    // Both kill confirms RE-VALIDATE their target against
-                    // live state before acting: the target may have vanished
-                    // (natural exit, another client's kill) between arming
-                    // and the `y`, and `cancel_stale_confirms` can't reach
-                    // THIS client mid-`handle_stdin` (it's removed from the
-                    // map). A missing target is a no-op cancel — NEVER
-                    // destroy-session; a `false` from `layout.remove`/
-                    // `kill_window` may only be trusted to mean "was the
-                    // only one" once existence has been established.
-                    match mode {
-                        ClientMode::ConfirmKillPane(target) => {
-                            if confirmed {
-                                // The pane's OWNING window, not blindly the
-                                // current one (another client may have
-                                // switched the session's current window
-                                // while this confirm was up).
-                                let owner_wid = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .and_then(|s| s.window_by_pane(target).map(|w| w.id));
-                                if let Some(wid) = owner_wid {
-                                    let removed = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .and_then(|s| s.windows.iter_mut().find(|w| w.id == wid))
-                                        .map(|w| w.layout.remove(target))
-                                        .unwrap_or(false);
-                                    if removed {
-                                        self.panes.remove(&target);
-                                        self.last_rects.remove(&target);
-                                        self.apply_layout_for_session(&session_name);
-                                    } else {
-                                        // The window's only pane: the window
-                                        // dies; the session only dies with it
-                                        // if it was also the only window.
-                                        let only_window = self
-                                            .registry
-                                            .session_mut(&session_name)
-                                            .map(|s| s.windows.len() == 1)
-                                            .unwrap_or(false);
-                                        if only_window {
-                                            destroy = true;
-                                            break 'events;
-                                        }
-                                        if let Some(s) = self.registry.session_mut(&session_name) {
-                                            s.kill_window(wid);
-                                        }
-                                        self.panes.remove(&target);
-                                        self.last_rects.remove(&target);
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                }
-                                // else: stale target — no-op cancel.
-                            }
-                        }
-                        ClientMode::ConfirmKillWindow(wid) => {
-                            if confirmed {
-                                let exists = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .map(|s| s.windows.iter().any(|w| w.id == wid))
-                                    .unwrap_or(false);
-                                if exists {
-                                    let only_window = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .map(|s| s.windows.len() == 1)
-                                        .unwrap_or(false);
-                                    if only_window {
-                                        destroy = true;
-                                        break 'events;
-                                    }
-                                    let pane_ids: Vec<PaneId> = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()))
-                                        .unwrap_or_default();
-                                    if self.registry.session_mut(&session_name).map(|s| s.kill_window(wid)).unwrap_or(false) {
-                                        for pid in pane_ids {
-                                            self.panes.remove(&pid);
-                                            self.last_rects.remove(&pid);
-                                        }
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                }
-                                // else: stale target — no-op cancel.
-                            }
-                        }
-                        ClientMode::Normal | ClientMode::Prompt { .. } => {}
                     }
                 }
             }
@@ -1122,8 +1004,12 @@ impl Server {
             return; // client dropped, not reinserted
         }
         if destroy {
+            // `destroy_session` (and messaging every OTHER attached client)
+            // has ALREADY run inside the dispatcher (`kill_pane_by_id`/
+            // `kill_window_by_id`) — this client, removed from `self.clients`
+            // at the top of this function, is the only one destroy_session
+            // couldn't reach.
             send_msg(&client.tx, &ServerMsg::Exit { code: 0, msg: "[exited]".to_string() });
-            self.destroy_session(&session_name); // handles any OTHER attached clients
             return; // client dropped, not reinserted
         }
         self.clients.insert(id, client);
@@ -1145,19 +1031,33 @@ impl Server {
     /// Render every attached client (see module docs: render-all, not
     /// per-session dirty tracking).
     fn render_all(&mut self) {
-        let clock = self.clock.clone();
+        let area_y = self.pane_area_y();
         for client in self.clients.values_mut() {
             let Some(name) = client.session.clone() else { continue };
             let Some(session) = self.registry.sessions().iter().find(|s| s.name == name) else { continue };
-            render_one(client, session, &self.panes, &clock);
+            render_one(client, session, &self.panes, &self.options, &self.hostname, area_y);
         }
     }
 }
 
-/// Compose and send one client's frame from shared session state.
-fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneId, PaneRuntime>, clock: &str) {
+/// Compose and send one client's frame from shared session state. Styles,
+/// status position/visibility, and the status-left/right strings all come
+/// from the option table (Task 8): the defaults reproduce the SP2 output
+/// byte for byte (`status-left "[#S] "` expands to the old `[<name>] `
+/// prefix; `status-right "%H:%M %d-%b-%y"` expands to the old
+/// `local_clock()` string). `area_y` is `Server::pane_area_y()` — the same
+/// origin `apply_layout_for_session` used, so the drawn rects line up with
+/// the pty/grid sizes.
+fn render_one(
+    client: &mut ClientState,
+    session: &Session,
+    panes: &HashMap<PaneId, PaneRuntime>,
+    options: &Options,
+    hostname: &str,
+    area_y: u16,
+) {
     let window = session.current_window();
-    let area = Rect { x: 0, y: 0, w: session.size.0, h: session.size.1 };
+    let area = Rect { x: 0, y: area_y, w: session.size.0, h: session.size.1 };
     let focused = window.layout.focused();
     let zoomed = window.layout.is_zoomed();
     let rects = window.layout.rects(area);
@@ -1165,42 +1065,87 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
     let too_small =
         area.w < MIN_PANE_W || area.h < MIN_PANE_H || rects.iter().any(|(_, r)| r.w < MIN_PANE_W || r.h < MIN_PANE_H);
 
-    // Precedence matches the pre-Task-7 code exactly: `ConfirmKillPane` had
-    // no match guard, so it (and now its Task 7 siblings `ConfirmKillWindow`/
-    // `Prompt`) always won regardless of `too_small` — a confirm/prompt
-    // overlay doesn't depend on pane space, so it stays visible even on a
-    // too-small terminal. `too_small` only applies in `Normal` mode, where it
-    // additionally takes priority over a transient status message.
+    // Precedence matches the pre-Task-6 code exactly: `ConfirmCmd` (the
+    // Task 6 generalization of the legacy `ConfirmKillPane`/`ConfirmKillWindow`
+    // variants) had no match guard, so it (and `Prompt`) always wins
+    // regardless of `too_small` — a confirm/prompt overlay doesn't depend on
+    // pane space, so it stays visible even on a too-small terminal.
+    // `too_small` only applies in `Normal` mode, where it additionally takes
+    // priority over a transient status message.
+    let default_style = Style::default();
+    let msg_style = options.message_style().apply_to(default_style);
     let message = match &client.mode {
-        ClientMode::ConfirmKillPane(pid) => {
-            let idx = window.layout.panes().iter().position(|p| p == pid).unwrap_or(0);
-            Some(format!("kill-pane {idx}? (y/n)"))
-        }
-        ClientMode::ConfirmKillWindow(wid) => {
-            let name = session.windows.iter().find(|w| w.id == *wid).map(|w| w.name.as_str()).unwrap_or("?");
-            Some(format!("kill-window {name}? (y/n)"))
-        }
+        ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
         ClientMode::Normal if too_small => Some("terminal too small".to_string()),
         ClientMode::Normal => client.message.as_ref().map(|(msg, _)| msg.clone()),
+    }
+    .map(|m| (m, msg_style));
+
+    // Status row from the option table. status off -> None (no row painted;
+    // the pane area already includes the freed row via
+    // `recompute_session_size`).
+    let status = if options.status_on() {
+        let base = options.status_style().apply_to(default_style);
+        // Format context from live state: the current window's index/name/
+        // flags and the focused pane's position in `layout.panes()`.
+        let mut window_flags = String::from("*");
+        if window.layout.is_zoomed() {
+            window_flags.push('Z');
+        }
+        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32;
+        let fctx = FormatCtx {
+            session: &session.name,
+            window_index: window.index,
+            window_name: &window.name,
+            window_flags: &window_flags,
+            pane_index,
+            hostname,
+            now: system_time_parts(),
+        };
+        // Option-length caps apply while building the strings (tmux
+        // truncates left/right to status-left/right-length); the renderer's
+        // spatial right-first truncation still applies on top when the
+        // capped strings don't fit the terminal width.
+        let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
+        let right = truncate_chars(&expand_format(options.status_right(), &fctx), options.status_right_length());
+        let entries: Vec<WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| WindowEntry {
+                index: w.index,
+                name: w.name.clone(),
+                current: w.id == session.current,
+                last: Some(w.id) == session.last,
+                zoomed: w.layout.is_zoomed(),
+            })
+            .collect();
+        let spans = status_spans(
+            &left,
+            &entries,
+            base,
+            options.window_status_style(),
+            options.window_status_current_style(),
+        );
+        Some(StatusRow {
+            top: options.status_position_top(),
+            base,
+            spans,
+            right,
+            // status-right styling via `#[]` inline styles is SP4; until
+            // then the right side is drawn with the row's base style.
+            right_style: base,
+        })
+    } else {
+        None
     };
 
-    let entries: Vec<WindowEntry> = session
-        .windows
-        .iter()
-        .map(|w| WindowEntry {
-            index: w.index,
-            name: w.name.clone(),
-            current: w.id == session.current,
-            last: Some(w.id) == session.last,
-            zoomed: w.layout.is_zoomed(),
-        })
-        .collect();
-    let spans = status_spans(&session.name, &entries);
+    let border = options.pane_border_style().apply_to(default_style);
+    let border_active = options.pane_active_border_style().apply_to(default_style);
     let scene_size = (client.cols, client.rows);
 
     if too_small {
-        let scene = Scene { size: scene_size, panes: Vec::new(), zoomed, status_spans: spans, status_right: clock.to_string(), message };
+        let scene = Scene { size: scene_size, panes: Vec::new(), zoomed, status, message, border, border_active };
         let out = client.renderer.compose(&scene, None, false);
         send_output(&client.tx, out);
         return;
@@ -1222,15 +1167,20 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
         _ => (None, false),
     };
 
-    let scene = Scene { size: scene_size, panes: views, zoomed, status_spans: spans, status_right: clock.to_string(), message };
+    let scene = Scene { size: scene_size, panes: views, zoomed, status, message, border, border_active };
     let out = client.renderer.compose(&scene, cursor, cursor_visible);
     send_output(&client.tx, out);
 }
 
-/// Run the multiplexer server: bind `pipe_full_name`, accept clients, and
-/// loop until every session has died (exit-empty). Does not touch the
-/// console and installs no panic hook (both are `main.rs`'s job, Task 8).
-pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the multiplexer server: bind `pipe_full_name`, load startup config,
+/// accept clients, and loop until every session has died (exit-empty). Does
+/// not touch the console and installs no panic hook (both are `main.rs`'s
+/// job, Task 8). `config_files` is the server role's `--config <path>` args
+/// (repeatable, in order; forwarded from the CLI's `-f`, Task 7) — empty
+/// means "use the default `.tmux.conf`/`.winmux.conf` discovery chain", a
+/// non-empty slice REPLACES that chain entirely (see
+/// `discover_config_files`).
+pub fn run(pipe_full_name: &str, config_files: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let listener = PipeListener::bind(pipe_full_name)?;
     let (tx, rx) = channel::<ServerEvent>();
 
@@ -1246,6 +1196,24 @@ pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut server = Server::new(tx);
+
+    // Startup config loading (Task 7): after the pipe is bound (so a client
+    // racing to connect never sees "not found"), before any client attach is
+    // served (the loop below). Errors don't stop the server from coming up
+    // (tmux behavior) — they're logged AND surfaced to the first attach.
+    {
+        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let userprofile = std::env::var("USERPROFILE").ok();
+        let candidates = discover_config_files(xdg.as_deref(), userprofile.as_deref(), config_files);
+        let errors = server.load_config_files(&candidates);
+        if !errors.is_empty() {
+            crate::logging::log_line(&format!("config: {} error(s)", errors.len()));
+            for e in &errors {
+                crate::logging::log_line(&format!("  {e}"));
+            }
+            server.pending_config_message = Some(format!("config: {} error(s), see server.log", errors.len()));
+        }
+    }
 
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(50)) {
@@ -1268,4 +1236,67 @@ pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_discovery_tests {
+    use super::discover_config_files;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_replaces_default_chain() {
+        let explicit = vec!["a.conf".to_string(), "b.conf".to_string()];
+        let got = discover_config_files(Some("ignored"), Some(r"C:\Users\x"), &explicit);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, PathBuf::from("a.conf"));
+        assert!(got[0].required);
+        assert_eq!(got[1].path, PathBuf::from("b.conf"));
+        assert!(got[1].required);
+    }
+
+    #[test]
+    fn xdg_wins_over_userprofile_tmux_conf() {
+        let got = discover_config_files(Some(r"C:\xdg"), Some(r"C:\Users\x"), &[]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\xdg").join("tmux").join("tmux.conf"));
+        assert!(!got[0].required);
+        assert_eq!(got[1].path, PathBuf::from(r"C:\Users\x").join(".winmux.conf"));
+        assert!(!got[1].required);
+    }
+
+    #[test]
+    fn empty_xdg_falls_back_to_userprofile_tmux_conf() {
+        let got = discover_config_files(Some(""), Some(r"C:\Users\x"), &[]);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\Users\x").join(".tmux.conf"));
+        assert!(!got[0].required);
+    }
+
+    #[test]
+    fn no_xdg_falls_back_to_userprofile_tmux_conf() {
+        let got = discover_config_files(None, Some(r"C:\Users\x"), &[]);
+        assert_eq!(got[0].path, PathBuf::from(r"C:\Users\x").join(".tmux.conf"));
+        assert_eq!(got[1].path, PathBuf::from(r"C:\Users\x").join(".winmux.conf"));
+    }
+
+    #[test]
+    fn no_userprofile_no_xdg_yields_no_candidates() {
+        let got = discover_config_files(None, None, &[]);
+        assert!(got.is_empty());
+    }
+
+    /// Task 7 review fix (Important): `--config -` (the tmux `-f /dev/null`
+    /// idiom) disables config loading entirely — no default chain, no
+    /// candidates, no errors. `-` entries are dropped but still count as
+    /// "explicit was given" (the default chain stays replaced), so
+    /// `--config - --config real.conf` loads only `real.conf`.
+    #[test]
+    fn dash_config_disables_defaults() {
+        let got = discover_config_files(Some(r"C:\xdg"), Some(r"C:\Users\x"), &["-".to_string()]);
+        assert!(got.is_empty());
+
+        let got = discover_config_files(None, Some(r"C:\Users\x"), &["-".to_string(), "real.conf".to_string()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, PathBuf::from("real.conf"));
+        assert!(got[0].required);
+    }
 }

@@ -10,21 +10,43 @@ pub struct PaneView<'a> {
     pub dead: bool,
 }
 
-/// One run of status-bar text; `underline` draws it with SGR 4 (tmux
-/// `window-status-current-style` = `underscore` default, used for the
-/// current window's span). Built by `status::status_spans`.
-pub struct StatusSpan {
-    pub text: String,
-    pub underline: bool,
+/// The status row's full drawing recipe (SP3 Task 8, superseding the old
+/// `StatusSpan { text, underline }`): where the row sits, its base fill
+/// style, left-aligned spans (each carrying a FULLY RESOLVED [`Style`] —
+/// styling decisions live with the builder, `status::status_spans` + the
+/// server's option table, not here), and the right-aligned text.
+pub struct StatusRow {
+    /// `true` = draw on row 0 (`status-position top`); `false` = the bottom
+    /// row. Pane rects are computed by the SERVER to leave this row free —
+    /// the renderer just paints where told.
+    pub top: bool,
+    /// Row fill style (`status-style` applied to the default style); padding
+    /// cells between the spans and `right` are drawn with it.
+    pub base: Style,
+    /// Left-aligned runs with their resolved styles (window tabs get
+    /// `window-status(-current)-style` layered over `base` upstream).
+    pub spans: Vec<(String, Style)>,
+    pub right: String,
+    /// Style for `right` (`base` in SP3 — `#[]` inline styles are SP4).
+    pub right_style: Style,
 }
 
 pub struct Scene<'a> {
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
     pub zoomed: bool,
-    pub status_spans: Vec<StatusSpan>,
-    pub status_right: String,
-    pub message: Option<String>,
+    /// `None` = `status off`: no status row is painted; panes may occupy
+    /// every row.
+    pub status: Option<StatusRow>,
+    /// When `Some`, replaces the status row's content (same row, message
+    /// style). With `status off`, the message overlays the BOTTOM row (tmux
+    /// draws messages on the last line even without a status bar).
+    pub message: Option<(String, Style)>,
+    /// Border cell style (`pane-border-style` applied to the default style).
+    pub border: Style,
+    /// Border cells adjacent to the focused pane (`pane-active-border-style`,
+    /// tmux default `fg=green`).
+    pub border_active: Style,
 }
 
 pub struct Renderer {
@@ -56,11 +78,18 @@ impl Renderer {
     }
 
     /// Fill the back buffer from the scene: pane grids, junction-aware borders
-    /// (unless zoomed), dead-pane overlays, then the status bar.
+    /// (unless zoomed), dead-pane overlays, then the status row (or message).
     fn compose_back(&mut self, scene: &Scene) {
         let cols = self.cols;
         let rows = self.rows;
-        let pane_rows = rows.saturating_sub(1); // last row is the status bar
+        // Which row (if any) the status bar occupies. `status: None` frees
+        // every row for panes.
+        let status_y: Option<u16> = match &scene.status {
+            Some(s) if rows > 0 => Some(if s.top { 0 } else { rows - 1 }),
+            _ => None,
+        };
+        // A row panes/borders may draw on (i.e. not the status row).
+        let in_band = |y: u16| -> bool { y < rows && Some(y) != status_y };
 
         // 0) clear back to default cells
         for c in self.back.iter_mut() {
@@ -72,7 +101,7 @@ impl Renderer {
             let r = pv.rect;
             for dy in 0..r.h {
                 let y = r.y + dy;
-                if y >= pane_rows {
+                if !in_band(y) {
                     continue;
                 }
                 for dx in 0..r.w {
@@ -91,13 +120,13 @@ impl Renderer {
         // 2) borders — only when not zoomed
         if !scene.zoomed {
             let w = cols as usize;
-            let h = pane_rows as usize;
+            let h = rows as usize;
             let mut covered = vec![false; w * h];
             for pv in &scene.panes {
                 let r = pv.rect;
                 for dy in 0..r.h {
                     let y = r.y + dy;
-                    if y >= pane_rows {
+                    if !in_band(y) {
                         continue;
                     }
                     for dx in 0..r.w {
@@ -110,7 +139,10 @@ impl Renderer {
                 }
             }
             let is_border = |x: i32, y: i32| -> bool {
-                if x < 0 || y < 0 || x >= cols as i32 || y >= pane_rows as i32 {
+                if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
+                    return false;
+                }
+                if !in_band(y as u16) {
                     return false;
                 }
                 !covered[y as usize * w + x as usize]
@@ -130,7 +162,10 @@ impl Renderer {
                     None => false,
                 }
             };
-            for y in 0..pane_rows as i32 {
+            for y in 0..rows as i32 {
+                if !in_band(y as u16) {
+                    continue;
+                }
                 for x in 0..cols as i32 {
                     if !is_border(x, y) {
                         continue;
@@ -141,10 +176,7 @@ impl Renderer {
                         is_border(x - 1, y),
                         is_border(x + 1, y),
                     );
-                    let mut style = Style::default();
-                    if touches_focused(x, y) {
-                        style.fg = Color::Idx(2); // green
-                    }
+                    let style = if touches_focused(x, y) { scene.border_active } else { scene.border };
                     self.set(x as u16, y as u16, Cell { ch, style });
                 }
             }
@@ -156,7 +188,7 @@ impl Renderer {
                 continue;
             }
             let y = pv.rect.y;
-            if y >= pane_rows {
+            if !in_band(y) {
                 continue;
             }
             let style = Style { reverse: true, ..Style::default() };
@@ -166,49 +198,41 @@ impl Renderer {
             }
         }
 
-        // 4) status bar on the bottom row
+        // 4) status row / message overlay
         if rows == 0 {
             return;
         }
-        let y = rows - 1;
         let cols_u = cols as usize;
-        let (style, message) = match &scene.message {
-            Some(m) => {
-                // black on yellow
-                let s = Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() };
-                (s, Some(m.clone()))
+        if let Some((msg, style)) = &scene.message {
+            // A message replaces the status row's content; with status off it
+            // overlays the bottom row (tmux behavior: messages use the last
+            // line even with no status bar).
+            let y = status_y.unwrap_or(rows - 1);
+            for x in 0..cols {
+                self.set(x, y, Cell { ch: ' ', style: *style });
             }
-            None => {
-                // black on green
-                let s = Style { fg: Color::Idx(0), bg: Color::Idx(2), ..Style::default() };
-                (s, None)
-            }
-        };
-        // fill the row with styled spaces
-        for x in 0..cols {
-            self.set(x, y, Cell { ch: ' ', style });
-        }
-        if let Some(msg) = message {
             for (i, ch) in msg.chars().enumerate() {
                 if i >= cols_u {
                     break;
                 }
-                self.set(i as u16, y, Cell { ch, style });
+                self.set(i as u16, y, Cell { ch, style: *style });
             }
-        } else {
-            let left_len_total: usize =
-                scene.status_spans.iter().map(|s| s.text.chars().count()).sum();
-            let right: Vec<char> = scene.status_right.chars().collect();
+        } else if let Some(st) = &scene.status {
+            let y = status_y.expect("status_y is Some whenever scene.status is (rows > 0)");
+            // fill the row with base-styled spaces
+            for x in 0..cols {
+                self.set(x, y, Cell { ch: ' ', style: st.base });
+            }
+            let left_len_total: usize = st.spans.iter().map(|(t, _)| t.chars().count()).sum();
+            let right: Vec<char> = st.right.chars().collect();
 
             let mut x = 0usize;
-            'spans: for span in &scene.status_spans {
-                let mut span_style = style;
-                span_style.underline = span.underline;
-                for ch in span.text.chars() {
+            'spans: for (text, style) in &st.spans {
+                for ch in text.chars() {
                     if x >= cols_u {
                         break 'spans;
                     }
-                    self.set(x as u16, y, Cell { ch, style: span_style });
+                    self.set(x as u16, y, Cell { ch, style: *style });
                     x += 1;
                 }
             }
@@ -217,7 +241,7 @@ impl Renderer {
             let right_len = right.len().min(max_right); // truncate right first
             let start = cols_u - right_len;
             for (i, &ch) in right[..right_len].iter().enumerate() {
-                self.set((start + i) as u16, y, Cell { ch, style });
+                self.set((start + i) as u16, y, Cell { ch, style: st.right_style });
             }
         }
     }
@@ -400,6 +424,28 @@ mod tests {
         g
     }
 
+    /// tmux default `status-style` resolved: `bg=green,fg=black`.
+    fn status_base() -> Style {
+        Style { fg: Color::Idx(0), bg: Color::Idx(2), ..Style::default() }
+    }
+
+    /// A bottom `StatusRow` with the default base style (what the server
+    /// builds from default options) — keeps the pre-Task-8 tests' expected
+    /// bytes unchanged.
+    fn default_status(spans: Vec<(String, Style)>, right: &str) -> StatusRow {
+        StatusRow { top: false, base: status_base(), spans, right: right.to_string(), right_style: status_base() }
+    }
+
+    /// tmux default `pane-active-border-style` resolved: `fg=green`.
+    fn green_active() -> Style {
+        Style { fg: Color::Idx(2), ..Style::default() }
+    }
+
+    /// tmux default `message-style` resolved: `bg=yellow,fg=black`.
+    fn default_msg_style() -> Style {
+        Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }
+    }
+
     // 7x4 terminal: two panes side-by-side, vertical border column at x=3,
     // status row at y=3. Right pane is focused (its border is green).
     #[test]
@@ -413,9 +459,10 @@ mod tests {
                 PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false },
             ],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(7, 4);
         r.compose_back(&scene);
@@ -447,9 +494,10 @@ mod tests {
                 PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false },
             ],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -469,9 +517,10 @@ mod tests {
             size: (10, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: vec![StatusSpan { text: "AB".into(), underline: false }],
-            status_right: "Z".into(),
+            status: Some(default_status(vec![("AB".to_string(), status_base())], "Z")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -494,9 +543,10 @@ mod tests {
             size: (6, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: vec![StatusSpan { text: "ab".into(), underline: false }],
-            status_right: "123456".into(),
+            status: Some(default_status(vec![("ab".to_string(), status_base())], "123456")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(6, 2);
         r.compose_back(&scene);
@@ -512,9 +562,10 @@ mod tests {
             size: (5, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: vec![StatusSpan { text: "ignored".into(), underline: false }],
-            status_right: "ignored".into(),
-            message: Some("hey".into()),
+            status: Some(default_status(vec![("ignored".to_string(), status_base())], "ignored")),
+            message: Some(("hey".to_string(), default_msg_style())),
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(5, 2);
         r.compose_back(&scene);
@@ -534,9 +585,10 @@ mod tests {
             size: (10, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true }],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -560,9 +612,10 @@ mod tests {
                 PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false },
             ],
             zoomed: true,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(7, 2);
         r.compose_back(&scene);
@@ -585,9 +638,10 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_spans: Vec::new(),
-                status_right: String::new(),
+                status: Some(default_status(Vec::new(), "")),
                 message: None,
+                border: Style::default(),
+                border_active: green_active(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -599,9 +653,10 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let out = r.compose(&scene, Some((1, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -618,9 +673,10 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_spans: Vec::new(),
-                status_right: String::new(),
+                status: Some(default_status(Vec::new(), "")),
                 message: None,
+                border: Style::default(),
+                border_active: green_active(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -632,9 +688,10 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let out = r.compose(&scene, Some((2, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -651,9 +708,10 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let _ = r.compose(&scene, Some((0, 0)), true); // prime
         // identical recompose, cursor hidden -> no diff bytes, just hide
@@ -670,9 +728,10 @@ mod tests {
                 size: (4, 2),
                 panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
                 zoomed: false,
-                status_spans: Vec::new(),
-                status_right: String::new(),
+                status: Some(default_status(Vec::new(), "")),
                 message: None,
+                border: Style::default(),
+                border_active: green_active(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true); // prime
         }
@@ -683,9 +742,10 @@ mod tests {
             size: (4, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: Vec::new(),
-            status_right: String::new(),
+            status: Some(default_status(Vec::new(), "")),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let out = r.compose(&scene, Some((0, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -707,12 +767,16 @@ mod tests {
             size: (10, 2),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
             zoomed: false,
-            status_spans: vec![
-                StatusSpan { text: "AB".into(), underline: false },
-                StatusSpan { text: "C".into(), underline: true },
-            ],
-            status_right: String::new(),
+            status: Some(default_status(
+                vec![
+                    ("AB".to_string(), status_base()),
+                    ("C".to_string(), Style { underline: true, ..status_base() }),
+                ],
+                "",
+            )),
             message: None,
+            border: Style::default(),
+            border_active: green_active(),
         };
         let mut r = Renderer::new(10, 2);
         let out = r.compose(&scene, None, false);
@@ -721,5 +785,133 @@ mod tests {
         assert!(got.contains("\x1b[0;30;42mAB"));
         // "C" (current window, underlined) gets SGR 4 added.
         assert!(got.contains("\x1b[0;4;30;42mC"));
+    }
+
+    // ---- SP3 Task 8: option-driven styles/position ----
+
+    // `status-position top`: the status row paints on row 0; the pane (whose
+    // rect the server shifted down to y=1) paints below it. Exact bytes.
+    #[test]
+    fn status_top_row_zero() {
+        let g = grid_with(4, 1, b"ab");
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 1, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status: Some(StatusRow {
+                top: true,
+                base: status_base(),
+                spans: vec![("AB".to_string(), status_base())],
+                right: String::new(),
+                right_style: status_base(),
+            }),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+        };
+        let mut r = Renderer::new(4, 2);
+        let out = r.compose(&scene, None, false);
+        let got = String::from_utf8_lossy(&out);
+        // row 0: "AB  " in status style (all 4 cells differ from the default
+        // front); row 1: "ab" default style (trailing spaces match the
+        // default front, so they are skipped).
+        let want = "\x1b[1;1H\x1b[0;30;42mAB  \x1b[2;1H\x1b[0;39;49mab\x1b[0m\x1b[?25l";
+        assert_eq!(got, want);
+    }
+
+    // `status off` (Scene.status None): no status bytes at all; the pane may
+    // occupy every row including the bottom one.
+    #[test]
+    fn status_off_no_row() {
+        let g = grid_with(4, 2, b"ab\r\ncd");
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+        };
+        let mut r = Renderer::new(4, 2);
+        let out = r.compose(&scene, None, false);
+        let got = String::from_utf8_lossy(&out);
+        // Both rows are pane content in the default style; no 30;42 status
+        // SGR appears anywhere.
+        let want = "\x1b[1;1H\x1b[0;39;49mab\x1b[2;1Hcd\x1b[0m\x1b[?25l";
+        assert_eq!(got, want);
+    }
+
+    // A span carrying a custom resolved style emits exactly that SGR.
+    #[test]
+    fn span_styles_emitted() {
+        let g = grid_with(6, 1, b"");
+        let custom = Style { fg: Color::Idx(7), bg: Color::Idx(4), ..Style::default() }; // white on blue
+        let scene = Scene {
+            size: (6, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status: Some(default_status(vec![("AB".to_string(), custom)], "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+        };
+        let mut r = Renderer::new(6, 2);
+        let out = r.compose(&scene, None, false);
+        let got = String::from_utf8_lossy(&out);
+        assert!(got.contains("\x1b[0;37;44mAB"), "got: {got:?}");
+    }
+
+    // Custom border + active-border styles: cells adjacent to the focused
+    // pane use `border_active`, all other border cells use `border`.
+    // Reuses the tee-junction layout with the LEFT pane focused so the
+    // horizontal arm between the two right panes is a non-active border.
+    #[test]
+    fn border_style_applied() {
+        let left = grid_with(3, 4, b"");
+        let rt = grid_with(3, 1, b"");
+        let rb = grid_with(3, 2, b"");
+        let scene = Scene {
+            size: (7, 5),
+            panes: vec![
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: true, dead: false },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: false, dead: false },
+            ],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style { fg: Color::Idx(240), ..Style::default() },      // pane-border-style fg=colour240
+            border_active: Style { fg: Color::Idx(1), ..Style::default() }, // pane-active-border-style fg=red
+        };
+        let mut r = Renderer::new(7, 5);
+        r.compose_back(&scene);
+        // vertical border column touches the focused left pane -> active red
+        assert_eq!(r.back_cell(3, 0).ch, '│');
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Idx(1));
+        // the horizontal arm between rt and rb does NOT touch the focused
+        // pane -> plain border style
+        assert_eq!(r.back_cell(4, 1).ch, '─');
+        assert_eq!(r.back_cell(4, 1).style.fg, Color::Idx(240));
+    }
+
+    // The message's own resolved style is emitted verbatim.
+    #[test]
+    fn message_style_applied() {
+        let g = grid_with(5, 1, b"");
+        let custom = Style { fg: Color::Idx(7), bg: Color::Idx(1), bold: true, ..Style::default() };
+        let scene = Scene {
+            size: (5, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: Some(("hi".to_string(), custom)),
+            border: Style::default(),
+            border_active: green_active(),
+        };
+        let mut r = Renderer::new(5, 2);
+        let out = r.compose(&scene, None, false);
+        let got = String::from_utf8_lossy(&out);
+        assert!(got.contains("\x1b[0;1;37;41mhi"), "got: {got:?}");
     }
 }

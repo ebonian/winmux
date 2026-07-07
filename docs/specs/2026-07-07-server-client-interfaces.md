@@ -7,6 +7,22 @@ consumer named here (same rule as the MVP contract).
 
 **Parent spec:** [`2026-07-07-server-client-design.md`](2026-07-07-server-client-design.md)
 
+**SUPERSEDED input section (sub-project 3, Task 6):** every reference below
+to `InputMachine`/`InputEvent`/`Action` (the `Server`/`ClientState` "Input
+routing" narrative, `ClientMode::ConfirmKillPane`/`ConfirmKillWindow`, and
+the CLI subset executed by the now-deleted `src/server/cli_exec.rs`)
+describes sub-project 2 behavior ONLY. `src/server.rs` was rewired in Task 6
+onto the table-driven `KeyMachine`/`Bindings`/command-dispatcher pipeline —
+see `docs/specs/2026-07-07-command-config-interfaces.md`'s `## input-v2`,
+`## bindings`, and `## server-dispatch` sections for the current (locked)
+contract. `ClientMode::ConfirmKillPane(PaneId)`/`ConfirmKillWindow(WindowId)`
+became the single `ConfirmCmd { prompt, cmds, pane_snapshot,
+window_snapshot }` variant; the CLI subset's exact output strings/usage
+lines are preserved byte-for-byte (see that file's `execute_cli_argv` and
+`cmd.rs`'s `sp2_usage_strings_match_cli_exec_verbatim` test) but now flow
+through `cmd::resolve` + the unified dispatcher instead of `cli_exec.rs`'s
+hand-rolled `CliArgs` parser. This section is kept for historical reference.
+
 ## `protocol` — client/server frame codec (pure)
 
 ```rust
@@ -208,11 +224,12 @@ pub struct Session {
     pub current: WindowId,
     pub last: Option<WindowId>,
     pub size: (u16, u16),            // current window size (smallest attached client)
+    // base_index: u32,              // NOT pub (Task 7 amendment, see below)
 }
 pub struct Registry { /* sessions: Vec<Session> in creation order, next_window_id */ }
 impl Registry {
     pub fn new() -> Registry;
-    pub fn create_session(&mut self, name: Option<&str>, first_pane: crate::layout::PaneId, size: (u16, u16))
+    pub fn create_session(&mut self, name: Option<&str>, first_pane: crate::layout::PaneId, size: (u16, u16), base_index: u32)
         -> Result<&mut Session, String>;                    // Err("duplicate session: <name>")
     pub fn find(&mut self, target: &str) -> Result<&mut Session, String>; // tmux -t rules: "=x" exact only; else exact, then unambiguous prefix; Err("can't find session: <t>")
     pub fn kill_session(&mut self, name: &str) -> bool;
@@ -236,6 +253,36 @@ impl Session {
 
 **Behavior notes:**
 
+- **Amendment (Task 7, SP3 config loading):** `create_session` gains a
+  `base_index: u32` parameter (tmux `base-index`; the caller — `server.rs`/
+  `server/dispatch.rs` — samples `Options::base_index()` at each call site).
+  The session's first window is created at `index: base_index` instead of a
+  hardcoded `0`, and the value is stashed on a NEW private (not `pub`)
+  `Session::base_index` field so every LATER `Session::new_window` on that
+  same session also floors its "lowest unused index" search at `base_index`
+  (a window killed and re-created never renumbers back down below it). Only
+  the session's OWN `base_index`, fixed at creation time, is used — changing
+  `set -g base-index` after a session already exists does not renumber its
+  existing windows (tmux behavior). All three call sites (`server.rs`'s
+  `NewAuto`/`NewNamed` attach paths, `server/dispatch.rs`'s
+  `exec_new_session`) pass `self.options.base_index()`. `lowest_unused_index`
+  (private free fn) gained a matching `base: u32` parameter (search starts
+  at `base` instead of `0`). **`Session::renumber()` (Task 7 review fix,
+  Critical)** also respects the same floor: it reassigns every window's
+  `index` to `base_index + position` (in the already-index-sorted `windows`
+  order), NOT `0 + position` — real tmux renumbers from `base-index`, so
+  `base-index 1` + `renumber-windows on` never produces a window 0. The
+  session's own stored `base_index` is used (no parameter needed at the
+  `renumber` call sites in `server/dispatch.rs`, which is why storing the
+  base on `Session` — rather than passing it through every call — was the
+  cleaner wiring). Tests: `model.rs`'s
+  `base_index_offsets_window_numbering` / `renumber_respects_base_index`;
+  end to end, `tests/server_proto.rs::config_file_applies_at_startup`
+  (`set -g base-index 1` at server startup -> the auto session's first
+  window renders `1:powershell*`, not `0:powershell*`) and
+  `renumber_windows_with_base_index` (base-index 1 + renumber-windows on
+  from a config file; killing window 1 renumbers the survivor to 1, never
+  0).
 - Session/window name validation: reject empty names, names containing `:`
   or `.` (tmux's target separators), and — final-review fix, 2026-07-07 —
   any control character (C0 incl. `\n`/`\r`/ESC, plus 0x7f DEL) →
@@ -338,7 +385,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8)
 
 ```rust
 // status.rs
@@ -350,23 +397,41 @@ pub struct WindowEntry {
     pub zoomed: bool,
 }
 
-pub fn status_spans(session_name: &str, windows: &[WindowEntry]) -> Vec<StatusSpan>;
+// SP3 Task 8 signature (styled spans; `StatusSpan`/its underline bool are
+// deleted — see the amended `render` section of 2026-07-06-mvp-interfaces.md
+// and the SP3 contract's `## render-styles` section):
+pub fn status_spans(
+    left: &str,                                     // pre-expanded, pre-length-capped status-left text
+    windows: &[WindowEntry],
+    base: crate::grid::Style,                       // status-style applied to Style::default()
+    win_style: &crate::style::PartialStyle,         // window-status-style
+    win_current_style: &crate::style::PartialStyle, // window-status-current-style
+) -> Vec<(String, crate::grid::Style)>;
 ```
 
-`StatusSpan { text: String, underline: bool }` is defined in `render.rs` (see
-the **LOCKED-CONTRACT AMENDMENT** in `2026-07-06-mvp-interfaces.md`'s `render`
-section: `Scene::status_left: String` → `Scene::status_spans:
-Vec<StatusSpan>`). `status.rs` is pure bookkeeping with no dependency on
-`model.rs`; a caller (future server/client wiring task) maps a `Session`'s
-`Window`s to `WindowEntry`s (`current`/`last` from `Session::current`/`last`,
-`zoomed` from `Window::layout.is_zoomed()`).
+**AMENDMENT (SP3 Task 8):** the original Task 5 signature was
+`status_spans(session_name: &str, windows: &[WindowEntry]) ->
+Vec<StatusSpan>`, hardcoding the `[<session>] ` prefix and an underline-only
+current-window marker. It now takes the ALREADY-EXPANDED `status-left` text
+(the server expands `[#S] ` — the default, which reproduces the old prefix
+exactly — via `options::expand_format` and caps it to `status-left-length`)
+plus the three style inputs, and returns fully resolved styles per span.
+`status.rs` remains pure bookkeeping with no dependency on `model.rs` (it
+now additionally depends on `grid::Style` + `style::PartialStyle`).
 
 **Span composition** (index order as given in `windows`):
-1. One span `"[<session_name>] "` (trailing space included), `underline: false`.
-2. Per window, one span `"<index>:<name><flags>"`, `underline: true` iff
-   `current`, else `false`.
+1. One span with `left`'s text, styled `base`.
+2. Per window, one span `"<index>:<name><flags>"`, styled
+   `win_current_style.apply_to(base)` iff `current`, else
+   `win_style.apply_to(base)`. Note the current style layers over BASE —
+   NOT over `win_style` (tmux layers `window-status-current-style` over
+   `status-style` directly, so an fg set only in `window-status-style` never
+   leaks into the current tab). With default options (`win_style` empty,
+   `win_current_style` = `underscore`) this reproduces the old behavior
+   exactly: every span equals `base` except the current tab = `base` +
+   underline.
 3. Between window spans (not after the last one), a separate single-space
-   span `" "`, `underline: false` — the separator itself is never underlined,
+   span `" "`, styled `base` — the separator never takes a window style,
    even when the window before or after it is current.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
@@ -378,22 +443,35 @@ during design; empty is correct and is what's implemented/tested):
   nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
   all → bare `<index>:<name>` (e.g. `2:logs`).
 
-**Render integration:** `render::compose_back`'s status-bar step draws
-`status_spans` left-to-right from column 0 (each span's cells get the
-status-row style — green bg/black fg, or yellow/black under a `message`
-override — with that span's `underline` flag set on the style), then
-`status_right` right-aligned as before; the "total left length" used for
-right-truncation is the summed char count of all spans' text.
+**Render integration (as amended SP3 Task 8):** the server packs the
+returned spans into `render::StatusRow` (base fill, right text/style, top
+flag from `status-position`) — see the SP3 contract's `## render-styles`
+section; `render::compose_back` draws them left-to-right from column 0 with
+each span's own resolved style, then the right text right-aligned; the
+"total left length" used for right-truncation is the summed char count of
+all spans' text.
 
 **Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
-exact expected `Vec<(String, bool)>` span vectors (mirrors `render.rs`'s
-exact-VT-bytes test style).
+exact expected `Vec<(String, Style)>` span vectors (mirrors `render.rs`'s
+exact-VT-bytes test style), including a `custom_styles_layering` test pinning
+the layered-over-base (not over-win_style) rule.
 
-## `server` — headless multiplexer server (Task 6)
+## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 
 ```rust
-pub fn run(pipe_full_name: &str) -> Result<(), Box<dyn std::error::Error>>;
+pub fn run(pipe_full_name: &str, config_files: &[String]) -> Result<(), Box<dyn std::error::Error>>;
 ```
+
+**Amendment (Task 7, SP3 config loading):** `run` gained a `config_files:
+&[String]` parameter — the server role's `--config <path>` args (repeatable,
+in order; forwarded from the CLI's `-f`, see the `## config` section of the
+sibling `2026-07-07-command-config-interfaces.md` contract for the full
+discovery/loading design). An empty slice means "use the default
+`.tmux.conf`/`.winmux.conf` discovery chain"; non-empty REPLACES that chain
+entirely. `main.rs` is the only real caller
+(`server::run(&pipe, &config)`); `tests/server_proto.rs`'s `start_server`
+helper now calls `server::run(&name, &[])` (a separate
+`start_server_with_config` helper is used by the Task 7 config tests).
 
 That is the ENTIRE public surface of `src/server.rs`; every type named below
 (`ServerEvent`, `PaneRuntime`, `ClientState`, `ClientMode`, `Server`, and the
@@ -409,6 +487,22 @@ various free helper functions) is private to the module.
   rendering once (follow-up #4's coalescing). Every attached client is
   re-rendered on any dirty turn (see "Design choices" below) — not a
   per-session dirty set.
+- **Startup config loading (Task 7, SP3 config loading):** after binding the
+  pipe and spawning the accept thread, but BEFORE entering the event loop
+  (so no attach is ever served against an unconfigured `Options`/`Bindings`),
+  `run` discovers and loads `.tmux.conf`/`.winmux.conf`/`--config` files
+  through the same headless command-dispatch path `source-file` uses. Any
+  collected errors are logged (`crate::logging::log_line`, one summary line
+  `config: N error(s)` plus one line per error) and stashed in
+  `Server::pending_config_message` (`Option<String>`, the exact text `config:
+  N error(s), see server.log`), which `finish_attach` `take()`s into the
+  FIRST client's `ClientState::message` — so only that one attach (across
+  ALL sessions/modes, not per-session) ever sees it. Full discovery/loading
+  design (env-var chain, `required` vs. silently-skipped-if-missing,
+  `discover_config_files`/`ConfigCandidate`/`Server::load_config_files`) is
+  in the sibling `2026-07-07-command-config-interfaces.md` contract's `##
+  config` section (that's also where `source-file`'s runtime re-use of the
+  same loader lives, superseding this file's stale placeholder text below).
 - `run` returns `Ok(())` once the registry has held at least one session
   AND is now empty (`had_session` flag guards against mistaking a
   never-yet-used server for exit-empty at startup). It does not touch the
@@ -657,22 +751,50 @@ Task 7's review-fix passes, and Task 8's
 `attach_empty_target_picks_most_recent` covering the empty-target
 `Existing` attach amendment above.
 
-## `cli` — argv parser (pure, Task 8)
+## `cli` — argv parser (pure, Task 8; amended Task 7 SP3 for `-f`)
 
 ```rust
-pub struct Invocation { pub socket: String /* -L, default "default" */, pub cmd: Command }
+pub struct Invocation {
+    pub socket: String,          // -L, default "default"
+    pub config: Option<String>,  // -f <config-file> (Task 7); None unless given
+    pub cmd: Command,
+}
 
 pub enum Command {
     NewSession { name: Option<String>, detached: bool, cols: u16, rows: u16 },
     Attach { target: Option<String>, detach_others: bool },
     Control(Vec<String>),
-    ServerRole { pipe: String },
+    ServerRole { pipe: String, config: Vec<String> }, // config: --config <path>, repeatable (Task 7)
     Help,
 }
 
 pub fn parse(args: &[String]) -> Result<Invocation, String>; // Err = usage message
 pub fn usage_text() -> &'static str; // printed by main.rs for `Help`, exit 0
 ```
+
+**Amendment (Task 7, SP3 config loading):** `-f <config-file>` is extracted
+from ANYWHERE in `args`, exactly like `-L` (same loop, same "no supported
+subcommand has a flag of its own named `-f`" non-collision argument); given
+more than once, the LAST occurrence wins (tmux's own `-f` takes a single
+value — this just doesn't error on a repeat rather than replicating tmux's
+own multi-`-f` behavior, which SP3 doesn't need). `-f` is accepted as a
+GLOBAL flag regardless of `cmd` variant, but only has any effect via
+`main.rs`'s routing when `cmd` is `NewSession` (the only autostart-capable
+entry point — see the `## client`/`## config` amendments); it is silently
+inert for `Attach`/`Control`/`Help`/`ServerRole`. The special value `-f -`
+disables config loading entirely (Task 7 review fix; tmux `-f /dev/null`
+idiom — the sentinel is interpreted by the server's discovery function, not
+by `cli.rs`, which passes it through like any other value; see the `##
+config` section of the sibling SP3 contract). `usage_text()`'s first line
+gained `[-f config-file]`; the `Global:` line documents both flags and the
+`-f -` sentinel.
+`__server`'s hidden role (`parse_server_role`) now also accepts `--config
+<path>`, repeatable, in any order relative to `--pipe` (still exactly one
+`--pipe`, still required) — collected into `Command::ServerRole`'s new
+`config: Vec<String>` field, forwarded verbatim to `server::run`. Tests:
+`dash_f_parses`, `dash_f_anywhere`, `dash_f_repeated_last_wins`,
+`server_role_config_args` (plus `bare_is_new_session`/`server_role_parse`
+updated for the new struct fields).
 
 **Behavior:**
 
@@ -718,12 +840,22 @@ Windows APIs) — unit-tested directly: `bare_is_new_session`, `new_flags`,
 `ls_alias`, `attach_t`, `attach_dashd`, `dash_l_socket`, `server_role_parse`,
 `unknown_flag_err`, `kill_session_passthrough`, `help_parses`.
 
-## `client` — thin attach client + server autostart (Task 8)
+## `client` — thin attach client + server autostart (Task 8; `autostart_server` amended Task 7)
 
 ```rust
 pub fn attach(pipe_full_name: &str, first: protocol::ClientMsg) -> Result<i32, Box<dyn std::error::Error>>;
-pub fn autostart_server(socket: &str) -> std::io::Result<()>;
+pub fn autostart_server(socket: &str, config: Option<&str>) -> std::io::Result<()>;
 ```
+
+**Amendment (Task 7, SP3 config loading):** `autostart_server` gained a
+`config: Option<&str>` parameter — the invocation's `-f <file>` (`cli::
+Invocation::config`). When `Some`, the spawned `__server` argv gets
+`--config <file>` appended after `--pipe <full-name>`; when `None`, no
+`--config` flag is passed at all (the server falls back to its own default
+`.tmux.conf`/`.winmux.conf` discovery). `main.rs`'s `run_new_session` is the
+only caller that ever passes `Some` (the autostart-capable entry point);
+`ensure_server`'s signature grew the same `config: Option<&str>` pass-
+through parameter.
 
 **`attach`:** `Host::enter()`s FIRST, then connects to `pipe_full_name` and
 sends `first` (an `Attach` frame, already built by the caller with the
@@ -785,14 +917,22 @@ does its own real `PipeConn::connect` afterward. Times out as the last
 caller, so documented here for context): `ServerRole` installs a SECOND,
 file-logging panic hook (chained in front of `host::install_panic_hook`'s
 console-restoring one via `take_hook`/`set_hook`, appending to
-`%LOCALAPPDATA%\winmux\server.log`) before calling `server::run`, since the
-server process has no console to print to. `NewSession{detached: false}`
+`%LOCALAPPDATA%\winmux\server.log`) before calling `server::run(&pipe,
+&config)`, since the server process has no console to print to. **Amendment
+(Task 7):** the `log_line`/`server_log_dir` helpers moved out of `main.rs`
+into a new small lib module, `src/logging.rs` (`pub fn log_line(&str)`),
+since `server.rs`'s startup config loading now ALSO needs to log (config
+errors) and `main.rs` (a bin, not part of the `winmux` lib) can't be `use`d
+from `server.rs`. `main.rs`'s panic hook and exit-code logging now call
+`winmux::logging::log_line` instead of a private duplicate. `NewSession{detached: false}`
 FIRST probes `host::console_size()` — `Err` (stdio not a console) prints
 `open terminal failed: not a console` to stderr and exits 1 BEFORE
 `ensure_server`/autostart ever runs (Task 9 scope A) — then probes-then-
-autostarts (`PipeConn::connect`; `NotFound` → `client::autostart_server`),
-sizes the `Attach` frame from the already-probed size (fallback `80x24`,
-overridden by nonzero `-x`/`-y`), and calls `client::attach`. Ordering
+autostarts (`PipeConn::connect`; `NotFound` → `client::autostart_server(socket,
+invocation.config.as_deref())`, forwarding `-f`'s file ONLY if this
+invocation is the one that actually spawns the server — Task 7), sizes the
+`Attach` frame from the already-probed size (fallback `80x24`, overridden by
+nonzero `-x`/`-y`), and calls `client::attach`. Ordering
 matters: without the upfront probe, a redirected-stdio invocation would
 still autostart a detached server via `ensure_server`, then only fail later
 inside `client::attach`'s own `Host::enter()` — stranding that autostarted

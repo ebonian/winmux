@@ -225,37 +225,57 @@ pub struct PaneView<'a> {
     pub dead: bool,
 }
 
-/// One run of status-bar text; `underline` draws it with SGR 4 (tmux
-/// `window-status-current-style` = `underscore` default). Built by
-/// `status::status_spans` — see the sibling `2026-07-07-server-client-interfaces.md`
-/// "status" section for the span-composition rule.
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-07, SP2 Task 5, historical):**
+/// `Scene::status_left: String` was first replaced by `Scene::status_spans:
+/// Vec<StatusSpan>` (`StatusSpan { text: String, underline: bool }`) so the
+/// status bar could render a real window list with the current window
+/// underlined.
 ///
-/// **LOCKED-CONTRACT AMENDMENT (2026-07-07, Task 5):** `Scene::status_left:
-/// String` was replaced by `Scene::status_spans: Vec<StatusSpan>` so the
-/// status bar can render a real window list with the current window
-/// underlined, instead of one opaque left-aligned string. `app.rs` (the MVP
-/// single-window loop, removed in a later sub-project-2 task) adapts by
-/// building two spans, `"[winmux] "` and `"0:powershell*"`, both
-/// `underline: false` — chosen over tmux's true-for-current so this module's
-/// existing hardcoded byte-stream assertions stay stable; it does not use
-/// `status::status_spans`.
-pub struct StatusSpan {
-    pub text: String,
-    pub underline: bool,
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-07, SP3 Task 8):** `StatusSpan` was
+/// then DELETED and the status/message/border fields replaced wholesale so
+/// every visual decision comes from the option table (`status-style`,
+/// `window-status(-current)-style`, `message-style`,
+/// `pane(-active)-border-style`, `status-position`, `status on|off`) instead
+/// of hardcoded SGRs. Spans now carry FULLY RESOLVED `grid::Style`s (the old
+/// per-span `underline` bool is subsumed); see the sibling SP3 contract's
+/// `## render-styles` section for the server-side building rules and
+/// `2026-07-07-server-client-interfaces.md` `## status` for the span
+/// composition. With default options the emitted bytes are IDENTICAL to the
+/// pre-amendment output (pinned by the untouched e2e suites).
+pub struct StatusRow {
+    /// true = row 0 (`status-position top`); false = the bottom row. Pane
+    /// rects are computed by the server to leave this row free — the
+    /// renderer just paints where told.
+    pub top: bool,
+    /// Row fill style (`status-style` applied to the default style).
+    pub base: grid::Style,
+    /// Left-aligned runs, each with its resolved style.
+    pub spans: Vec<(String, grid::Style)>,
+    pub right: String,
+    /// Style for `right` (`base` in SP3; `#[]` inline styles are SP4).
+    pub right_style: grid::Style,
 }
 
 pub struct Scene<'a> {
-    /// Host terminal size (cols, rows). The status bar is the bottom row;
-    /// panes live in rows 0..rows-1.
+    /// Host terminal size (cols, rows).
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
     pub zoomed: bool,
-    pub status_spans: Vec<StatusSpan>,  // e.g. spans for "[winmux] 0:powershell*"
-    pub status_right: String,  // e.g. "21:04 06-Jul-26"
-    /// When Some, the status row shows this message instead (confirm prompt,
-    /// "terminal too small"), styled bg yellow(SGR 43) fg black(30) like tmux
-    /// message-style.
-    pub message: Option<String>,
+    /// None = `status off`: no status row is painted; panes may occupy every
+    /// row (the server's pane-area computation already freed the row).
+    pub status: Option<StatusRow>,
+    /// When Some, replaces the status row's content (confirm prompt,
+    /// "terminal too small", transient messages), drawn with its own
+    /// resolved style (`message-style`). With `status off` the message
+    /// overlays the BOTTOM row (tmux draws messages on the last line even
+    /// without a status bar).
+    pub message: Option<(String, grid::Style)>,
+    /// Border cell style (`pane-border-style` resolved; default = default
+    /// style).
+    pub border: grid::Style,
+    /// Style for border cells adjacent to the focused pane
+    /// (`pane-active-border-style` resolved; default fg green).
+    pub border_active: grid::Style,
 }
 
 pub struct Renderer { /* private: front + back cell buffers */ }
@@ -276,28 +296,52 @@ impl Renderer {
 }
 ```
 
-**Compositing rules:**
-- Pane cells copy from `grid.cell(...)` into the pane's rect; cells outside any
-  pane rect (borders) are drawn with box chars `─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼`
-  (junction-aware). Active pane's border: fg green (SGR 32); others fg default
-  (tmux default `pane-active-border-style fg=green`). When zoomed, no borders.
+**Compositing rules (amended SP3 Task 8 — option-driven styles):**
+- Pane cells copy from `grid.cell(...)` into the pane's rect; cells outside
+  any pane rect (borders) are drawn with box chars `─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼`
+  (junction-aware; glyph logic unchanged since the MVP). Border cells
+  adjacent to the focused pane use `Scene::border_active`; all other border
+  cells use `Scene::border` (defaults reproduce the old hardcoded fg-green /
+  fg-default). When zoomed, no borders. Panes and borders never draw on the
+  status row (whichever row `StatusRow::top` selects); with `status: None`
+  they may occupy every row, including the bottom one.
 - Dead pane: its grid still renders; the string `[exited]` is overlaid in
-  reverse video at the pane rect's top-left.
-- Status bar (bottom row): bg green (42) fg black (30), tmux default (bg
-  yellow 43 fg black 30 when `message` overrides). `status_spans` drawn
-  left-to-right starting at col 0, each span's cells carrying the status-row
-  style with `underline` set from that span (SGR is always emitted as one
-  combined `\x1b[0;...m` sequence per style change — see `sgr()` — so an
-  underlined span's SGR includes `4`, and the following non-underlined span's
-  SGR simply omits it; there is no separate SGR 24 reset), then
-  `status_right` right-aligned; middle padded with spaces; truncate
-  right-first if too narrow (left length for this purpose is the sum of all
-  spans' char counts).
+  reverse video at the pane rect's top-left (skipped if the rect's top row
+  IS the status row).
+- Status row (`Scene::status: Some`): drawn on row 0 when `top`, else the
+  bottom row; the row is filled with `base`-styled spaces, then `spans` drawn
+  left-to-right starting at col 0, each span's cells carrying that span's own
+  resolved style (SGR is always emitted as one combined `\x1b[0;...m`
+  sequence per style change — see `sgr()`), then `right` right-aligned in
+  `right_style`; middle padded with spaces; truncate right-first if too
+  narrow (left length for this purpose is the sum of all spans' char counts).
+  `Scene::status: None` (`status off`): no status bytes are emitted at all.
+- Message (`Scene::message: Some((text, style))`): replaces the status row's
+  content, filling that row with `style`; when `status` is `None` it overlays
+  the BOTTOM row instead.
 - Diff emission: for each changed cell, emit minimal CUP (skip if the cursor is
   already adjacent from the previous emitted cell) + SGR (only on style change)
   + the char. UTF-8 encode chars. Reset SGR (CSI 0m) at stream end.
+- **Default-byte equivalence (Task 8 invariant):** with all options at their
+  tmux defaults, `compose` emits byte-for-byte the same stream as before this
+  amendment — pinned by the unchanged expected byte strings in `render.rs`'s
+  default-styled unit tests and the untouched `tests/e2e.rs` /
+  `tests/e2e_sessions.rs`.
 
 ## `input` — prefix state machine (pure)
+
+**SUPERSEDED (sub-project 3, Task 6):** `Action`/`InputEvent`/`InputMachine`
+below were DELETED from `src/input.rs` once `src/server.rs` was rewired onto
+the table-driven `KeyMachine`/`KeyInputEvent`/`Bindings` pipeline — see the
+`## input-v2` and `## bindings` sections of
+`docs/specs/2026-07-07-command-config-interfaces.md` for the replacement
+(locked) contract, and that same file's `## server-dispatch` section for how
+the server resolves `KeyInputEvent::Key` against the mutable bindings table
+and dispatches the resulting commands. This section is kept for historical
+reference only — every behavior it describes (split/focus/resize/zoom/close/
+window nav/rename/detach/switch-client) is reproduced exactly by
+`crate::bindings::Bindings::default()`'s commands, unit-tested in
+`bindings::tests::defaults_cover_current_behavior`.
 
 ```rust
 use std::time::Instant;

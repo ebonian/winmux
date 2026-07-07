@@ -11,6 +11,14 @@
 pub struct Invocation {
     /// `-L <name>` socket name; defaults to `"default"`.
     pub socket: String,
+    /// `-f <config-file>` (Task 7, SP3 config loading): `None` unless given.
+    /// Only takes effect if THIS invocation is the one that ends up
+    /// autostarting the server (`main.rs`'s job to check) — tmux semantics:
+    /// config is read once at server start, so `-f` against an already-
+    /// running server is a no-op. Accepted at most once meaningfully; if
+    /// given more than once, the LAST occurrence wins (same "extract
+    /// wherever it appears" handling as `-L`).
+    pub config: Option<String>,
     pub cmd: Command,
 }
 
@@ -39,13 +47,15 @@ pub enum Command {
     /// forwarded verbatim as a `Cli` frame's argv — the server owns parsing
     /// and validation for these.
     Control(Vec<String>),
-    /// `__server --pipe <full-pipe-name>` — hidden headless server role.
-    ServerRole { pipe: String },
+    /// `__server --pipe <full-pipe-name> [--config <path> ...]` — hidden
+    /// headless server role. `config` is repeatable (Task 7): empty means
+    /// "use the default `.tmux.conf`/`.winmux.conf` discovery chain".
+    ServerRole { pipe: String, config: Vec<String> },
     /// `--help` / `-h` / `help`.
     Help,
 }
 
-const USAGE: &str = "usage: winmux [-L socket-name] [command [args]]\n\
+const USAGE: &str = "usage: winmux [-L socket-name] [-f config-file] [command [args]]\n\
 Supported commands:\n\
   new-session|new [-d] [-s name] [-x cols] [-y rows]\n\
   attach-session|attach|a [-d] [-t target]\n\
@@ -57,7 +67,7 @@ Supported commands:\n\
   kill-server\n\
   rename-session [-t target] new-name\n\
   rename-window [-t target] new-name\n\
-Global: -L socket-name\n\
+Global: -L socket-name, -f config-file (server startup only; -f - disables config)\n\
 Bare `winmux` (no command) is `new-session`.\n";
 
 /// Usage text for `Help` (printed by `main.rs`, exit 0).
@@ -126,26 +136,42 @@ fn parse_attach(rest: &[String]) -> Result<Command, String> {
 }
 
 fn parse_server_role(rest: &[String]) -> Result<Command, String> {
-    if rest.len() == 2 && rest[0] == "--pipe" {
-        Ok(Command::ServerRole { pipe: rest[1].clone() })
-    } else {
-        Err(format!("usage: __server --pipe <full-pipe-name>\n{USAGE}"))
+    let usage = || format!("usage: __server --pipe <full-pipe-name> [--config <path> ...]\n{USAGE}");
+    let mut pipe: Option<String> = None;
+    let mut config: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--pipe" => pipe = Some(take_value(rest, &mut i, "--pipe")?),
+            "--config" => config.push(take_value(rest, &mut i, "--config")?),
+            _ => return Err(usage()),
+        }
+    }
+    match pipe {
+        Some(pipe) => Ok(Command::ServerRole { pipe, config }),
+        None => Err(usage()),
     }
 }
 
 /// Parse `env::args().skip(1)`-style argv into an `Invocation`. `Err` is a
 /// usage message meant to be printed to stderr with exit code 1.
 pub fn parse(args: &[String]) -> Result<Invocation, String> {
-    // Extract every top-level `-L <name>` pair, wherever it appears, leaving
-    // the remaining tokens in order — "keep it simple: accept -L anywhere
-    // top-level" (task brief). None of the supported subcommands has a flag
-    // of its own named `-L`, so this can't collide with passthrough argv.
+    // Extract every top-level `-L <name>` / `-f <config-file>` pair, wherever
+    // it appears, leaving the remaining tokens in order — "keep it simple:
+    // accept -L anywhere top-level" (task brief), extended the same way to
+    // `-f`. None of the supported subcommands has a flag of its own named
+    // `-L`/`-f`, so this can't collide with passthrough argv. `-f` given more
+    // than once: last occurrence wins (tmux's own `-f` is single-value; we
+    // just don't error on a repeat).
     let mut socket = "default".to_string();
+    let mut config: Option<String> = None;
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-L" {
             socket = take_value(args, &mut i, "-L")?;
+        } else if args[i] == "-f" {
+            config = Some(take_value(args, &mut i, "-f")?);
         } else {
             rest.push(args[i].clone());
             i += 1;
@@ -155,6 +181,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
     if rest.is_empty() {
         return Ok(Invocation {
             socket,
+            config,
             cmd: Command::NewSession { name: None, detached: false, cols: 0, rows: 0 },
         });
     }
@@ -167,7 +194,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
         s if s.starts_with('-') => return Err(usage_err()),
         _ => Command::Control(rest),
     };
-    Ok(Invocation { socket, cmd })
+    Ok(Invocation { socket, config, cmd })
 }
 
 #[cfg(test)]
@@ -185,6 +212,7 @@ mod tests {
             inv,
             Invocation {
                 socket: "default".to_string(),
+                config: None,
                 cmd: Command::NewSession { name: None, detached: false, cols: 0, rows: 0 },
             }
         );
@@ -235,7 +263,47 @@ mod tests {
     #[test]
     fn server_role_parse() {
         let inv = parse(&args(&["__server", "--pipe", r"\\.\pipe\winmux-test"])).unwrap();
-        assert_eq!(inv.cmd, Command::ServerRole { pipe: r"\\.\pipe\winmux-test".to_string() });
+        assert_eq!(
+            inv.cmd,
+            Command::ServerRole { pipe: r"\\.\pipe\winmux-test".to_string(), config: vec![] }
+        );
+    }
+
+    #[test]
+    fn server_role_config_args() {
+        let inv = parse(&args(&["__server", "--pipe", "p", "--config", "a", "--config", "b"])).unwrap();
+        assert_eq!(
+            inv.cmd,
+            Command::ServerRole {
+                pipe: "p".to_string(),
+                config: vec!["a".to_string(), "b".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn dash_f_parses() {
+        let inv = parse(&args(&["-f", "x.conf", "new", "-s", "w"])).unwrap();
+        assert_eq!(inv.config, Some("x.conf".to_string()));
+        assert_eq!(
+            inv.cmd,
+            Command::NewSession { name: Some("w".to_string()), detached: false, cols: 0, rows: 0 }
+        );
+    }
+
+    #[test]
+    fn dash_f_anywhere() {
+        // -f is extracted from anywhere in argv, same as -L, not just before
+        // the subcommand token.
+        let inv = parse(&args(&["ls", "-f", "x.conf"])).unwrap();
+        assert_eq!(inv.config, Some("x.conf".to_string()));
+        assert_eq!(inv.cmd, Command::Control(vec!["ls".to_string()]));
+    }
+
+    #[test]
+    fn dash_f_repeated_last_wins() {
+        let inv = parse(&args(&["-f", "a.conf", "-f", "b.conf", "new"])).unwrap();
+        assert_eq!(inv.config, Some("b.conf".to_string()));
     }
 
     #[test]

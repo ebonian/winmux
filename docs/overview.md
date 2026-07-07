@@ -72,8 +72,8 @@ previous and is independently useful.
 |---|---|---|
 | **1** | **Multiplexing MVP** — DELIVERED | ConPTY-spawned PowerShell panes, VT parsing, a split-tree layout, panes + borders + status bar drawn into the host terminal, prefix-key handling, split/switch/resize/close panes. **One session, one window, one attached client, no detach.** |
 | **2** | **Server/client split + sessions + detach** — DELIVERED | Daemonized background server, named-pipe client↔server protocol, multiple sessions and windows, detach/attach, tmux CLI subset, survives SSH disconnect. |
-| **3** | **Command layer + config compatibility** | The tmux command dispatcher (`split-window`, `select-pane`, …) powering keybindings, the `winmux <cmd>` CLI, and the `.tmux.conf` parser (prefix, `bind-key`, `set-option`, styles/colors). |
-| **4** | **Parity polish** | Copy mode, mouse support, more options, status-bar format strings, the long tail. |
+| **3** | **Command layer + config compatibility** — DELIVERED | One command dispatcher (`cmd`/`options`/`keys`/`style`/`bindings` modules) powering all four entry points: keybindings, the `winmux <cmd>` CLI, the `prefix-:` command prompt, and a real `.tmux.conf`/`-f`/`.winmux.conf` config loader — `set-option`/`set`, `bind-key`/`bind`, `unbind-key`, styles/colors, `status-left`/`status-right` formatting, `base-index`/`pane-base-index`, prefix remapping, and option-driven status/border/message styling. |
+| **4** | **Parity polish** | Copy mode, mouse support, per-session/window option scopes, a fuller format-string engine, the long tail. |
 
 **Build order:** sub-project 1 first (visible, motivating, proves the hardest
 rendering/ConPTY problems), then 2 → 3 → 4.
@@ -82,3 +82,4 @@ rendering/ConPTY problems), then 2 → 3 → 4.
 
 - [`specs/2026-07-06-multiplexing-mvp-design.md`](specs/2026-07-06-multiplexing-mvp-design.md) — sub-project 1 (delivered); companion interface contract [`specs/2026-07-06-mvp-interfaces.md`](specs/2026-07-06-mvp-interfaces.md)
 - [`specs/2026-07-07-server-client-design.md`](specs/2026-07-07-server-client-design.md) — sub-project 2 (delivered); companion interface contract [`specs/2026-07-07-server-client-interfaces.md`](specs/2026-07-07-server-client-interfaces.md)
+- [`specs/2026-07-07-command-config-design.md`](specs/2026-07-07-command-config-design.md) — sub-project 3 (delivered); companion interface contract [`specs/2026-07-07-command-config-interfaces.md`](specs/2026-07-07-command-config-interfaces.md)

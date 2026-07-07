@@ -171,3 +171,75 @@ merge blockers).
     isn't obvious from the test names alone.
 24. `no_console_fails_fast` test naming is inconsistent with the sibling
     tests around it (naming convention drift, not a behavior issue).
+
+## Deferred from sub-project 3 (command layer + config, 2026-07-07) — SP4 candidates
+
+Documented deviations from real tmux, accepted for SP3's scope (global-only
+options, one dispatcher shared by all four entry points) and carried forward
+as sub-project 4 ("parity polish") candidates rather than merge blockers.
+
+25. **`escape-time` is parsed and stored but not honored.** The option
+    exists in the registry (`src/options.rs`) with tmux's default (500ms)
+    and round-trips through `set`/`show`, but nothing reads it back to
+    govern the actual Escape-vs-Alt-sequence disambiguation window in
+    `src/keys.rs`'s input decoder or `src/input.rs`'s `KeyMachine` — that
+    timing is currently a fixed constant, not configurable.
+26. **No per-session/per-window option scopes.** `Options` (Task 4) is one
+    global instance on `Server`, matching tmux's `-g` (global) scope only;
+    real tmux allows session- and window-level overlays (`set -w`,
+    unprefixed `set` inside a window context) that override the global
+    value. SP3 accepts `-g`/bare `set` as globally-scoped regardless of the
+    flag actually passed, which is a real behavioral gap for any config that
+    relies on per-window styling.
+27. **Format engine covers a fixed subset of `#`-codes, not the general
+    tmux format language.** `expand_format` (`src/options.rs`) supports
+    `#S`/`#W`/`#I`/`#P`/`#F`/`#H`/strftime-style `%H:%M`-class codes and
+    nothing else — no `#{...}` braced expressions, no conditionals
+    (`#{?...}`), no arithmetic/string format functions. `status-right`'s
+    real tmux default (`#{=21:pane_title}`-bearing) is out of reach for this
+    reason (documented deviation in `src/options.rs`'s `default_value`).
+28. **`automatic-rename` is inert.** The option is registered with tmux's
+    default (`on`) and round-trips through `set`/`show`, but no code path
+    actually renames a window based on its running command — window names
+    only ever change via explicit `rename-window`/the `,` prompt/config.
+29. **`status-interval` is stored but unused for a general refresh timer.**
+    The status-right clock still only re-renders on a minute-granularity
+    change-detector (`server.rs`'s `local_clock`/Tick handling, inherited
+    from SP2), not on the configured interval — a custom `status-right`
+    format with sub-minute-sensitive content (were the format engine to
+    support one, see #27) would not refresh on schedule.
+30. **`bind -n` (no-prefix bindings) can't be given a bare printable
+    character.** The `-n` (root-table, no-prefix-required) binding path
+    exists and is tested against non-printable/special keys, but tmux's
+    real semantics — binding a bare letter with `-n` shadows normal typing
+    in that pane entirely — is not exercised or specifically guarded against
+    for printable characters; SP3's key-machine dispatch order for that case
+    is unverified.
+31. **`status-right`'s inline `#[...]` per-segment style overrides are not
+    parsed.** Real tmux lets `status-right`/`status-left` embed
+    `#[fg=red,bold]`-style directives mid-string to change color partway
+    through the line; SP3 renders the whole right side in one style
+    (`options.status_style()`, per `render_one`'s `right_style: base`) — see
+    the code comment at `src/server.rs`'s status-row assembly, "status-right
+    styling via `#[]` inline styles is SP4; until then the right side is
+    drawn with the row's base style."
+32. **`pane-base-index` is accepted + stored but inert.** The design spec
+    lists it as a real option (default 0) alongside `base-index`, but
+    nothing consumes it: pane indexes in kill-pane prompts/targets are
+    position-based from 0 regardless of this option's value. Unlike the
+    other inert options, it DOES have a typed getter
+    (`Options::pane_base_index`) — the getter itself is simply never called.
+    Reclassified as accepted-inert (final whole-branch review, 2026-07-07);
+    no code change, since it is already stored/validated exactly like the
+    other inert options.
+33. **Config errors surface via `server.log` + a first-attach transient
+    message, not tmux's interactive error view.** Real tmux reports a
+    `.tmux.conf` parse/apply error interactively (an in-place message in the
+    client that loaded it, with `set -g @tmux_error` style follow-up
+    tooling in some configs); winmux instead logs the error to
+    `%LOCALAPPDATA%\winmux\server.log` and surfaces a one-shot transient
+    message to the first client that attaches after the failed load. This is
+    one of the design spec's explicit documented deviations from tmux
+    (`docs/specs/2026-07-07-command-config-design.md`'s "Explicit
+    deviations from tmux" section) that had not yet been cross-referenced
+    here.
