@@ -3431,3 +3431,186 @@ fn mouse_border_drag_resizes() {
 // `p.grid.alt_screen()` check `dispatch::Server::mouse_wheel` branches on.
 // `grid::tests::alt_screen_getter_tracks_mode` separately covers that the
 // `Grid` itself correctly tracks alt-screen state end to end.
+
+// ---- layout presets, swap-pane, rotate-window (Task 6, sub-project 4) -----
+
+/// True if some row (excluding the bottom status row) is a full run of `─`
+/// across every column -- a pure horizontal split border (no other border
+/// crossing it, so no `┬`/`┴`/`┼` junction characters).
+fn has_horizontal_border(g: &Grid) -> bool {
+    let pane_rows = g.rows().saturating_sub(1);
+    (0..pane_rows).any(|r| (0..g.cols()).all(|c| g.cell(c, r).ch == '─'))
+}
+
+/// The column of the first occurrence of `marker` in any row, or `None` if
+/// it isn't (yet) on screen anywhere.
+fn marker_col(g: &Grid, marker: &str) -> Option<u16> {
+    (0..g.rows()).find_map(|r| row_text(g, r).find(marker).map(|c| c as u16))
+}
+
+#[test]
+fn space_cycles_layouts() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Two manual HORIZONTAL splits (prefix-% twice) build a plain 3-in-a-row
+    // tree, but with SKEWED ratios (borders at columns 40 and 60) rather
+    // than the preset's evenly-balanced columns (26 and 53) -- a manual
+    // layout that's already topologically "even-horizontal"-shaped, but at
+    // different border positions, so applying the preset is still visibly
+    // distinguishable.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 60));
+    assert!(has_vertical_border_at(&grid, 40), "expected the first split's border to remain at column 40");
+    assert!(!has_vertical_border_at(&grid, 26), "borders must not already be at the preset's columns");
+
+    // prefix-Space applies next-layout: from `last_layout == None`, the
+    // first press lands on cycle index 0 (even-horizontal) -- three EVENLY
+    // spread panes in one row, borders at columns 26 and 53.
+    c.send(&ClientMsg::Stdin(vec![0x02, b' ']));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 26) && has_vertical_border_at(g, 53));
+
+    // A second press advances to index 1 (even-vertical): three panes
+    // stacked, horizontal borders only (each spanning the FULL width, since
+    // there's no more nested split), no vertical border anywhere.
+    c.send(&ClientMsg::Stdin(vec![0x02, b' ']));
+    c.recv_output_until(&mut grid, |g| has_horizontal_border(g) && !has_vertical_border(g));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn select_layout_by_name() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // Default main-pane-width (80) exceeds an 80-col window, so it clamps:
+    // total=80, MIN=2, max_main = 80-1-2 = 77 -> border at column 77.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["select-layout".into(), "main-vertical".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 77));
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn main_pane_width_option_respected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "main-pane-width".into(), "30".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["select-layout".into(), "main-vertical".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 30));
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn swap_pane_braces() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Split: pane1 (left, {0,0,40,24}) | pane2 (right, {41,0,39,24},
+    // focused -- split-window gives the new pane focus).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+
+    c.send(&ClientMsg::Stdin(b"echo right123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "right123").is_some());
+
+    // Click into the left pane to focus pane1, then mark it too.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+    c.send(&ClientMsg::Stdin(b"echo left456\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "left456").is_some());
+
+    // prefix-{ = swap-pane -U: with only two panes, this swaps them
+    // outright. Focus follows the active pane (pane1, currently focused) to
+    // its new position -- the RIGHT side -- so pane1's content ("left456")
+    // ends up right of the border and pane2's ("right123") ends up left of
+    // it; the border column itself is unchanged (swap relabels leaves, it
+    // doesn't touch the tree's ratios).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'{']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > border_x);
+    assert!(has_vertical_border_at(&grid, border_x), "border column must not move on a swap");
+    c.recv_output_until(&mut grid, |g| marker_col(g, "right123").map(|c| c < border_x).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "left456").map(|c| c > border_x).unwrap_or(false));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn rotate_window_ctrl_o() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // H(1, V(2,3)): pane1 {0,0,40,24}, pane2 {41,0,39,12} (focused after the
+    // first split), pane3 {41,13,39,11} (focused after the second split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(b"echo two222\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").is_some());
+    assert!(marker_col(&grid, "two222").unwrap() > 40, "pane2's marker must start out on the right");
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    // pane3 (the new, focused pane after the vertical split) sits at
+    // {41,13,39,11} -- wait for the cursor to land there rather than
+    // `has_horizontal_border` (that helper requires a FULL-width border row,
+    // but this nested split's border only spans the right half).
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    // Click into pane1 (left) to focus it before rotating.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 5, true)));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40);
+
+    // prefix-C-o = bare rotate-window (C-o is byte 0x0f). Per
+    // `Layout::rotate`'s `forward=false` permutation (bare rotate-window
+    // maps to `down: false`), leaf position 0 (pane1's old rect,
+    // {0,0,40,24}) ends up showing pane2's content -- pane2's "two222"
+    // marker moves from the right half of the screen to the left half.
+    c.send(&ClientMsg::Stdin(vec![0x02, 0x0f]));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").map(|c| c < 40).unwrap_or(false));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+

@@ -1134,3 +1134,137 @@ and feed `\x1b[?1049h` straight into the pane's `Grid`, no ConPTY involved —
 exercising the exact same `p.grid.alt_screen()` check with no passthrough
 uncertainty. `grid::tests::alt_screen_getter_tracks_mode` separately covers
 that `Grid` itself correctly tracks alt-screen state end to end.
+
+## `layout-presets` — layout presets, swap-pane, rotate-window (Task 6)
+
+Implements the design spec's `## 5. Layout presets + swap/rotate` section.
+The `layout` amendment itself (`LayoutPreset`, `PRESET_CYCLE`,
+`Layout::apply_preset`/`swap_panes`/`rotate`) is documented in the `## layout`
+section of
+[`2026-07-06-mvp-interfaces.md`](2026-07-06-mvp-interfaces.md) (that file
+owns `layout`'s public surface); this section covers everything ABOVE it:
+`model::Window`, `options`, `cmd`, `bindings`, and `server::dispatch`.
+
+### `model` amendment
+
+`Window` gains one field:
+
+```rust
+pub struct Window {
+    // ...unchanged...
+    /// `next-layout`'s cycle position: the `layout::PRESET_CYCLE` index of
+    /// the last preset APPLIED via `select-layout`/`next-layout` (`None`
+    /// until the first one ever applied). Manual splits/resizes never touch
+    /// this -- `next-layout` still resumes from wherever the cycle last
+    /// landed, matching tmux.
+    pub last_layout: Option<u8>,
+}
+```
+
+Both `Window`-constructing call sites (`Registry::create_session`'s first
+window, `Session::new_window`) initialize it to `None`.
+
+### `options` amendment
+
+Two new `Number` options, both with typed getters returning `u16`:
+
+```rust
+// SPECS additions: Spec { name: "main-pane-width", kind: Kind::Number, .. },
+//                  Spec { name: "main-pane-height", kind: Kind::Number, .. }
+// defaults: main-pane-width = 80, main-pane-height = 24 (tmux defaults)
+
+impl Options {
+    pub fn main_pane_width(&self) -> u16;
+    pub fn main_pane_height(&self) -> u16;
+}
+```
+
+### `cmd` amendment
+
+`ParsedCmd` gains:
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `select-layout|selectl [-t target] [layout-name]`. `name: None`
+    /// (bare) re-applies the target window's current cycle position
+    /// (dispatch-time, needs `Window::last_layout`). `name: Some(n)` is
+    /// validated against the five exact tmux layout names IN `resolve`
+    /// itself (mirrors `bind-key -T`'s inline table-name validation) --
+    /// `Err("unknown layout: {n}")` for anything else.
+    SelectLayout { target: Option<String>, name: Option<String> },
+    /// `next-layout|nextl [-t target]`: advance the target window's
+    /// `next-layout` cycle by one (wrapping), per `layout::PRESET_CYCLE`.
+    NextLayout { target: Option<String> },
+    /// `swap-pane|swapp [-U] [-D] [-s src] [-t dst]`. `dir: Some(Up | Down)`
+    /// (`-U`/`-D`) swaps the acting client's active pane with the
+    /// previous/next pane in creation order, wrapping; `resolve`'s flag
+    /// scanner only ever admits `-U`/`-D` for this command, so any other
+    /// `Direction` reaching dispatch is unreachable. `dir: None` uses the
+    /// explicit `-s src`/`-t dst` pane targets instead (each resolved via
+    /// the normal `resolve_pane_target` fallback chain).
+    SwapPane { dir: Option<Direction>, src: Option<String>, dst: Option<String> },
+    /// `rotate-window|rotatew [-D] [-t target]`. `down` is the `-D` flag;
+    /// bare `rotate-window` (`down: false`) and `-D` (`down: true`) rotate
+    /// in opposite directions -- see `Layout::rotate`'s doc comment.
+    RotateWindow { down: bool, target: Option<String> },
+}
+```
+
+Canonical names/aliases: `select-layout`/`selectl`, `next-layout`/`nextl`,
+`swap-pane`/`swapp`, `rotate-window`/`rotatew`. Usage strings: `usage:
+select-layout [-t target] [layout-name]`, `usage: next-layout [-t target]`,
+`usage: swap-pane [-U] [-D] [-s src] [-t dst]`, `usage: rotate-window [-D]
+[-t target]`.
+
+### `bindings` amendment
+
+Six new prefix-table defaults (`Bindings::default()`):
+
+| Key | Command |
+|---|---|
+| `Space` (bound under `char_key(' ')`, NOT `named("Space")` -- same real-keypress gotcha as copy mode's spacebar bindings) | `next-layout` |
+| `M-1`..`M-5` | `select-layout even-horizontal` / `even-vertical` / `main-horizontal` / `main-vertical` / `tiled` (tmux's real default order) |
+| `{` | `swap-pane -U` |
+| `}` | `swap-pane -D` |
+| `C-o` | `rotate-window` (bare) |
+| `M-o` | `rotate-window -D` |
+
+The task brief specified `C-o`/`M-o`'s tmux semantics ("C-o = rotate-window
+(upward), M-o = rotate-window -D") but neither the brief nor the design spec
+pin down the EXACT permutation "upward"/"-D" maps to at the `Layout::rotate`
+level. Judgment call, documented here: bare `rotate-window` (`down: false`)
+calls `layout.rotate(forward: false)`; `-D` (`down: true`) calls
+`layout.rotate(forward: true)`.
+
+### `server::dispatch` amendment
+
+Four new `exec_*` helpers, wired into both `execute_headless` (CLI/config,
+acting client `None`) and `execute_for_client` (key binding / `:` prompt) —
+same shared-helper pattern as every other Task 6-era command:
+
+- `exec_select_layout`/`exec_next_layout`: resolve the target window
+  (`resolve_window_target`), compute `area` from `session.size` (same
+  `Rect { x: 0, y: pane_area_y(), w, h }` convention as
+  `exec_split_window`/`apply_layout_for_session`), read `main-pane-width`/
+  `-height` from `self.options`, call `Layout::apply_preset` with the
+  window's panes in CREATION order (`panes_in_creation_order`: `layout
+  .panes()` sorted ascending by `PaneId`, NOT raw tree order — see the
+  `## layout` section's rationale), set `Window::last_layout`, then
+  `apply_layout_for_session` to resize every pane's ConPTY to the new rects.
+- `exec_swap_pane`: `-U`/`-D` resolves the previous/next pane in creation
+  order relative to the ACTING client's current window's active pane
+  (`Direction::Left`/`Right` are unreachable here — `resolve`'s flag scanner
+  for `swap-pane` only ever admits `-U`/`-D`); the explicit `-s`/`-t` form
+  resolves two independent pane targets via `resolve_pane_target`. SP4
+  simplification, documented: cross-window/cross-session `-s`/`-t` swaps are
+  NOT supported (real tmux allows moving a pane between windows this way) —
+  `Layout::swap_panes` operates on one window's tree and silently no-ops if
+  either id isn't one of its leaves, so a cross-window pair degrades to a
+  harmless no-op rather than an error or an actual cross-window move.
+- `exec_rotate_window`: resolves the target window, calls `Layout::rotate`.
+
+All four call `apply_layout_for_session` unconditionally at the end (same
+established pattern as `kill_window_by_id` etc.) — harmless even when the
+target window wasn't the session's current one; the geometry change is
+picked up whenever that window next becomes current.

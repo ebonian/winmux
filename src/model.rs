@@ -21,6 +21,13 @@ pub struct Window {
     /// Default "powershell"; renamed via tmux prefix `,` (future task).
     pub name: String,
     pub layout: Layout,
+    /// `next-layout`'s cycle position (Task 6, sub-project 4): the
+    /// `layout::PRESET_CYCLE` index of the last preset APPLIED via
+    /// `select-layout`/`next-layout` (`None` until the first one ever
+    /// applied, or if the window's layout is currently a manual/custom tree
+    /// -- manual splits/resizes never touch this field, so `next-layout`
+    /// still resumes from wherever the cycle last landed, matching tmux).
+    pub last_layout: Option<u8>,
 }
 
 pub struct Session {
@@ -131,6 +138,7 @@ impl Registry {
             index: base_index,
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
+            last_layout: None,
         };
         let session = Session {
             name,
@@ -253,6 +261,7 @@ impl Session {
             index,
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
+            last_layout: None,
         };
         let pos = self
             .windows

@@ -104,6 +104,10 @@ const SPECS: &[Spec] = &[
     Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
     // Selection + paste buffers (Task 3, sub-project 4).
     Spec { name: "buffer-limit", kind: Kind::Number, choices: &[] },
+    // Layout presets (Task 6, sub-project 4): `main-horizontal`/
+    // `main-vertical`'s main-pane size.
+    Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
+    Spec { name: "main-pane-height", kind: Kind::Number, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -183,6 +187,8 @@ fn default_value(name: &str) -> Value {
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
         "buffer-limit" => Value::Number(50),
+        "main-pane-width" => Value::Number(80),
+        "main-pane-height" => Value::Number(24),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -435,6 +441,19 @@ impl Options {
     /// manual (`set-buffer -b`) buffers are exempt. tmux default 50.
     pub fn buffer_limit(&self) -> u32 {
         self.number("buffer-limit")
+    }
+
+    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4): the
+    /// `main-horizontal`/`main-vertical` layout presets' main-pane size,
+    /// clamped at APPLICATION time by `layout::apply_preset` so the other
+    /// panes never fall below `MIN_PANE_W`/`MIN_PANE_H`. tmux defaults: width
+    /// 80, height 24.
+    pub fn main_pane_width(&self) -> u16 {
+        self.number("main-pane-width") as u16
+    }
+
+    pub fn main_pane_height(&self) -> u16 {
+        self.number("main-pane-height") as u16
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -919,6 +938,17 @@ mod tests {
         assert_eq!(ms.apply_to(crate::grid::Style::default()).bg, crate::grid::Color::Idx(3));
         o.set("mode-keys", Some("vi"), false, false).unwrap();
         assert!(o.mode_keys_vi());
+    }
+
+    #[test]
+    fn main_pane_size_getters() {
+        let mut o = Options::new();
+        assert_eq!(o.main_pane_width(), 80);
+        assert_eq!(o.main_pane_height(), 24);
+        o.set("main-pane-width", Some("30"), false, false).unwrap();
+        o.set("main-pane-height", Some("10"), false, false).unwrap();
+        assert_eq!(o.main_pane_width(), 30);
+        assert_eq!(o.main_pane_height(), 10);
     }
 
     #[test]

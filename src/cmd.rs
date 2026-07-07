@@ -238,6 +238,34 @@ pub enum ParsedCmd {
     /// `copy-selection-and-cancel`); `Some(name)` sets/overwrites a MANUAL
     /// buffer (exempt from eviction).
     SetBuffer { name: Option<String>, data: String },
+    /// `select-layout|selectl [-t target] [layout-name]` (Task 6, sub-project
+    /// 4): rebuild the target window's split tree as one of the five preset
+    /// layouts. `name: None` (bare `select-layout`) re-applies the window's
+    /// current cycle position (tmux's "re-flow the current named layout"
+    /// idiom) -- dispatch-time, since it needs `Window::last_layout`.
+    /// `name: Some(n)` is validated against the five exact tmux layout names
+    /// HERE (mirroring `bind-key -T`'s inline table-name validation just
+    /// above) -- `Err("unknown layout: {n}")` for anything else.
+    SelectLayout { target: Option<String>, name: Option<String> },
+    /// `next-layout|nextl [-t target]` (Task 6): advance the target window's
+    /// `next-layout` cycle by one (wrapping), per `layout::PRESET_CYCLE`.
+    NextLayout { target: Option<String> },
+    /// `swap-pane|swapp [-U] [-D] [-s src] [-t dst]` (Task 6): `dir: Some(Up
+    /// | Down)` swaps the ACTING client's active pane with the
+    /// previous/next pane in creation order (wrapping), focus following the
+    /// active pane to its new position. `dir: None` uses the explicit
+    /// `-s src`/`-t dst` pane targets instead (each `None` half defaults via
+    /// the normal `resolve_pane_target` fallback -- the acting client's
+    /// focused pane). Any other `Direction` is unreachable: `resolve`'s flag
+    /// scanner only ever admits `-U`/`-D` for this command.
+    SwapPane { dir: Option<Direction>, src: Option<String>, dst: Option<String> },
+    /// `rotate-window|rotatew [-D] [-t target]` (Task 6): rotate every pane's
+    /// content through the target window's leaf positions by one step.
+    /// `down` is the `-D` flag; bare `rotate-window` (`down: false`, the
+    /// `C-o` default binding) and `-D` (the `M-o` binding) rotate in opposite
+    /// directions -- see `Layout::rotate`'s doc comment for the exact
+    /// permutation each maps to.
+    RotateWindow { down: bool, target: Option<String> },
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
@@ -468,6 +496,10 @@ fn canonical(name: &str) -> Option<&'static str> {
         "list-buffers" | "lsb" => "list-buffers",
         "delete-buffer" | "deleteb" => "delete-buffer",
         "set-buffer" | "setb" => "set-buffer",
+        "select-layout" | "selectl" => "select-layout",
+        "next-layout" | "nextl" => "next-layout",
+        "swap-pane" | "swapp" => "swap-pane",
+        "rotate-window" | "rotatew" => "rotate-window",
         _ => return None,
     })
 }
@@ -525,6 +557,10 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "list-buffers" => "usage: list-buffers",
         "delete-buffer" => "usage: delete-buffer [-b name]",
         "set-buffer" => "usage: set-buffer [-b name] data",
+        "select-layout" => "usage: select-layout [-t target] [layout-name]",
+        "next-layout" => "usage: next-layout [-t target]",
+        "swap-pane" => "usage: swap-pane [-U] [-D] [-s src] [-t dst]",
+        "rotate-window" => "usage: rotate-window [-D] [-t target]",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -1020,6 +1056,40 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             }
             Ok(ParsedCmd::SetBuffer { name: value_of(&v, "-b"), data: p.join(" ") })
         }
+        "select-layout" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-t"]) else { return Err(bad()) };
+            if p.len() > 1 {
+                return Err(bad());
+            }
+            let name = p.into_iter().next();
+            if let Some(n) = &name {
+                if !matches!(n.as_str(), "even-horizontal" | "even-vertical" | "main-horizontal" | "main-vertical" | "tiled") {
+                    return Err(format!("unknown layout: {n}"));
+                }
+            }
+            Ok(ParsedCmd::SelectLayout { target: value_of(&v, "-t"), name })
+        }
+        "next-layout" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::NextLayout { target: value_of(&v, "-t") })
+        }
+        "swap-pane" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-U", "-D"], &["-s", "-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::SwapPane { dir: direction_of(&b), src: value_of(&v, "-s"), dst: value_of(&v, "-t") })
+        }
+        "rotate-window" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-D"], &["-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::RotateWindow { down: has(&b, "-D"), target: value_of(&v, "-t") })
+        }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
 }
@@ -1306,6 +1376,63 @@ mod tests {
             ParsedCmd::ResizePane { dir: Some(Direction::Left), zoom: false, count: 5 }
         );
         assert_eq!(resolve(&raw("resize-pane", &["-L", "abc"])).unwrap_err(), usage("resize-pane").unwrap());
+    }
+
+    // ---- layout presets, swap-pane, rotate-window (Task 6, sub-project 4) --
+
+    #[test]
+    fn select_layout_flags_and_name_validation() {
+        assert_eq!(
+            resolve(&raw("select-layout", &["main-vertical"])).unwrap(),
+            ParsedCmd::SelectLayout { target: None, name: Some("main-vertical".to_string()) }
+        );
+        assert_eq!(
+            resolve(&raw("selectl", &["-t", "work", "tiled"])).unwrap(),
+            ParsedCmd::SelectLayout { target: Some("work".to_string()), name: Some("tiled".to_string()) }
+        );
+        assert_eq!(resolve(&raw("select-layout", &[])).unwrap(), ParsedCmd::SelectLayout { target: None, name: None });
+        assert_eq!(
+            resolve(&raw("select-layout", &["bogus"])).unwrap_err(),
+            "unknown layout: bogus"
+        );
+        assert_eq!(resolve(&raw("select-layout", &["a", "b"])).unwrap_err(), usage("select-layout").unwrap());
+    }
+
+    #[test]
+    fn next_layout_no_args() {
+        assert_eq!(resolve(&raw("next-layout", &[])).unwrap(), ParsedCmd::NextLayout { target: None });
+        assert_eq!(resolve(&raw("nextl", &["-t", "s"])).unwrap(), ParsedCmd::NextLayout { target: Some("s".to_string()) });
+        assert_eq!(resolve(&raw("next-layout", &["extra"])).unwrap_err(), usage("next-layout").unwrap());
+    }
+
+    #[test]
+    fn swap_pane_flags() {
+        assert_eq!(
+            resolve(&raw("swap-pane", &["-U"])).unwrap(),
+            ParsedCmd::SwapPane { dir: Some(Direction::Up), src: None, dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("swapp", &["-D"])).unwrap(),
+            ParsedCmd::SwapPane { dir: Some(Direction::Down), src: None, dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("swap-pane", &["-s", "0", "-t", "1"])).unwrap(),
+            ParsedCmd::SwapPane { dir: None, src: Some("0".to_string()), dst: Some("1".to_string()) }
+        );
+        assert_eq!(resolve(&raw("swap-pane", &["-L"])).unwrap_err(), usage("swap-pane").unwrap());
+    }
+
+    #[test]
+    fn rotate_window_flags() {
+        assert_eq!(resolve(&raw("rotate-window", &[])).unwrap(), ParsedCmd::RotateWindow { down: false, target: None });
+        assert_eq!(
+            resolve(&raw("rotatew", &["-D"])).unwrap(),
+            ParsedCmd::RotateWindow { down: true, target: None }
+        );
+        assert_eq!(
+            resolve(&raw("rotate-window", &["-t", "work"])).unwrap(),
+            ParsedCmd::RotateWindow { down: false, target: Some("work".to_string()) }
+        );
     }
 
     #[test]

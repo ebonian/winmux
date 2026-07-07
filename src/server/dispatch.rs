@@ -1007,6 +1007,140 @@ impl Server {
         Ok(String::new())
     }
 
+    // ---- layout presets, swap-pane, rotate-window (Task 6, sub-project 4) --
+
+    /// Current window's panes in CREATION order (ascending `PaneId`, since
+    /// `Server::mint_pane_id` is a global monotonic counter) -- what
+    /// `Layout::apply_preset` uses to place panes (position 0 = the "main"
+    /// pane for `main-horizontal`/`main-vertical`). Deliberately NOT
+    /// `layout.panes()`'s raw tree order: a prior `swap-pane`/`rotate-window`
+    /// can have scrambled the tree's leaf order, and the task brief is
+    /// explicit that preset placement must stay pinned to creation/index
+    /// order regardless (matches tmux, which places panes by its window pane
+    /// LIST, not by wherever they currently sit on screen).
+    fn panes_in_creation_order(window: &Window) -> Vec<PaneId> {
+        let mut ids = window.layout.panes();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn exec_select_layout(&mut self, target: Option<String>, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
+        let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
+        let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
+        let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
+        let main_w = self.options.main_pane_width();
+        let main_h = self.options.main_pane_height();
+        let Some(session) = self.registry.session_mut(&session_name) else {
+            return Err(format!("can't find session: {session_name}"));
+        };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else {
+            return Err("window not found".to_string());
+        };
+        // Bare `select-layout` (no name): tmux re-flows the CURRENT named
+        // layout. SP4 simplification, documented: winmux has no "custom vs.
+        // named" tree classification beyond `last_layout`, so a bare
+        // `select-layout` re-applies whichever cycle position `last_layout`
+        // last recorded (or the first cycle entry if none has ever been
+        // applied).
+        let preset = match &name {
+            Some(n) => crate::layout::LayoutPreset::from_name(n).expect("cmd::resolve already validated the layout name"),
+            None => crate::layout::PRESET_CYCLE[window.last_layout.unwrap_or(0) as usize],
+        };
+        let panes = Self::panes_in_creation_order(window);
+        window.layout.apply_preset(preset, &panes, area, main_w, main_h);
+        window.last_layout = Some(preset.cycle_index());
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    fn exec_next_layout(&mut self, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
+        let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
+        let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
+        let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
+        let main_w = self.options.main_pane_width();
+        let main_h = self.options.main_pane_height();
+        let Some(session) = self.registry.session_mut(&session_name) else {
+            return Err(format!("can't find session: {session_name}"));
+        };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else {
+            return Err("window not found".to_string());
+        };
+        let next_idx = match window.last_layout {
+            Some(i) => (i + 1) % crate::layout::PRESET_CYCLE.len() as u8,
+            None => 0,
+        };
+        let preset = crate::layout::PRESET_CYCLE[next_idx as usize];
+        let panes = Self::panes_in_creation_order(window);
+        window.layout.apply_preset(preset, &panes, area, main_w, main_h);
+        window.last_layout = Some(next_idx);
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap the ACTING client's active
+    /// pane with the previous/next pane in creation order (wrapping),
+    /// operating only on the acting client's CURRENT window (matches the
+    /// `{`/`}` bindings' intent; tmux itself scopes `-U`/`-D` to the target
+    /// window's own pane list too). The explicit `-s`/`-t` form resolves two
+    /// independent pane targets via the normal `resolve_pane_target`
+    /// fallback chain; SP4 simplification (documented): both targets are
+    /// expected to resolve to panes of the SAME window as each other --
+    /// `Layout::swap_panes` operates on that window's own tree and silently
+    /// no-ops if either id isn't one of its leaves, so a cross-window `-s`/
+    /// `-t` pair degrades to a harmless no-op rather than actually moving a
+    /// pane between windows (real tmux supports this; deferred here).
+    fn exec_swap_pane(&mut self, dir: Option<Direction>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String> {
+        let (session_name, a, b, target_wid) = if let Some(d) = dir {
+            let session_name = self.resolve_session_name(None, cs)?;
+            let Some(session) = self.registry.session_mut(&session_name) else {
+                return Err(format!("can't find session: {session_name}"));
+            };
+            let wid = session.current;
+            let window = session.current_window();
+            let order = Self::panes_in_creation_order(window);
+            let active = window.layout.focused();
+            let Some(pos) = order.iter().position(|&p| p == active) else {
+                return Err("pane not found".to_string());
+            };
+            let n = order.len();
+            let other = match d {
+                Direction::Up => order[(pos + n - 1) % n],
+                Direction::Down => order[(pos + 1) % n],
+                // `resolve`'s flag scanner for swap-pane only ever admits
+                // `-U`/`-D`; any other `Direction` is unreachable.
+                _ => return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string()),
+            };
+            (session_name, active, other, wid)
+        } else {
+            let (s1, w1, pa) = self.resolve_pane_target(cs, src.as_deref())?;
+            let (_s2, _w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
+            // Both targets are expected to resolve within the same window as
+            // each other (see this fn's doc comment); `s1`/`w1` (the SOURCE
+            // pane's session/window) are used as the operand -- if `dst`
+            // resolved to a different session/window, `Layout::swap_panes`
+            // below simply won't find `pb` among `w1`'s leaves and no-ops.
+            (s1, pa, pb, w1)
+        };
+        if let Some(session) = self.registry.session_mut(&session_name) {
+            if let Some(window) = session.windows.iter_mut().find(|w| w.id == target_wid) {
+                window.layout.swap_panes(a, b);
+            }
+        }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    fn exec_rotate_window(&mut self, down: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
+        let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
+        if let Some(session) = self.registry.session_mut(&session_name) {
+            if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
+                window.layout.rotate(down);
+            }
+        }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
     fn exec_send_prefix(&mut self, cs: Option<&str>) -> Result<String, String> {
         let (_session, _wid, pane_id) = self.resolve_pane_target(cs, None)?;
         let bytes = crate::keys::encode_key(&self.options.prefix()).unwrap_or_default();
@@ -2112,6 +2246,10 @@ impl Server {
             ListBuffers => self.exec_list_buffers_headless(),
             DeleteBuffer { name } => self.exec_delete_buffer(name),
             SetBuffer { name, data } => self.exec_set_buffer(name, data),
+            SelectLayout { target, name } => self.exec_select_layout(target, name, None),
+            NextLayout { target } => self.exec_next_layout(target, None),
+            SwapPane { dir, src, dst } => self.exec_swap_pane(dir, src, dst, None),
+            RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
         }
     }
 
@@ -2245,6 +2383,10 @@ impl Server {
             ListBuffers => self.exec_list_buffers_client(),
             DeleteBuffer { name } => wrap(self.exec_delete_buffer(name)),
             SetBuffer { name, data } => wrap(self.exec_set_buffer(name, data)),
+            SelectLayout { target, name } => wrap(self.exec_select_layout(target, name, Some(session_name.as_str()))),
+            NextLayout { target } => wrap(self.exec_next_layout(target, Some(session_name.as_str()))),
+            SwapPane { dir, src, dst } => wrap(self.exec_swap_pane(dir, src, dst, Some(session_name.as_str()))),
+            RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
         }
     }
 

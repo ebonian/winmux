@@ -76,6 +76,77 @@ that ISN'T currently focused, without changing focus. `resize_focused`'s own
 signature/behavior is unchanged. See the `## mouse` section of
 [`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md).
 
+**Amendment (sub-project 4, Task 6 — layout presets, swap-pane,
+rotate-window):** three additions, all still pure (no I/O):
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+/// `next-layout`'s cycle order; also the canonical index (0..=4) stored in
+/// `model::Window::last_layout`.
+pub const PRESET_CYCLE: [LayoutPreset; 5] = [ /* the 5 variants above, in order */ ];
+
+impl LayoutPreset {
+    pub fn name(self) -> &'static str;             // "even-horizontal", ...
+    pub fn from_name(s: &str) -> Option<LayoutPreset>; // exact match only
+    pub fn cycle_index(self) -> u8;                 // position in PRESET_CYCLE
+}
+
+impl Layout {
+    /// Rebuild the split tree from scratch as one of the five presets.
+    /// `panes` is the CALLER-supplied pane order used for placement
+    /// (position 0 is the "main" pane for MainHorizontal/MainVertical) --
+    /// callers pass CREATION order (ascending PaneId), not `self.panes()`'s
+    /// current tree order, so a preset re-applied after a swap/rotate stays
+    /// pinned to the same placement regardless of how the tree got
+    /// scrambled. `main_width`/`main_height` are the `main-pane-width`/
+    /// `main-pane-height` option values, clamped internally so the main pane
+    /// is >= MIN_PANE_W/H and the other panes are too. A single pane always
+    /// just fills `area`. Focus is preserved if still present in `panes`
+    /// (else falls back to `panes[0]`); zoom is cleared. No-op if `panes` is
+    /// empty.
+    pub fn apply_preset(&mut self, preset: LayoutPreset, panes: &[PaneId], area: Rect, main_width: u16, main_height: u16);
+
+    /// Swap the CONTENTS of the two leaves holding `a` and `b` (each pane
+    /// keeps its id; they trade tree/screen positions). `self.focused`
+    /// stores a PaneId, so a focused pane that is one of `a`/`b`
+    /// automatically "follows" to its new position -- no explicit focus
+    /// bookkeeping. Clears zoom. `false` (no-op) if `a == b` or either id
+    /// isn't a leaf of this layout.
+    pub fn swap_panes(&mut self, a: PaneId, b: PaneId) -> bool;
+
+    /// Rotate every pane's content through the tree's leaf positions by one
+    /// step. `forward` shifts each position's content to what the PREVIOUS
+    /// leaf position held (content moves one position later, wrapping last
+    /// -> first); `!forward` is the mirror. Focus follows the SCREEN CELL
+    /// (leaf position), not the pane -- whichever position was focused stays
+    /// focused, now showing whichever pane rotated into it. Clears zoom.
+    /// `false` (no-op) with 0 or 1 panes.
+    pub fn rotate(&mut self, forward: bool) -> bool;
+}
+```
+
+Rounding rule for every preset's even splits: remainder cells go to the
+EARLIER (leftmost/topmost) entries first (`even_lengths`, a private helper).
+`tiled`'s rows-first grid: `rows=cols=1; while r*c<n { r+=1; if r*c<n {
+c+=1 } }`; a short final row's panes are spread evenly over the row's OWN
+pane count (not the full `cols`), so the last pane in a short row ends up
+wider than a normal column ("last short row spans"). Deviation from the SP4
+design spec's `Layout::rotate(forward: bool)` signature: none — the
+parameter name and meaning match; only the mapping from
+`rotate-window`/`-D` to `forward` was a judgment call (see
+`cmd`/`server::dispatch` amendments in
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)'s
+`## layout-presets` section) since neither the task brief nor the design
+spec pin down the exact `-D`/bare direction-to-permutation mapping.
+
 ```rust
 pub type PaneId = u32;
 

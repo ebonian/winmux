@@ -150,6 +150,22 @@ impl Default for Bindings {
         b(char_key('#'), vec![cmd1("list-buffers", &[])], false);
         b(char_key('-'), vec![cmd1("delete-buffer", &[])], false);
 
+        // Layout presets + swap/rotate (Task 6, sub-project 4). `Space` is
+        // bound under the literal space CHARACTER, not `named("Space")` --
+        // same project-wide gotcha as copy mode's spacebar bindings (a real
+        // spacebar press decodes as `Key{Char(' ')}`, never `KeyCode::Space`).
+        b(char_key(' '), vec![cmd1("next-layout", &[])], false);
+        b(named("M-1"), vec![cmd1("select-layout", &["even-horizontal"])], false);
+        b(named("M-2"), vec![cmd1("select-layout", &["even-vertical"])], false);
+        b(named("M-3"), vec![cmd1("select-layout", &["main-horizontal"])], false);
+        b(named("M-4"), vec![cmd1("select-layout", &["main-vertical"])], false);
+        b(named("M-5"), vec![cmd1("select-layout", &["tiled"])], false);
+        b(char_key('{'), vec![cmd1("swap-pane", &["-U"])], false);
+        b(char_key('}'), vec![cmd1("swap-pane", &["-D"])], false);
+        // tmux: `C-o` rotate-window (bare, no `-D`), `M-o` rotate-window -D.
+        b(named("C-o"), vec![cmd1("rotate-window", &[])], false);
+        b(named("M-o"), vec![cmd1("rotate-window", &["-D"])], false);
+
         Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
@@ -429,6 +445,16 @@ mod tests {
             ("]", "paste-buffer", &["-p"], false),
             ("#", "list-buffers", &[], false),
             ("-", "delete-buffer", &[], false),
+            (" ", "next-layout", &[], false),
+            ("M-1", "select-layout", &["even-horizontal"], false),
+            ("M-2", "select-layout", &["even-vertical"], false),
+            ("M-3", "select-layout", &["main-horizontal"], false),
+            ("M-4", "select-layout", &["main-vertical"], false),
+            ("M-5", "select-layout", &["tiled"], false),
+            ("{", "swap-pane", &["-U"], false),
+            ("}", "swap-pane", &["-D"], false),
+            ("C-o", "rotate-window", &[], false),
+            ("M-o", "rotate-window", &["-D"], false),
         ];
 
         for (k, name, args, repeat) in expected {
