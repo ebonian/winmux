@@ -29,18 +29,20 @@ use crate::bindings::Binding;
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
-use crate::keys::{MouseEvent, MouseKind};
+use crate::keys::{Key, KeyCode, MouseEvent, MouseKind};
 use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    advance_click_run, anchor_key_now, key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId,
-    ClientMode, ClientState, ConfigCandidate, CopyState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState,
-    Server, MONTHS, MOUSE_WHEEL_STEP,
+    advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, sel_key, send_msg, spawn_pane,
+    system_time_parts, ChooseTreeState, ChooseTreeView, ClientId, ClientMode, ClientState, ConfigCandidate, CopyState,
+    DisplayPanesState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState, Server, TreeTarget, MONTHS,
+    MOUSE_WHEEL_STEP,
 };
 use crate::grid::Grid;
+use std::time::Duration;
 
 /// Abbreviated C-locale English weekday names, indexed by
 /// `SYSTEMTIME::wDayOfWeek` (0 = Sunday .. 6 = Saturday). Duplicated from the
@@ -2426,6 +2428,8 @@ impl Server {
             BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
             FindWindow { pattern } => self.exec_find_window(pattern, None),
+            ChooseTree { .. } => Err("no current client".to_string()),
+            DisplayPanes { .. } => Err("no current client".to_string()),
         }
     }
 
@@ -2607,6 +2611,8 @@ impl Server {
             BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
+            ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client),
+            DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
         }
     }
 
@@ -2647,12 +2653,13 @@ impl Server {
         match client.mode {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
-            // Copy mode (Task 2) without an open search prompt never arms
-            // raw capture (`set_capture`) — its keys flow through the normal
-            // `KeyInputEvent::Key` path with a table override (see
+            // Copy mode (Task 2) without an open search prompt, and
+            // choose-tree/display-panes (Task 8), never arm raw capture
+            // (`set_capture`) — their keys flow through the normal
+            // `KeyInputEvent::Key`/`Forward` path with a table override (see
             // `handle_stdin`), not `Captured` bytes. This arm exists only
             // for match-exhaustiveness.
-            ClientMode::Normal | ClientMode::Copy(_) => (true, None),
+            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (true, None),
         }
     }
 
@@ -2844,6 +2851,300 @@ impl Server {
     }
 }
 
+// ---- overlays: choose-tree + display-panes (Task 8, sub-project 4) --------
+
+/// One choose-tree row: its already-formatted display text and the
+/// underlying session/window identity it acts on. Built fresh every time by
+/// [`Server::build_tree_rows`] — never cached across a render or a keypress
+/// (see `ClientMode::ChooseTree`'s doc comment for why).
+pub(super) struct TreeRow {
+    pub(super) text: String,
+    target: TreeTarget,
+}
+
+/// Hardcoded choose-tree key resolution (Task 8) — deliberately NOT routed
+/// through the mutable `Bindings` table (the design spec's `## 7. Overlays`
+/// section calls these out as hardcoded, same footing as the mouse
+/// bindings), and NOT `set_capture`-based raw-byte capture either: capture
+/// mode's `edit_line_buf` treats a lone `0x1b` as an immediate cancel byte,
+/// which would make `Up`/`Down` (`\x1b[A`/`\x1b[B`) unusable — see the
+/// `ClientMode::Copy`/copy-mode "table-override key routing" exemplar this
+/// mode follows instead (`handle_stdin` intercepts already-DECODED `Key`
+/// events). `None` = unbound: swallowed (choose-tree, like copy mode, never
+/// leaks a keystroke to the pane underneath), overlay stays open.
+enum ChooseTreeAction {
+    Up,
+    Down,
+    Commit,
+    Cancel,
+    Kill,
+}
+
+fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
+    if key.ctrl && matches!(key.code, KeyCode::Char('c')) {
+        return Some(ChooseTreeAction::Cancel);
+    }
+    if key.ctrl || key.meta {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(ChooseTreeAction::Up),
+        KeyCode::Down => Some(ChooseTreeAction::Down),
+        KeyCode::Char('k') => Some(ChooseTreeAction::Up),
+        KeyCode::Char('j') => Some(ChooseTreeAction::Down),
+        KeyCode::Enter => Some(ChooseTreeAction::Commit),
+        KeyCode::Char('q') => Some(ChooseTreeAction::Cancel),
+        KeyCode::Escape => Some(ChooseTreeAction::Cancel),
+        KeyCode::Char('x') => Some(ChooseTreeAction::Kill),
+        _ => None,
+    }
+}
+
+impl Server {
+    /// Build choose-tree's row list fresh from LIVE registry state (Task 8)
+    /// — the single source of truth both `render_one`'s overlay and every
+    /// key that resolves `sel` to a concrete target go through, which is
+    /// what makes stale-row bugs structurally unreachable (see
+    /// `ClientMode::ChooseTree`'s doc comment).
+    ///
+    /// `Sessions`: one row per session, `<name>: N windows[ (attached)]`.
+    /// `Windows`: the CURRENT session only — a header row in the same format
+    /// as a `Sessions` row, followed by one indented row per window,
+    /// `  <index>: <name><flags>` (`*` current, `-` last, else nothing) —
+    /// see the design spec's `## 7. Overlays` section for the exact format
+    /// and the documented "current session's windows only" scope
+    /// simplification (real tmux's `-w` shows the whole tree).
+    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView) -> Vec<TreeRow> {
+        let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
+        let session_row = |s: &Session| TreeRow {
+            text: format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" }),
+            target: TreeTarget::Session(s.name.clone()),
+        };
+        match view {
+            ChooseTreeView::Sessions => self.registry.sessions().iter().map(session_row).collect(),
+            ChooseTreeView::Windows => {
+                let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+                    return Vec::new();
+                };
+                let mut rows = vec![session_row(session)];
+                for w in &session.windows {
+                    let flag = if w.id == session.current {
+                        "*"
+                    } else if Some(w.id) == session.last {
+                        "-"
+                    } else {
+                        ""
+                    };
+                    rows.push(TreeRow {
+                        text: format!("  {}: {}{}", w.index, w.name, flag),
+                        target: TreeTarget::Window(session.name.clone(), w.id),
+                    });
+                }
+                rows
+            }
+        }
+    }
+
+    /// `kill-session <name>? (y/n)` / `kill-window <name>? (y/n)` for `x`
+    /// (Task 8) — same prompt-string shape as the `&`/`x` prefix bindings'
+    /// `confirm-before -p "kill-window #W? (y/n)" kill-window`, computed
+    /// directly here instead since choose-tree's kill flow doesn't route
+    /// through `ClientMode::ConfirmCmd` (see `ChooseTreeState::pending_kill`'s
+    /// doc comment for why).
+    fn tree_kill_prompt(&self, target: &TreeTarget) -> String {
+        match target {
+            TreeTarget::Session(name) => format!("kill-session {name}? (y/n)"),
+            TreeTarget::Window(session_name, wid) => {
+                let name = self
+                    .registry
+                    .sessions()
+                    .iter()
+                    .find(|s| s.name == *session_name)
+                    .and_then(|s| s.windows.iter().find(|w| w.id == *wid))
+                    .map(|w| w.name.clone())
+                    .unwrap_or_default();
+                format!("kill-window {name}? (y/n)")
+            }
+        }
+    }
+
+    /// Execute a confirmed choose-tree kill (Task 8): re-validates the
+    /// target still exists (belt-and-braces — `cancel_stale_choose_trees`
+    /// already clears a stale `pending_kill` before this can even be
+    /// reached, same defense-in-depth as `feed_confirm_byte`'s own
+    /// re-check), then reuses the SAME kill helpers `&`/`x` and `kill-
+    /// session`/`kill-window` already go through. `Destroy` only when the
+    /// killed session IS the acting client's own (same rule as
+    /// `exec_kill_window_client`/`exec_kill_pane_client`) — the overlay
+    /// simply closes along with the rest of that client's exit, matching a
+    /// normal kill-your-own-session flow.
+    fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str) -> ExecOutcome {
+        match target {
+            TreeTarget::Session(name) => {
+                if self.registry.session_mut(&name).is_none() {
+                    return ExecOutcome::Ok(String::new());
+                }
+                let acting = name == session_name;
+                self.destroy_session(&name);
+                if acting {
+                    ExecOutcome::Destroy
+                } else {
+                    ExecOutcome::Ok(String::new())
+                }
+            }
+            TreeTarget::Window(sname, wid) => {
+                let exists = self.registry.sessions().iter().any(|s| s.name == sname && s.windows.iter().any(|w| w.id == wid));
+                if !exists {
+                    return ExecOutcome::Ok(String::new());
+                }
+                match self.kill_window_by_id(&sname, wid) {
+                    Ok(true) if sname == session_name => ExecOutcome::Destroy,
+                    Ok(_) => ExecOutcome::Ok(String::new()),
+                    Err(e) => ExecOutcome::Err(e),
+                }
+            }
+        }
+    }
+
+    /// Commit choose-tree's selection (Task 8, Enter): re-validates the
+    /// target still exists (a stale row, e.g. killed by another client while
+    /// this one was browsing, is a silent no-op rather than acting on a dead
+    /// id) then switches this client to the session, or selects the window
+    /// within its (always-current, per the `Windows` view's own scope) session
+    /// — same underlying mutation as `switch-client -p/-n`/`select-window`.
+    fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        match target {
+            TreeTarget::Session(name) => {
+                if self.registry.session_mut(&name).is_none() || name == *session_name {
+                    return ExecOutcome::Ok(String::new());
+                }
+                let old = std::mem::replace(session_name, name.clone());
+                client.session = Some(name.clone());
+                client.renderer.resize(client.cols.max(1), client.rows.max(1));
+                ExecOutcome::SwitchedSession(old, name)
+            }
+            TreeTarget::Window(sname, wid) => {
+                let exists = self.registry.sessions().iter().any(|s| s.name == sname && s.windows.iter().any(|w| w.id == wid));
+                if !exists {
+                    return ExecOutcome::Ok(String::new());
+                }
+                if let Some(session) = self.registry.session_mut(&sname) {
+                    if wid != session.current {
+                        session.last = Some(session.current);
+                        session.current = wid;
+                    }
+                }
+                self.apply_layout_for_session(&sname);
+                ExecOutcome::Ok(String::new())
+            }
+        }
+    }
+
+    /// Route one decoded key to the acting client's choose-tree overlay
+    /// (Task 8). `None` = the key was swallowed (unbound, or a navigation
+    /// key while `pending_kill` absorbed it) with NO dispatch to report;
+    /// `handle_stdin` only calls `route_outcome` on `Some`.
+    pub(super) fn dispatch_choose_tree_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> Option<ExecOutcome> {
+        // A pending kill-confirm (`x` was already pressed) absorbs the VERY
+        // NEXT key as its y/n answer, taking priority over ordinary
+        // navigation -- same y/Y/Enter-confirms, anything-else-cancels rule
+        // as `feed_confirm_byte`.
+        let pending = match &mut client.mode {
+            ClientMode::ChooseTree(state) => state.pending_kill.take(),
+            _ => return None,
+        };
+        if let Some((target, _prompt)) = pending {
+            let confirmed = matches!(key.code, KeyCode::Enter) || matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            return Some(if confirmed { self.exec_tree_kill(target, session_name) } else { ExecOutcome::Ok(String::new()) });
+        }
+
+        let action = resolve_choose_tree_key(key)?;
+        let (view, sel) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.sel),
+            _ => return None,
+        };
+        let rows = self.build_tree_rows(session_name, view);
+
+        match action {
+            ChooseTreeAction::Up => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.sel = sel.saturating_sub(1);
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::Down => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.sel = (sel + 1).min(rows.len().saturating_sub(1));
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::Cancel => {
+                client.mode = ClientMode::Normal;
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::Kill => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                let prompt = self.tree_kill_prompt(&row.target);
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.pending_kill = Some((row.target.clone(), prompt));
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::Commit => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                let target = row.target.clone();
+                client.mode = ClientMode::Normal;
+                Some(self.exec_tree_commit(target, client, session_name))
+            }
+        }
+    }
+
+    /// Route one decoded key to the acting client's display-panes overlay
+    /// (Task 8): a digit `0`-`9` focuses the matching pane (per the SAME
+    /// digit-to-pane mapping the overlay was drawn with, [`pane_digit_entries`]
+    /// recomputed fresh here rather than trusting anything stored); any
+    /// other key just dismisses. Either way, exactly one key ever reaches
+    /// this — the overlay closes unconditionally.
+    pub(super) fn dispatch_display_panes_key(&mut self, key: &Key, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if !matches!(client.mode, ClientMode::DisplayPanes(_)) {
+            return ExecOutcome::Ok(String::new());
+        }
+        client.mode = ClientMode::Normal;
+        if let KeyCode::Char(c) = key.code {
+            if !key.ctrl && !key.meta {
+                if let Some(d) = c.to_digit(10) {
+                    if let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) {
+                        let entries = pane_digit_entries(session.current_window());
+                        if let Some((pane_id, _)) = entries.into_iter().find(|(_, dg)| *dg == d) {
+                            self.mouse_focus_pane(session_name, pane_id);
+                        }
+                    }
+                }
+            }
+        }
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// `choose-tree [-s|-w]` (Task 8): opens the overlay, replacing whatever
+    /// mode the client was previously in (matches copy mode's own entry
+    /// behavior — no special-casing for "already in copy mode"/"prompt open"
+    /// etc., since a prompt/confirm keeps capture armed and therefore can
+    /// never actually dispatch this command in the first place).
+    fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState) -> ExecOutcome {
+        let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
+        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel: 0, pending_kill: None });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// `display-panes [-d ms]` (Task 8): `ms` overrides `display-panes-time`
+    /// for this invocation only (the option itself is untouched).
+    fn exec_display_panes_client(&mut self, ms: Option<u32>, client: &mut ClientState) -> ExecOutcome {
+        let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or_else(|| self.options.display_panes_time());
+        client.mode = ClientMode::DisplayPanes(DisplayPanesState { deadline: Instant::now() + dur });
+        ExecOutcome::Ok(String::new())
+    }
+}
+
 #[cfg(test)]
 mod copy_search_tests {
     use super::*;
@@ -2986,6 +3287,8 @@ mod mouse_dispatch_tests {
                 ClientMode::Copy(_) => "Copy",
                 ClientMode::Prompt { .. } => "Prompt",
                 ClientMode::ConfirmCmd { .. } => "ConfirmCmd",
+                ClientMode::ChooseTree(_) => "ChooseTree",
+                ClientMode::DisplayPanes(_) => "DisplayPanes",
             }
         );
     }

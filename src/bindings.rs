@@ -180,6 +180,13 @@ impl Default for Bindings {
         b(char_key('f'), vec![cmd1("find-window", &[])], false);
         b(char_key('\''), vec![cmd1("select-window", &[])], false);
 
+        // Overlays (Task 8, sub-project 4): `w` choose-tree (windows of the
+        // current session), `s` choose-tree (sessions, collapsed), `q`
+        // display-panes. See the design spec's `## 7. Overlays` section.
+        b(char_key('w'), vec![cmd1("choose-tree", &["-w"])], false);
+        b(char_key('s'), vec![cmd1("choose-tree", &["-s"])], false);
+        b(char_key('q'), vec![cmd1("display-panes", &[])], false);
+
         Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
@@ -473,6 +480,9 @@ mod tests {
             (".", "move-window", &[], false),
             ("f", "find-window", &[], false),
             ("'", "select-window", &[], false),
+            ("w", "choose-tree", &["-w"], false),
+            ("s", "choose-tree", &["-s"], false),
+            ("q", "display-panes", &[], false),
         ];
 
         for (k, name, args, repeat) in expected {

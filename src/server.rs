@@ -50,7 +50,7 @@ use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{CopyView, PaneView, Renderer, Scene, StatusRow};
+use crate::render::{CopyView, ListOverlay, Overlay, PaneView, Renderer, Scene, StatusRow};
 use crate::status::{status_spans, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
@@ -139,6 +139,111 @@ enum ClientMode {
     /// spec's `## 2. Copy mode` section) — two clients can independently be
     /// in copy mode on the same or different panes.
     Copy(CopyState),
+    /// choose-tree overlay (Task 8, sub-project 4; `w`/`s`, `choose-tree
+    /// [-s|-w]`). Per-CLIENT, table-override key routing exactly like
+    /// `Copy` (the exemplar this mode follows) — see `dispatch::
+    /// resolve_choose_tree_key`/`dispatch_choose_tree_key`. Deliberately
+    /// carries no snapshotted `rows`: `ChooseTreeState` only remembers WHICH
+    /// view is showing and the selected INDEX into it; the actual row list
+    /// (text + target identity) is rebuilt fresh from live registry state on
+    /// every render AND every key that needs to resolve `sel` to a concrete
+    /// target (`dispatch::Server::build_tree_rows`) — this is what makes the
+    /// "stale row acts on the wrong/dead target" bug class structurally
+    /// unreachable for navigation/commit (see the design brief's "multi-
+    /// client and staleness" section). The one piece of state that DOES
+    /// persist across renders, `pending_kill`, is re-validated against live
+    /// state before acting (`Server::cancel_stale_choose_trees`) for exactly
+    /// the same reason `cancel_stale_confirms` re-validates `ConfirmCmd`.
+    ChooseTree(ChooseTreeState),
+    /// display-panes overlay (Task 8; `q`, `display-panes [-d ms]`): a
+    /// per-client TIMED overlay (`deadline`) showing a digit on every pane of
+    /// the client's current window, auto-dismissing on `Tick` once expired.
+    /// No pane-set snapshot either -- the digit-to-pane mapping is rebuilt
+    /// fresh from the CURRENT window layout both when rendering
+    /// (`Server::build_render_overlay`) and when resolving a digit keypress
+    /// (`dispatch::Server::dispatch_display_panes_key`), so a pane that died
+    /// mid-overlay simply stops being offered a digit rather than a stale
+    /// key press acting on a dead `PaneId`.
+    DisplayPanes(DisplayPanesState),
+}
+
+/// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
+/// one collapsed row; `Windows` (`-w`, the default) lists the CURRENT
+/// session's windows (a session header row + one indented row per window) --
+/// see the design spec's `## 7. Overlays` section for the documented
+/// "windows of the current session only" scope simplification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChooseTreeView {
+    Windows,
+    Sessions,
+}
+
+/// choose-tree's per-client state (Task 8). `sel` is a plain index into
+/// whatever `dispatch::Server::build_tree_rows(session_name, view)` returns
+/// THIS render/keypress -- always clamped fresh, never stale (see
+/// `ClientMode::ChooseTree`'s doc comment). `pending_kill` is `Some((target,
+/// prompt))` between pressing `x` and answering y/n: the confirm PROMPT TEXT
+/// is precomputed at `x`-press time (mirrors `ClientMode::ConfirmCmd`'s own
+/// `prompt` field, deliberately NOT routed through `client.message` --
+/// message is cleared on every `Stdin` frame, which would make the prompt
+/// vanish before the user could answer it).
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    sel: usize,
+    pending_kill: Option<(TreeTarget, String)>,
+}
+
+/// A choose-tree row's underlying identity (Task 8): resolved fresh from the
+/// registry at both render time and commit/kill time, never cached across a
+/// render -- see `ClientMode::ChooseTree`'s doc comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeTarget {
+    Session(String),
+    /// Session name + window id (the session is always the acting client's
+    /// current session in THIS project's simplified `Windows` view, but
+    /// carried explicitly rather than assumed, for clarity at the exec
+    /// sites).
+    Window(String, WindowId),
+}
+
+/// display-panes' per-client state (Task 8): just the auto-dismiss deadline
+/// (`Instant::now() + display-panes-time` at entry, or `+ -d ms` if given).
+/// See `ClientMode::DisplayPanes`'s doc comment for why no pane-set snapshot
+/// is carried either.
+struct DisplayPanesState {
+    deadline: Instant,
+}
+
+/// Task 8 (display-panes): pane-index -> digit mapping, in the window's
+/// `layout.panes()` order (the SAME order the status bar's pane-index format
+/// and `select-pane -t <n>` use), capped at the first 10 panes -- digits
+/// 0-9 only (design spec `## 7. Overlays`: an 11th+ pane simply gets no
+/// digit and is never offered as a display-panes target, a documented tmux-
+/// parity simplification). Shared by both the render path
+/// (`Server::build_render_overlay`) and the digit-keypress resolution path
+/// (`dispatch::Server::dispatch_display_panes_key`) so they can never
+/// disagree about which digit means which pane.
+fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
+    window.layout.panes().into_iter().take(10).enumerate().map(|(i, id)| (id, i as u32)).collect()
+}
+
+/// Precomputed, render-ready overlay content for one client (Task 8),
+/// resolved in `Server::build_render_overlay` -- a pass over `&self`
+/// BEFORE `render_all`'s per-client `self.clients.values_mut()` loop begins,
+/// because `ChooseTree`'s `Sessions` view needs the WHOLE registry (not just
+/// the client's own session) and its "(attached)" suffix needs `self.
+/// clients`, neither of which the per-client `render_one` (called while
+/// `self.clients` is already mutably borrowed) can see directly.
+enum RenderOverlay {
+    /// Already-formatted row text, in order, plus which index is selected;
+    /// `render_one` turns this into a `render::Overlay::List` (padding/
+    /// scrolling is a rendering concern, computed there with the client's
+    /// own `rows`/`cols` in hand).
+    Tree { rows: Vec<String>, sel: usize },
+    /// The digit-to-pane mapping for the client's current window (see
+    /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
+    /// current rect and active-ness.
+    Digits(Vec<(PaneId, u32)>),
 }
 
 /// Copy mode's per-client state. `scroll` == tmux `oy` (lines scrolled up
@@ -799,6 +904,14 @@ impl Server {
                             dirty = true;
                         }
                     }
+                    // display-panes (Task 8): auto-dismiss once its deadline
+                    // has passed -- this 50ms tick is the same mechanism
+                    // `MESSAGE_LIFETIME` expiry already uses above.
+                    let expired = matches!(&client.mode, ClientMode::DisplayPanes(s) if deadline >= s.deadline);
+                    if expired {
+                        client.mode = ClientMode::Normal;
+                        dirty = true;
+                    }
                 }
                 dirty
             }
@@ -1113,6 +1226,33 @@ impl Server {
         }
     }
 
+    /// Cancel any attached client's choose-tree (Task 8) `pending_kill`
+    /// confirm whose snapshotted target no longer exists (killed by another
+    /// client, or by this same client's own dispatch, while the `x` (y/n)
+    /// prompt was up). Navigation/commit never go stale (see
+    /// `ClientMode::ChooseTree`'s doc comment for why) — `pending_kill` is
+    /// the one piece of state this mode carries across renders, so it is the
+    /// only thing this sweep needs to re-validate. Called from the same two
+    /// sites as `cancel_stale_confirms`/`cancel_stale_copy_modes`.
+    fn cancel_stale_choose_trees(&mut self) {
+        let live_sessions: HashSet<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+        let live_windows: HashSet<(String, WindowId)> =
+            self.registry.sessions().iter().flat_map(|s| s.windows.iter().map(move |w| (s.name.clone(), w.id))).collect();
+        for client in self.clients.values_mut() {
+            if let ClientMode::ChooseTree(state) = &mut client.mode {
+                if let Some((target, _)) = &state.pending_kill {
+                    let alive = match target {
+                        TreeTarget::Session(n) => live_sessions.contains(n),
+                        TreeTarget::Window(sn, wid) => live_windows.contains(&(sn.clone(), *wid)),
+                    };
+                    if !alive {
+                        state.pending_kill = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// Session's shared size = min over its attached clients of
     /// `(cols, rows - status_rows)` (the status row, when on, is not part of
     /// the pane area; `status off` gives panes the full height — Task 8).
@@ -1222,6 +1362,7 @@ impl Server {
         // any confirm on it must be reset, or its `y` would act on stale state.
         self.cancel_stale_confirms();
         self.cancel_stale_copy_modes();
+        self.cancel_stale_choose_trees();
         true
     }
 
@@ -1328,6 +1469,41 @@ impl Server {
                             // Unbound in a copy table: swallowed, matching
                             // the `Key`-path rule.
                         }
+                    } else if matches!(client.mode, ClientMode::ChooseTree(_)) {
+                        // choose-tree (Task 8): same Forward-blob re-decode
+                        // as copy mode above (`j`/`k`/`x`/`q`/digits are all
+                        // plain-forwardable) — every decoded key is resolved
+                        // against the HARDCODED choose-tree key table (not
+                        // `self.bindings` — see `dispatch::
+                        // resolve_choose_tree_key`'s doc comment), never
+                        // forwarded to the pane underneath.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        for item in decoded {
+                            let crate::keys::DecodedInput::Key(dk) = item else { continue };
+                            if let Some(outcome) = self.dispatch_choose_tree_key(&dk.key, &mut client, &mut session_name) {
+                                dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                                if detach || destroy {
+                                    break 'events;
+                                }
+                            }
+                        }
+                    } else if matches!(client.mode, ClientMode::DisplayPanes(_)) {
+                        // display-panes (Task 8): only the FIRST decoded key
+                        // of a coalesced blob matters (digit selects, any
+                        // other key dismisses) — the rest of the blob is
+                        // discarded, per the design spec's documented
+                        // "not reprocessed" simplification.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let decoded = dec.feed(&data);
+                        if let Some(crate::keys::DecodedInput::Key(dk)) = decoded.into_iter().next() {
+                            let outcome = self.dispatch_display_panes_key(&dk.key, &mut client, &session_name);
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
+                            }
+                        }
                     } else if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
@@ -1338,6 +1514,30 @@ impl Server {
                     }
                 }
                 KeyInputEvent::Key { table, key, raw } => {
+                    // choose-tree/display-panes (Task 8): a `Root`-table Key
+                    // event is fully intercepted (never falls to the normal
+                    // bindings-table/pane-forwarding logic below); a
+                    // `Prefix`-table event is left alone so prefix bindings
+                    // still fire, same rule as copy mode.
+                    if table == WhichTable::Root {
+                        if matches!(client.mode, ClientMode::ChooseTree(_)) {
+                            if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name) {
+                                dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                                if detach || destroy {
+                                    break 'events;
+                                }
+                            }
+                            continue;
+                        }
+                        if matches!(client.mode, ClientMode::DisplayPanes(_)) {
+                            let outcome = self.dispatch_display_panes_key(&key, &mut client, &session_name);
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
+                            }
+                            continue;
+                        }
+                    }
                     // Copy mode (Task 2): a `Root`-table Key event while the
                     // acting client is in `ClientMode::Copy` is looked up
                     // against the copy table `mode-keys` selects instead —
@@ -1463,16 +1663,49 @@ impl Server {
         // sequence, etc.) — re-check every client's copy mode after every
         // Stdin-driven dispatch batch.
         self.cancel_stale_copy_modes();
+        // Same idea for choose-tree's `pending_kill` (Task 8): a `y` from
+        // this OR another client may have just removed the session/window
+        // this client had a kill confirm armed on.
+        self.cancel_stale_choose_trees();
+    }
+
+    /// Precompute per-client overlay render data (Task 8) for every
+    /// currently attached client, BEFORE `render_all`'s mutable
+    /// `self.clients.values_mut()` loop begins — see [`RenderOverlay`]'s doc
+    /// comment for why this can't happen inside `render_one` itself.
+    fn build_render_overlay(&self, client: &ClientState) -> Option<RenderOverlay> {
+        let session_name = client.session.as_deref()?;
+        match &client.mode {
+            ClientMode::ChooseTree(state) => {
+                let rows = self.build_tree_rows(session_name, state.view);
+                let sel = state.sel.min(rows.len().saturating_sub(1));
+                Some(RenderOverlay::Tree { rows: rows.into_iter().map(|r| r.text).collect(), sel })
+            }
+            ClientMode::DisplayPanes(_) => {
+                let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
+                Some(RenderOverlay::Digits(pane_digit_entries(session.current_window())))
+            }
+            _ => None,
+        }
     }
 
     /// Render every attached client (see module docs: render-all, not
     /// per-session dirty tracking).
     fn render_all(&mut self) {
         let area_y = self.pane_area_y();
-        for client in self.clients.values_mut() {
+        let ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        let mut overlays: HashMap<ClientId, RenderOverlay> = HashMap::new();
+        for id in ids {
+            if let Some(client) = self.clients.get(&id) {
+                if let Some(ov) = self.build_render_overlay(client) {
+                    overlays.insert(id, ov);
+                }
+            }
+        }
+        for (id, client) in self.clients.iter_mut() {
             let Some(name) = client.session.clone() else { continue };
             let Some(session) = self.registry.sessions().iter().find(|s| s.name == name) else { continue };
-            render_one(client, session, &self.panes, &self.options, &self.hostname, area_y);
+            render_one(client, session, &self.panes, &self.options, &self.hostname, area_y, overlays.get(id));
         }
     }
 }
@@ -1492,6 +1725,7 @@ fn render_one(
     options: &Options,
     hostname: &str,
     area_y: u16,
+    overlay_data: Option<&RenderOverlay>,
 ) {
     let window = session.current_window();
     let area = Rect { x: 0, y: area_y, w: session.size.0, h: session.size.1 };
@@ -1531,6 +1765,20 @@ fn render_one(
             }
             None => client.message.as_ref().map(|(msg, _)| msg.clone()),
         },
+        // choose-tree/display-panes (Task 8): `too_small` still wins first
+        // (an overlay painted over a degenerate-size terminal is nonsensical
+        // -- the `too_small` branch below returns early with no overlay at
+        // all). Otherwise the pending kill-confirm prompt (precomputed at
+        // `x`-press time, see `ChooseTreeState::pending_kill`'s doc comment)
+        // takes priority over any ordinary transient message; display-panes
+        // never has a message of its own beyond the digits themselves.
+        ClientMode::ChooseTree(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::DisplayPanes(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::ChooseTree(state) => match &state.pending_kill {
+            Some((_, prompt)) => Some(prompt.clone()),
+            None => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        },
+        ClientMode::DisplayPanes(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
@@ -1595,11 +1843,24 @@ fn render_one(
     let border = options.pane_border_style().apply_to(default_style);
     let border_active = options.pane_active_border_style().apply_to(default_style);
     let mode_style = options.mode_style().apply_to(default_style);
+    let display_panes_colour = Style { bg: options.display_panes_colour(), ..default_style };
+    let display_panes_active_colour = Style { bg: options.display_panes_active_colour(), ..default_style };
     let scene_size = (client.cols, client.rows);
 
     if too_small {
-        let scene =
-            Scene { size: scene_size, panes: Vec::new(), zoomed, status, message, border, border_active, mode_style };
+        let scene = Scene {
+            size: scene_size,
+            panes: Vec::new(),
+            zoomed,
+            status,
+            message,
+            border,
+            border_active,
+            mode_style,
+            display_panes_colour,
+            display_panes_active_colour,
+            overlay: None,
+        };
         let out = client.renderer.compose(&scene, None, false);
         send_output(&client.tx, out);
         return;
@@ -1634,27 +1895,65 @@ fn render_one(
         }
     }
 
-    let (cursor, cursor_visible) = if let ClientMode::Copy(cs) = &client.mode {
-        match rects.iter().find(|(id, _)| *id == cs.pane).map(|(_, r)| *r) {
+    let (cursor, cursor_visible) = match &client.mode {
+        ClientMode::Copy(cs) => match rects.iter().find(|(id, _)| *id == cs.pane).map(|(_, r)| *r) {
             Some(r) => {
                 let cx = cs.cx.min(r.w.saturating_sub(1));
                 let cy = cs.cy.min(r.h.saturating_sub(1));
                 (Some((r.x + cx, r.y + cy)), message.is_none())
             }
             None => (None, false),
-        }
-    } else {
-        match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
+        },
+        // choose-tree/display-panes (Task 8): both cover the pane area (a
+        // full-screen panel, or per-pane digit blocks) — the real terminal
+        // cursor has nothing sensible to sit on, so it's simply hidden
+        // (same end effect `message.is_none()` gating already gives every
+        // OTHER overlay/message case above).
+        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (None, false),
+        _ => match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
             (Some(r), Some(p)) => {
                 let (cx, cy) = p.grid.cursor();
                 let visible = p.grid.cursor_visible() && !p.dead && message.is_none();
                 (Some((r.x + cx, r.y + cy)), visible)
             }
             _ => (None, false),
-        }
+        },
     };
 
-    let scene = Scene { size: scene_size, panes: views, zoomed, status, message, border, border_active, mode_style };
+    let overlay = overlay_data.map(|ov| match ov {
+        RenderOverlay::Tree { rows, sel } => {
+            let visible = scene_size.1 as usize;
+            let top = sel.saturating_sub(visible.saturating_sub(1));
+            Overlay::List(ListOverlay {
+                title: String::new(),
+                rows: rows.iter().enumerate().map(|(i, t)| (t.clone(), i == *sel)).collect(),
+                top,
+            })
+        }
+        RenderOverlay::Digits(entries) => {
+            let mut v = Vec::with_capacity(entries.len());
+            for (pane_id, digit) in entries {
+                if let Some((_, rect)) = rects.iter().find(|(id, _)| id == pane_id) {
+                    v.push((*rect, *digit, *pane_id == focused));
+                }
+            }
+            Overlay::PaneDigits(v)
+        }
+    });
+
+    let scene = Scene {
+        size: scene_size,
+        panes: views,
+        zoomed,
+        status,
+        message,
+        border,
+        border_active,
+        mode_style,
+        display_panes_colour,
+        display_panes_active_colour,
+        overlay,
+    };
     let out = client.renderer.compose(&scene, cursor, cursor_visible);
     send_output(&client.tx, out);
 }

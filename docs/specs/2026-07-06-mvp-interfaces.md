@@ -352,6 +352,43 @@ pub struct StatusRow {
     pub right_style: grid::Style,
 }
 
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-08, SP4 Task 8 — overlays):**
+/// `PaneView` gains `copy: Option<render::CopyView>` (SP4 Task 2, already in
+/// effect — see the sibling SP4 contract's `## copy-mode` section) and
+/// `Scene` gains `mode_style: grid::Style`, `display_panes_colour: grid::
+/// Style`, `display_panes_active_colour: grid::Style`, and `overlay:
+/// Option<render::Overlay>`:
+///
+/// ```rust
+/// pub struct ListOverlay {
+///     /// Optional header row (empty = none); painted in the default style.
+///     pub title: String,
+///     /// (already-formatted row text, is this row selected).
+///     pub rows: Vec<(String, bool)>,
+///     /// Index into `rows` of the first row shown below the title —
+///     /// scrolling when `rows` is longer than the available height.
+///     pub top: usize,
+/// }
+///
+/// pub enum Overlay {
+///     /// choose-tree: clears/replaces the WHOLE client area; selected row
+///     /// painted in `Scene::mode_style`, everything else default style.
+///     List(ListOverlay),
+///     /// display-panes: `(pane rect, digit 0-9, is the focused pane)` —
+///     /// colour comes from `Scene::display_panes_colour`/
+///     /// `display_panes_active_colour`, not carried per-entry.
+///     PaneDigits(Vec<(geom::Rect, u32, bool)>),
+/// }
+/// ```
+///
+/// Painted LAST, over everything else `compose_back` already composed
+/// (panes/borders/status/message) — see the compositing rules below. Both
+/// new colour fields resolve `display-panes-colour`/`-active-colour`
+/// (design spec `## 7. Overlays`; defaults blue/red) applied as a `bg` onto
+/// the default style. See `2026-07-07-parity-polish-interfaces.md`'s
+/// `## overlays` section for the server-side building rules (`ClientMode::
+/// ChooseTree`/`DisplayPanes`, the hardcoded key tables, the `cmd`/
+/// `bindings`/`options` amendments).
 pub struct Scene<'a> {
     /// Host terminal size (cols, rows).
     pub size: (u16, u16),
@@ -364,7 +401,8 @@ pub struct Scene<'a> {
     /// "terminal too small", transient messages), drawn with its own
     /// resolved style (`message-style`). With `status off` the message
     /// overlays the BOTTOM row (tmux draws messages on the last line even
-    /// without a status bar).
+    /// without a status bar). With an `Overlay::List` active, the message
+    /// instead takes the PANEL's own last row (see the compositing rules).
     pub message: Option<(String, grid::Style)>,
     /// Border cell style (`pane-border-style` resolved; default = default
     /// style).
@@ -372,6 +410,18 @@ pub struct Scene<'a> {
     /// Style for border cells adjacent to the focused pane
     /// (`pane-active-border-style` resolved; default fg green).
     pub border_active: grid::Style,
+    /// Copy mode's position-indicator/selection style (`mode-style`
+    /// resolved; default `bg=yellow,fg=black`) — ALSO the choose-tree
+    /// selected-row highlight style (SP4 Task 8).
+    pub mode_style: grid::Style,
+    /// display-panes digit-block colour for every pane except the focused
+    /// one (SP4 Task 8; default blue).
+    pub display_panes_colour: grid::Style,
+    /// display-panes digit-block colour for the focused pane (SP4 Task 8;
+    /// default red).
+    pub display_panes_active_colour: grid::Style,
+    /// choose-tree / display-panes overlay (SP4 Task 8); `None` = inactive.
+    pub overlay: Option<Overlay>,
 }
 
 pub struct Renderer { /* private: front + back cell buffers */ }
@@ -415,6 +465,21 @@ impl Renderer {
 - Message (`Scene::message: Some((text, style))`): replaces the status row's
   content, filling that row with `style`; when `status` is `None` it overlays
   the BOTTOM row instead.
+- **Overlay pass (SP4 Task 8), painted LAST:** `Overlay::List` clears the
+  ENTIRE client area to the default style, paints an optional title row (row
+  0, default style), then `rows` (each padded to full width: selected in
+  `Scene::mode_style`, others default style), scrolled so `top`'s row is the
+  first shown below the title. If `Scene::message` is also `Some` (e.g.
+  choose-tree's `x` kill-confirm prompt), it takes the panel's own LAST row
+  (reserved before laying out `rows`, painted after them so it always wins)
+  instead of the ordinary status-row placement above — the panel would
+  otherwise have already overwritten it. `Overlay::PaneDigits` paints, for
+  each `(rect, digit, active)`: a centered 5x5 block-digit bitmap (space
+  cells in `display_panes_colour`/`display_panes_active_colour`) when `rect`
+  is at least 6 wide x 5 tall, else a single centered glyph in the same
+  colour (a "small-number fallback", `rect.w == 0 || rect.h == 0` paints
+  nothing) — touching only cells inside each listed pane's rect, leaving
+  everything else (borders, status, other panes) untouched.
 - Diff emission: for each changed cell, emit minimal CUP (skip if the cursor is
   already adjacent from the previous emitted cell) + SGR (only on style change)
   + the char. UTF-8 encode chars. Reset SGR (CSI 0m) at stream end.

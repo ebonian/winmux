@@ -4069,3 +4069,199 @@ fn quote_prompt_rejects_non_numeric() {
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after last session dies");
 }
+
+// ---- overlays: choose-tree + display-panes (Task 8, sub-project 4) --------
+
+/// `true` if any cell in `[x0,x1) x [y0,y1)` has background colour `bg` --
+/// used to detect a display-panes digit block by its resolved colour
+/// (`display-panes-colour`/`-active-colour`) rather than pinning exact
+/// bitmap coordinates, which would over-couple the test to `render.rs`'s
+/// private 5x5 font.
+fn has_bg(g: &Grid, bg: Color, x0: u16, x1: u16, y0: u16, y1: u16) -> bool {
+    (y0..y1.min(g.rows())).any(|y| (x0..x1.min(g.cols())).any(|x| g.cell(x, y).style.bg == bg))
+}
+
+#[test]
+fn display_panes_q_shows_digits_and_selects() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Horizontal split: the RIGHT pane (digit 1) is focused immediately.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // Explicitly move focus to the LEFT pane (digit 0) first, so pressing
+    // digit `1` later is an observable focus CHANGE rather than a no-op —
+    // proven by a marker typed here landing left of the split.
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.send(&ClientMsg::Stdin(b"leftmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "leftmark").map(|col| col < 40).unwrap_or(false));
+
+    // display-panes: a red (active, left pane) AND a blue (inactive, right
+    // pane) digit block both appear.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'q']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(1), 0, 80, 0, 23) && has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Digit `1` selects the SECOND pane (the right one): focus moves there,
+    // and the overlay closes on its own (no further key needed).
+    c.send(&ClientMsg::Stdin(b"1".to_vec()));
+    c.send(&ClientMsg::Stdin(b"rightmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "rightmark").map(|col| col > 40).unwrap_or(false));
+
+    // `-d 200`: a shorter-lived overlay auto-dismisses on its own (the 50ms
+    // server tick, once its deadline has passed) with no keypress at all.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"display-panes -d 200\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(1), 0, 80, 0, 23) || has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(1), 0, 80, 0, 23) && !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Clean up: exiting the (still-focused) right pane's shell autocloses
+    // just that pane; the last remaining pane's exit destroys the session.
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn choose_tree_w_lists_and_switches() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("0: 2 windows (attached)"))
+            && lines.iter().any(|l| l.contains("  0: powershell-"))
+            && lines.iter().any(|l| l.contains("  1: powershell*"))
+    });
+
+    // Down (session header -> window 0's row) + Enter switches to window 0.
+    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    // Clean up: kill the now-current window 0, falls back to window 1.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn choose_tree_s_sessions() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "sA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // `s` from sA: a collapsed row per session, both marked attached.
+    a.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    a.recv_output_until(&mut grid_a, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("sA: 1 windows (attached)")) && lines.iter().any(|l| l.contains("sB: 1 windows (attached)"))
+    });
+
+    // Down (sA -> sB) + Enter switches THIS client to sB.
+    a.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    a.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Named `..._escape_cancels` per the task brief, but the concrete keypress
+/// exercised is `q` (also bound to `ChooseTreeAction::Cancel`, alongside
+/// `Escape`/`C-c`), not a literal bare ESC byte -- a lone `0x1b` with
+/// nothing after it can NEVER decode through `KeyDecoder`'s normal (non-
+/// capture) path within a single `feed()` call: `classify_escape` returns
+/// `None` ("wait for more bytes, could be the start of a CSI/SS3/meta
+/// sequence") and `KeyMachine::feed` never calls `decoder.flush()` itself,
+/// so the byte sits in the decoder's pending buffer forever absent the
+/// `escape-time` flush timer (design spec `## 8. escape-time`) -- NOT YET
+/// implemented (a separate, later piece of work). This is a pre-existing
+/// harness/architecture limitation, not a Task 8 regression: the project's
+/// OWN copy-mode test suite hits the identical wall and works around it the
+/// identical way (`copy_mode_q_exits` tests `q`, never a bare `Escape`,
+/// despite `Escape -> copy-cancel` being a real default binding too). `q`
+/// and `Escape` share the exact same `ChooseTreeAction::Cancel` dispatch
+/// path (`resolve_choose_tree_key`), so this still proves the cancel
+/// behavior end-to-end.
+#[test]
+fn choose_tree_escape_cancels() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn choose_tree_x_kills_with_confirm() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("  0: powershell-")));
+
+    // Down selects window 0's row; `x` arms the confirm, `y` commits it.
+    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
+
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    // Window 0 is gone; the overlay stays OPEN (tmux keeps choose-tree up)
+    // with an updated row list -- only window 1's row remains.
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("  1: powershell*")) && !lines.iter().any(|l| l.contains("  0: powershell"))
+    });
+
+    // `q` closes the still-open overlay (see `choose_tree_escape_cancels`'s
+    // doc comment for why a bare Escape byte isn't used here); window 1 is
+    // current.
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

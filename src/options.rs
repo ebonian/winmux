@@ -26,6 +26,7 @@
 //! `#{session_name}`, `%H:%M`, ...) used by `status-left`/`status-right`/
 //! `display-message`.
 
+use crate::grid::Color;
 use crate::keys::{self, Key};
 use crate::style::{self, PartialStyle};
 use std::collections::BTreeMap;
@@ -108,6 +109,14 @@ const SPECS: &[Spec] = &[
     // `main-vertical`'s main-pane size.
     Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
     Spec { name: "main-pane-height", kind: Kind::Number, choices: &[] },
+    // Overlays (Task 8, sub-project 4): choose-tree + display-panes.
+    // `display-panes-colour`/`-active-colour` are plain BARE colours (not
+    // full `fg=...`/`bg=...` style strings) -- stored as `Str` and parsed on
+    // read via `style::parse_color` (see the two getters below), per the
+    // design spec's `## 7. Overlays` section.
+    Spec { name: "display-panes-time", kind: Kind::Number, choices: &[] },
+    Spec { name: "display-panes-colour", kind: Kind::Str, choices: &[] },
+    Spec { name: "display-panes-active-colour", kind: Kind::Str, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -189,6 +198,9 @@ fn default_value(name: &str) -> Value {
         "buffer-limit" => Value::Number(50),
         "main-pane-width" => Value::Number(80),
         "main-pane-height" => Value::Number(24),
+        "display-panes-time" => Value::Number(1000),
+        "display-panes-colour" => Value::Str("blue".to_string()),
+        "display-panes-active-colour" => Value::Str("red".to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -454,6 +466,30 @@ impl Options {
 
     pub fn main_pane_height(&self) -> u16 {
         self.number("main-pane-height") as u16
+    }
+
+    /// `display-panes-time` (Task 8, sub-project 4): how long the
+    /// `display-panes` (`q`) overlay stays up before auto-dismissing, absent
+    /// an explicit `-d ms` override on the command itself. tmux default
+    /// 1000ms.
+    pub fn display_panes_time(&self) -> Duration {
+        Duration::from_millis(self.number("display-panes-time") as u64)
+    }
+
+    /// `display-panes-colour` (Task 8): the digit-overlay background colour
+    /// for every pane EXCEPT the acting client's currently focused one. A
+    /// stored value that no longer parses as a bare colour (only reachable
+    /// by a future `set-option` bypassing today's `set`-time validation --
+    /// there isn't one yet, `Kind::Str` accepts any control-char-free string)
+    /// falls back to the compiled default rather than panicking.
+    pub fn display_panes_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("display-panes-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    /// `display-panes-active-colour` (Task 8): same as
+    /// [`Options::display_panes_colour`], for the focused pane's digit only.
+    pub fn display_panes_active_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("display-panes-active-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(1))
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -949,6 +985,23 @@ mod tests {
         o.set("main-pane-height", Some("10"), false, false).unwrap();
         assert_eq!(o.main_pane_width(), 30);
         assert_eq!(o.main_pane_height(), 10);
+    }
+
+    /// Task 8, sub-project 4: `display-panes-time` (Duration getter) and the
+    /// two bare-colour getters, defaults AND after a `set-option` round trip.
+    #[test]
+    fn display_panes_getters() {
+        let mut o = Options::new();
+        assert_eq!(o.display_panes_time(), Duration::from_millis(1000));
+        assert_eq!(o.display_panes_colour(), Color::Idx(4)); // blue
+        assert_eq!(o.display_panes_active_colour(), Color::Idx(1)); // red
+
+        o.set("display-panes-time", Some("200"), false, false).unwrap();
+        o.set("display-panes-colour", Some("green"), false, false).unwrap();
+        o.set("display-panes-active-colour", Some("colour208"), false, false).unwrap();
+        assert_eq!(o.display_panes_time(), Duration::from_millis(200));
+        assert_eq!(o.display_panes_colour(), Color::Idx(2));
+        assert_eq!(o.display_panes_active_colour(), Color::Idx(208));
     }
 
     #[test]

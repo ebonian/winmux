@@ -234,6 +234,16 @@ impl PartialStyle {
 pub fn parse_style(input: &str) -> Result<PartialStyle, String>; // Err = "bad style: <input>"
 ```
 
+**Amendment (SP4 Task 8 — overlays):** the private `parse_color(s: &str) ->
+Result<grid::Color, ()>` helper `parse_style` already used internally is now
+`pub(crate)`, so `options.rs` can parse `display-panes-colour`/`-active-
+colour` (plain bare colours, not full `fg=...`/`bg=...` style strings)
+directly against the SAME colour grammar without going through a whole style
+string. `parse_style` itself is unchanged; this only widens `parse_color`'s
+visibility (still not `pub` — no consumer outside this crate). Case-folding
+is still the CALLER's job (`parse_style` lowercases before calling it;
+`options.rs`'s two getters do the same).
+
 Pure module: no I/O, `std` only. **Implementation module:** `src/style.rs`.
 Depends only on `crate::grid::{Color, Style}`. `PartialStyle` is deliberately
 opaque per the brief (no public fields) — every field is `Option<T>`

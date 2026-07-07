@@ -201,7 +201,14 @@ fn apply_component(style: &mut PartialStyle, part: &str) -> Result<(), ()> {
 /// 6 hex digits after the `#`; any other length or a non-hex digit is `Err`).
 /// The caller has already lowercased the token, making every form
 /// case-insensitive (tmux `colour_fromstring` uses `strcasecmp`).
-fn parse_color(s: &str) -> Result<Color, ()> {
+/// `pub(crate)` (Task 8, sub-project 4): `display-panes-colour`/`display-
+/// panes-active-colour` are plain bare-colour options (not full style
+/// strings — see the design spec's `## 7. Overlays` section), so
+/// `options.rs` needs this same colour grammar directly rather than going
+/// through a whole `fg=...` style string. Case-insensitivity is the CALLER's
+/// job (mirrors `parse_style`'s own lowercasing convention) — this function
+/// itself performs no case-folding.
+pub(crate) fn parse_color(s: &str) -> Result<Color, ()> {
     if s == "default" {
         return Ok(Color::Default);
     }

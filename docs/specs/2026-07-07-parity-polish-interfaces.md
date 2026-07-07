@@ -1441,3 +1441,243 @@ Four new prefix-table defaults:
 | `.` | `move-window` (bare — `dispatch_client`'s `is_bare` special-casing opens the `(move-window) ` prompt with a client context, same "no-args-means-open-the-prompt" idiom as `,`/`$`) |
 | `f` | `find-window` (bare — same idiom, opens the `(find-window) ` prompt) |
 | `'` | `select-window` (bare — no distinct "index-window" tmux command exists, so the `'` binding repurposes a bare `select-window`, which would otherwise always be a usage error since `-t` is normally required, as the trigger for the `index` prompt) |
+
+## `overlays` — display-panes and choose-tree (Task 8, sub-project 4)
+
+Implements the design spec's `## 7. Overlays` section (the user's `prefix-s`
+session-chooser ask). Covers `render` (see the render contract's own
+locked-amendment entry, `2026-07-06-mvp-interfaces.md`), `cmd`, `options`,
+`bindings`, `server` (`ClientMode` + new state types), and
+`server::dispatch`.
+
+### `render` amendment
+
+Documented in full in `2026-07-06-mvp-interfaces.md`'s render section
+(`ListOverlay`/`Overlay`/`Scene` amendment + the overlay compositing-rules
+paragraph) — not repeated here.
+
+### `cmd` amendment
+
+`ParsedCmd` gains two variants:
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `choose-tree|choosetree [-s] [-w]`: open the choose-tree overlay.
+    /// `sessions: true` (`-s`) lists every session (one collapsed row
+    /// each); `false` (bare, or tmux's own `-w`) lists the ACTING CLIENT's
+    /// CURRENT session's windows only (a header row + one indented row per
+    /// window — winmux's documented "current session only" scope
+    /// simplification; real tmux's `-w` shows the whole tree). `-s`/`-w`
+    /// together is a usage error.
+    ChooseTree { sessions: bool },
+    /// `display-panes|displayp [-d ms]`: show a per-pane digit overlay on
+    /// the acting client's current window. `ms: None` resolves
+    /// `display-panes-time` at DISPATCH time (not here).
+    DisplayPanes { ms: Option<u32> },
+}
+```
+
+Canonical names/aliases: `choose-tree`/`choosetree`, `display-panes`/
+`displayp`. Usage strings: `usage: choose-tree [-s] [-w]`, `usage: display-
+panes [-d ms]`. Both are `Err("no current client")` from the headless
+(CLI/`.tmux.conf`) execution path, same rule as `copy-mode`/`copy-*`.
+
+### `options` amendment
+
+Three new `Spec`s:
+
+| Name | Kind | Default |
+|---|---|---|
+| `display-panes-time` | Number | `1000` |
+| `display-panes-colour` | Str (bare colour, NOT a full style string) | `"blue"` |
+| `display-panes-active-colour` | Str | `"red"` |
+
+Getters:
+
+```rust
+impl Options {
+    pub fn display_panes_time(&self) -> std::time::Duration;
+    /// Parses the stored bare-colour string via `style::parse_color`
+    /// (now `pub(crate)`, see the `## style` amendment); an unparseable
+    /// stored value (unreachable today — `Kind::Str`'s `set`-time
+    /// validation is only "no control chars", not "is a valid colour") falls
+    /// back to the compiled default rather than panicking.
+    pub fn display_panes_colour(&self) -> grid::Color;
+    pub fn display_panes_active_colour(&self) -> grid::Color;
+}
+```
+
+### `bindings` amendment
+
+Three new prefix-table defaults:
+
+| Key | Command |
+|---|---|
+| `w` | `choose-tree -w` (windows of the current session) |
+| `s` | `choose-tree -s` (sessions, collapsed) |
+| `q` | `display-panes` |
+
+### `server` amendment: `ClientMode` + overlay state
+
+Two new variants, alongside the existing `Normal`/`ConfirmCmd`/`Prompt`/
+`Copy`:
+
+```rust
+enum ClientMode {
+    // ...
+    ChooseTree(ChooseTreeState),
+    DisplayPanes(DisplayPanesState),
+}
+
+enum ChooseTreeView { Windows, Sessions }
+
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    /// Plain index into whatever `dispatch::Server::build_tree_rows`
+    /// returns THIS render/keypress — clamped fresh every time, never
+    /// stored as a stale snapshot (see below).
+    sel: usize,
+    /// `Some((target, prompt))` between pressing `x` and answering y/n; the
+    /// prompt text is precomputed at `x`-press time and rendered directly
+    /// from here (NOT via `client.message`, which is cleared on every
+    /// `Stdin` frame and would make the prompt vanish before an answer).
+    pending_kill: Option<(TreeTarget, String)>,
+}
+
+enum TreeTarget {
+    Session(String),
+    Window(String /* session name */, WindowId),
+}
+
+struct DisplayPanesState {
+    /// `Instant::now() + display-panes-time` (or `+ -d ms`) at entry;
+    /// checked on every 50ms `Tick` (same mechanism `MESSAGE_LIFETIME`
+    /// expiry already uses) to auto-dismiss back to `ClientMode::Normal`.
+    deadline: std::time::Instant,
+}
+```
+
+**Design decision — no stored row/pane snapshot (the brief's "multi-client
+and staleness" requirement, addressed structurally rather than by a bolt-on
+recheck):** unlike the brief's literal `ChooseTree{rows: Vec<TreeRow>, sel:
+usize}` sketch, `ChooseTreeState` carries only `view`/`sel`/`pending_kill` —
+the actual row list (text + target identity) is rebuilt FRESH from live
+registry state by `dispatch::Server::build_tree_rows` both when RENDERING
+(`Server::build_render_overlay`) and when a key COMMITS `sel` to a concrete
+target (`dispatch::Server::dispatch_choose_tree_key`). This makes "a listed
+window/session died mid-overlay, Enter/x must not act on a stale/wrong
+target" unreachable by construction for navigation/commit — there is no
+snapshot to go stale. The ONE piece of state that DOES persist across
+renders, `pending_kill`, is re-validated by `Server::cancel_stale_choose_
+trees` (parallels `cancel_stale_confirms`/`cancel_stale_copy_modes`, called
+from the same two sites: end of `handle_exited`, end of `handle_stdin`).
+`DisplayPanesState` follows the identical pattern — no pane-set snapshot;
+`pane_digit_entries(window: &model::Window) -> Vec<(PaneId, u32)>` (a free
+fn in `server.rs`, digits 0-9 only, `layout.panes()` order, capped at the
+first 10 panes) is recomputed fresh both for rendering and for resolving a
+digit keypress, so a pane that died mid-overlay simply stops being offered a
+digit.
+
+### `server::dispatch` amendment: key routing + exec helpers
+
+**Key routing follows the `ClientMode::Copy` exemplar (table-override on
+DECODED key events), NOT `set_capture`-based raw-byte capture**, despite
+both overlays superficially resembling a "capture the next input" prompt:
+capture mode's shared `edit_line_buf` treats a lone `0x1b` as an immediate
+cancel byte, which would make `Up`/`Down`/`Escape`-as-cancel unusable (a lone
+ESC never even reaches that far — see the next paragraph). Instead,
+`handle_stdin`'s existing copy-mode interception (both the `Forward`-blob
+re-decode arm and the `Key{table: Root, ..}` arm) is extended with two more
+`matches!(client.mode, ..)` branches:
+
+- `ClientMode::ChooseTree(_)`: every decoded key (Forward-redecoded or
+  direct) is resolved via the HARDCODED `resolve_choose_tree_key(key:
+  &keys::Key) -> Option<ChooseTreeAction>` (`Up`/`Down`/`Commit`/`Cancel`/
+  `Kill`) — deliberately NOT routed through the mutable `Bindings` table
+  (same footing as the mouse bindings; the design spec calls these
+  "hardcoded"). `None` = unbound: swallowed, overlay stays open (choose-tree
+  never leaks a keystroke to the pane underneath, same rule as copy mode).
+  `dispatch_choose_tree_key(key, client, session_name) -> Option<ExecOutcome>`
+  handles the pending-kill y/n sub-state FIRST (y/Y/Enter confirms via
+  `exec_tree_kill`; anything else just clears `pending_kill`), then
+  navigation (`Up`/`Down` clamp `sel` against a freshly-built row list),
+  `Cancel` (-> `ClientMode::Normal`), `Kill` (resolves the selected row's
+  target, computes the `kill-session <name>? (y/n)` / `kill-window <name>?
+  (y/n)` prompt via `tree_kill_prompt`, arms `pending_kill`), and `Commit`
+  (resolves the selected row's target, dispatches to `exec_tree_commit`,
+  always returns to `ClientMode::Normal` regardless of the outcome).
+- `ClientMode::DisplayPanes(_)`: exactly ONE key is ever consumed —
+  `dispatch_display_panes_key(key, client, session_name) -> ExecOutcome`
+  unconditionally resets `client.mode = ClientMode::Normal` first, then (for
+  a bare, unmodified digit `0`-`9` only) looks it up against
+  `pane_digit_entries` for the CURRENT window and focuses the matching pane
+  via the pre-existing `mouse_focus_pane` helper (Task 5). Any other key —
+  including a digit outside the currently-offered set — is a pure dismiss.
+  On the `Forward`-blob path, only the FIRST decoded key of a coalesced blob
+  is consulted; the rest of the blob is discarded (design spec's documented
+  "not reprocessed" simplification).
+
+**Why not `Escape` in tests (a genuine, PRE-EXISTING harness/architecture
+limitation, not introduced by this task):** a bare, unterminated `0x1b` byte
+can never decode through `keys::KeyDecoder`'s normal (non-capture) path
+within a single `feed()` call — `classify_escape` returns `None` ("could
+still be the start of a CSI/SS3/meta sequence, wait for more bytes") and
+`input::KeyMachine::feed` never calls `decoder.flush()` on its own, so the
+byte sits in the decoder's pending buffer forever absent the `escape-time`
+flush timer (design spec `## 8. escape-time`, NOT YET implemented — a
+separate, later piece of work). `q` (also bound to `ChooseTreeAction::
+Cancel`, alongside `Escape`/`C-c`) is what the `server_proto.rs` tests use
+to exercise cancel end-to-end; the project's own copy-mode test suite hits
+the identical wall and works around it the identical way (`copy_mode_q_exits`
+tests `q`, never a bare `Escape`, despite `Escape -> copy-cancel` being a
+real default binding too).
+
+**`build_tree_rows(session_name: &str, view: ChooseTreeView) -> Vec<TreeRow>`**
+(`TreeRow { text: String, target: TreeTarget }`, `text`/`build_tree_rows`
+itself `pub(super)` for `server.rs`'s `build_render_overlay` to reach; `target`
+private): `Sessions` — one row per session, `<name>: N windows[ (attached)]`
+(attached = ANY client currently has that session). `Windows` — the CURRENT
+session only: a header row in the same format, then one indented row per
+window, `  <index>: <name><flags>` (`*` current / `-` last / `` neither).
+
+**`exec_tree_kill`/`exec_tree_commit`** both re-validate the target still
+exists in the registry before acting (a stale `pending_kill`/`sel`, e.g.
+killed by ANOTHER client mid-browse, is a silent no-op rather than acting on
+a dead id) and reuse the SAME underlying mutation helpers `&`/`kill-window`/
+`kill-session`/`select-window`/`switch-client` already go through
+(`kill_window_by_id`, `destroy_session`, direct `Session::current`/`last`
+mutation, `switch_client_session`'s inline equivalent). `Destroy`/
+`SwitchedSession` outcomes follow the SAME rules as their `&`/`(`/`)`-bound
+counterparts (only the ACTING client's own session destruction reports
+`Destroy`; a foreign session's kill is a plain `Ok`).
+
+**`Server::build_render_overlay(client: &ClientState) -> Option<RenderOverlay>`**
+(private, `server.rs`) is a PRECOMPUTE pass over `&self` run BEFORE
+`render_all`'s per-client `self.clients.values_mut()` mutable loop begins —
+`ChooseTree`'s `Sessions` view needs the WHOLE registry (not just the
+client's own session) and the "(attached)" suffix needs `self.clients`,
+neither of which the per-client `render_one` (called while `self.clients` is
+already mutably borrowed) can see directly. `render_one` gained a new
+trailing parameter, `overlay_data: Option<&RenderOverlay>`, and turns it into
+a `render::Overlay` using the client's own `rows`/`cols` (List's scrolling
+`top`) and the current window's pane `rects` (Digits' `PaneId` -> `Rect`
+mapping) — a rendering concern kept out of the precompute pass. `too_small`
+suppresses the overlay entirely (same precedence family as the "terminal too
+small" message) — a degenerate-size terminal has nothing sensible to paint
+an overlay onto either. The real terminal cursor is hidden
+(`(None, false)`) for both modes — an overlay covers the pane area, so there
+is nothing for it to sit on.
+
+### TDD evidence (test names, `server_proto.rs`)
+
+`display_panes_q_shows_digits_and_selects` (split, move focus left, `q`
+opens the overlay — asserted via detecting `display-panes-colour`/`-active-
+colour` background cells rather than pinning exact bitmap coordinates —
+digit `1` selects the right pane, confirmed by a typed marker's column; a
+second `-d 200` invocation via the `:` prompt auto-dismisses on its own, no
+keypress, confirmed by the colours disappearing), `choose_tree_w_lists_and_
+switches`, `choose_tree_s_sessions`, `choose_tree_escape_cancels` (see the
+`q`-not-`Escape` note above), `choose_tree_x_kills_with_confirm` (`x` ->
+confirm text appears -> `y` -> the killed row is gone AND the overlay stays
+open with the refreshed list -> `q` closes it).

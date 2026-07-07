@@ -292,6 +292,20 @@ pub enum ParsedCmd {
     /// (not an `Err` -- matches tmux, which never treats "nothing found" as
     /// a command failure).
     FindWindow { pattern: String },
+    /// `choose-tree|choosetree [-s] [-w]` (Task 8, sub-project 4): open the
+    /// choose-tree overlay on the acting client. `sessions: true` (`-s`)
+    /// lists every session (one collapsed row each); `false` (bare, or the
+    /// real tmux `-w` flag) lists the acting client's CURRENT session's
+    /// windows (a session header row + one indented row per window) — see
+    /// the design spec's `## 7. Overlays` section for the exact row format
+    /// and the documented "windows of the current session only" scope
+    /// simplification. `-s`/`-w` together is a usage error.
+    ChooseTree { sessions: bool },
+    /// `display-panes|displayp [-d ms]` (Task 8): show a per-pane digit
+    /// overlay on the acting client's current window; `ms: None` uses the
+    /// `display-panes-time` option's current value (resolved at dispatch
+    /// time, not here).
+    DisplayPanes { ms: Option<u32> },
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
@@ -529,6 +543,8 @@ fn canonical(name: &str) -> Option<&'static str> {
         "break-pane" | "breakp" => "break-pane",
         "move-window" | "movew" => "move-window",
         "find-window" | "findw" => "find-window",
+        "choose-tree" | "choosetree" => "choose-tree",
+        "display-panes" | "displayp" => "display-panes",
         _ => return None,
     })
 }
@@ -593,6 +609,8 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "break-pane" => "usage: break-pane [-d] [-n name]",
         "move-window" => "usage: move-window [-k] -t index",
         "find-window" => "usage: find-window pattern",
+        "choose-tree" => "usage: choose-tree [-s] [-w]",
+        "display-panes" => "usage: display-panes [-d ms]",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -1144,6 +1162,24 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             }
             Ok(ParsedCmd::FindWindow { pattern: p[0].clone() })
         }
+        "choose-tree" => {
+            let Ok((b, _, p)) = scan_flags(&raw.args, &["-s", "-w"], &[]) else { return Err(bad()) };
+            if !p.is_empty() || (has(&b, "-s") && has(&b, "-w")) {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseTree { sessions: has(&b, "-s") })
+        }
+        "display-panes" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-d"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            let ms = match value_of(&v, "-d") {
+                Some(s) => Some(s.parse::<u32>().map_err(|_| bad())?),
+                None => None,
+            };
+            Ok(ParsedCmd::DisplayPanes { ms })
+        }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
 }
@@ -1535,6 +1571,28 @@ mod tests {
         );
         assert_eq!(resolve(&raw("find-window", &[])).unwrap_err(), usage("find-window").unwrap());
         assert_eq!(resolve(&raw("find-window", &["a", "b"])).unwrap_err(), usage("find-window").unwrap());
+    }
+
+    // ---- overlays (Task 8, sub-project 4) ----------------------------------
+
+    #[test]
+    fn choose_tree_flags() {
+        assert_eq!(resolve(&raw("choose-tree", &[])).unwrap(), ParsedCmd::ChooseTree { sessions: false });
+        assert_eq!(resolve(&raw("choose-tree", &["-w"])).unwrap(), ParsedCmd::ChooseTree { sessions: false });
+        assert_eq!(resolve(&raw("choosetree", &["-s"])).unwrap(), ParsedCmd::ChooseTree { sessions: true });
+        assert_eq!(resolve(&raw("choose-tree", &["-s", "-w"])).unwrap_err(), usage("choose-tree").unwrap());
+        assert_eq!(resolve(&raw("choose-tree", &["extra"])).unwrap_err(), usage("choose-tree").unwrap());
+    }
+
+    #[test]
+    fn display_panes_flags() {
+        assert_eq!(resolve(&raw("display-panes", &[])).unwrap(), ParsedCmd::DisplayPanes { ms: None });
+        assert_eq!(
+            resolve(&raw("displayp", &["-d", "200"])).unwrap(),
+            ParsedCmd::DisplayPanes { ms: Some(200) }
+        );
+        assert_eq!(resolve(&raw("display-panes", &["-d", "nope"])).unwrap_err(), usage("display-panes").unwrap());
+        assert_eq!(resolve(&raw("display-panes", &["extra"])).unwrap_err(), usage("display-panes").unwrap());
     }
 
     #[test]

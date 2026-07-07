@@ -58,6 +58,37 @@ pub struct StatusRow {
     pub right_style: Style,
 }
 
+/// One row of a [`Overlay::List`] panel (choose-tree, Task 8): the row's
+/// already-formatted display text and whether it is the current selection
+/// (painted in `Scene::mode_style`, reversed against the panel's plain
+/// rows). Built fresh by the SERVER on every render from live registry state
+/// (never a stale snapshot -- see the `## overlays` contract section).
+pub struct ListOverlay {
+    /// Optional header line, painted on the panel's first row in the
+    /// default style (empty = no header row; the first `rows` entry starts
+    /// at row 0 instead).
+    pub title: String,
+    pub rows: Vec<(String, bool)>,
+    /// Index into `rows` of the first row painted at the panel's top visible
+    /// line (below the title, if any) -- how the panel scrolls when `rows`
+    /// is longer than the available height.
+    pub top: usize,
+}
+
+/// Everything [`Scene::overlay`] can paint OVER the already-composed frame
+/// (Task 8, sub-project 4 — design spec `## 7. Overlays`): `List`
+/// (choose-tree) clears the whole client area and paints a full-screen
+/// panel; `PaneDigits` (display-panes) paints a 5x5 block-digit bitmap (or a
+/// single-glyph fallback for an undersized pane) centered in each listed
+/// pane's rect, without touching anything else on screen. The `(Rect, u32,
+/// bool)` tuple is `(pane rect, digit 0-9, is the acting client's focused
+/// pane)` — colour is resolved once via `Scene::display_panes_colour` /
+/// `display_panes_active_colour`, not carried per-entry.
+pub enum Overlay {
+    List(ListOverlay),
+    PaneDigits(Vec<(Rect, u32, bool)>),
+}
+
 pub struct Scene<'a> {
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
@@ -78,6 +109,16 @@ pub struct Scene<'a> {
     /// highlight) style (`mode-style` applied to the default style, tmux
     /// default `bg=yellow,fg=black`).
     pub mode_style: Style,
+    /// display-panes (Task 8) digit-block colour for every pane EXCEPT the
+    /// acting client's focused one (`display-panes-colour` applied to the
+    /// default style, tmux default blue).
+    pub display_panes_colour: Style,
+    /// display-panes (Task 8) digit-block colour for the acting client's
+    /// FOCUSED pane (`display-panes-active-colour`, tmux default red).
+    pub display_panes_active_colour: Style,
+    /// choose-tree / display-panes (Task 8): painted last, over everything
+    /// else composed above. `None` = no overlay active.
+    pub overlay: Option<Overlay>,
 }
 
 pub struct Renderer {
@@ -337,6 +378,104 @@ impl Renderer {
                 self.set((start + i) as u16, y, Cell { ch, style: st.right_style });
             }
         }
+
+        // 5) overlay (Task 8, sub-project 4): painted LAST, over everything
+        // above. `List` (choose-tree) clears/replaces the whole client area
+        // (including the status row just painted); `PaneDigits`
+        // (display-panes) only touches cells inside the listed pane rects.
+        match &scene.overlay {
+            None => {}
+            Some(Overlay::List(list)) => {
+                for c in self.back.iter_mut() {
+                    *c = Cell { ch: ' ', style: Style::default() };
+                }
+                let mut y: u16 = 0;
+                if !list.title.is_empty() && y < rows {
+                    for (i, ch) in list.title.chars().enumerate() {
+                        if i as u16 >= cols {
+                            break;
+                        }
+                        self.set(i as u16, y, Cell { ch, style: Style::default() });
+                    }
+                    y += 1;
+                }
+                // A message (e.g. choose-tree's `x` kill-confirm prompt, see
+                // `ClientMode::ChooseTree`'s `pending_kill`) takes the panel's
+                // LAST row, same as it takes the status row outside the
+                // overlay -- reserved BEFORE laying out the row list so the
+                // two never collide, and painted AFTER the rows so it always
+                // wins visually.
+                let msg_reserved: u16 = if scene.message.is_some() && rows > y { 1 } else { 0 };
+                let visible = rows.saturating_sub(y).saturating_sub(msg_reserved) as usize;
+                let start = list.top.min(list.rows.len());
+                let end = (start + visible).min(list.rows.len());
+                for (i, (text, selected)) in list.rows[start..end].iter().enumerate() {
+                    let yy = y + i as u16;
+                    let style = if *selected { scene.mode_style } else { Style::default() };
+                    for x in 0..cols {
+                        self.set(x, yy, Cell { ch: ' ', style });
+                    }
+                    for (cx, ch) in text.chars().enumerate() {
+                        if cx as u16 >= cols {
+                            break;
+                        }
+                        self.set(cx as u16, yy, Cell { ch, style });
+                    }
+                }
+                if let Some((msg, style)) = &scene.message {
+                    let msg_y = rows - 1;
+                    for x in 0..cols {
+                        self.set(x, msg_y, Cell { ch: ' ', style: *style });
+                    }
+                    for (i, ch) in msg.chars().enumerate() {
+                        if i as u16 >= cols {
+                            break;
+                        }
+                        self.set(i as u16, msg_y, Cell { ch, style: *style });
+                    }
+                }
+            }
+            Some(Overlay::PaneDigits(entries)) => {
+                for (rect, digit, active) in entries {
+                    let style = if *active { scene.display_panes_active_colour } else { scene.display_panes_colour };
+                    self.paint_pane_digit(*rect, *digit, style, cols, rows);
+                }
+            }
+        }
+    }
+
+    /// Paint one display-panes (Task 8) digit into `rect`: a 5x5 block
+    /// bitmap (see [`digit_bitmap`]) centered in the rect when it's at least
+    /// 6 cells wide (5 + a 1-cell margin) and 5 tall; otherwise a
+    /// single-glyph "small-number fallback" (the design spec's own term) at
+    /// the rect's center; a zero-size rect paints nothing.
+    fn paint_pane_digit(&mut self, rect: Rect, digit: u32, style: Style, cols: u16, rows: u16) {
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        if rect.w >= 6 && rect.h >= 5 {
+            let ox = rect.x + (rect.w - 5) / 2;
+            let oy = rect.y + (rect.h - 5) / 2;
+            for (dy, row) in digit_bitmap(digit).iter().enumerate() {
+                for (dx, ch) in row.chars().enumerate() {
+                    if ch != '#' {
+                        continue;
+                    }
+                    let x = ox + dx as u16;
+                    let y = oy + dy as u16;
+                    if x < cols && y < rows {
+                        self.set(x, y, Cell { ch: ' ', style });
+                    }
+                }
+            }
+        } else {
+            let ch = char::from_digit(digit, 10).unwrap_or('?');
+            let x = rect.x + rect.w / 2;
+            let y = rect.y + rect.h / 2;
+            if x < cols && y < rows {
+                self.set(x, y, Cell { ch, style });
+            }
+        }
     }
 
     /// Reallocate both buffers to the new size and invalidate the front buffer
@@ -441,6 +580,30 @@ fn border_glyph(up: bool, down: bool, left: bool, right: bool) -> char {
         (false, false, true, false) => '─',
         (false, false, false, true) => '─',
         (false, false, false, false) => '─',
+    }
+}
+
+/// display-panes (Task 8, sub-project 4): a 5-row x 5-column block-digit
+/// bitmap for `0..=9` (`'#'` = painted cell, `'.'` = untouched). Not a real
+/// tmux artifact -- tmux's own display-panes digit rendering isn't a
+/// documented byte-for-byte spec, so this is winmux's own simple, legible
+/// 5x5 font (the design spec only pins the CELL SIZE, not the exact glyph
+/// shapes). `digit` outside `0..=9` (unreachable via the digit-key/pane-cap
+/// path, which only ever mints 0-9) falls back to all-blank rather than
+/// panicking.
+fn digit_bitmap(digit: u32) -> [&'static str; 5] {
+    match digit {
+        0 => ["#####", "#...#", "#...#", "#...#", "#####"],
+        1 => ["..#..", ".##..", "..#..", "..#..", "#####"],
+        2 => ["#####", "....#", "#####", "#....", "#####"],
+        3 => ["#####", "....#", "..###", "....#", "#####"],
+        4 => ["#...#", "#...#", "#####", "....#", "....#"],
+        5 => ["#####", "#....", "#####", "....#", "#####"],
+        6 => ["#####", "#....", "#####", "#...#", "#####"],
+        7 => ["#####", "....#", "...#.", "..#..", "..#.."],
+        8 => ["#####", "#...#", "#####", "#...#", "#####"],
+        9 => ["#####", "#...#", "#####", "....#", "#####"],
+        _ => ["", "", "", "", ""],
     }
 }
 
@@ -557,6 +720,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 4);
         r.compose_back(&scene);
@@ -593,6 +759,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -617,6 +786,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -644,6 +816,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(6, 2);
         r.compose_back(&scene);
@@ -664,6 +839,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(5, 2);
         r.compose_back(&scene);
@@ -688,6 +866,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -716,6 +897,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 2);
         r.compose_back(&scene);
@@ -743,6 +927,9 @@ mod tests {
                 border: Style::default(),
                 border_active: green_active(),
                 mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -759,6 +946,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((1, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -780,6 +970,9 @@ mod tests {
                 border: Style::default(),
                 border_active: green_active(),
                 mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -796,6 +989,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((2, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -817,6 +1013,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let _ = r.compose(&scene, Some((0, 0)), true); // prime
         // identical recompose, cursor hidden -> no diff bytes, just hide
@@ -838,6 +1037,9 @@ mod tests {
                 border: Style::default(),
                 border_active: green_active(),
                 mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true); // prime
         }
@@ -853,6 +1055,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((0, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -885,6 +1090,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         let out = r.compose(&scene, None, false);
@@ -917,6 +1125,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -942,6 +1153,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -966,6 +1180,9 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(6, 2);
         let out = r.compose(&scene, None, false);
@@ -995,6 +1212,9 @@ mod tests {
             border: Style { fg: Color::Idx(240), ..Style::default() },      // pane-border-style fg=colour240
             border_active: Style { fg: Color::Idx(1), ..Style::default() }, // pane-active-border-style fg=red
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -1021,10 +1241,135 @@ mod tests {
             border: Style::default(),
             border_active: green_active(),
             mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(5, 2);
         let out = r.compose(&scene, None, false);
         let got = String::from_utf8_lossy(&out);
         assert!(got.contains("\x1b[0;1;37;41mhi"), "got: {got:?}");
+    }
+
+    // ---- overlays (Task 8, sub-project 4) ----------------------------------
+
+    /// `Overlay::List` clears the whole client area, paints each row's text
+    /// left-aligned padded to full width, and paints the SELECTED row in
+    /// `mode_style` while every other row stays the plain default style.
+    #[test]
+    fn overlay_list_paints_rows_and_selection() {
+        let g = grid_with(10, 3, b"should be hidden");
+        let mode_style = Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }; // yellow/black
+        let scene = Scene {
+            size: (10, 3),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 3 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style,
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::List(ListOverlay {
+                title: String::new(),
+                rows: vec![("row0".to_string(), false), ("row1 sel".to_string(), true)],
+                top: 0,
+            })),
+        };
+        let mut r = Renderer::new(10, 3);
+        r.compose_back(&scene);
+
+        // Row 0 (unselected): text painted, default style.
+        let row0: String = (0..4).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, "row0");
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+        // Padding past the text is still cleared to the row's style (full
+        // client-area clear, not just the text run).
+        assert_eq!(r.back_cell(9, 0).ch, ' ');
+        assert_eq!(r.back_cell(9, 0).style, Style::default());
+
+        // Row 1 (selected): text painted in mode_style, including padding.
+        let row1: String = (0..8).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, "row1 sel");
+        assert_eq!(r.back_cell(0, 1).style, mode_style);
+        assert_eq!(r.back_cell(9, 1).ch, ' ');
+        assert_eq!(r.back_cell(9, 1).style, mode_style);
+
+        // The overlay fully replaced the pane's own content underneath.
+        assert_eq!(r.back_cell(0, 2).ch, ' ');
+    }
+
+    /// display-panes' 5x5 block digit for `1`, exact cells, in a rect sized
+    /// exactly to the bitmap's minimum (6 wide x 5 tall): per
+    /// `digit_bitmap(1)` (`"..#..", ".##..", "..#..", "..#..", "#####"`),
+    /// centering offsets `ox = (6-5)/2 = 0`, `oy = (5-5)/2 = 0`, so the
+    /// bitmap occupies columns 0..5, rows 0..5 exactly with column 5 blank.
+    /// `active: true` -> painted in `display_panes_active_colour` (bg red).
+    #[test]
+    fn overlay_digits_5x5() {
+        let g = grid_with(6, 5, b"");
+        let red = Style { bg: Color::Idx(1), ..Style::default() };
+        let blue = Style { bg: Color::Idx(4), ..Style::default() };
+        let scene = Scene {
+            size: (6, 5),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 5 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: blue,
+            display_panes_active_colour: red,
+            overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 6, h: 5 }, 1, true)])),
+        };
+        let mut r = Renderer::new(6, 5);
+        r.compose_back(&scene);
+
+        // "on" cells per digit_bitmap(1), each a space char in the active
+        // (red) style.
+        let on_cells: &[(u16, u16)] = &[(2, 0), (1, 1), (2, 1), (2, 2), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)];
+        for &(x, y) in on_cells {
+            assert_eq!(r.back_cell(x, y).ch, ' ', "cell ({x},{y}) should be an 'on' block");
+            assert_eq!(r.back_cell(x, y).style.bg, Color::Idx(1), "cell ({x},{y}) should be display_panes_active_colour (red)");
+        }
+        // An "off" cell within the bitmap's bounding box is left untouched
+        // (still the pane's own default-styled blank content, not painted).
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+        // Column 5 (outside the 5-wide glyph, inside the 6-wide rect) is
+        // also untouched.
+        assert_eq!(r.back_cell(5, 0).style, Style::default());
+    }
+
+    /// A pane too small for the 5x5 block (below the 6x5 threshold) falls
+    /// back to a single centered glyph in the resolved colour, not the block
+    /// bitmap.
+    #[test]
+    fn overlay_digits_small_fallback() {
+        let g = grid_with(3, 3, b"");
+        let blue = Style { bg: Color::Idx(4), ..Style::default() };
+        let scene = Scene {
+            size: (3, 3),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &g, focused: false, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: blue,
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 3, h: 3 }, 7, false)])),
+        };
+        let mut r = Renderer::new(3, 3);
+        r.compose_back(&scene);
+        // centered single glyph: x = 0 + 3/2 = 1, y = 0 + 3/2 = 1
+        assert_eq!(r.back_cell(1, 1).ch, '7');
+        assert_eq!(r.back_cell(1, 1).style.bg, Color::Idx(4));
+        // nowhere else touched
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
     }
 }
