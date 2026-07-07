@@ -24,16 +24,24 @@ pub struct Binding {
     pub repeat: bool,
 }
 
-/// The two key tables (`root`/`prefix`), matching tmux's `bind-key -T`.
+/// The four key tables (`root`/`prefix`/`copy-mode`/`copy-mode-vi`), matching
+/// tmux's `bind-key -T`. The two copy-mode tables (Task 2, sub-project 4) are
+/// only ever consulted by the server after it substitutes them in for `Root`
+/// while the acting client is in `ClientMode::Copy` — see the
+/// `## copy-mode` contract section.
 pub struct Bindings {
     root: HashMap<Key, Binding>,
     prefix: HashMap<Key, Binding>,
+    copy_mode: HashMap<Key, Binding>,
+    copy_mode_vi: HashMap<Key, Binding>,
 }
 
 fn table_name(t: WhichTable) -> &'static str {
     match t {
         WhichTable::Root => "root",
         WhichTable::Prefix => "prefix",
+        WhichTable::CopyMode => "copy-mode",
+        WhichTable::CopyModeVi => "copy-mode-vi",
     }
 }
 
@@ -127,8 +135,105 @@ impl Default for Bindings {
 
         b(char_key(':'), vec![cmd1("command-prompt", &[])], false);
 
-        Bindings { root: HashMap::new(), prefix }
+        // Copy mode entry (Task 2, sub-project 4): `[` and `PPage` were
+        // deliberately left unbound in SP3 (see that task's report) pending
+        // copy mode existing at all.
+        b(char_key('['), vec![cmd1("copy-mode", &[])], false);
+        b(named("PPage"), vec![cmd1("copy-mode", &["-u"])], false);
+
+        Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
+}
+
+/// Default `copy-mode` (emacs `mode-keys`) table: movement/scroll/cancel
+/// subset only (Task 2 scope — selection/search bindings are Tasks 3/4).
+/// `H`/`M`/`L` (top/middle/bottom line) are tmux emacs-table bindings too,
+/// but the design spec flags them as unverified for the emacs table; they
+/// are bound in the vi table only here (documented deviation).
+fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
+    let mut t: HashMap<Key, Binding> = HashMap::new();
+    let mut b = |k: Key, name: &str, args: &[&str]| {
+        t.insert(k, Binding { cmds: vec![cmd1(name, args)], repeat: false });
+    };
+
+    b(named("Left"), "copy-cursor-left", &[]);
+    b(named("Right"), "copy-cursor-right", &[]);
+    b(named("Up"), "copy-cursor-up", &[]);
+    b(named("Down"), "copy-cursor-down", &[]);
+    b(named("C-b"), "copy-cursor-left", &[]);
+    b(named("C-f"), "copy-cursor-right", &[]);
+    b(named("C-p"), "copy-cursor-up", &[]);
+    b(named("C-n"), "copy-cursor-down", &[]);
+
+    b(named("C-a"), "copy-start-of-line", &[]);
+    b(named("Home"), "copy-start-of-line", &[]);
+    b(named("C-e"), "copy-end-of-line", &[]);
+    b(named("End"), "copy-end-of-line", &[]);
+
+    b(named("M-<"), "copy-history-top", &[]);
+    b(named("M->"), "copy-history-bottom", &[]);
+
+    b(named("M-v"), "copy-page-up", &[]);
+    b(named("C-v"), "copy-page-down", &[]);
+    b(named("PPage"), "copy-page-up", &[]);
+    b(named("NPage"), "copy-page-down", &[]);
+    b(named("Space"), "copy-page-down", &[]);
+
+    b(char_key('q'), "copy-cancel", &[]);
+    b(named("Escape"), "copy-cancel", &[]);
+
+    t
+}
+
+/// Default `copy-mode-vi` table: movement/scroll/cancel subset only (Task 2
+/// scope). `Escape` is deliberately left UNBOUND (tmux vi-table `Escape` is
+/// `clear-selection`, Task 3 — until then an unbound key in a copy table
+/// swallows, i.e. a documented no-op).
+fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
+    let mut t: HashMap<Key, Binding> = HashMap::new();
+    let mut b = |k: Key, name: &str, args: &[&str]| {
+        t.insert(k, Binding { cmds: vec![cmd1(name, args)], repeat: false });
+    };
+
+    b(char_key('h'), "copy-cursor-left", &[]);
+    b(char_key('l'), "copy-cursor-right", &[]);
+    b(char_key('k'), "copy-cursor-up", &[]);
+    b(char_key('j'), "copy-cursor-down", &[]);
+    b(named("Left"), "copy-cursor-left", &[]);
+    b(named("Right"), "copy-cursor-right", &[]);
+    b(named("Up"), "copy-cursor-up", &[]);
+    b(named("Down"), "copy-cursor-down", &[]);
+
+    b(char_key('w'), "copy-next-word", &[]);
+    b(char_key('b'), "copy-previous-word", &[]);
+    b(char_key('e'), "copy-next-word-end", &[]);
+
+    b(char_key('0'), "copy-start-of-line", &[]);
+    b(char_key('$'), "copy-end-of-line", &[]);
+    // `^` (first non-blank) is simplified to start-of-line in v1 (documented).
+    b(char_key('^'), "copy-start-of-line", &[]);
+
+    b(char_key('g'), "copy-history-top", &[]);
+    b(char_key('G'), "copy-history-bottom", &[]);
+
+    b(char_key('H'), "copy-top-line", &[]);
+    b(char_key('M'), "copy-middle-line", &[]);
+    b(char_key('L'), "copy-bottom-line", &[]);
+
+    b(char_key('K'), "copy-scroll-up", &[]);
+    b(char_key('J'), "copy-scroll-down", &[]);
+
+    b(named("C-u"), "copy-halfpage-up", &[]);
+    b(named("C-d"), "copy-halfpage-down", &[]);
+
+    b(named("C-b"), "copy-page-up", &[]);
+    b(named("C-f"), "copy-page-down", &[]);
+    b(named("PPage"), "copy-page-up", &[]);
+    b(named("NPage"), "copy-page-down", &[]);
+
+    b(char_key('q'), "copy-cancel", &[]);
+
+    t
 }
 
 impl Bindings {
@@ -153,6 +258,8 @@ impl Bindings {
         match table {
             WhichTable::Root => &mut self.root,
             WhichTable::Prefix => &mut self.prefix,
+            WhichTable::CopyMode => &mut self.copy_mode,
+            WhichTable::CopyModeVi => &mut self.copy_mode_vi,
         }
     }
 
@@ -160,6 +267,8 @@ impl Bindings {
         match table {
             WhichTable::Root => &self.root,
             WhichTable::Prefix => &self.prefix,
+            WhichTable::CopyMode => &self.copy_mode,
+            WhichTable::CopyModeVi => &self.copy_mode_vi,
         }
     }
 
@@ -172,6 +281,12 @@ impl Bindings {
         }
         for (k, v) in &self.root {
             entries.push((WhichTable::Root, *k, v));
+        }
+        for (k, v) in &self.copy_mode {
+            entries.push((WhichTable::CopyMode, *k, v));
+        }
+        for (k, v) in &self.copy_mode_vi {
+            entries.push((WhichTable::CopyModeVi, *k, v));
         }
         entries.sort_by(|a, b| {
             table_name(a.0).cmp(table_name(b.0)).then_with(|| keys::key_name(&a.1).cmp(&keys::key_name(&b.1)))
@@ -258,6 +373,8 @@ mod tests {
             (")", "switch-client", &["-n"], false),
             ("C-b", "send-prefix", &[], false),
             (":", "command-prompt", &[], false),
+            ("[", "copy-mode", &[], false),
+            ("PPage", "copy-mode", &["-u"], false),
         ];
 
         for (k, name, args, repeat) in expected {
@@ -313,11 +430,105 @@ mod tests {
         assert!(b.lookup(WhichTable::Prefix, &key(":")).is_none());
     }
 
+    /// Copy-mode (emacs) default table: the exact movement/scroll/cancel
+    /// subset per the design spec, and nothing else (no selection/search
+    /// bindings — Tasks 3/4).
+    #[test]
+    fn copy_mode_emacs_defaults_exact() {
+        let b = Bindings::default();
+        let expected: &[(&str, &str, &[&str])] = &[
+            ("Left", "copy-cursor-left", &[]),
+            ("Right", "copy-cursor-right", &[]),
+            ("Up", "copy-cursor-up", &[]),
+            ("Down", "copy-cursor-down", &[]),
+            ("C-b", "copy-cursor-left", &[]),
+            ("C-f", "copy-cursor-right", &[]),
+            ("C-p", "copy-cursor-up", &[]),
+            ("C-n", "copy-cursor-down", &[]),
+            ("C-a", "copy-start-of-line", &[]),
+            ("Home", "copy-start-of-line", &[]),
+            ("C-e", "copy-end-of-line", &[]),
+            ("End", "copy-end-of-line", &[]),
+            ("M-<", "copy-history-top", &[]),
+            ("M->", "copy-history-bottom", &[]),
+            ("M-v", "copy-page-up", &[]),
+            ("C-v", "copy-page-down", &[]),
+            ("PPage", "copy-page-up", &[]),
+            ("NPage", "copy-page-down", &[]),
+            ("Space", "copy-page-down", &[]),
+            ("q", "copy-cancel", &[]),
+            ("Escape", "copy-cancel", &[]),
+        ];
+        for (k, name, args) in expected {
+            let binding = b
+                .lookup(WhichTable::CopyMode, &key(k))
+                .unwrap_or_else(|| panic!("default copy-mode binding missing for {k}"));
+            assert_eq!(
+                binding.cmds,
+                vec![RawCmd { name: name.to_string(), args: args.iter().map(|s| s.to_string()).collect() }],
+                "wrong command for copy-mode {k}"
+            );
+            assert!(!binding.repeat);
+        }
+        assert_eq!(b.copy_mode.len(), expected.len());
+    }
+
+    /// Copy-mode-vi default table: same exactness check.
+    #[test]
+    fn copy_mode_vi_defaults_exact() {
+        let b = Bindings::default();
+        let expected: &[(&str, &str, &[&str])] = &[
+            ("h", "copy-cursor-left", &[]),
+            ("l", "copy-cursor-right", &[]),
+            ("k", "copy-cursor-up", &[]),
+            ("j", "copy-cursor-down", &[]),
+            ("Left", "copy-cursor-left", &[]),
+            ("Right", "copy-cursor-right", &[]),
+            ("Up", "copy-cursor-up", &[]),
+            ("Down", "copy-cursor-down", &[]),
+            ("w", "copy-next-word", &[]),
+            ("b", "copy-previous-word", &[]),
+            ("e", "copy-next-word-end", &[]),
+            ("0", "copy-start-of-line", &[]),
+            ("$", "copy-end-of-line", &[]),
+            ("^", "copy-start-of-line", &[]),
+            ("g", "copy-history-top", &[]),
+            ("G", "copy-history-bottom", &[]),
+            ("H", "copy-top-line", &[]),
+            ("M", "copy-middle-line", &[]),
+            ("L", "copy-bottom-line", &[]),
+            ("K", "copy-scroll-up", &[]),
+            ("J", "copy-scroll-down", &[]),
+            ("C-u", "copy-halfpage-up", &[]),
+            ("C-d", "copy-halfpage-down", &[]),
+            ("C-b", "copy-page-up", &[]),
+            ("C-f", "copy-page-down", &[]),
+            ("PPage", "copy-page-up", &[]),
+            ("NPage", "copy-page-down", &[]),
+            ("q", "copy-cancel", &[]),
+        ];
+        for (k, name, args) in expected {
+            let binding = b
+                .lookup(WhichTable::CopyModeVi, &key(k))
+                .unwrap_or_else(|| panic!("default copy-mode-vi binding missing for {k}"));
+            assert_eq!(
+                binding.cmds,
+                vec![RawCmd { name: name.to_string(), args: args.iter().map(|s| s.to_string()).collect() }],
+                "wrong command for copy-mode-vi {k}"
+            );
+        }
+        assert_eq!(b.copy_mode_vi.len(), expected.len());
+        // Escape is deliberately unbound in vi (swallow-as-no-op).
+        assert!(b.lookup(WhichTable::CopyModeVi, &key("Escape")).is_none());
+    }
+
     #[test]
     fn list_keys_format_exact() {
         let mut b = Bindings::default();
         b.unbind_all(WhichTable::Prefix);
         b.unbind_all(WhichTable::Root);
+        b.unbind_all(WhichTable::CopyMode);
+        b.unbind_all(WhichTable::CopyModeVi);
         b.bind(
             WhichTable::Prefix,
             key("C-Up"),

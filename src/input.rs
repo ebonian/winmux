@@ -24,6 +24,15 @@ pub const REPEAT_TIME: std::time::Duration = std::time::Duration::from_millis(50
 pub enum WhichTable {
     Root,
     Prefix,
+    /// Copy-mode (emacs `mode-keys`) key table. `KeyMachine` never produces
+    /// this itself (it knows nothing of client modes) — the SERVER
+    /// substitutes it for a `Root`-table `Key` event when the acting client
+    /// is in `ClientMode::Copy` and `mode-keys` is `emacs` (see the
+    /// `## copy-mode` contract section).
+    CopyMode,
+    /// Copy-mode (vi `mode-keys`) key table; same substitution rule as
+    /// `CopyMode` but for `mode-keys vi`.
+    CopyModeVi,
 }
 
 /// Event produced by [`KeyMachine::feed`].

@@ -205,11 +205,147 @@ pub enum ParsedCmd {
     HasSession { target: String },
     KillSession { target: Option<String> },
     KillServer,
+    /// `copy-mode [-u] [-e]` (Task 2, sub-project 4): enter copy mode on the
+    /// acting client's focused pane. `page_up` (`-u`) additionally scrolls up
+    /// one page immediately (the `PPage` binding). `mouse` (`-e`) is stored
+    /// but unused until the mouse task (SP4 §4) wires wheel-triggered entry.
+    CopyMode { page_up: bool, mouse: bool },
+    /// One internal `copy-*` movement/scroll/cancel command (Task 2 scope —
+    /// selection/search commands are Tasks 3/4). Dispatched only with an
+    /// acting client currently in `ClientMode::Copy`; see the
+    /// `## copy-mode` contract section. Also reachable via tmux's
+    /// `send-keys -X <name>` spelling (`resolve`'s `send-keys` arm maps the
+    /// `-X` name to this).
+    CopyCmd(CopyAction),
+}
+
+/// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
+/// `send-keys -X` command set. See the design spec's `## 2. Copy mode`
+/// section and the `## copy-mode` contract section for the exact per-name
+/// mapping (`copy_action_name`/`copy_action_from_x_name` below).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyAction {
+    CursorLeft,
+    CursorRight,
+    CursorUp,
+    CursorDown,
+    StartOfLine,
+    EndOfLine,
+    HistoryTop,
+    HistoryBottom,
+    TopLine,
+    MiddleLine,
+    BottomLine,
+    ScrollUp,
+    ScrollDown,
+    HalfpageUp,
+    HalfpageDown,
+    PageUp,
+    PageDown,
+    NextWord,
+    PreviousWord,
+    NextWordEnd,
+    Cancel,
+}
+
+/// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
+/// table storage, `list-keys` output).
+fn copy_action_name(a: CopyAction) -> &'static str {
+    match a {
+        CopyAction::CursorLeft => "copy-cursor-left",
+        CopyAction::CursorRight => "copy-cursor-right",
+        CopyAction::CursorUp => "copy-cursor-up",
+        CopyAction::CursorDown => "copy-cursor-down",
+        CopyAction::StartOfLine => "copy-start-of-line",
+        CopyAction::EndOfLine => "copy-end-of-line",
+        CopyAction::HistoryTop => "copy-history-top",
+        CopyAction::HistoryBottom => "copy-history-bottom",
+        CopyAction::TopLine => "copy-top-line",
+        CopyAction::MiddleLine => "copy-middle-line",
+        CopyAction::BottomLine => "copy-bottom-line",
+        CopyAction::ScrollUp => "copy-scroll-up",
+        CopyAction::ScrollDown => "copy-scroll-down",
+        CopyAction::HalfpageUp => "copy-halfpage-up",
+        CopyAction::HalfpageDown => "copy-halfpage-down",
+        CopyAction::PageUp => "copy-page-up",
+        CopyAction::PageDown => "copy-page-down",
+        CopyAction::NextWord => "copy-next-word",
+        CopyAction::PreviousWord => "copy-previous-word",
+        CopyAction::NextWordEnd => "copy-next-word-end",
+        CopyAction::Cancel => "copy-cancel",
+    }
+}
+
+/// Every [`CopyAction`], for building the canonical-name table and iterating
+/// in tests.
+const COPY_ACTIONS: &[CopyAction] = &[
+    CopyAction::CursorLeft,
+    CopyAction::CursorRight,
+    CopyAction::CursorUp,
+    CopyAction::CursorDown,
+    CopyAction::StartOfLine,
+    CopyAction::EndOfLine,
+    CopyAction::HistoryTop,
+    CopyAction::HistoryBottom,
+    CopyAction::TopLine,
+    CopyAction::MiddleLine,
+    CopyAction::BottomLine,
+    CopyAction::ScrollUp,
+    CopyAction::ScrollDown,
+    CopyAction::HalfpageUp,
+    CopyAction::HalfpageDown,
+    CopyAction::PageUp,
+    CopyAction::PageDown,
+    CopyAction::NextWord,
+    CopyAction::PreviousWord,
+    CopyAction::NextWordEnd,
+    CopyAction::Cancel,
+];
+
+fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
+    COPY_ACTIONS.iter().copied().find(|a| copy_action_name(*a) == name)
+}
+
+/// `send-keys -X <name>` spelling -> [`CopyAction`] (tmux's copy-mode
+/// command names, hyphenated without the `copy-` prefix).
+fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
+    Some(match name {
+        "cancel" => CopyAction::Cancel,
+        "cursor-left" => CopyAction::CursorLeft,
+        "cursor-right" => CopyAction::CursorRight,
+        "cursor-up" => CopyAction::CursorUp,
+        "cursor-down" => CopyAction::CursorDown,
+        "start-of-line" => CopyAction::StartOfLine,
+        "end-of-line" => CopyAction::EndOfLine,
+        "history-top" => CopyAction::HistoryTop,
+        "history-bottom" => CopyAction::HistoryBottom,
+        "top-line" => CopyAction::TopLine,
+        "middle-line" => CopyAction::MiddleLine,
+        "bottom-line" => CopyAction::BottomLine,
+        "scroll-up" => CopyAction::ScrollUp,
+        "scroll-down" => CopyAction::ScrollDown,
+        "halfpage-up" => CopyAction::HalfpageUp,
+        "halfpage-down" => CopyAction::HalfpageDown,
+        "page-up" => CopyAction::PageUp,
+        "page-down" => CopyAction::PageDown,
+        "next-word" => CopyAction::NextWord,
+        "previous-word" => CopyAction::PreviousWord,
+        "next-word-end" => CopyAction::NextWordEnd,
+        _ => return None,
+    })
 }
 
 /// Map a command name OR any tmux alias to its canonical full name. `None`
 /// for an unrecognized name.
 fn canonical(name: &str) -> Option<&'static str> {
+    if name == "copy-mode" {
+        return Some("copy-mode");
+    }
+    // Internal copy-* commands: bindable and resolvable but their canonical
+    // name IS the alias (no separate short form).
+    if let Some(a) = copy_action_from_canonical(name) {
+        return Some(copy_action_name(a));
+    }
     Some(match name {
         "split-window" | "splitw" => "split-window",
         "select-pane" | "selectp" => "select-pane",
@@ -257,6 +393,12 @@ fn canonical(name: &str) -> Option<&'static str> {
 /// once the server rewires onto this table.
 pub fn usage(name: &str) -> Option<&'static str> {
     let canon = canonical(name)?;
+    if canon == "copy-mode" {
+        return Some("usage: copy-mode [-u] [-e]");
+    }
+    if copy_action_from_canonical(canon).is_some() {
+        return Some("usage: copy-<action> (no arguments)");
+    }
     Some(match canon {
         "split-window" => "usage: split-window [-h] [-v] [-t target]",
         "select-pane" => "usage: select-pane [-L] [-R] [-U] [-D] [-t target]",
@@ -388,6 +530,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
     let usage_str = usage(canon).expect("canonical() and usage() command lists must agree");
     let bad = || usage_str.to_string();
 
+    if canon == "copy-mode" {
+        let Ok((b, _, p)) = scan_flags(&raw.args, &["-u", "-e"], &[]) else { return Err(bad()) };
+        if !p.is_empty() {
+            return Err(bad());
+        }
+        return Ok(ParsedCmd::CopyMode { page_up: has(&b, "-u"), mouse: has(&b, "-e") });
+    }
+    if let Some(action) = copy_action_from_canonical(canon) {
+        if !raw.args.is_empty() {
+            return Err(bad());
+        }
+        return Ok(ParsedCmd::CopyCmd(action));
+    }
+
     match canon {
         "split-window" => {
             let Ok((b, v, p)) = scan_flags(&raw.args, &["-h", "-v"], &["-t"]) else { return Err(bad()) };
@@ -494,7 +650,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::DetachClient { target: value_of(&v, "-s") })
         }
         "send-keys" => {
-            let Ok((b, v, p)) = scan_flags(&raw.args, &["-l"], &["-t"]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-l", "-X"], &["-t"]) else { return Err(bad()) };
+            if has(&b, "-X") {
+                // tmux `send-keys -X <name>` spelling for a copy-mode
+                // command: the first positional arg is the -X command name,
+                // mapped to the internal `copy-*` command it aliases (see
+                // `copy_action_from_x_name`). Whether the acting client is
+                // actually IN copy mode is a dispatch-time (not parse-time)
+                // concern — see the `## copy-mode` contract section.
+                let Some(xname) = p.first() else { return Err(bad()) };
+                let Some(action) = copy_action_from_x_name(xname) else {
+                    return Err(format!("unknown -X command: {xname}"));
+                };
+                return Ok(ParsedCmd::CopyCmd(action));
+            }
             if p.is_empty() {
                 return Err(bad());
             }
@@ -609,7 +778,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                     "-T" => {
                         i += 1;
                         let Some(t) = raw.args.get(i) else { return Err(bad()) };
-                        if t != "root" && t != "prefix" {
+                        if !matches!(t.as_str(), "root" | "prefix" | "copy-mode" | "copy-mode-vi") {
                             return Err(format!("unknown key table: {t}"));
                         }
                         table = Some(t.clone());
@@ -647,7 +816,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                     "-T" => {
                         i += 1;
                         let Some(t) = raw.args.get(i) else { return Err(bad()) };
-                        if t != "root" && t != "prefix" {
+                        if !matches!(t.as_str(), "root" | "prefix" | "copy-mode" | "copy-mode-vi") {
                             return Err(format!("unknown key table: {t}"));
                         }
                         table = Some(t.clone());
@@ -1090,6 +1259,61 @@ mod tests {
             resolve(&raw("renamew", &["newname"])).unwrap(),
             ParsedCmd::RenameWindow { target: None, name: "newname".to_string() }
         );
+    }
+
+    // ---- copy-mode (Task 2, sub-project 4) ----
+
+    #[test]
+    fn copy_mode_flags() {
+        assert_eq!(resolve(&raw("copy-mode", &[])).unwrap(), ParsedCmd::CopyMode { page_up: false, mouse: false });
+        assert_eq!(
+            resolve(&raw("copy-mode", &["-u"])).unwrap(),
+            ParsedCmd::CopyMode { page_up: true, mouse: false }
+        );
+        assert_eq!(
+            resolve(&raw("copy-mode", &["-u", "-e"])).unwrap(),
+            ParsedCmd::CopyMode { page_up: true, mouse: true }
+        );
+        assert_eq!(resolve(&raw("copy-mode", &["bogus"])).unwrap_err(), usage("copy-mode").unwrap());
+    }
+
+    #[test]
+    fn copy_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-cursor-left", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::CursorLeft));
+        assert_eq!(resolve(&raw("copy-cancel", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::Cancel));
+        assert_eq!(
+            resolve(&raw("copy-history-bottom", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::HistoryBottom)
+        );
+        // No arguments accepted.
+        assert_eq!(resolve(&raw("copy-cancel", &["x"])).unwrap_err(), usage("copy-cancel").unwrap());
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_to_copy_action() {
+        assert_eq!(resolve(&raw("send-keys", &["-X", "cancel"])).unwrap(), ParsedCmd::CopyCmd(CopyAction::Cancel));
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "cursor-left"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CursorLeft)
+        );
+        assert_eq!(
+            resolve(&raw("send", &["-X", "history-top"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::HistoryTop)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "bogus"])).unwrap_err(),
+            "unknown -X command: bogus"
+        );
+    }
+
+    #[test]
+    fn bind_key_accepts_copy_mode_tables() {
+        let ParsedCmd::BindKey { table, .. } =
+            resolve(&raw("bind", &["-T", "copy-mode-vi", "h", "copy-cursor-left"])).unwrap()
+        else {
+            panic!("expected BindKey")
+        };
+        assert_eq!(table, "copy-mode-vi");
     }
 
     #[test]

@@ -98,6 +98,8 @@ const SPECS: &[Spec] = &[
     Spec { name: "default-terminal", kind: Kind::Str, choices: &[] },
     Spec { name: "exit-empty", kind: Kind::Flag, choices: &[] },
     Spec { name: "aggressive-resize", kind: Kind::Flag, choices: &[] },
+    // Copy mode (Task 2, sub-project 4).
+    Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -172,6 +174,10 @@ fn default_value(name: &str) -> Value {
         "default-terminal" => Value::Str("screen".to_string()),
         "exit-empty" => Value::Flag(true),
         "aggressive-resize" => Value::Flag(false),
+        "mode-style" => {
+            let s = "bg=yellow,fg=black";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -393,6 +399,19 @@ impl Options {
 
     pub fn history_limit(&self) -> u32 {
         self.number("history-limit")
+    }
+
+    /// Copy mode's key table selector: `true` = `mode-keys vi`
+    /// (`WhichTable::CopyModeVi`), `false` = the emacs default
+    /// (`WhichTable::CopyMode`).
+    pub fn mode_keys_vi(&self) -> bool {
+        matches!(self.values.get("mode-keys"), Some(Value::Choice("vi")))
+    }
+
+    /// Copy mode's position-indicator/selection style (Task 2: only the
+    /// position indicator uses this yet; selection highlighting is Task 3).
+    pub fn mode_style(&self) -> &PartialStyle {
+        self.style_ref("mode-style")
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -856,6 +875,17 @@ mod tests {
                 spec.name, kind, spec.kind
             );
         }
+    }
+
+    #[test]
+    fn copy_mode_getters() {
+        let mut o = Options::new();
+        assert!(!o.mode_keys_vi());
+        let ms = o.mode_style();
+        assert_eq!(ms.apply_to(crate::grid::Style::default()).fg, crate::grid::Color::Idx(0));
+        assert_eq!(ms.apply_to(crate::grid::Style::default()).bg, crate::grid::Color::Idx(3));
+        o.set("mode-keys", Some("vi"), false, false).unwrap();
+        assert!(o.mode_keys_vi());
     }
 
     #[test]

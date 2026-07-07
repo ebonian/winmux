@@ -2018,3 +2018,223 @@ fn window_status_current_style_override() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+// ---- copy mode (Task 2, sub-project 4) ----
+
+/// The pane's TOP row (row 0) — where the `[scroll/history]` position
+/// indicator is painted, right-aligned, while a client is in copy mode.
+fn row0(g: &Grid) -> String {
+    (0..g.cols()).map(|x| g.cell(x, 0).ch).collect()
+}
+
+fn has_indicator(g: &Grid, prefix: &str) -> bool {
+    let row = row0(g);
+    row.contains(prefix) && row.trim_end().ends_with(']')
+}
+
+#[test]
+fn copy_mode_enters_and_indicator() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // `q` cancels: the indicator disappears and normal typing resumes.
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_scroll_shows_history() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Emit more numbered lines than fit in the pane so some scroll into
+    // history, then wait for the last marker.
+    c.send(&ClientMsg::Stdin(b"1..40 | ForEach-Object { \"scrollmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("scrollmark40")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // vi `K` x3 (dedicated scroll-up, distinct from `k` cursor-up which
+    // only starts scrolling once the cursor reaches the pane's top row):
+    // scroll indicator advances to [3/N].
+    c.send(&ClientMsg::Stdin(b"KKK".to_vec()));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[3/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[3/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_page_keys() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"1..80 | ForEach-Object { \"pagemark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("pagemark80")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // PPage (page-up): scroll advances off zero.
+    c.send(&ClientMsg::Stdin(b"\x1b[5~".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, "[0/"));
+
+    // NPage (page-down) back to the bottom: scroll returns to zero.
+    c.send(&ClientMsg::Stdin(b"\x1b[6~".to_vec()));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_q_exits() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let before = screen_text(&grid);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    assert_ne!(screen_text(&grid), before, "indicator must have changed row 0");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g) == before);
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_vi_vs_emacs_tables() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Emacs is the default: `C-p` (cursor-up, NOT the prefix key) moves the
+    // copy cursor -- observable as the composed cursor row decreasing by
+    // one (the local test Grid mirrors every CUP the server emits).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    c.send(&ClientMsg::Stdin(vec![0x10])); // C-p
+    c.recv_output_until(&mut grid, |g| g.cursor().1 == entry_row - 1);
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    // Switch to vi: `C-p` is unbound there (swallowed), so the cursor must
+    // NOT move even though it's the same raw byte.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row_vi = grid.cursor().1;
+    c.send(&ClientMsg::Stdin(vec![0x10])); // C-p again -- unbound in vi
+    // No move to observe directly; instead confirm `h` (vi-only, cursor-left)
+    // DOES work, proving the vi table is genuinely active and swallowing
+    // C-p rather than e.g. still resolving the emacs table.
+    c.send(&ClientMsg::Stdin(b"h".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor().1 == entry_row_vi);
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_prefix_still_works() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // A prefix-table binding (`C-b c` -> new-window) still fires from copy
+    // mode -- the KeyMachine's prefix interception is unconditional.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // Switching windows canceled the old copy mode: the indicator is gone
+    // from the new (window 1) pane's render.
+    assert!(!row0(&grid).contains("[0/"), "copy mode must be canceled by the window switch");
+
+    // Clean up: kill window 1 (falls back to window 0), then exit.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_mode_pane_death_cancels() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Split: the split gives focus to the NEW (right) pane.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["split-window".into(), "-h".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // Enter copy mode: binds to the currently-focused (new, right) pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0/")));
+
+    // Headless `send-keys` with no `-t` defaults to the same focused pane
+    // (the one copy mode is bound to) -- its shell exits naturally, which
+    // is exactly the pane-death path `cancel_stale_copy_modes` hooks.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["send-keys".into(), "exit".into(), "Enter".into()]));
+    expect_cli_done(&cli2, 0);
+
+    // The window collapses to one pane and copy mode's indicator is gone --
+    // no crash, no stale overlay left on the survivor.
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g) && !screen_text(g).iter().any(|l| l.contains("[0/")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

@@ -49,7 +49,7 @@ use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{PaneView, Renderer, Scene, StatusRow};
+use crate::render::{CopyView, PaneView, Renderer, Scene, StatusRow};
 use crate::status::{status_spans, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
@@ -122,6 +122,28 @@ enum ClientMode {
     /// command-prompt). `buf` is the live-edited text (pre-filled with the
     /// current name, or empty/initial for `:`); `label` is the fixed prefix.
     Prompt { label: String, buf: String, kind: PromptKind },
+    /// Copy mode (Task 2, sub-project 4): scrollback navigation bound to the
+    /// pane that was focused at entry. Per-CLIENT, not per-pane (tmux models
+    /// copy mode per-pane; winmux's divergence is documented in the design
+    /// spec's `## 2. Copy mode` section) — two clients can independently be
+    /// in copy mode on the same or different panes.
+    Copy(CopyState),
+}
+
+/// Copy mode's per-client state. `scroll` == tmux `oy` (lines scrolled up
+/// from the live bottom, 0 = live screen); `cx`/`cy` are the copy cursor in
+/// VIEW coordinates (0-based, within the pane's current `cols`/`rows`).
+/// `scroll_exit` is a placeholder for the mouse task's scroll-past-bottom
+/// auto-exit (SP4 §4) — unused until then. Selection/search fields
+/// (`sel`/`search`) are Tasks 3/4 and deliberately NOT present yet (kept
+/// minimal per the task brief).
+struct CopyState {
+    pane: PaneId,
+    scroll: u32,
+    cx: u16,
+    cy: u16,
+    #[allow(dead_code)]
+    scroll_exit: bool,
 }
 
 /// Per-client attached state.
@@ -766,6 +788,53 @@ impl Server {
         }
     }
 
+    /// Cancel any attached client's copy mode (Task 2) whose bound pane no
+    /// longer exists (natural exit / killed while copy mode was active), OR
+    /// whose ATTACHED SESSION's current window no longer contains that pane
+    /// — the simplest robust way to implement "cancel on any window/session
+    /// switch by that client" (design spec `## 2. Copy mode`): a
+    /// `select-window`/`next-window`/`switch-client`/etc. dispatch always
+    /// changes which window is `session.current`, so re-checking membership
+    /// after every dispatch catches all of them uniformly without hooking
+    /// each mutating path individually. Called from the same two sites as
+    /// `cancel_stale_confirms` (natural pane exit, and once per `Stdin`
+    /// frame after the client is back in `self.clients`).
+    fn cancel_stale_copy_modes(&mut self) {
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        let ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        for id in ids {
+            let stale = match self.clients.get(&id).map(|c| &c.mode) {
+                Some(ClientMode::Copy(cs)) => {
+                    if !live_panes.contains(&cs.pane) {
+                        true
+                    } else {
+                        match self.clients.get(&id).and_then(|c| c.session.as_deref()) {
+                            Some(session_name) => !self
+                                .registry
+                                .sessions()
+                                .iter()
+                                .find(|s| s.name == session_name)
+                                .map(|s| s.current_window().layout.panes().contains(&cs.pane))
+                                .unwrap_or(false),
+                            None => true,
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if stale {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.mode = ClientMode::Normal;
+                }
+            }
+        }
+    }
+
     /// Session's shared size = min over its attached clients of
     /// `(cols, rows - status_rows)` (the status row, when on, is not part of
     /// the pane area; `status off` gives panes the full height — Task 8).
@@ -874,6 +943,7 @@ impl Server {
         // The removal above may have invalidated a client's pending confirm;
         // any confirm on it must be reset, or its `y` would act on stale state.
         self.cancel_stale_confirms();
+        self.cancel_stale_copy_modes();
         true
     }
 
@@ -937,7 +1007,37 @@ impl Server {
         'events: while let Some(ev) = queue.pop_front() {
             match ev {
                 KeyInputEvent::Forward(data) => {
-                    if let Some(session) = self.registry.session_mut(&session_name) {
+                    // Copy mode (Task 2): `KeyMachine` coalesces a whole run
+                    // of PLAIN unmodified keys (bare letters, digits, Space,
+                    // Enter, Tab, BSpace — most copy-mode bindings, e.g.
+                    // `q`/`h`/`j`/`k`/`w`) into one `Forward` blob for
+                    // throughput, entirely bypassing the `Key{table,..}`
+                    // path this module's table-override lives on (see the
+                    // `## input-v2` contract's documented deviation). While
+                    // in copy mode those bytes must NOT reach the pane —
+                    // re-decode the blob back into individual keys (a fresh
+                    // `KeyDecoder` reproduces exactly the keys that were
+                    // coalesced, since the blob is always a complete,
+                    // self-contained run) and resolve each one against the
+                    // copy table instead.
+                    if matches!(client.mode, ClientMode::Copy(_)) {
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        let which = if self.options.mode_keys_vi() { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
+                        for dk in decoded {
+                            let binding = self.bindings.lookup(which, &dk.key).cloned();
+                            if let Some(b) = binding {
+                                let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
+                                dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                                if detach || destroy {
+                                    break 'events;
+                                }
+                            }
+                            // Unbound in a copy table: swallowed, matching
+                            // the `Key`-path rule.
+                        }
+                    } else if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
                             if let Some(pty) = pane.pty.as_mut() {
@@ -947,6 +1047,23 @@ impl Server {
                     }
                 }
                 KeyInputEvent::Key { table, key, raw } => {
+                    // Copy mode (Task 2): a `Root`-table Key event while the
+                    // acting client is in `ClientMode::Copy` is looked up
+                    // against the copy table `mode-keys` selects instead —
+                    // `KeyMachine` knows nothing of client modes, so this
+                    // substitution is the server's job (see the
+                    // `## copy-mode` contract section). A `Prefix`-table
+                    // event is left alone: prefix bindings (e.g. `C-b c`)
+                    // still fire from copy mode, matching tmux.
+                    let table = if matches!(client.mode, ClientMode::Copy(_)) && table == WhichTable::Root {
+                        if self.options.mode_keys_vi() {
+                            WhichTable::CopyModeVi
+                        } else {
+                            WhichTable::CopyMode
+                        }
+                    } else {
+                        table
+                    };
                     let binding = self.bindings.lookup(table, &key).cloned();
                     match binding {
                         Some(b) => {
@@ -974,6 +1091,10 @@ impl Server {
                             }
                             // Unbound in the prefix table: swallowed (tmux).
                             WhichTable::Prefix => {}
+                            // Unbound in a copy table: swallowed (per the
+                            // design spec — copy mode never leaks stray
+                            // keystrokes to the pane underneath).
+                            WhichTable::CopyMode | WhichTable::CopyModeVi => {}
                         },
                     }
                 }
@@ -1035,6 +1156,12 @@ impl Server {
         // This client may have just removed a pane/window that ANOTHER
         // client (same session) had a pending kill confirm armed on.
         self.cancel_stale_confirms();
+        // Same idea for copy mode (Task 2): this client's own dispatch (or
+        // another client's) may have changed a window's live panes, or this
+        // client's own current window (a `[` copy-mode-then-prefix-`c`
+        // sequence, etc.) — re-check every client's copy mode after every
+        // Stdin-driven dispatch batch.
+        self.cancel_stale_copy_modes();
     }
 
     /// Render every attached client (see module docs: render-all, not
@@ -1087,7 +1214,12 @@ fn render_one(
         ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
         ClientMode::Normal if too_small => Some("terminal too small".to_string()),
+        ClientMode::Copy(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::Normal => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // Copy mode has no message of its own (the position indicator is
+        // painted directly on the pane, not the status row) but a transient
+        // message (e.g. an error) can still be showing underneath it.
+        ClientMode::Copy(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
@@ -1151,10 +1283,12 @@ fn render_one(
 
     let border = options.pane_border_style().apply_to(default_style);
     let border_active = options.pane_active_border_style().apply_to(default_style);
+    let mode_style = options.mode_style().apply_to(default_style);
     let scene_size = (client.cols, client.rows);
 
     if too_small {
-        let scene = Scene { size: scene_size, panes: Vec::new(), zoomed, status, message, border, border_active };
+        let scene =
+            Scene { size: scene_size, panes: Vec::new(), zoomed, status, message, border, border_active, mode_style };
         let out = client.renderer.compose(&scene, None, false);
         send_output(&client.tx, out);
         return;
@@ -1163,20 +1297,39 @@ fn render_one(
     let mut views = Vec::with_capacity(rects.len());
     for (id, rect) in &rects {
         if let Some(p) = panes.get(id) {
-            views.push(PaneView { id: *id, rect: *rect, grid: &p.grid, focused: *id == focused, dead: p.dead });
+            // Copy mode (Task 2): the pane bound to THIS client's
+            // `ClientMode::Copy` (if any) renders its scrolled view; every
+            // other pane (including one another client has zoomed/focused)
+            // renders live, unaffected by this client's copy mode.
+            let copy = match &client.mode {
+                ClientMode::Copy(cs) if cs.pane == *id => Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy) }),
+                _ => None,
+            };
+            views.push(PaneView { id: *id, rect: *rect, grid: &p.grid, focused: *id == focused, dead: p.dead, copy });
         }
     }
 
-    let (cursor, cursor_visible) = match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
-        (Some(r), Some(p)) => {
-            let (cx, cy) = p.grid.cursor();
-            let visible = p.grid.cursor_visible() && !p.dead && message.is_none();
-            (Some((r.x + cx, r.y + cy)), visible)
+    let (cursor, cursor_visible) = if let ClientMode::Copy(cs) = &client.mode {
+        match rects.iter().find(|(id, _)| *id == cs.pane).map(|(_, r)| *r) {
+            Some(r) => {
+                let cx = cs.cx.min(r.w.saturating_sub(1));
+                let cy = cs.cy.min(r.h.saturating_sub(1));
+                (Some((r.x + cx, r.y + cy)), message.is_none())
+            }
+            None => (None, false),
         }
-        _ => (None, false),
+    } else {
+        match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
+            (Some(r), Some(p)) => {
+                let (cx, cy) = p.grid.cursor();
+                let visible = p.grid.cursor_visible() && !p.dead && message.is_none();
+                (Some((r.x + cx, r.y + cy)), visible)
+            }
+            _ => (None, false),
+        }
     };
 
-    let scene = Scene { size: scene_size, panes: views, zoomed, status, message, border, border_active };
+    let scene = Scene { size: scene_size, panes: views, zoomed, status, message, border, border_active, mode_style };
     let out = client.renderer.compose(&scene, cursor, cursor_visible);
     send_output(&client.tx, out);
 }

@@ -147,3 +147,231 @@ row `index - history_len`.
   `Grid::new(cols, rows)` call site updated to `Grid::new(cols, rows, 0)`
   (no scrollback needed — these tests decode client/server output, not
   scrollback UI, which is a later SP4 task).
+
+## `copy-mode` — scrollback navigation core (Task 2)
+
+Implements the design spec's `## 2. Copy mode` movement/scroll/cancel
+subset ONLY — selection (`copy-begin-selection`, `copy-rectangle-toggle`,
+`copy-selection-and-cancel`, `copy-other-end`, `copy-clear-selection`) and
+search (`copy-search-*`) are explicitly OUT of scope (Tasks 3/4) and neither
+their `ParsedCmd`/`CopyAction` variants nor their bindings exist yet.
+
+### `input` amendment
+
+```rust
+pub enum WhichTable {
+    Root,
+    Prefix,
+    CopyMode,    // NEW: emacs mode-keys copy table
+    CopyModeVi,  // NEW: vi mode-keys copy table
+}
+```
+
+`KeyMachine` itself is UNCHANGED — it still only ever produces `Root`/`Prefix`
+table events (it knows nothing of client modes). The two new variants are
+produced/consumed exclusively by the server (`src/server.rs`), which
+substitutes them in per the rule below.
+
+### `bindings` amendment
+
+`Bindings` gains two more tables (`copy_mode`, `copy_mode_vi`), the same
+`HashMap<Key, Binding>` shape as `root`/`prefix`. `table_name`/`table_mut`/
+`table_ref`/`list()` all grow arms; `bind-key`/`unbind-key`'s `-T` validation
+(`cmd::resolve`) accepts `"copy-mode"`/`"copy-mode-vi"` in addition to
+`"root"`/`"prefix"`.
+
+`Bindings::default()` additionally binds, in the PREFIX table:
+`[` → `copy-mode`, `PPage` → `copy-mode -u` (both were deliberately left
+unbound through sub-project 3).
+
+Default `copy-mode` (emacs) table — movement/scroll/cancel subset only:
+
+| Key(s) | Command |
+|---|---|
+| `Left`/`C-b`, `Right`/`C-f`, `Up`/`C-p`, `Down`/`C-n` | `copy-cursor-left`, `copy-cursor-right`, `copy-cursor-up`, `copy-cursor-down` |
+| `C-a`/`Home` | `copy-start-of-line` |
+| `C-e`/`End` | `copy-end-of-line` |
+| `M-<` | `copy-history-top` |
+| `M->` | `copy-history-bottom` |
+| `M-v`/`C-v`/`PPage` | `copy-page-up` |
+| `NPage` | `copy-page-down` |
+| `Space` | `copy-page-down` |
+| `q`/`Escape` | `copy-cancel` |
+
+`H`/`M`/`L` (top/middle/bottom-line) are NOT bound in the emacs table — the
+design spec flags them "unverified" for emacs; bound in vi only (documented
+deviation). Selection/search bindings (`C-Space`, `C-w`/`M-w`, `C-g`,
+`C-s`/`C-r`, `n`/`N`, `R`, `o`) are Tasks 3/4 and absent.
+
+Default `copy-mode-vi` table — movement/scroll/cancel subset only:
+
+| Key(s) | Command |
+|---|---|
+| `h`/`l`/`k`/`j`, `Left`/`Right`/`Up`/`Down` | `copy-cursor-{left,right,up,down}` |
+| `w`/`b`/`e` | `copy-next-word`/`copy-previous-word`/`copy-next-word-end` |
+| `0`/`$`/`^` | `copy-start-of-line`/`copy-end-of-line`/`copy-start-of-line` (`^` simplified to start-of-line, documented) |
+| `g`/`G` | `copy-history-top`/`copy-history-bottom` |
+| `H`/`M`/`L` | `copy-top-line`/`copy-middle-line`/`copy-bottom-line` |
+| `K`/`J` | `copy-scroll-up`/`copy-scroll-down` |
+| `C-u`/`C-d` | `copy-halfpage-up`/`copy-halfpage-down` |
+| `C-b`/`PPage` | `copy-page-up` |
+| `C-f`/`NPage` | `copy-page-down` |
+| `q` | `copy-cancel` |
+
+`Escape` is deliberately UNBOUND in vi (tmux binds it to `clear-selection`,
+Task 3; until then an unbound copy-table key swallows — a documented no-op).
+`Space`/`v`/`Enter`/`/`/`?`/`n`/`N`/`o` (selection/search) are Tasks 3/4 and
+absent.
+
+### `cmd` amendment
+
+`ParsedCmd` gains:
+
+```rust
+CopyMode { page_up: bool, mouse: bool },  // -u / -e
+CopyCmd(CopyAction),
+```
+
+```rust
+pub enum CopyAction {
+    CursorLeft, CursorRight, CursorUp, CursorDown,
+    StartOfLine, EndOfLine,
+    HistoryTop, HistoryBottom,
+    TopLine, MiddleLine, BottomLine,
+    ScrollUp, ScrollDown,
+    HalfpageUp, HalfpageDown,
+    PageUp, PageDown,
+    NextWord, PreviousWord, NextWordEnd,
+    Cancel,
+}
+```
+
+`copy-mode [-u] [-e]` is a PUBLIC command (in `canonical()`/`usage()`
+normally). Each `CopyAction` also has its own canonical command name
+(`copy-cursor-left`, `copy-cancel`, ...) — INTERNAL (bindable/resolvable, but
+not part of the discoverable "did you mean" surface; `usage()` returns a
+generic `"usage: copy-<action> (no arguments)"` for all of them) — taking no
+arguments.
+
+`send-keys` gains `-X <name>`: when present, `resolve` maps `<name>` (tmux's
+copy-mode command spelling, e.g. `cancel`, `cursor-left`, `history-top`) via
+a fixed table directly to `ParsedCmd::CopyCmd` (bypassing `SendKeys`
+entirely) — `Err("unknown -X command: <name>")` for an unrecognized name.
+Whether the acting client is actually in copy mode is a DISPATCH-time
+concern, not `resolve`'s: `exec_copy_action` returns `Err("not in a
+mode")` when it isn't (tmux's own wording), covering `send-keys -X` used
+outside copy mode identically to a directly-bound `copy-*` command.
+
+`bind-key`/`unbind-key -T` accepts `"copy-mode"`/`"copy-mode-vi"` (see the
+`bindings` amendment above).
+
+### `options` amendment
+
+Adds `mode-style` (`Style`, default `bg=yellow,fg=black`) and two getters:
+
+```rust
+pub fn mode_style(&self) -> &PartialStyle;
+pub fn mode_keys_vi(&self) -> bool; // true iff mode-keys == "vi"
+```
+
+### `server`/`server::dispatch` amendment
+
+`ClientMode` gains `Copy(CopyState)`:
+
+```rust
+struct CopyState {
+    pane: PaneId,
+    scroll: u32,   // tmux `oy`; 0 = live screen
+    cx: u16,       // view-coordinate cursor column
+    cy: u16,       // view-coordinate cursor row
+    scroll_exit: bool, // placeholder for the mouse task; unused in Task 2
+}
+```
+
+winmux models copy mode PER-CLIENT bound to the pane focused at entry
+(`pane`), not per-pane like real tmux (documented divergence, design spec
+`## 2. Copy mode`): two clients can independently be in copy mode, even on
+the same pane, with separate `scroll`/`cx`/`cy`.
+
+**Entry**: `copy-mode [-u] [-e]`, dispatched only `execute_for_client`
+(`execute_headless` — CLI/config with no client — errors `"no current
+client"`). Binds to `session.current_window().layout.focused()` at the
+moment of dispatch. `cx`/`cy` seed from the pane's LIVE cursor
+(`Grid::cursor()`); `-u` additionally seeds `scroll = min(pane_rows,
+history_len)` and `cy = 0` (page-up-on-entry, the `PPage` binding).
+
+**Key routing** (`handle_stdin`): `KeyMachine` is unaware of client modes, so
+the server performs TWO distinct substitutions while `client.mode` is
+`Copy(_)`:
+1. `KeyInputEvent::Key { table: Root, .. }` → the table is swapped to
+   `CopyMode`/`CopyModeVi` (per `options.mode_keys_vi()`) BEFORE
+   `bindings.lookup`. A `Prefix`-table event is left untouched (prefix
+   bindings, e.g. `C-b c`, still fire from copy mode — tmux behavior).
+2. **`KeyInputEvent::Forward(data)`** (CRITICAL, easy to miss): `KeyMachine`
+   coalesces every PLAIN unmodified key (bare letters/digits, `Space`,
+   `Enter`, `Tab`, `BSpace` — covering most copy-mode bindings, e.g. `q`,
+   `h`/`j`/`k`/`l`, `w`/`b`/`e`, `g`/`G`, `H`/`M`/`L`, `K`/`J`) into ONE
+   `Forward` blob for throughput (see the `## input-v2` contract's
+   documented deviation) — this NEVER reaches the `Key{table,..}` arm at
+   all. While in copy mode, `handle_stdin`'s `Forward` arm re-decodes the
+   blob with a fresh `crate::keys::KeyDecoder` (reproducing exactly the keys
+   that were coalesced, since the blob is always complete and
+   self-contained) and resolves each decoded key against the copy table
+   individually, instead of writing the bytes to the pane's pty.
+
+Unbound key in EITHER copy table (via either routing path): swallowed (never
+forwarded to the pane).
+
+**Execution** (`server::dispatch`): `exec_copy_mode` (entry, above) and
+`exec_copy_action` (movement/scroll/cancel, mutating `CopyState` in place).
+Word motion (`NextWord`/`PreviousWord`/`NextWordEnd`) is a v1 simplification:
+whitespace-delimited words via `Grid::view_row_text(scroll, cy)`, no line
+wrapping (clamps at the current view row's edges) — documented, Task 3/4
+territory for anything richer. All movement reads pane dimensions/history via
+`self.panes.get(&cs.pane)`; a pane that's disappeared resets `client.mode` to
+`Normal` defensively (belt-and-braces — `cancel_stale_copy_modes` is the
+primary mechanism, see below).
+
+**Stale invalidation**: `cancel_stale_copy_modes` (parallels
+`cancel_stale_confirms`) resets any client's `Copy(cs)` to `Normal` when
+EITHER `cs.pane` no longer exists in any live window, OR the client's
+attached session's CURRENT window no longer contains `cs.pane` — the latter
+is how "cancel on any window/session switch by that client" is implemented:
+every window/session-changing dispatch (`select-window`, `next-window`,
+`switch-client`, ...) changes `session.current`, so re-checking pane
+membership in `session.current_window()` after every dispatch batch catches
+all of them uniformly without hooking each mutating command individually.
+Called from the same two sites as `cancel_stale_confirms`: `handle_exited`
+(natural pane exit) and once per `Stdin` frame at the tail of `handle_stdin`
+(after the client is back in `self.clients`).
+
+### `render` amendment
+
+```rust
+pub struct CopyView { pub scroll: u32, pub cursor: (u16, u16) }
+
+pub struct PaneView<'a> {
+    // ...unchanged fields...
+    pub copy: Option<CopyView>,  // NEW
+}
+
+pub struct Scene<'a> {
+    // ...unchanged fields...
+    pub mode_style: Style,  // NEW
+}
+```
+
+`Renderer::compose_back`: pass 1 (pane content copy) reads
+`grid.view_cell(cv.scroll, dx, dy)` instead of `grid.cell(dx, dy)` whenever
+`PaneView::copy` is `Some`. A new pass 1b paints the position indicator
+`[<scroll>/<history_len>]` right-aligned on that pane's TOP row
+(`rect.y`), in `scene.mode_style`, truncating from the LEFT if the indicator
+is wider than the pane. `history_len` comes from `pv.grid.history_len()` —
+no separate field needed.
+
+`server::render_one`: when `client.mode` is `Copy(cs)`, the `PaneView` whose
+`id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, cursor: (cs.cx,
+cs.cy)})` (every other pane, including a DIFFERENT client's focused/zoomed
+pane, renders live as before); the terminal cursor is placed at
+`cs.pane`'s rect origin + `(cs.cx, cs.cy)` (clamped into the rect) instead of
+the focused pane's live cursor, visible whenever there's no overlay message.

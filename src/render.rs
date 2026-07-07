@@ -2,12 +2,27 @@ use crate::geom::Rect;
 use crate::grid::{Cell, Color, Grid, Style};
 use crate::layout::PaneId;
 
+/// Copy-mode rendering data for one pane (Task 2, sub-project 4): the pane's
+/// content is read via `Grid::view_cell(scroll, ..)` instead of the live
+/// `cell` when this is `Some`, a `[scroll/history_len]` position indicator is
+/// painted right-aligned on the pane's top row in `Scene::mode_style`, and
+/// `cursor` (view coordinates) replaces the pane's live cursor for terminal
+/// cursor placement. Selection highlighting (`sel_cells`) is Task 3.
+pub struct CopyView {
+    pub scroll: u32,
+    pub cursor: (u16, u16),
+}
+
 pub struct PaneView<'a> {
     pub id: PaneId,
     pub rect: Rect,
     pub grid: &'a Grid,
     pub focused: bool,
     pub dead: bool,
+    /// `Some` when this pane is the one bound to some client's
+    /// `ClientMode::Copy` (see module docs above); `None` for ordinary live
+    /// rendering.
+    pub copy: Option<CopyView>,
 }
 
 /// The status row's full drawing recipe (SP3 Task 8, superseding the old
@@ -47,6 +62,10 @@ pub struct Scene<'a> {
     /// Border cells adjacent to the focused pane (`pane-active-border-style`,
     /// tmux default `fg=green`).
     pub border_active: Style,
+    /// Copy mode's position-indicator (and, from Task 3, selection
+    /// highlight) style (`mode-style` applied to the default style, tmux
+    /// default `bg=yellow,fg=black`).
+    pub mode_style: Style,
 }
 
 pub struct Renderer {
@@ -96,7 +115,8 @@ impl Renderer {
             *c = Cell::default();
         }
 
-        // 1) copy each pane's grid into its rect
+        // 1) copy each pane's grid into its rect -- copy-mode panes read a
+        // scrolled view (`view_cell`) instead of the live screen (`cell`).
         for pv in &scene.panes {
             let r = pv.rect;
             for dy in 0..r.h {
@@ -110,9 +130,34 @@ impl Renderer {
                         continue;
                     }
                     if dx < pv.grid.cols() && dy < pv.grid.rows() {
-                        let cell = pv.grid.cell(dx, dy);
+                        let cell = match &pv.copy {
+                            Some(cv) => pv.grid.view_cell(cv.scroll, dx, dy),
+                            None => pv.grid.cell(dx, dy),
+                        };
                         self.set(x, y, cell);
                     }
+                }
+            }
+        }
+
+        // 1b) copy-mode position indicator: `[scroll/history_len]`,
+        // right-aligned on the pane's TOP row, in `mode_style`.
+        for pv in &scene.panes {
+            let Some(cv) = &pv.copy else { continue };
+            let r = pv.rect;
+            if !in_band(r.y) {
+                continue;
+            }
+            let history_len = pv.grid.history_len();
+            let indicator = format!("[{}/{}]", cv.scroll, history_len);
+            let chars: Vec<char> = indicator.chars().collect();
+            let ind_len = (chars.len() as u16).min(r.w);
+            let start_x = r.x + r.w.saturating_sub(ind_len);
+            let skip = chars.len() - ind_len as usize; // truncate from the left if wider than the pane
+            for (i, ch) in chars[skip..].iter().enumerate() {
+                let x = start_x + i as u16;
+                if x < cols {
+                    self.set(x, r.y, Cell { ch: *ch, style: scene.mode_style });
                 }
             }
         }
@@ -455,14 +500,15 @@ mod tests {
         let scene = Scene {
             size: (7, 4),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(7, 4);
         r.compose_back(&scene);
@@ -489,15 +535,16 @@ mod tests {
         let scene = Scene {
             size: (7, 5),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false },
-                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -515,12 +562,13 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("AB".to_string(), status_base())], "Z")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -541,12 +589,13 @@ mod tests {
         let g = grid_with(6, 1, b"");
         let scene = Scene {
             size: (6, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("ab".to_string(), status_base())], "123456")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(6, 2);
         r.compose_back(&scene);
@@ -560,12 +609,13 @@ mod tests {
         let g = grid_with(5, 1, b"");
         let scene = Scene {
             size: (5, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("ignored".to_string(), status_base())], "ignored")),
             message: Some(("hey".to_string(), default_msg_style())),
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(5, 2);
         r.compose_back(&scene);
@@ -583,12 +633,13 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -608,14 +659,15 @@ mod tests {
         let scene = Scene {
             size: (7, 2),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 1 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 1 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false, copy: None },
             ],
             zoomed: true,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(7, 2);
         r.compose_back(&scene);
@@ -636,12 +688,13 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -651,12 +704,13 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let out = r.compose(&scene, Some((1, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -671,12 +725,13 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -686,12 +741,13 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let out = r.compose(&scene, Some((2, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -706,12 +762,13 @@ mod tests {
         let mut r = Renderer::new(4, 2);
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let _ = r.compose(&scene, Some((0, 0)), true); // prime
         // identical recompose, cursor hidden -> no diff bytes, just hide
@@ -726,12 +783,13 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
             };
             let _ = r.compose(&scene, Some((0, 0)), true); // prime
         }
@@ -740,12 +798,13 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let out = r.compose(&scene, Some((0, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -765,7 +824,7 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(
                 vec![
@@ -777,6 +836,7 @@ mod tests {
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(10, 2);
         let out = r.compose(&scene, None, false);
@@ -796,7 +856,7 @@ mod tests {
         let g = grid_with(4, 1, b"ab");
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 1, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 1, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(StatusRow {
                 top: true,
@@ -808,6 +868,7 @@ mod tests {
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -826,12 +887,13 @@ mod tests {
         let g = grid_with(4, 2, b"ab\r\ncd");
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: None,
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -849,12 +911,13 @@ mod tests {
         let custom = Style { fg: Color::Idx(7), bg: Color::Idx(4), ..Style::default() }; // white on blue
         let scene = Scene {
             size: (6, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("AB".to_string(), custom)], "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(6, 2);
         let out = r.compose(&scene, None, false);
@@ -874,15 +937,16 @@ mod tests {
         let scene = Scene {
             size: (7, 5),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: true, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false },
-                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: false, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: true, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: false, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style { fg: Color::Idx(240), ..Style::default() },      // pane-border-style fg=colour240
             border_active: Style { fg: Color::Idx(1), ..Style::default() }, // pane-active-border-style fg=red
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -902,12 +966,13 @@ mod tests {
         let custom = Style { fg: Color::Idx(7), bg: Color::Idx(1), bold: true, ..Style::default() };
         let scene = Scene {
             size: (5, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: Some(("hi".to_string(), custom)),
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
         };
         let mut r = Renderer::new(5, 2);
         let out = r.compose(&scene, None, false);

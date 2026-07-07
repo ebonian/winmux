@@ -26,7 +26,7 @@ use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use crate::bindings::Binding;
-use crate::cmd::{self, ParsedCmd, RawCmd};
+use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
 use crate::layout::{PaneId, SplitDir};
@@ -35,8 +35,8 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate, PromptKind, Server,
-    MONTHS,
+    send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate, CopyState,
+    PromptKind, Server, MONTHS,
 };
 
 /// Abbreviated C-locale English weekday names, indexed by
@@ -631,6 +631,147 @@ impl Server {
         Ok(String::new())
     }
 
+    // ---- copy mode (Task 2, sub-project 4) ----
+
+    /// `copy-mode [-u] [-e]`: enter copy mode on the acting client's
+    /// CURRENTLY FOCUSED pane (the client's `ClientMode::Copy` then binds to
+    /// that pane id for the duration — see the type's doc comment).
+    /// `page_up` immediately scrolls up one page (the `PPage` binding);
+    /// `mouse` is stored on... nothing yet (Task 2 has no selection/mouse
+    /// state to carry it on) — accepted and validated but otherwise inert
+    /// until the mouse task wires wheel-triggered entry (SP4 §4).
+    fn exec_copy_mode(&mut self, page_up: bool, _mouse: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let pane = match self.registry.session_mut(session_name) {
+            Some(s) => s.current_window().layout.focused(),
+            None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
+        };
+        let Some(p) = self.panes.get(&pane) else {
+            return ExecOutcome::Err("pane not found".to_string());
+        };
+        let (live_cx, live_cy) = p.grid.cursor();
+        let history_len = p.grid.history_len();
+        let rows = p.grid.rows();
+        let (scroll, cx, cy) = if page_up {
+            (u32::from(rows).min(history_len), live_cx, 0)
+        } else {
+            (0u32, live_cx, live_cy)
+        };
+        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// One internal `copy-*` movement/scroll/cancel command (Task 2 scope).
+    /// `Err("not in a mode")` when the acting client isn't currently in copy
+    /// mode — the same error a bare `send-keys -X <name>` hits outside copy
+    /// mode (its `resolve()` maps straight onto this same `CopyCmd`, see the
+    /// `## copy-mode` contract section), matching tmux's own wording.
+    fn exec_copy_action(&mut self, action: CopyAction, client: &mut ClientState) -> ExecOutcome {
+        let ClientMode::Copy(cs) = &mut client.mode else {
+            return ExecOutcome::Err("not in a mode".to_string());
+        };
+        if action == CopyAction::Cancel {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
+        let Some(p) = self.panes.get(&cs.pane) else {
+            // The pane died between the keystroke's Stdin frame arriving and
+            // this dispatch running (the normal case is caught by
+            // `cancel_stale_copy_modes` right after, but belt-and-braces:
+            // never index a gone pane).
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        };
+        let cols = p.grid.cols();
+        let rows = p.grid.rows();
+        let history_len = p.grid.history_len();
+
+        match action {
+            CopyAction::Cancel => unreachable!("handled above"),
+            CopyAction::CursorLeft => cs.cx = cs.cx.saturating_sub(1),
+            CopyAction::CursorRight => cs.cx = (cs.cx + 1).min(cols.saturating_sub(1)),
+            CopyAction::CursorUp => {
+                if cs.cy > 0 {
+                    cs.cy -= 1;
+                } else if cs.scroll < history_len {
+                    cs.scroll += 1;
+                }
+            }
+            CopyAction::CursorDown => {
+                if cs.cy + 1 < rows {
+                    cs.cy += 1;
+                } else if cs.scroll > 0 {
+                    cs.scroll -= 1;
+                }
+            }
+            CopyAction::StartOfLine => cs.cx = 0,
+            CopyAction::EndOfLine => cs.cx = cols.saturating_sub(1),
+            CopyAction::HistoryTop => {
+                cs.scroll = history_len;
+                cs.cy = 0;
+            }
+            CopyAction::HistoryBottom => {
+                cs.scroll = 0;
+                cs.cy = rows.saturating_sub(1);
+            }
+            CopyAction::TopLine => cs.cy = 0,
+            CopyAction::MiddleLine => cs.cy = rows / 2,
+            CopyAction::BottomLine => cs.cy = rows.saturating_sub(1),
+            CopyAction::ScrollUp => cs.scroll = (cs.scroll + 1).min(history_len),
+            CopyAction::ScrollDown => cs.scroll = cs.scroll.saturating_sub(1),
+            CopyAction::HalfpageUp => cs.scroll = (cs.scroll + u32::from(rows / 2).max(1)).min(history_len),
+            CopyAction::HalfpageDown => cs.scroll = cs.scroll.saturating_sub(u32::from(rows / 2).max(1)),
+            CopyAction::PageUp => cs.scroll = (cs.scroll + u32::from(rows)).min(history_len),
+            CopyAction::PageDown => cs.scroll = cs.scroll.saturating_sub(u32::from(rows)),
+            CopyAction::NextWord | CopyAction::PreviousWord | CopyAction::NextWordEnd => {
+                // v1 word motion (documented simplification, design spec's
+                // word-motion note): whitespace-delimited words, no line
+                // wrapping — motion clamps at the current view row's edges
+                // rather than continuing onto the next/previous line.
+                let text = p.grid.view_row_text(cs.scroll, cs.cy);
+                let chars: Vec<char> = text.chars().collect();
+                let n = chars.len();
+                match action {
+                    CopyAction::NextWord => {
+                        let mut i = (cs.cx as usize).min(n);
+                        while i < n && !chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                        while i < n && chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                        cs.cx = i.min(cols.saturating_sub(1) as usize) as u16;
+                    }
+                    CopyAction::PreviousWord => {
+                        let mut i = (cs.cx as usize).min(n);
+                        i = i.saturating_sub(1);
+                        while i > 0 && chars[i].is_whitespace() {
+                            i -= 1;
+                        }
+                        while i > 0 && !chars[i - 1].is_whitespace() {
+                            i -= 1;
+                        }
+                        cs.cx = i as u16;
+                    }
+                    CopyAction::NextWordEnd => {
+                        let mut i = (cs.cx as usize).min(n);
+                        if i < n {
+                            i += 1;
+                        }
+                        while i < n && chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                        while i + 1 < n && !chars[i + 1].is_whitespace() {
+                            i += 1;
+                        }
+                        cs.cx = i.min(n.saturating_sub(1)) as u16;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        ExecOutcome::Ok(String::new())
+    }
+
     fn exec_display_message(&mut self, text: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let fmt = text.unwrap_or_default();
         Ok(self.expand_with_ctx(&fmt, cs))
@@ -1016,6 +1157,8 @@ impl Server {
             HasSession { target } => self.exec_has_session(target),
             KillSession { target } => self.exec_kill_session(target),
             KillServer => self.exec_kill_server(),
+            CopyMode { .. } => Err("no current client".to_string()),
+            CopyCmd(_) => Err("no current client".to_string()),
         }
     }
 
@@ -1143,6 +1286,8 @@ impl Server {
             HasSession { target } => wrap(self.exec_has_session(target)),
             KillSession { target } => wrap(self.exec_kill_session(target)),
             KillServer => wrap(self.exec_kill_server()),
+            CopyMode { page_up, mouse } => self.exec_copy_mode(page_up, mouse, client, session_name),
+            CopyCmd(action) => self.exec_copy_action(action, client),
         }
     }
 
@@ -1170,7 +1315,11 @@ impl Server {
         match client.mode {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
-            ClientMode::Normal => (true, None),
+            // Copy mode (Task 2) never arms raw capture (`set_capture`) —
+            // its keys flow through the normal `KeyInputEvent::Key` path
+            // with a table override (see `handle_stdin`), not `Captured`
+            // bytes. This arm exists only for match-exhaustiveness.
+            ClientMode::Normal | ClientMode::Copy(_) => (true, None),
         }
     }
 
