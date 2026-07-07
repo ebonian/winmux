@@ -243,3 +243,30 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (`docs/specs/2026-07-07-command-config-design.md`'s "Explicit
     deviations from tmux" section) that had not yet been cross-referenced
     here.
+
+## Discovered during sub-project 4 (parity polish)
+
+34. **`Key{code: KeyCode::Space}` is unreachable by a real spacebar
+    keypress** (discovered implementing Task 3, selection + paste buffers).
+    `keys::classify_single_byte` (the live input decoder) only ever produces
+    the `Space` code variant for `Ctrl-Space` (byte `0x00`, explicitly
+    special-cased); an ordinary bare spacebar press (byte `0x20`) decodes to
+    `Key{code: KeyCode::Char(' ')}` instead. `KeyCode::Space` otherwise
+    exists purely for `parse_key("Space")`/`send-keys Space`/`key_name`
+    notation (config files, `list-keys` output), not live keyboard input.
+    Consequence: ANY default or user binding registered via
+    `named("Space")`/`bind ... Space ...` targeting the ROOT, PREFIX, or a
+    copy-mode table is unreachable by an actual spacebar press — confirmed
+    live via Task 2's pre-existing emacs `copy-mode` default `Space →
+    copy-page-down` (`src/bindings.rs`), which is affected but was left
+    AS-IS (out of Task 3's scope). Task 3's OWN `copy-mode-vi` `Space →
+    copy-begin-selection` default was written around this gap from the
+    start (bound under `Char(' ')`, not `named("Space")`), so it works
+    correctly. A real fix belongs in `keys::classify_single_byte` (making a
+    bare `0x20` decode as `KeyCode::Space` instead of `Char(' ')`, or
+    equivalently normalizing `Char(' ')` to `Space` wherever keys are
+    looked up) — deferred since it's a decoder-level change with unknown
+    blast radius across every existing table/test that relies on today's
+    `Char(' ')` semantics for plain-space forwarding to a pane (see
+    `input::is_plain_forwardable`, which currently forwards `Char(' ')` as
+    ordinary typed input — changing the decode would need to preserve that).

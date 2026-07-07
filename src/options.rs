@@ -100,6 +100,8 @@ const SPECS: &[Spec] = &[
     Spec { name: "aggressive-resize", kind: Kind::Flag, choices: &[] },
     // Copy mode (Task 2, sub-project 4).
     Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
+    // Selection + paste buffers (Task 3, sub-project 4).
+    Spec { name: "buffer-limit", kind: Kind::Number, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -178,6 +180,7 @@ fn default_value(name: &str) -> Value {
             let s = "bg=yellow,fg=black";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
+        "buffer-limit" => Value::Number(50),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -412,6 +415,13 @@ impl Options {
     /// position indicator uses this yet; selection highlighting is Task 3).
     pub fn mode_style(&self) -> &PartialStyle {
         self.style_ref("mode-style")
+    }
+
+    /// Max AUTOMATIC paste buffers (Task 3, sub-project 4) before
+    /// `copy-selection-and-cancel`/bare `set-buffer` evicts the oldest;
+    /// manual (`set-buffer -b`) buffers are exempt. tmux default 50.
+    pub fn buffer_limit(&self) -> u32 {
+        self.number("buffer-limit")
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -886,6 +896,14 @@ mod tests {
         assert_eq!(ms.apply_to(crate::grid::Style::default()).bg, crate::grid::Color::Idx(3));
         o.set("mode-keys", Some("vi"), false, false).unwrap();
         assert!(o.mode_keys_vi());
+    }
+
+    #[test]
+    fn buffer_limit_getter() {
+        let mut o = Options::new();
+        assert_eq!(o.buffer_limit(), 50);
+        o.set("buffer-limit", Some("10"), false, false).unwrap();
+        assert_eq!(o.buffer_limit(), 10);
     }
 
     #[test]

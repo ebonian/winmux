@@ -35,9 +35,10 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate, CopyState,
-    PromptKind, Server, MONTHS,
+    key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState, ConfigCandidate,
+    CopyState, PromptKind, SelState, Server, MONTHS,
 };
+use crate::grid::Grid;
 
 /// Abbreviated C-locale English weekday names, indexed by
 /// `SYSTEMTIME::wDayOfWeek` (0 = Sunday .. 6 = Saturday). Duplicated from the
@@ -217,6 +218,83 @@ fn format_ctime(t: SystemTime) -> String {
 
 fn is_bare(raw: &RawCmd, names: &[&str]) -> bool {
     raw.args.is_empty() && names.contains(&raw.name.as_str())
+}
+
+/// Trim a trailing run of blank (space) characters — tmux copy-mode's "don't
+/// carry trailing pad cells into the copied text" rule, applied per extracted
+/// line.
+fn trim_trailing_blanks(s: &str) -> String {
+    s.trim_end_matches(' ').to_string()
+}
+
+/// Extract one selection's text from `grid` (Task 3, sub-project 4): `sel`'s
+/// anchor and the current cursor (`cx`/`cy`/`scroll`) are converted to
+/// `sel_key`-comparable positions so extraction is independent of
+/// `history_len` drift while selecting. Linear (`sel.rect == false`):
+/// reading-order between the two endpoints — a single row is a plain
+/// substring; multiple rows join the first row's tail, every whole row in
+/// between, and the last row's head with `\n` (tmux-style; NOT `\r\n`),
+/// each trailing-blank-trimmed. Rectangle (`sel.rect == true`): every
+/// spanned row's `[min_col..=max_col]` slice, same per-row trimming, `\n`-
+/// joined.
+fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll: u32) -> String {
+    let rows = grid.rows();
+    let anchor_key = sel_key(sel.anchor_scroll, sel.anchor_y);
+    let cursor_key = sel_key(scroll, cy);
+
+    let row_text = |key: i64| -> Vec<char> {
+        let (sb, row) = key_to_view(key, rows);
+        grid.view_row_text(sb, row).chars().collect()
+    };
+
+    if sel.rect {
+        let min_col = sel.anchor_x.min(cx) as usize;
+        let max_col = sel.anchor_x.max(cx) as usize;
+        let (top, bottom) = if anchor_key <= cursor_key { (anchor_key, cursor_key) } else { (cursor_key, anchor_key) };
+        let mut lines = Vec::new();
+        for key in top..=bottom {
+            let chars = row_text(key);
+            let lo = min_col.min(chars.len());
+            let hi = (max_col + 1).min(chars.len());
+            let slice: String = chars[lo..hi].iter().collect();
+            lines.push(trim_trailing_blanks(&slice));
+        }
+        return lines.join("\n");
+    }
+
+    let (start_key, start_col, end_key, end_col) = if (anchor_key, sel.anchor_x) <= (cursor_key, cx) {
+        (anchor_key, sel.anchor_x as usize, cursor_key, cx as usize)
+    } else {
+        (cursor_key, cx as usize, anchor_key, sel.anchor_x as usize)
+    };
+
+    if start_key == end_key {
+        let chars = row_text(start_key);
+        let lo = start_col.min(chars.len());
+        let hi = (end_col + 1).min(chars.len());
+        let slice: String = chars[lo..hi].iter().collect();
+        return trim_trailing_blanks(&slice);
+    }
+
+    let mut lines = Vec::new();
+    {
+        let chars = row_text(start_key);
+        let lo = start_col.min(chars.len());
+        let slice: String = chars[lo..].iter().collect();
+        lines.push(trim_trailing_blanks(&slice));
+    }
+    for key in (start_key + 1)..end_key {
+        let chars = row_text(key);
+        let full: String = chars.iter().collect();
+        lines.push(trim_trailing_blanks(&full));
+    }
+    {
+        let chars = row_text(end_key);
+        let hi = (end_col + 1).min(chars.len());
+        let slice: String = chars[..hi].iter().collect();
+        lines.push(trim_trailing_blanks(&slice));
+    }
+    lines.join("\n")
 }
 
 impl Server {
@@ -656,7 +734,7 @@ impl Server {
         } else {
             (0u32, live_cx, live_cy)
         };
-        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false });
+        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false, sel: None });
         ExecOutcome::Ok(String::new())
     }
 
@@ -768,8 +846,125 @@ impl Server {
                     _ => unreachable!(),
                 }
             }
+            CopyAction::BeginSelection => {
+                cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: cs.cx, anchor_y: cs.cy, rect: false });
+            }
+            CopyAction::RectangleToggle => {
+                // v1 simplification (documented in the design spec): a
+                // no-op with no active selection, rather than tmux's
+                // "sticks for the next selection too" behavior.
+                if let Some(sel) = &mut cs.sel {
+                    sel.rect = !sel.rect;
+                }
+            }
+            CopyAction::OtherEnd => {
+                // No-op with no active selection.
+                if let Some(sel) = cs.sel {
+                    let SelState { anchor_scroll, anchor_x, anchor_y, rect } = sel;
+                    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: cs.cx, anchor_y: cs.cy, rect });
+                    cs.scroll = anchor_scroll;
+                    cs.cx = anchor_x;
+                    cs.cy = anchor_y;
+                }
+            }
+            CopyAction::ClearSelection => {
+                cs.sel = None;
+            }
+            CopyAction::SelectionAndCancel => {
+                let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
+                let text = sel_opt.map(|sel| extract_selection_text(&p.grid, &sel, ccx, ccy, cscroll));
+                client.mode = ClientMode::Normal;
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        let limit = self.options.buffer_limit();
+                        self.buffers.add_automatic(t, limit);
+                    }
+                }
+                return ExecOutcome::Ok(String::new());
+            }
         }
         ExecOutcome::Ok(String::new())
+    }
+
+    // ---- paste buffers (Task 3, sub-project 4) ----
+
+    /// `paste-buffer` (client-aware like `send-keys`: `-t` resolves via
+    /// `resolve_pane_target`, falling back to the acting client's focused
+    /// pane, or erroring headlessly with no `-t`). Default `no_replace ==
+    /// false` replaces every `\n` in the buffer with `\r` before writing —
+    /// tmux's own default (`-r` disables it; see the `ParsedCmd::PasteBuffer`
+    /// doc comment).
+    fn exec_paste_buffer(&mut self, name: Option<String>, target: Option<String>, no_replace: bool, cs: Option<&str>) -> Result<String, String> {
+        let (_session, _wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
+        let data = match &name {
+            Some(n) => self.buffers.get(n).ok_or_else(|| format!("buffer not found: {n}"))?.to_string(),
+            None => self.buffers.newest().map(|(_, d)| d.to_string()).ok_or_else(|| "no buffer".to_string())?,
+        };
+        let bytes = if no_replace { data.into_bytes() } else { data.replace('\n', "\r").into_bytes() };
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            if let Some(pty) = pane.pty.as_mut() {
+                let _ = pty.write_input(&bytes);
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// Full multi-line `list-buffers` text (CLI/headless path): one
+    /// `<name>: <size> bytes: "<sample>"` line per buffer, oldest first.
+    fn list_buffers_text(&self) -> String {
+        self.buffers
+            .list()
+            .into_iter()
+            .map(|(name, size, sample)| format!("{name}: {size} bytes: \"{sample}\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn exec_list_buffers_headless(&mut self) -> Result<String, String> {
+        let s = self.list_buffers_text();
+        Ok(if s.is_empty() { s } else { format!("{s}\n") })
+    }
+
+    /// Dispatched from a CLIENT (key binding or the `:` prompt): a
+    /// documented simplification of tmux's pager -- the first buffer's line
+    /// plus a `(N buffers)` suffix when there's more than one, shown as a
+    /// transient status-line message (which can only ever hold one line).
+    fn exec_list_buffers_client(&mut self) -> ExecOutcome {
+        let list = self.buffers.list();
+        if list.is_empty() {
+            return ExecOutcome::Ok("no buffers".to_string());
+        }
+        let (name, size, sample) = &list[0];
+        let first_line = format!("{name}: {size} bytes: \"{sample}\"");
+        let msg = if list.len() > 1 { format!("{first_line} ({} buffers)", list.len()) } else { first_line };
+        ExecOutcome::Ok(msg)
+    }
+
+    fn exec_delete_buffer(&mut self, name: Option<String>) -> Result<String, String> {
+        match name {
+            Some(n) => {
+                if self.buffers.delete(&n) {
+                    Ok(String::new())
+                } else {
+                    Err(format!("buffer not found: {n}"))
+                }
+            }
+            None => match self.buffers.delete_newest() {
+                Some(_) => Ok(String::new()),
+                None => Err("no buffer".to_string()),
+            },
+        }
+    }
+
+    fn exec_set_buffer(&mut self, name: Option<String>, data: String) -> Result<String, String> {
+        match name {
+            Some(n) => self.buffers.set_named(&n, data),
+            None => {
+                let limit = self.options.buffer_limit();
+                self.buffers.add_automatic(data, limit);
+            }
+        }
+        Ok(String::new())
     }
 
     fn exec_display_message(&mut self, text: Option<String>, cs: Option<&str>) -> Result<String, String> {
@@ -1159,6 +1354,10 @@ impl Server {
             KillServer => self.exec_kill_server(),
             CopyMode { .. } => Err("no current client".to_string()),
             CopyCmd(_) => Err("no current client".to_string()),
+            PasteBuffer { name, target, no_replace } => self.exec_paste_buffer(name, target, no_replace, None),
+            ListBuffers => self.exec_list_buffers_headless(),
+            DeleteBuffer { name } => self.exec_delete_buffer(name),
+            SetBuffer { name, data } => self.exec_set_buffer(name, data),
         }
     }
 
@@ -1288,6 +1487,10 @@ impl Server {
             KillServer => wrap(self.exec_kill_server()),
             CopyMode { page_up, mouse } => self.exec_copy_mode(page_up, mouse, client, session_name),
             CopyCmd(action) => self.exec_copy_action(action, client),
+            PasteBuffer { name, target, no_replace } => wrap(self.exec_paste_buffer(name, target, no_replace, Some(session_name.as_str()))),
+            ListBuffers => self.exec_list_buffers_client(),
+            DeleteBuffer { name } => wrap(self.exec_delete_buffer(name)),
+            SetBuffer { name, data } => wrap(self.exec_set_buffer(name, data)),
         }
     }
 

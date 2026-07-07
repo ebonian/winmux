@@ -210,13 +210,34 @@ pub enum ParsedCmd {
     /// one page immediately (the `PPage` binding). `mouse` (`-e`) is stored
     /// but unused until the mouse task (SP4 §4) wires wheel-triggered entry.
     CopyMode { page_up: bool, mouse: bool },
-    /// One internal `copy-*` movement/scroll/cancel command (Task 2 scope —
-    /// selection/search commands are Tasks 3/4). Dispatched only with an
-    /// acting client currently in `ClientMode::Copy`; see the
-    /// `## copy-mode` contract section. Also reachable via tmux's
-    /// `send-keys -X <name>` spelling (`resolve`'s `send-keys` arm maps the
-    /// `-X` name to this).
+    /// One internal `copy-*` movement/scroll/cancel/selection command (Task
+    /// 2/3 scope). Dispatched only with an acting client currently in
+    /// `ClientMode::Copy`; see the `## copy-mode` contract section. Also
+    /// reachable via tmux's `send-keys -X <name>` spelling (`resolve`'s
+    /// `send-keys` arm maps the `-X` name to this).
     CopyCmd(CopyAction),
+    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3):
+    /// write a buffer's contents to a pane's pty. `name: None` = the newest
+    /// buffer. `no_replace` (`-r`, tmux "do not replace LF with CR") default
+    /// `false` -- the DEFAULT behavior replaces every `\n` in the buffer with
+    /// `\r` before writing (tmux's own default; shells expect `\r` to submit
+    /// a line). `-p` (bracketed-paste passthrough) is accepted and IGNORED
+    /// (v1 simplification, documented in the design spec's deferrals list).
+    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+    /// `list-buffers|lsb` (Task 3): `<name>: <size> bytes: "<sample>"` lines,
+    /// oldest first. Full multi-line text via the CLI/headless path;
+    /// dispatched from a CLIENT (a key binding, or the `:` prompt) instead
+    /// shows just the first line plus a `(N buffers)` suffix as a transient
+    /// message (documented simplification -- tmux shows a pager).
+    ListBuffers,
+    /// `delete-buffer|deleteb [-b name]` (Task 3): `name: None` = the newest
+    /// buffer.
+    DeleteBuffer { name: Option<String> },
+    /// `set-buffer|setb [-b name] data...` (Task 3): `name: None` creates a
+    /// new AUTOMATIC buffer (same `buffer-limit` eviction as
+    /// `copy-selection-and-cancel`); `Some(name)` sets/overwrites a MANUAL
+    /// buffer (exempt from eviction).
+    SetBuffer { name: Option<String>, data: String },
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
@@ -246,6 +267,23 @@ pub enum CopyAction {
     PreviousWord,
     NextWordEnd,
     Cancel,
+    /// Task 3, sub-project 4 (selection): anchor := cursor, starting a new
+    /// linear selection (or restarting one if a selection was already
+    /// active).
+    BeginSelection,
+    /// Toggle rectangle mode on the CURRENT selection; a no-op (v1
+    /// simplification, documented) when there is no active selection --
+    /// tmux additionally sticks the toggled mode for the NEXT selection in
+    /// the same copy-mode session, which winmux does not reproduce.
+    RectangleToggle,
+    /// Swap the anchor and cursor (including each one's own scroll offset).
+    /// A no-op when there is no active selection.
+    OtherEnd,
+    /// Drop the current selection (if any); copy mode itself stays active.
+    ClearSelection,
+    /// Extract the current selection's text (if any) into a new automatic
+    /// paste buffer, then exit copy mode (the "copy" action).
+    SelectionAndCancel,
 }
 
 /// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
@@ -273,6 +311,11 @@ fn copy_action_name(a: CopyAction) -> &'static str {
         CopyAction::PreviousWord => "copy-previous-word",
         CopyAction::NextWordEnd => "copy-next-word-end",
         CopyAction::Cancel => "copy-cancel",
+        CopyAction::BeginSelection => "copy-begin-selection",
+        CopyAction::RectangleToggle => "copy-rectangle-toggle",
+        CopyAction::OtherEnd => "copy-other-end",
+        CopyAction::ClearSelection => "copy-clear-selection",
+        CopyAction::SelectionAndCancel => "copy-selection-and-cancel",
     }
 }
 
@@ -300,6 +343,11 @@ const COPY_ACTIONS: &[CopyAction] = &[
     CopyAction::PreviousWord,
     CopyAction::NextWordEnd,
     CopyAction::Cancel,
+    CopyAction::BeginSelection,
+    CopyAction::RectangleToggle,
+    CopyAction::OtherEnd,
+    CopyAction::ClearSelection,
+    CopyAction::SelectionAndCancel,
 ];
 
 fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
@@ -331,6 +379,14 @@ fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
         "next-word" => CopyAction::NextWord,
         "previous-word" => CopyAction::PreviousWord,
         "next-word-end" => CopyAction::NextWordEnd,
+        "begin-selection" => CopyAction::BeginSelection,
+        "rectangle-toggle" => CopyAction::RectangleToggle,
+        "other-end" => CopyAction::OtherEnd,
+        "clear-selection" => CopyAction::ClearSelection,
+        // tmux's own -X spelling for this one command retains the "copy-"
+        // prefix (unlike every other -X name above) -- verified against
+        // tmux master's `cmd-copy-mode.c`/`window-copy.c` command table.
+        "copy-selection-and-cancel" => CopyAction::SelectionAndCancel,
         _ => return None,
     })
 }
@@ -380,6 +436,10 @@ fn canonical(name: &str) -> Option<&'static str> {
         "has-session" | "has" => "has-session",
         "kill-session" => "kill-session",
         "kill-server" => "kill-server",
+        "paste-buffer" | "pasteb" => "paste-buffer",
+        "list-buffers" | "lsb" => "list-buffers",
+        "delete-buffer" | "deleteb" => "delete-buffer",
+        "set-buffer" | "setb" => "set-buffer",
         _ => return None,
     })
 }
@@ -433,6 +493,10 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "has-session" => "usage: has-session -t target",
         "kill-session" => "usage: kill-session [-t target]",
         "kill-server" => "usage: kill-server",
+        "paste-buffer" => "usage: paste-buffer [-p] [-r] [-b name] [-t target-pane]",
+        "list-buffers" => "usage: list-buffers",
+        "delete-buffer" => "usage: delete-buffer [-b name]",
+        "set-buffer" => "usage: set-buffer [-b name] data",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -901,6 +965,33 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             }
             Ok(ParsedCmd::KillServer)
         }
+        "paste-buffer" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-p", "-r"], &["-b", "-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::PasteBuffer { name: value_of(&v, "-b"), target: value_of(&v, "-t"), no_replace: has(&b, "-r") })
+        }
+        "list-buffers" => {
+            if !raw.args.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ListBuffers)
+        }
+        "delete-buffer" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-b"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::DeleteBuffer { name: value_of(&v, "-b") })
+        }
+        "set-buffer" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-b"]) else { return Err(bad()) };
+            if p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::SetBuffer { name: value_of(&v, "-b"), data: p.join(" ") })
+        }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
 }
@@ -1314,6 +1405,90 @@ mod tests {
             panic!("expected BindKey")
         };
         assert_eq!(table, "copy-mode-vi");
+    }
+
+    // ---- selection + paste buffers (Task 3, sub-project 4) ----
+
+    #[test]
+    fn copy_selection_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-begin-selection", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::BeginSelection));
+        assert_eq!(resolve(&raw("copy-rectangle-toggle", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::RectangleToggle));
+        assert_eq!(resolve(&raw("copy-other-end", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::OtherEnd));
+        assert_eq!(resolve(&raw("copy-clear-selection", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::ClearSelection));
+        assert_eq!(
+            resolve(&raw("copy-selection-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SelectionAndCancel)
+        );
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_selection_names() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "begin-selection"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BeginSelection)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "rectangle-toggle"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::RectangleToggle)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "other-end"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::OtherEnd)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "clear-selection"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::ClearSelection)
+        );
+        // The one -X name that keeps the "copy-" prefix.
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-selection-and-cancel"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SelectionAndCancel)
+        );
+    }
+
+    #[test]
+    fn paste_buffer_flags() {
+        assert_eq!(
+            resolve(&raw("paste-buffer", &[])).unwrap(),
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false }
+        );
+        assert_eq!(
+            resolve(&raw("pasteb", &["-p", "-b", "foo", "-t", "work"])).unwrap(),
+            ParsedCmd::PasteBuffer { name: Some("foo".to_string()), target: Some("work".to_string()), no_replace: false }
+        );
+        assert_eq!(
+            resolve(&raw("paste-buffer", &["-r"])).unwrap(),
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true }
+        );
+        assert_eq!(resolve(&raw("paste-buffer", &["bogus"])).unwrap_err(), usage("paste-buffer").unwrap());
+    }
+
+    #[test]
+    fn list_buffers_takes_no_args() {
+        assert_eq!(resolve(&raw("lsb", &[])).unwrap(), ParsedCmd::ListBuffers);
+        assert_eq!(resolve(&raw("list-buffers", &["x"])).unwrap_err(), usage("list-buffers").unwrap());
+    }
+
+    #[test]
+    fn delete_buffer_flags() {
+        assert_eq!(resolve(&raw("deleteb", &[])).unwrap(), ParsedCmd::DeleteBuffer { name: None });
+        assert_eq!(
+            resolve(&raw("delete-buffer", &["-b", "foo"])).unwrap(),
+            ParsedCmd::DeleteBuffer { name: Some("foo".to_string()) }
+        );
+    }
+
+    #[test]
+    fn set_buffer_flags_and_requires_data() {
+        assert_eq!(
+            resolve(&raw("setb", &["hello", "world"])).unwrap(),
+            ParsedCmd::SetBuffer { name: None, data: "hello world".to_string() }
+        );
+        assert_eq!(
+            resolve(&raw("set-buffer", &["-b", "foo", "hi"])).unwrap(),
+            ParsedCmd::SetBuffer { name: Some("foo".to_string()), data: "hi".to_string() }
+        );
+        assert_eq!(resolve(&raw("set-buffer", &["-b", "foo"])).unwrap_err(), usage("set-buffer").unwrap());
     }
 
     #[test]

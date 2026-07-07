@@ -141,6 +141,15 @@ impl Default for Bindings {
         b(char_key('['), vec![cmd1("copy-mode", &[])], false);
         b(named("PPage"), vec![cmd1("copy-mode", &["-u"])], false);
 
+        // Paste buffers (Task 3, sub-project 4): `]` paste (bracketed-paste
+        // flag accepted-ignored, see the `## buffers` contract section),
+        // `#` list (a binding shows a one-line summary, not the full
+        // multi-line CLI output -- see `exec_list_buffers`), `-` delete the
+        // newest buffer.
+        b(char_key(']'), vec![cmd1("paste-buffer", &["-p"])], false);
+        b(char_key('#'), vec![cmd1("list-buffers", &[])], false);
+        b(char_key('-'), vec![cmd1("delete-buffer", &[])], false);
+
         Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
@@ -182,13 +191,20 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(char_key('q'), "copy-cancel", &[]);
     b(named("Escape"), "copy-cancel", &[]);
 
+    // Selection (Task 3, sub-project 4).
+    b(named("C-Space"), "copy-begin-selection", &[]);
+    b(named("C-w"), "copy-selection-and-cancel", &[]);
+    b(named("M-w"), "copy-selection-and-cancel", &[]);
+    b(char_key('R'), "copy-rectangle-toggle", &[]);
+    b(named("C-g"), "copy-clear-selection", &[]);
+    b(char_key('o'), "copy-other-end", &[]);
+
     t
 }
 
-/// Default `copy-mode-vi` table: movement/scroll/cancel subset only (Task 2
-/// scope). `Escape` is deliberately left UNBOUND (tmux vi-table `Escape` is
-/// `clear-selection`, Task 3 — until then an unbound key in a copy table
-/// swallows, i.e. a documented no-op).
+/// Default `copy-mode-vi` table: movement/scroll/cancel subset (Task 2) plus
+/// selection (Task 3, sub-project 4): `Escape` -- left UNBOUND through Task
+/// 2 -- is now bound to `clear-selection`, matching tmux.
 fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     let mut t: HashMap<Key, Binding> = HashMap::new();
     let mut b = |k: Key, name: &str, args: &[&str]| {
@@ -232,6 +248,22 @@ fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     b(named("NPage"), "copy-page-down", &[]);
 
     b(char_key('q'), "copy-cancel", &[]);
+
+    // Selection (Task 3, sub-project 4). NOTE: a real spacebar press decodes
+    // as `Key{Char(' ')}`, NEVER `Key{code: KeyCode::Space}` -- the decoder
+    // only ever produces the `Space` code variant for `Ctrl-Space` (byte
+    // 0x00, see `keys::classify_single_byte`); `KeyCode::Space` otherwise
+    // exists purely for `parse_key("Space")`/`send-keys Space` notation. So
+    // this binds the literal space CHARACTER, matching what a keypress
+    // actually decodes to (the same latent gap affects the pre-existing
+    // Task 2 emacs `Space -> copy-page-down` default, which is therefore
+    // ALSO unreachable by a real spacebar press -- left as-is here since
+    // fixing it is out of this task's scope; noted in the report).
+    b(char_key(' '), "copy-begin-selection", &[]);
+    b(char_key('v'), "copy-rectangle-toggle", &[]);
+    b(named("Enter"), "copy-selection-and-cancel", &[]);
+    b(named("Escape"), "copy-clear-selection", &[]);
+    b(char_key('o'), "copy-other-end", &[]);
 
     t
 }
@@ -375,6 +407,9 @@ mod tests {
             (":", "command-prompt", &[], false),
             ("[", "copy-mode", &[], false),
             ("PPage", "copy-mode", &["-u"], false),
+            ("]", "paste-buffer", &["-p"], false),
+            ("#", "list-buffers", &[], false),
+            ("-", "delete-buffer", &[], false),
         ];
 
         for (k, name, args, repeat) in expected {
@@ -458,6 +493,12 @@ mod tests {
             ("Space", "copy-page-down", &[]),
             ("q", "copy-cancel", &[]),
             ("Escape", "copy-cancel", &[]),
+            ("C-Space", "copy-begin-selection", &[]),
+            ("C-w", "copy-selection-and-cancel", &[]),
+            ("M-w", "copy-selection-and-cancel", &[]),
+            ("R", "copy-rectangle-toggle", &[]),
+            ("C-g", "copy-clear-selection", &[]),
+            ("o", "copy-other-end", &[]),
         ];
         for (k, name, args) in expected {
             let binding = b
@@ -506,6 +547,11 @@ mod tests {
             ("PPage", "copy-page-up", &[]),
             ("NPage", "copy-page-down", &[]),
             ("q", "copy-cancel", &[]),
+            (" ", "copy-begin-selection", &[]),
+            ("v", "copy-rectangle-toggle", &[]),
+            ("Enter", "copy-selection-and-cancel", &[]),
+            ("Escape", "copy-clear-selection", &[]),
+            ("o", "copy-other-end", &[]),
         ];
         for (k, name, args) in expected {
             let binding = b
@@ -518,8 +564,6 @@ mod tests {
             );
         }
         assert_eq!(b.copy_mode_vi.len(), expected.len());
-        // Escape is deliberately unbound in vi (swallow-as-no-op).
-        assert!(b.lookup(WhichTable::CopyModeVi, &key("Escape")).is_none());
     }
 
     #[test]

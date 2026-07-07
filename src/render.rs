@@ -7,10 +7,22 @@ use crate::layout::PaneId;
 /// `cell` when this is `Some`, a `[scroll/history_len]` position indicator is
 /// painted right-aligned on the pane's top row in `Scene::mode_style`, and
 /// `cursor` (view coordinates) replaces the pane's live cursor for terminal
-/// cursor placement. Selection highlighting (`sel_cells`) is Task 3.
+/// cursor placement.
 pub struct CopyView {
     pub scroll: u32,
     pub cursor: (u16, u16),
+    /// Selection highlight (Task 3, sub-project 4), precomputed by the
+    /// SERVER in VIEW coordinates (`start_col, start_row, end_col, end_row,
+    /// rect`) and already clamped into the visible pane rect -- `None` when
+    /// there is no active selection, or the selection is wholly scrolled out
+    /// of the current view. Linear (`rect == false`): `start_row`'s
+    /// highlighted run is `start_col..`, `end_row`'s is `..=end_col`, every
+    /// row strictly between is fully highlighted (standard "line-wrap"
+    /// selection painting) -- a caller that clamped an off-screen endpoint
+    /// widens `start_col`/`end_col` to 0/`cols-1` so this rule still paints
+    /// correctly at the clamped edge. Rectangle (`rect == true`): every row
+    /// in `start_row..=end_row` highlights exactly `start_col..=end_col`.
+    pub sel: Option<(u16, u16, u16, u16, bool)>,
 }
 
 pub struct PaneView<'a> {
@@ -136,6 +148,42 @@ impl Renderer {
                         };
                         self.set(x, y, cell);
                     }
+                }
+            }
+        }
+
+        // 1a) copy-mode selection highlight (Task 3, sub-project 4):
+        // `mode_style`'s fg/bg painted ON TOP of whatever pass 1 already put
+        // there (character and every OTHER style attribute -- bold,
+        // underline, etc. -- preserved), for every cell inside the
+        // precomputed (already view-clamped) selection rect.
+        for pv in &scene.panes {
+            let Some(cv) = &pv.copy else { continue };
+            let Some((sc, sr, ec, er, rect)) = cv.sel else { continue };
+            let r = pv.rect;
+            for dy in sr..=er.min(r.h.saturating_sub(1)) {
+                let y = r.y + dy;
+                if !in_band(y) || dy >= pv.grid.rows() {
+                    continue;
+                }
+                let (row_lo, row_hi) = if rect || (dy == sr && dy == er) {
+                    (sc, ec)
+                } else if dy == sr {
+                    (sc, r.w.saturating_sub(1))
+                } else if dy == er {
+                    (0, ec)
+                } else {
+                    (0, r.w.saturating_sub(1))
+                };
+                for dx in row_lo..=row_hi.min(r.w.saturating_sub(1)) {
+                    let x = r.x + dx;
+                    if x >= cols || dx >= pv.grid.cols() {
+                        continue;
+                    }
+                    let idx = y as usize * cols as usize + x as usize;
+                    let existing = self.back[idx];
+                    let style = Style { fg: scene.mode_style.fg, bg: scene.mode_style.bg, ..existing.style };
+                    self.set(x, y, Cell { ch: existing.ch, style });
                 }
             }
         }

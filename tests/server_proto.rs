@@ -2238,3 +2238,285 @@ fn copy_mode_pane_death_cancels() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+// ---- selection + paste buffers (Task 3, sub-project 4) ----
+
+#[test]
+fn copy_selection_to_buffer_and_paste() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+    let baseline = screen_text(&grid).iter().filter(|l| l.contains("hello123")).count();
+
+    // Enter copy mode, move to the start of the "hello123" line.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    let mut moves = vec![b'0'];
+    moves.extend(std::iter::repeat_n(b'k', (entry_row - target_row) as usize));
+    c.send(&ClientMsg::Stdin(moves));
+    c.recv_output_until(&mut grid, |g| g.cursor().1 == target_row);
+
+    // Select the whole line (Space=begin-selection, $=end-of-line -- trailing
+    // blanks get trimmed at extraction time) and copy (Enter).
+    c.send(&ClientMsg::Stdin(b" $\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert!(out.contains("buffer0: 8 bytes: \"hello123\""), "unexpected list-buffers output: {out:?}");
+
+    // `\x02]` (prefix `]`) pastes the newest buffer into the shell -- the
+    // paste has no embedded newline, so it lands as unsubmitted text on the
+    // current prompt line: one more line now contains "hello123" than before.
+    c.send(&ClientMsg::Stdin(vec![0x02, b']']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().filter(|l| l.contains("hello123")).count() > baseline);
+
+    // The pasted text is now pending, unsubmitted input on the prompt line
+    // (no shell-specific line-editing assumptions needed for cleanup): kill
+    // the server directly.
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn rectangle_selection() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // One command, three consecutive output lines (no prompt lines between
+    // them), so a rectangle spanning all three rows is unambiguous.
+    c.send(&ClientMsg::Stdin(b"Write-Output \"ABCDEF`nGHIJKL`nMNOPQR\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "MNOPQR"));
+    let top_row = screen_text(&grid).iter().position(|l| l.trim_end() == "ABCDEF").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+
+    // Move to (col 1, top_row): `0` then `l` (col 0 -> col 1), then `k` up to
+    // the top row.
+    let mut moves = vec![b'0', b'l'];
+    moves.extend(std::iter::repeat_n(b'k', (entry_row - top_row) as usize));
+    c.send(&ClientMsg::Stdin(moves));
+    c.recv_output_until(&mut grid, |g| g.cursor().1 == top_row && g.cursor().0 == 1);
+
+    // Begin a selection, toggle rectangle, then extend down 2 rows and right
+    // 2 columns (cols 1..=3): rows "ABCDEF"/"GHIJKL"/"MNOPQR" -> "BCD"/"HIJ"/"NOP".
+    c.send(&ClientMsg::Stdin(b" v".to_vec()));
+    c.send(&ClientMsg::Stdin(b"jjll".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor().1 == top_row + 2 && g.cursor().0 == 3);
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    // 11 bytes = "BCD\nHIJ\nNOP"; the sample sanitizes control chars
+    // (including embedded `\n`) to `?`.
+    assert!(out.contains("buffer0: 11 bytes: \"BCD?HIJ?NOP\""), "unexpected list-buffers output: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn selection_highlight_styled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    let row = grid.cursor().1;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Emacs defaults: C-a start-of-line, C-Space begin-selection, C-f x3
+    // cursor-right -> selection spans view columns 0..=3.
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a
+    c.send(&ClientMsg::Stdin(vec![0x00])); // C-Space
+    c.send(&ClientMsg::Stdin(vec![0x06, 0x06, 0x06])); // C-f C-f C-f
+    c.recv_output_until(&mut grid, |g| {
+        g.cell(3, row).style.bg == Color::Idx(3) && g.cell(3, row).style.fg == Color::Idx(0)
+    });
+
+    // Column 0..=3 highlighted in mode-style (default bg=yellow fg=black);
+    // column 4 (just past the selection) is untouched.
+    for x in 0..=3u16 {
+        assert_eq!(grid.cell(x, row).style.bg, Color::Idx(3), "col {x} should be highlighted");
+        assert_eq!(grid.cell(x, row).style.fg, Color::Idx(0), "col {x} should be highlighted");
+    }
+    assert_ne!(grid.cell(4, row).style.bg, Color::Idx(3), "col 4 must be outside the selection");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn other_end_swaps() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    let row = grid.cursor().1;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Anchor at col 0, cursor extended to col 3.
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line
+    c.send(&ClientMsg::Stdin(vec![0x00])); // C-Space: begin-selection (anchor = col 0)
+    c.send(&ClientMsg::Stdin(vec![0x06, 0x06, 0x06])); // C-f x3: cursor -> col 3
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, row));
+
+    // `o` (other-end): the LIVE cursor jumps back to the former anchor (col
+    // 0) -- proof the anchor/cursor actually swapped, not a no-op.
+    c.send(&ClientMsg::Stdin(b"o".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, row));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn clear_selection_keeps_mode() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    let row = grid.cursor().1;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a
+    c.send(&ClientMsg::Stdin(vec![0x00])); // C-Space: begin-selection
+    c.send(&ClientMsg::Stdin(vec![0x06, 0x06, 0x06])); // C-f x3
+    c.recv_output_until(&mut grid, |g| g.cell(3, row).style.bg == Color::Idx(3));
+
+    // C-g: clear-selection. The highlight disappears but copy mode itself
+    // (the position indicator) stays up -- this command does NOT cancel.
+    c.send(&ClientMsg::Stdin(vec![0x07]));
+    c.recv_output_until(&mut grid, |g| g.cell(3, row).style.bg != Color::Idx(3));
+    assert!(has_indicator(&grid, "[0/"), "copy mode must still be active after clear-selection");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn list_buffers_format() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "hello world".into()]));
+    expect_cli_done(&cli, 0);
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert_eq!(out, "buffer0: 11 bytes: \"hello world\"\n");
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn delete_buffer_newest() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "first".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["set-buffer".into(), "second".into()]));
+    expect_cli_done(&cli2, 0);
+
+    // No `-b`: deletes the NEWEST (buffer1, "second"), leaving buffer0.
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["delete-buffer".into()]));
+    expect_cli_done(&cli3, 0);
+
+    let mut cli4 = cli_client(&name);
+    cli4.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli4, 0);
+    assert_eq!(out, "buffer0: 5 bytes: \"first\"\n");
+
+    // Deleting an unknown named buffer is an error.
+    let mut cli5 = cli_client(&name);
+    cli5.send(&ClientMsg::Cli(vec!["delete-buffer".into(), "-b".into(), "nope".into()]));
+    let (_, err) = expect_cli_done(&cli5, 1);
+    assert_eq!(err, "buffer not found: nope");
+
+    let mut cli6 = cli_client(&name);
+    cli6.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli6, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn set_buffer_named_exempt_from_eviction() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "buffer-limit".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["set-buffer".into(), "-b".into(), "keepme".into(), "important".into()]));
+    expect_cli_done(&cli2, 0);
+
+    // Two automatic buffers, limit 1: the first automatic is evicted, but
+    // the manual "keepme" buffer must survive regardless.
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["set-buffer".into(), "auto-one".into()]));
+    expect_cli_done(&cli3, 0);
+    let mut cli4 = cli_client(&name);
+    cli4.send(&ClientMsg::Cli(vec!["set-buffer".into(), "auto-two".into()]));
+    expect_cli_done(&cli4, 0);
+
+    let mut cli5 = cli_client(&name);
+    cli5.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli5, 0);
+    assert!(out.contains("keepme: 9 bytes: \"important\""), "manual buffer must survive: {out:?}");
+    assert!(out.contains("auto-two"), "newest automatic buffer must survive: {out:?}");
+    assert!(!out.contains("auto-one"), "oldest automatic buffer must be evicted: {out:?}");
+
+    let mut cli6 = cli_client(&name);
+    cli6.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli6, 0);
+    server.join().expect("server exits after kill-server");
+}

@@ -148,13 +148,14 @@ row `index - history_len`.
   (no scrollback needed — these tests decode client/server output, not
   scrollback UI, which is a later SP4 task).
 
-## `copy-mode` — scrollback navigation core (Task 2)
+## `copy-mode` — scrollback navigation core (Task 2) + selection & paste buffers (Task 3)
 
 Implements the design spec's `## 2. Copy mode` movement/scroll/cancel
-subset ONLY — selection (`copy-begin-selection`, `copy-rectangle-toggle`,
-`copy-selection-and-cancel`, `copy-other-end`, `copy-clear-selection`) and
-search (`copy-search-*`) are explicitly OUT of scope (Tasks 3/4) and neither
-their `ParsedCmd`/`CopyAction` variants nor their bindings exist yet.
+subset (Task 2) PLUS selection (`copy-begin-selection`,
+`copy-rectangle-toggle`, `copy-other-end`, `copy-clear-selection`,
+`copy-selection-and-cancel`) and tmux paste buffers (Task 3, sub-project 4,
+`## buffers` section below). Search (`copy-search-*`) remains OUT of scope
+(Task 4) — no `ParsedCmd`/`CopyAction` variants or bindings exist for it yet.
 
 ### `input` amendment
 
@@ -200,8 +201,17 @@ Default `copy-mode` (emacs) table — movement/scroll/cancel subset only:
 
 `H`/`M`/`L` (top/middle/bottom-line) are NOT bound in the emacs table — the
 design spec flags them "unverified" for emacs; bound in vi only (documented
-deviation). Selection/search bindings (`C-Space`, `C-w`/`M-w`, `C-g`,
-`C-s`/`C-r`, `n`/`N`, `R`, `o`) are Tasks 3/4 and absent.
+deviation). Search bindings (`C-s`/`C-r`, `n`/`N`) are Task 4 and absent.
+
+**Task 3 amendment** — selection, added to the emacs table:
+
+| Key(s) | Command |
+|---|---|
+| `C-Space` | `copy-begin-selection` |
+| `C-w`, `M-w` | `copy-selection-and-cancel` |
+| `R` | `copy-rectangle-toggle` |
+| `C-g` | `copy-clear-selection` |
+| `o` | `copy-other-end` |
 
 Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 
@@ -218,10 +228,31 @@ Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 | `C-f`/`NPage` | `copy-page-down` |
 | `q` | `copy-cancel` |
 
-`Escape` is deliberately UNBOUND in vi (tmux binds it to `clear-selection`,
-Task 3; until then an unbound copy-table key swallows — a documented no-op).
-`Space`/`v`/`Enter`/`/`/`?`/`n`/`N`/`o` (selection/search) are Tasks 3/4 and
-absent.
+`/`/`?`/`n`/`N` (search) are Task 4 and absent.
+
+**Task 3 amendment** — selection, added to the vi table (`Escape`, left
+UNBOUND through Task 2, is now bound):
+
+| Key(s) | Command |
+|---|---|
+| `Space` (the literal space CHARACTER — see the gotcha below) | `copy-begin-selection` |
+| `v` | `copy-rectangle-toggle` |
+| `Enter` | `copy-selection-and-cancel` |
+| `Escape` | `copy-clear-selection` |
+| `o` | `copy-other-end` |
+
+**Gotcha (discovered implementing this task, applies to both tables):** the
+live decoder (`keys::classify_single_byte`) NEVER produces
+`Key{code: KeyCode::Space}` for an actual spacebar press — byte `0x20`
+decodes to `Key{code: KeyCode::Char(' ')}`; the `Space` code variant is only
+ever produced for `Ctrl-Space` (byte `0x00`, explicitly special-cased) and
+otherwise exists purely for `parse_key("Space")`/`send-keys Space` notation.
+The vi table's `Space` binding above is therefore registered under
+`Char(' ')`, NOT `named("Space")`, so a real keypress actually reaches it.
+This means the PRE-EXISTING Task 2 emacs default `Space → copy-page-down`
+(registered under `named("Space")`, unchanged by this task) is itself
+unreachable by a literal spacebar press — a latent bug, left as-is here
+(out of this task's scope; flagged in `docs/follow-ups.md`).
 
 ### `cmd` amendment
 
@@ -243,6 +274,8 @@ pub enum CopyAction {
     PageUp, PageDown,
     NextWord, PreviousWord, NextWordEnd,
     Cancel,
+    // Task 3 additions (selection):
+    BeginSelection, RectangleToggle, OtherEnd, ClearSelection, SelectionAndCancel,
 }
 ```
 
@@ -251,7 +284,9 @@ normally). Each `CopyAction` also has its own canonical command name
 (`copy-cursor-left`, `copy-cancel`, ...) — INTERNAL (bindable/resolvable, but
 not part of the discoverable "did you mean" surface; `usage()` returns a
 generic `"usage: copy-<action> (no arguments)"` for all of them) — taking no
-arguments.
+arguments. The Task 3 additions' canonical names are `copy-begin-selection`,
+`copy-rectangle-toggle`, `copy-other-end`, `copy-clear-selection`,
+`copy-selection-and-cancel`.
 
 `send-keys` gains `-X <name>`: when present, `resolve` maps `<name>` (tmux's
 copy-mode command spelling, e.g. `cancel`, `cursor-left`, `history-top`) via
@@ -261,6 +296,15 @@ Whether the acting client is actually in copy mode is a DISPATCH-time
 concern, not `resolve`'s: `exec_copy_action` returns `Err("not in a
 mode")` when it isn't (tmux's own wording), covering `send-keys -X` used
 outside copy mode identically to a directly-bound `copy-*` command.
+
+**Task 3 amendment** — the `-X` name table grows: `begin-selection`,
+`rectangle-toggle`, `other-end`, `clear-selection` map onto their
+same-named `CopyAction`s (tmux drops the `copy-` prefix for `-X`, as with
+every Task 2 name); `copy-selection-and-cancel` is the ONE exception that
+KEEPS the `copy-` prefix in its `-X` spelling too (verified against tmux
+master's `window-copy.c` command table) — `resolve` maps the literal string
+`"copy-selection-and-cancel"` (not `"selection-and-cancel"`) to
+`CopyAction::SelectionAndCancel`.
 
 `bind-key`/`unbind-key -T` accepts `"copy-mode"`/`"copy-mode-vi"` (see the
 `bindings` amendment above).
@@ -274,6 +318,13 @@ pub fn mode_style(&self) -> &PartialStyle;
 pub fn mode_keys_vi(&self) -> bool; // true iff mode-keys == "vi"
 ```
 
+**Task 3 amendment** — adds `buffer-limit` (`Number`, default `50`; see the
+`## buffers` section) and its getter:
+
+```rust
+pub fn buffer_limit(&self) -> u32;
+```
+
 ### `server`/`server::dispatch` amendment
 
 `ClientMode` gains `Copy(CopyState)`:
@@ -285,6 +336,19 @@ struct CopyState {
     cx: u16,       // view-coordinate cursor column
     cy: u16,       // view-coordinate cursor row
     scroll_exit: bool, // placeholder for the mouse task; unused in Task 2
+    sel: Option<SelState>, // Task 3: the active selection, if any
+}
+
+/// Task 3 addition. The anchor is stored with ITS OWN scroll offset
+/// (independent of `CopyState::scroll`) so scrolling the view keeps the
+/// anchor pinned to the same absolute grid line; the anchor's and cursor's
+/// absolute positions are compared/recomputed via `sel_key` at use time
+/// (render precompute, text extraction), never cached.
+struct SelState {
+    anchor_scroll: u32,
+    anchor_x: u16,
+    anchor_y: u16,
+    rect: bool, // rectangle (column bounding-box) vs. linear (reading-order)
 }
 ```
 
@@ -345,19 +409,81 @@ Called from the same two sites as `cancel_stale_confirms`: `handle_exited`
 (natural pane exit) and once per `Stdin` frame at the tail of `handle_stdin`
 (after the client is back in `self.clients`).
 
+**Task 3 amendment — selection commands** (`exec_copy_action`, same
+`Err("not in a mode")`-outside-copy-mode rule as every other `CopyAction`):
+
+- `BeginSelection`: `cs.sel = Some(SelState{anchor_scroll: cs.scroll,
+  anchor_x: cs.cx, anchor_y: cs.cy, rect: false})` — always starts a NEW
+  linear selection anchored at the current cursor (restarts one if already
+  selecting).
+- `RectangleToggle`: `sel.rect = !sel.rect` if `cs.sel.is_some()`, else a
+  no-op (v1 simplification, documented deviation from tmux's "sticks for the
+  next selection too").
+- `OtherEnd`: swaps `(cs.scroll, cs.cx, cs.cy)` with the SelState's
+  `(anchor_scroll, anchor_x, anchor_y)` if a selection is active, else a
+  no-op.
+- `ClearSelection`: `cs.sel = None`. Copy mode itself stays active (does
+  NOT reset `client.mode`).
+- `SelectionAndCancel`: if `cs.sel` is `Some`, extracts its text (below) via
+  `extract_selection_text`; if the extracted text is non-empty, inserts it
+  as a new automatic buffer (`self.buffers.add_automatic(text,
+  self.options.buffer_limit())`); either way sets `client.mode =
+  ClientMode::Normal` (exits copy mode) — matching the `Cancel` action's
+  established "read `cs`'s Copy fields into locals before reassigning
+  `client.mode`" NLL pattern.
+
+**Task 3 amendment — position/ordering key** (`sel_key`, `key_to_view`,
+`compute_sel_view`, private `fn`s in `src/server.rs`, used by both
+`server::dispatch`'s extraction and `render_one`'s precompute below):
+`sel_key(scroll, row) = row as i64 - scroll as i64` is a `history_len`-
+independent ordering/delta key — for two positions under the SAME (or
+different) scroll offsets, comparing their keys reproduces comparing their
+absolute grid-line indices (the `history_len` term cancels out of the
+difference), and `key + new_scroll` gives that same absolute position's view
+row under a DIFFERENT scroll offset. `key_to_view(key, rows)` is the
+inverse: the `(scroll_back, row)` pair to pass to `Grid::view_row_text`/
+`view_cell` that reproduces `key` in view coordinates (`Grid` clamps
+`scroll_back` to its actual `history_len` internally, so an over-large value
+is harmless).
+
+**Task 3 amendment — text extraction** (`extract_selection_text` in
+`src/server/dispatch.rs`, a free `fn(grid: &Grid, sel: &SelState, cx: u16,
+cy: u16, scroll: u32) -> String`): anchor and cursor positions are converted
+to `sel_key`-comparable values so extraction is independent of `history_len`
+drift while selecting.
+- Linear (`sel.rect == false`): reading order between the two endpoints
+  (whichever of anchor/cursor sorts first by `(key, col)`). A single-row
+  selection is a plain `[start_col..=end_col]` substring. A multi-row
+  selection joins the first row's `[start_col..]` tail, every whole row
+  strictly between, and the last row's `[..=end_col]` head, with `\n`
+  (never `\r\n`) — each line trailing-blank-trimmed (`trim_end_matches('
+  ')`) independently.
+- Rectangle (`sel.rect == true`): every row from `min(anchor_key,
+  cursor_key)` to `max(...)` inclusive, each sliced to
+  `[min_col..=max_col]` (columns from `min`/`max` of the anchor's and
+  cursor's `x`, NOT sorted by which is anchor), same per-row trimming,
+  `\n`-joined.
+
 ### `render` amendment
 
 ```rust
-pub struct CopyView { pub scroll: u32, pub cursor: (u16, u16) }
+pub struct CopyView {
+    pub scroll: u32,
+    pub cursor: (u16, u16),
+    // Task 3: precomputed by the server in VIEW coordinates, already
+    // clamped into the pane's visible rows/cols; None = no active
+    // selection, or it's wholly scrolled out of the current view.
+    pub sel: Option<(u16, u16, u16, u16, bool)>, // (start_col, start_row, end_col, end_row, rect)
+}
 
 pub struct PaneView<'a> {
     // ...unchanged fields...
-    pub copy: Option<CopyView>,  // NEW
+    pub copy: Option<CopyView>,  // NEW (Task 2)
 }
 
 pub struct Scene<'a> {
     // ...unchanged fields...
-    pub mode_style: Style,  // NEW
+    pub mode_style: Style,  // NEW (Task 2)
 }
 ```
 
@@ -369,9 +495,141 @@ pub struct Scene<'a> {
 is wider than the pane. `history_len` comes from `pv.grid.history_len()` —
 no separate field needed.
 
+**Task 3 amendment — pass 1a, selection highlight** (runs BEFORE pass 1b,
+so the position indicator paints on top of a highlighted cell if they
+overlap): for every pane with `copy.sel == Some((sc, sr, ec, er, rect))`,
+every cell in the shape below gets `scene.mode_style`'s `fg`/`bg` painted
+ON TOP of whatever pass 1 already wrote there — the character and every
+OTHER style attribute (bold, underline, ...) from pass 1 are PRESERVED, only
+`fg`/`bg` are overridden. Shape: for `rect == true`, every row `sr..=er`
+highlights `sc..=ec`. For `rect == false` (linear): row `sr` (if `sr != er`)
+highlights `sc..`, row `er` (if `sr != er`) highlights `..=ec`, every row
+strictly between highlights the full pane width, and if `sr == er` the
+single row highlights exactly `sc..=ec`. (A `compute_sel_view`-clamped
+endpoint whose true row is off-screen already arrives with `sc`/`ec` widened
+to 0/`cols-1`, so this same shape logic paints it correctly as a full-width
+"middle" row — see `compute_sel_view`'s doc comment in `src/server.rs`.)
+
 `server::render_one`: when `client.mode` is `Copy(cs)`, the `PaneView` whose
 `id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, cursor: (cs.cx,
-cs.cy)})` (every other pane, including a DIFFERENT client's focused/zoomed
-pane, renders live as before); the terminal cursor is placed at
-`cs.pane`'s rect origin + `(cs.cx, cs.cy)` (clamped into the rect) instead of
-the focused pane's live cursor, visible whenever there's no overlay message.
+cs.cy), sel: cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
+cs.cy, cs.scroll, rect.h, rect.w))})` (every other pane, including a
+DIFFERENT client's focused/zoomed pane, renders live as before); the
+terminal cursor is placed at `cs.pane`'s rect origin + `(cs.cx, cs.cy)`
+(clamped into the rect) instead of the focused pane's live cursor, visible
+whenever there's no overlay message.
+
+## `buffers` — tmux paste buffers (Task 3)
+
+New module, `src/buffers.rs`. Pure (no I/O). Insertion-ordered storage
+(oldest first, newest last); `list()`'s row order is this same order.
+
+```rust
+pub struct Buffers { /* private */ }
+
+impl Buffers {
+    pub fn new() -> Self;
+
+    /// Insert a new AUTOMATIC buffer named `buffer<N>` from a counter that
+    /// NEVER resets (a deleted `buffer3` is never reused), evicting the
+    /// oldest AUTOMATIC entries first so the automatic count stays under
+    /// `limit` -- eviction happens BEFORE the insert, so the just-inserted
+    /// buffer always survives even when `limit` is reached exactly. Manual
+    /// (`set_named`) entries are NEVER evicted, regardless of `limit`.
+    /// Returns the new buffer's name.
+    pub fn add_automatic(&mut self, data: String, limit: u32) -> String;
+
+    /// Insert or overwrite a MANUAL, named buffer -- exempt from
+    /// `buffer-limit` eviction. Overwriting an existing name (automatic or
+    /// manual) replaces its data and marks it manual.
+    pub fn set_named(&mut self, name: &str, data: String);
+
+    pub fn get(&self, name: &str) -> Option<&str>;
+    /// The most recently inserted buffer (by any of the three insert paths)
+    /// -- `paste-buffer`'s default target. `None` when empty.
+    pub fn newest(&self) -> Option<(&str, &str)>;
+    /// `true` if a buffer with that name existed and was removed.
+    pub fn delete(&mut self, name: &str) -> bool;
+    /// Remove and return the name of the newest buffer. `None` when empty.
+    pub fn delete_newest(&mut self) -> Option<String>;
+    /// `(name, size_in_bytes, sample)` per buffer, oldest first. `sample` is
+    /// the first 200 `char`s with every control character (INCLUDING `\n`
+    /// -- `char::is_control()` classifies it as one) replaced by `?`.
+    pub fn list(&self) -> Vec<(String, usize, String)>;
+}
+```
+
+**Deviation from the task brief's sketch**: `add_automatic` takes an
+explicit `limit: u32` parameter (the brief's pseudocode omitted it). Since
+`buffer-limit` eviction must happen somewhere with knowledge of the current
+option value, and `Buffers` itself is deliberately option-registry-agnostic
+(pure, no dependency on `crate::options`), the caller (`server::dispatch`)
+passes `self.options.buffer_limit()` at each call site instead of `Buffers`
+reading it from a stored config. This keeps `Buffers` unit-testable with
+arbitrary limits per call (see `src/buffers.rs`'s own tests) without a
+mutable "current limit" field to keep in sync with `set -g buffer-limit`.
+
+### `options` amendment
+
+`buffer-limit` (`Number`, default `50`) + `pub fn buffer_limit(&self) ->
+u32` getter — see the `## copy-mode` section's `options amendment` above.
+
+### `cmd` amendment
+
+`ParsedCmd` gains:
+
+```rust
+PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+ListBuffers,
+DeleteBuffer { name: Option<String> },
+SetBuffer { name: Option<String>, data: String },
+```
+
+- `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]`: `name: None` =
+  newest buffer; `target: None` resolves via the same `resolve_pane_target`
+  grammar `send-keys` uses (acting client's focused pane, or a headless
+  error with no `-t`). `no_replace` is `-r`'s value: DEFAULT (`false`)
+  replaces every `\n` in the buffer with `\r` before writing to the pane's
+  pty (tmux's own default -- tmux's `-r` flag means "do NOT replace LF with
+  CR"; verified against tmux master's `paste.c`). `-p` (bracketed-paste
+  passthrough) is accepted and IGNORED -- v1 simplification, documented in
+  the design spec's deferrals list.
+- `list-buffers|lsb`: no arguments. Full multi-line CLI/headless text (one
+  `<name>: <size> bytes: "<sample>"` line per buffer, oldest first,
+  newline-terminated) via `exec_list_buffers_headless`; dispatched from a
+  CLIENT (a key binding, or the `:` prompt) instead goes through
+  `exec_list_buffers_client`, which shows just the FIRST buffer's line plus
+  a `(N buffers)` suffix (only when there's more than one) as a transient
+  status-line message -- a status message can only ever hold one line, and
+  this is a documented simplification of tmux's pager.
+- `delete-buffer|deleteb [-b name]`: `name: None` = delete the newest
+  buffer. `Err("no buffer")` if empty; `Err("buffer not found: <name>")` for
+  an unknown name.
+- `set-buffer|setb [-b name] data...`: `name: None` creates a new AUTOMATIC
+  buffer (`self.buffers.add_automatic`, same eviction as
+  `copy-selection-and-cancel`); `Some(name)` sets/overwrites a MANUAL buffer
+  (`self.buffers.set_named`, exempt from eviction). `data` is the remaining
+  positional tokens joined with single spaces (same convention as
+  `set-option`'s value / `display-message`'s text).
+
+Aliases: `pasteb`, `lsb`, `deleteb`, `setb`. All four are usable from EVERY
+entry point (CLI, config, `:` prompt, key bindings) via the normal
+`execute_headless`/`execute_for_client` dispatch, like every other SP3+
+command -- `list-buffers` is the only one whose OUTPUT shape differs
+between the two paths (see above), not its availability.
+
+### `bindings` amendment
+
+`Bindings::default()` additionally binds, in the PREFIX table: `]` →
+`paste-buffer -p`, `#` → `list-buffers`, `-` → `delete-buffer`. tmux's `=`
+(choose-buffer) is DEFERRED (documented in the design spec's deferrals
+list; no winmux equivalent yet).
+
+### `server` amendment
+
+`Server` gains a `buffers: Buffers` field (`Buffers::new()` at
+construction) -- one instance, shared by every session/client (tmux itself
+scopes buffers server-wide too, not per-session). No wire-protocol change:
+buffers are purely a dispatch-time server concern, never sent to clients
+directly (their effects are observed through `paste-buffer`'s pty write and
+`list-buffers`' text/message output).

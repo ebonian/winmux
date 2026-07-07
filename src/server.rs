@@ -39,6 +39,7 @@ use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 
 use crate::bindings::Bindings;
+use crate::buffers::Buffers;
 use crate::cmd::RawCmd;
 use crate::geom::Rect;
 use crate::grid::{Grid, Style};
@@ -134,9 +135,9 @@ enum ClientMode {
 /// from the live bottom, 0 = live screen); `cx`/`cy` are the copy cursor in
 /// VIEW coordinates (0-based, within the pane's current `cols`/`rows`).
 /// `scroll_exit` is a placeholder for the mouse task's scroll-past-bottom
-/// auto-exit (SP4 §4) — unused until then. Selection/search fields
-/// (`sel`/`search`) are Tasks 3/4 and deliberately NOT present yet (kept
-/// minimal per the task brief).
+/// auto-exit (SP4 §4) — unused until then. `sel` (Task 3, sub-project 4) is
+/// the active selection, if any; `search` (Task 4) is still deliberately
+/// absent.
 struct CopyState {
     pane: PaneId,
     scroll: u32,
@@ -144,6 +145,93 @@ struct CopyState {
     cy: u16,
     #[allow(dead_code)]
     scroll_exit: bool,
+    sel: Option<SelState>,
+}
+
+/// A copy-mode selection's anchor + shape (Task 3, sub-project 4). The
+/// anchor is stored with ITS OWN scroll offset (independent of the live
+/// `CopyState::scroll`) so scrolling the view keeps the anchor pinned to the
+/// same absolute grid line rather than drifting with the viewport — the
+/// anchor's and cursor's absolute positions are compared/recomputed via
+/// `sel_key` (below) at use time (render precompute, text extraction),
+/// never cached. `rect` toggles rectangle (column-bounding-box) selection
+/// vs. the default linear (reading-order) selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelState {
+    anchor_scroll: u32,
+    anchor_x: u16,
+    anchor_y: u16,
+    rect: bool,
+}
+
+/// A copy-mode view position's ordering/delta key, independent of
+/// `history_len` (which can drift while scrolled, e.g. new pane output
+/// evicting old scrollback): for a position at view row `row` under scroll
+/// offset `scroll`, `key = row - scroll`. Two positions' keys compare the
+/// same way their absolute grid-line indices would (`history_len` cancels
+/// out of the difference), and `key + new_scroll` gives that same absolute
+/// position's view row under a DIFFERENT scroll offset — exactly what
+/// selection rendering (fixed anchor key, current cursor scroll) and text
+/// extraction (walking every row a selection spans) both need.
+fn sel_key(scroll: u32, row: u16) -> i64 {
+    row as i64 - scroll as i64
+}
+
+/// Inverse of [`sel_key`] for `Grid::view_row_text`/`view_cell`-style
+/// `(scroll_back, row)` queries: the smallest valid `scroll_back` (`Grid`
+/// clamps to its actual `history_len` internally, so an over-large value
+/// here is harmless) that reproduces `key` in view coordinates, with `row`
+/// picked so it's always >= 0 regardless of how far `key` reaches into
+/// history. `rows` clamps a below-the-live-screen `row` defensively (a
+/// selection endpoint should never legitimately need this, but a resized
+/// pane between selecting and extracting could otherwise index out of the
+/// grid's current dimensions).
+fn key_to_view(key: i64, rows: u16) -> (u32, u16) {
+    if key <= 0 {
+        ((-key) as u32, 0)
+    } else {
+        (0, (key as u16).min(rows.saturating_sub(1)))
+    }
+}
+
+/// Precompute a copy-mode selection's render data in VIEW coordinates
+/// (`## copy-mode` / render contract amendment, Task 3): `(start_col,
+/// start_row, end_col, end_row, rect)`, both endpoints clamped into the
+/// visible `rows`x`cols` view under the CURRENT `scroll`/`cx`/`cy`. `None`
+/// when the selection is wholly scrolled out of view.
+fn compute_sel_view(sel: &SelState, cx: u16, cy: u16, scroll: u32, rows: u16, cols: u16) -> Option<(u16, u16, u16, u16, bool)> {
+    let anchor_key = sel_key(sel.anchor_scroll, sel.anchor_y);
+    let cursor_key = sel_key(scroll, cy);
+    let (start_key, start_col, end_key, end_col) = if (anchor_key, sel.anchor_x) <= (cursor_key, cx) {
+        (anchor_key, sel.anchor_x, cursor_key, cx)
+    } else {
+        (cursor_key, cx, anchor_key, sel.anchor_x)
+    };
+
+    let start_row_signed = start_key + scroll as i64;
+    let end_row_signed = end_key + scroll as i64;
+    if end_row_signed < 0 || start_row_signed >= rows as i64 {
+        return None; // wholly above or wholly below the current view
+    }
+    let clipped_top = start_row_signed < 0;
+    let clipped_bottom = end_row_signed >= rows as i64;
+    let start_row = start_row_signed.max(0) as u16;
+    let end_row = end_row_signed.min(rows as i64 - 1) as u16;
+
+    let last_col = cols.saturating_sub(1);
+    let (sc, ec) = if sel.rect {
+        (start_col.min(end_col).min(last_col), start_col.max(end_col).min(last_col))
+    } else {
+        // A vertically-clipped endpoint's real column is off-screen too --
+        // widen to the row edge so the render pass's "first row from
+        // start_col" / "last row to end_col" rule paints that (now a
+        // full-width MIDDLE row of the true selection) row correctly. See
+        // `CopyView::sel`'s doc comment.
+        let sc = if clipped_top { 0 } else { start_col.min(last_col) };
+        let ec = if clipped_bottom { last_col } else { end_col.min(last_col) };
+        (sc, ec)
+    };
+    Some((sc, start_row, ec, end_row, sel.rect))
 }
 
 /// Per-client attached state.
@@ -199,6 +287,11 @@ struct Server {
     /// (Task 8; `GetComputerNameW` — a hostname doesn't change under a
     /// running server).
     hostname: String,
+    /// Server-global paste buffers (Task 3, sub-project 4): `copy-
+    /// selection-and-cancel`'s automatic buffers and `set-buffer`'s named
+    /// ones. One instance, shared by every session/client (tmux itself
+    /// scopes buffers server-wide too, not per-session).
+    buffers: Buffers,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
@@ -476,6 +569,7 @@ impl Server {
             bindings: Bindings::default(),
             pending_config_message: None,
             hostname: computer_name(),
+            buffers: Buffers::new(),
         }
     }
 
@@ -1302,7 +1396,13 @@ fn render_one(
             // other pane (including one another client has zoomed/focused)
             // renders live, unaffected by this client's copy mode.
             let copy = match &client.mode {
-                ClientMode::Copy(cs) if cs.pane == *id => Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy) }),
+                ClientMode::Copy(cs) if cs.pane == *id => {
+                    let sel = cs
+                        .sel
+                        .as_ref()
+                        .and_then(|sel| compute_sel_view(sel, cs.cx, cs.cy, cs.scroll, rect.h, rect.w));
+                    Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy), sel })
+                }
                 _ => None,
             };
             views.push(PaneView { id: *id, rect: *rect, grid: &p.grid, focused: *id == focused, dead: p.dead, copy });
