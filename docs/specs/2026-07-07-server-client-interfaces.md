@@ -771,17 +771,30 @@ file-logging panic hook (chained in front of `host::install_panic_hook`'s
 console-restoring one via `take_hook`/`set_hook`, appending to
 `%LOCALAPPDATA%\winmux\server.log`) before calling `server::run`, since the
 server process has no console to print to. `NewSession{detached: false}`
-probes-then-autostarts (`PipeConn::connect`; `NotFound` →
-`client::autostart_server`), sizes the `Attach` frame from
-`host::console_size()` (fallback `80x24`, overridden by nonzero `-x`/`-y`),
-and calls `client::attach`. `NewSession{detached: true}` probes-then-
-autostarts the same way, then sends a one-shot `new-session -d [-s name] -x
-<cols> -y <rows>` `Control` command (defaulting unset `-x`/`-y` to `80`/`24`
-directly, since there's no console to probe for a session nobody is
-attaching to). `Attach` and `Control` both connect WITHOUT autostarting —
-`NotFound` prints `no server running on <pipe>` and exits 1 — matching the
-design spec's "pure queries... error... auto-start: new-session... starts
-the server" rule.
+FIRST probes `host::console_size()` — `Err` (stdio not a console) prints
+`open terminal failed: not a console` to stderr and exits 1 BEFORE
+`ensure_server`/autostart ever runs (Task 9 scope A) — then probes-then-
+autostarts (`PipeConn::connect`; `NotFound` → `client::autostart_server`),
+sizes the `Attach` frame from the already-probed size (fallback `80x24`,
+overridden by nonzero `-x`/`-y`), and calls `client::attach`. Ordering
+matters: without the upfront probe, a redirected-stdio invocation would
+still autostart a detached server via `ensure_server`, then only fail later
+inside `client::attach`'s own `Host::enter()` — stranding that autostarted
+server alive forever, since it never gets a session and `run`'s exit-empty
+check (`had_session && registry.is_empty()`) needs `had_session` to have
+ever flipped true. `NewSession{detached: true}` has no console to probe (and
+needs none — skips the guard entirely), probes-then-autostarts the same way,
+then sends a one-shot `new-session -d [-s name] -x <cols> -y <rows>`
+`Control` command (defaulting unset `-x`/`-y` to `80`/`24` directly, since
+there's no console to probe for a session nobody is attaching to). `Attach`
+ALSO probes `host::console_size()` first (same `open terminal failed`/exit 1
+on failure, before even `probe_running`'s connect) — an attach with no
+console must not touch the server at all — then connects WITHOUT
+autostarting; `Control` connects WITHOUT autostarting either. Both of these
+non-autostarting paths' `NotFound` prints `no server running on <pipe>` and
+exits 1 — matching the design spec's "pure queries... error... auto-start:
+new-session... starts the server" rule. Covered by
+`tests/e2e_sessions.rs::no_console_fails_fast`.
 
 **Implementation module:** `src/client.rs`. No unit tests (pure I/O glue:
 threads, a live named pipe, a live console) — coverage is

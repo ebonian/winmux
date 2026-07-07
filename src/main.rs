@@ -64,6 +64,10 @@ fn ensure_server(pipe: &str, socket: &str) -> io::Result<()> {
     }
 }
 
+/// stderr text for the fail-fast "no console" guard (Task 9 scope A) shared
+/// by both attached-session entry points below.
+const NO_CONSOLE_MSG: &str = "open terminal failed: not a console";
+
 fn run_new_session(
     socket: &str,
     name: Option<String>,
@@ -72,6 +76,27 @@ fn run_new_session(
     rows: u16,
 ) -> i32 {
     let pipe_full_name = pipe::pipe_name(socket);
+
+    // Fail fast, BEFORE autostart: an attached session needs a real console.
+    // Probing here (rather than only inside `client::attach`, after
+    // `ensure_server` may already have spawned a detached server) closes a
+    // gap where redirected stdio (no console at all) would leave an idle
+    // autostarted server behind forever -- it never gets a session, so
+    // `run`'s exit-empty check (`had_session && registry.is_empty()`) never
+    // fires because `had_session` never flips true. `NewSession{detached:
+    // true}` has no console to probe (and needs none), so it's exempt.
+    let console = if detached {
+        None
+    } else {
+        match host::console_size() {
+            Ok(sz) => Some(sz),
+            Err(_) => {
+                eprintln!("{NO_CONSOLE_MSG}");
+                return 1;
+            }
+        }
+    };
+
     if let Err(e) = ensure_server(&pipe_full_name, socket) {
         eprintln!("winmux: failed to start server: {e}");
         return 1;
@@ -92,7 +117,7 @@ fn run_new_session(
         return send_cli(&pipe_full_name, argv);
     }
 
-    let (probe_cols, probe_rows) = host::console_size().unwrap_or((80, 24));
+    let (probe_cols, probe_rows) = console.unwrap_or((80, 24));
     let cols = if cols != 0 { cols } else { probe_cols };
     let rows = if rows != 0 { rows } else { probe_rows };
     let mode = if name.is_some() { AttachMode::NewNamed } else { AttachMode::NewAuto };
@@ -107,13 +132,23 @@ fn run_new_session(
 }
 
 fn run_attach(socket: &str, target: Option<String>, detach_others: bool) -> i32 {
+    // Fail fast, BEFORE even probing/connecting: an attach with no console
+    // must not touch the server at all (scope A) -- there is nothing a
+    // console-less client could usefully do with an existing session either.
+    let (cols, rows) = match host::console_size() {
+        Ok(sz) => sz,
+        Err(_) => {
+            eprintln!("{NO_CONSOLE_MSG}");
+            return 1;
+        }
+    };
+
     let pipe_full_name = pipe::pipe_name(socket);
     // NO autostart: a pure attach against a missing server is an error.
     if let Err(e) = probe_running(&pipe_full_name) {
         return report_connect_error(&pipe_full_name, e);
     }
 
-    let (cols, rows) = host::console_size().unwrap_or((80, 24));
     let first = ClientMsg::Attach {
         mode: AttachMode::Existing,
         detach_others,
