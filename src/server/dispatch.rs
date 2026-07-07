@@ -1077,29 +1077,39 @@ impl Server {
         Ok(String::new())
     }
 
-    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap the ACTING client's active
-    /// pane with the previous/next pane in creation order (wrapping),
-    /// operating only on the acting client's CURRENT window (matches the
-    /// `{`/`}` bindings' intent; tmux itself scopes `-U`/`-D` to the target
-    /// window's own pane list too). The explicit `-s`/`-t` form resolves two
-    /// independent pane targets via the normal `resolve_pane_target`
-    /// fallback chain; SP4 simplification (documented): both targets are
-    /// expected to resolve to panes of the SAME window as each other --
-    /// `Layout::swap_panes` operates on that window's own tree and silently
-    /// no-ops if either id isn't one of its leaves, so a cross-window `-s`/
-    /// `-t` pair degrades to a harmless no-op rather than actually moving a
-    /// pane between windows (real tmux supports this; deferred here).
+    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap a target pane with the
+    /// previous/next pane in creation order (wrapping), operating only on
+    /// that pane's own window (matches the `{`/`}` bindings' intent; tmux
+    /// itself scopes `-U`/`-D` to the target window's own pane list too).
+    /// The target pane is `-t` if given (SP4 fix round: previously silently
+    /// discarded alongside `-U`/`-D` -- see `docs/follow-ups.md`), else the
+    /// acting client's active pane (tmux's own default when `-t` is
+    /// omitted). A co-supplied `-s` is REJECTED with a usage error rather
+    /// than silently ignored: real tmux additionally lets `-s` override the
+    /// "which pane is `-U`/`-D` relative to" side of the swap, but winmux
+    /// does not implement that fuller matrix yet -- smaller, honest scope
+    /// chosen over a silent partial implementation.
+    ///
+    /// The explicit `-s`/`-t` form (`dir: None`) resolves two independent
+    /// pane targets via the normal `resolve_pane_target` fallback chain and
+    /// REQUIRES both to resolve to the same window (SP4 fix round: this used
+    /// to silently no-op cross-window instead of erroring -- see
+    /// `docs/follow-ups.md`). Real tmux supports moving a pane to a
+    /// different window this way; winmux does not yet.
     fn exec_swap_pane(&mut self, dir: Option<Direction>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, a, b, target_wid) = if let Some(d) = dir {
-            let session_name = self.resolve_session_name(None, cs)?;
+            if src.is_some() {
+                return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string());
+            }
+            let (session_name, wid, target) = self.resolve_pane_target(cs, dst.as_deref())?;
             let Some(session) = self.registry.session_mut(&session_name) else {
                 return Err(format!("can't find session: {session_name}"));
             };
-            let wid = session.current;
-            let window = session.current_window();
+            let Some(window) = session.windows.iter().find(|w| w.id == wid) else {
+                return Err("window not found".to_string());
+            };
             let order = Self::panes_in_creation_order(window);
-            let active = window.layout.focused();
-            let Some(pos) = order.iter().position(|&p| p == active) else {
+            let Some(pos) = order.iter().position(|&p| p == target) else {
                 return Err("pane not found".to_string());
             };
             let n = order.len();
@@ -1110,15 +1120,13 @@ impl Server {
                 // `-U`/`-D`; any other `Direction` is unreachable.
                 _ => return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string()),
             };
-            (session_name, active, other, wid)
+            (session_name, target, other, wid)
         } else {
             let (s1, w1, pa) = self.resolve_pane_target(cs, src.as_deref())?;
-            let (_s2, _w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
-            // Both targets are expected to resolve within the same window as
-            // each other (see this fn's doc comment); `s1`/`w1` (the SOURCE
-            // pane's session/window) are used as the operand -- if `dst`
-            // resolved to a different session/window, `Layout::swap_panes`
-            // below simply won't find `pb` among `w1`'s leaves and no-ops.
+            let (_s2, w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
+            if w1 != w2 {
+                return Err("swap-pane: can only swap panes within the same window".to_string());
+            }
             (s1, pa, pb, w1)
         };
         if let Some(session) = self.registry.session_mut(&session_name) {

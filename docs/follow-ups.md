@@ -337,3 +337,39 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     horizontal border one column over). Documented, not treated as a bug —
     real tmux has the same class of single-cell ambiguity at a "+" junction
     and doesn't document a resolution rule either.
+41. **`swap-pane -s`/`-t` cannot move a pane between windows or sessions**
+    (Task 6, layout presets). `exec_swap_pane`'s explicit-target form now
+    ERRORS (`"swap-pane: can only swap panes within the same window"`)
+    rather than silently no-opping when `-s`/`-t` resolve to different
+    windows — but real tmux actually supports this (moving a pane to a
+    different window/session, swapping it there). Implementing it for real
+    would mean teaching `Layout` to remove a leaf from one tree and insert it
+    into another (today `Layout::swap_panes` only relabels leaf values within
+    a single tree) — worth doing for full tmux parity, but out of scope for
+    the Task 6 fix round, which only closed the "silent no-op" gap with an
+    honest error.
+42. **`swap-pane -U`/`-D` combined with `-s` is rejected, not implemented**
+    (Task 6, layout presets). Real tmux's full `swap-pane [-dDU] [-s
+    src-pane] [-t dst-pane]` semantics let `-s` additionally override which
+    pane a directional (`-U`/`-D`) swap is computed relative to. The Task 6
+    fix round implements the more common case (`-t` selects which pane is
+    swapped up/down, defaulting to the active pane when `-t` is absent) but
+    rejects `-U`/`-D` combined with `-s` with a usage error rather than
+    guessing at the full matrix. Worth revisiting if a real workflow needs
+    the `-s`-with-direction form.
+43. **`main-pane-width`/`main-pane-height` are baked into a ratio at
+    `select-layout`/`next-layout` apply-time, not stored as an absolute
+    size** (Task 6, layout presets). `Layout`'s tree only ever stores `f32`
+    split ratios (no absolute-size node variant), so `apply_preset` computes
+    `ratio_for(target_absolute_cells, area_len)` ONCE, at application time —
+    the first render reproduces the exact configured main-pane cell count,
+    but a LATER window resize scales the main pane proportionally rather
+    than preserving the literal configured width/height the way real tmux
+    does (tmux recomputes the absolute size on every resize). One-line fix
+    framing: preserve absolute main-pane size across resize like tmux — would
+    need a `Layout` node variant (or side-table) that remembers "this split's
+    first child wants N absolute cells" and re-derives the ratio from the
+    CURRENT area on every resize/render, not just at apply-time. Functionally
+    acceptable for now (documented deviation, not a bug); doc gap closed by
+    this same fix round (see `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
+    `layout-presets` section).

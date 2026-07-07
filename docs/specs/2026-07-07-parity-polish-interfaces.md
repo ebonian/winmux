@@ -1179,6 +1179,19 @@ impl Options {
 }
 ```
 
+**Documented deviation: ratio-baked, not absolute, across later resizes.**
+`Layout`'s tree only ever stores `f32` split ratios (no absolute-size node
+variant), so `apply_preset` converts `main-pane-width`/`-height`'s absolute
+cell count into a ratio via `ratio_for(target, area_len)` ONCE, at
+`select-layout`/`next-layout` apply-time. The FIRST render after applying the
+preset reproduces the exact configured cell count, but a LATER window
+resize scales the main pane proportionally along with everything else,
+rather than re-deriving the same absolute width/height the way real tmux
+does (tmux recomputes the absolute size on every resize). Functionally
+acceptable given the architecture and the Task 6 brief's test scope (exact
+rects at a fixed area); tracked as `docs/follow-ups.md` #43 for eventual
+absolute-size preservation.
+
 ### `cmd` amendment
 
 `ParsedCmd` gains:
@@ -1197,12 +1210,19 @@ pub enum ParsedCmd {
     /// `next-layout` cycle by one (wrapping), per `layout::PRESET_CYCLE`.
     NextLayout { target: Option<String> },
     /// `swap-pane|swapp [-U] [-D] [-s src] [-t dst]`. `dir: Some(Up | Down)`
-    /// (`-U`/`-D`) swaps the acting client's active pane with the
-    /// previous/next pane in creation order, wrapping; `resolve`'s flag
-    /// scanner only ever admits `-U`/`-D` for this command, so any other
-    /// `Direction` reaching dispatch is unreachable. `dir: None` uses the
-    /// explicit `-s src`/`-t dst` pane targets instead (each resolved via
-    /// the normal `resolve_pane_target` fallback chain).
+    /// (`-U`/`-D`) swaps a TARGET pane (`-t` if given, else the acting
+    /// client's active pane -- tmux's own default) with the previous/next
+    /// pane in creation order, wrapping, within the target's own window;
+    /// `resolve`'s flag scanner only ever admits `-U`/`-D` for this command,
+    /// so any other `Direction` reaching dispatch is unreachable. A
+    /// co-supplied `-s` alongside `-U`/`-D` is a dispatch-time usage error
+    /// (Task 6 fix round: winmux does not implement tmux's fuller `-s`-as-
+    /// reference-override semantics for the directional form). `dir: None`
+    /// uses the explicit `-s src`/`-t dst` pane targets instead (each
+    /// resolved via the normal `resolve_pane_target` fallback chain); both
+    /// MUST resolve to the same window, or dispatch errors (`"swap-pane: can
+    /// only swap panes within the same window"` -- Task 6 fix round: this
+    /// used to silently no-op cross-window instead).
     SwapPane { dir: Option<Direction>, src: Option<String>, dst: Option<String> },
     /// `rotate-window|rotatew [-D] [-t target]`. `down` is the `-D` flag;
     /// bare `rotate-window` (`down: false`) and `-D` (`down: true`) rotate
@@ -1252,16 +1272,24 @@ same shared-helper pattern as every other Task 6-era command:
   .panes()` sorted ascending by `PaneId`, NOT raw tree order — see the
   `## layout` section's rationale), set `Window::last_layout`, then
   `apply_layout_for_session` to resize every pane's ConPTY to the new rects.
-- `exec_swap_pane`: `-U`/`-D` resolves the previous/next pane in creation
-  order relative to the ACTING client's current window's active pane
-  (`Direction::Left`/`Right` are unreachable here — `resolve`'s flag scanner
-  for `swap-pane` only ever admits `-U`/`-D`); the explicit `-s`/`-t` form
-  resolves two independent pane targets via `resolve_pane_target`. SP4
-  simplification, documented: cross-window/cross-session `-s`/`-t` swaps are
-  NOT supported (real tmux allows moving a pane between windows this way) —
-  `Layout::swap_panes` operates on one window's tree and silently no-ops if
-  either id isn't one of its leaves, so a cross-window pair degrades to a
-  harmless no-op rather than an error or an actual cross-window move.
+- `exec_swap_pane` (Task 6 fix round: reworked to close two review findings):
+  `-U`/`-D` resolves the previous/next pane in creation order relative to a
+  TARGET pane -- `-t` if given (resolved via `resolve_pane_target`, so it can
+  name any pane, defaulting to the acting client's current window's active
+  pane when `-t` is absent, matching tmux) -- within that target's own
+  window (`Direction::Left`/`Right` are unreachable here — `resolve`'s flag
+  scanner for `swap-pane` only ever admits `-U`/`-D`). A co-supplied `-s`
+  alongside `-U`/`-D` returns the `swap-pane` usage-string error instead of
+  being silently discarded (winmux does not implement tmux's fuller
+  `-s`-as-reference-override matrix for the directional form — see
+  `docs/follow-ups.md` #42). The explicit `-s`/`-t` form (`dir: None`)
+  resolves two independent pane targets via `resolve_pane_target` and now
+  REQUIRES both to resolve to the same `WindowId` (window ids are minted from
+  a single global monotonic counter — `Registry::mint_window_id` — so a
+  plain `!=` comparison also catches cross-session pairs): a mismatch returns
+  `Err("swap-pane: can only swap panes within the same window")` instead of
+  the old silent no-op. Real tmux allows moving a pane to a different window
+  this way; winmux does not yet (`docs/follow-ups.md` #41 tracks it).
 - `exec_rotate_window`: resolves the target window, calls `Layout::rotate`.
 
 All four call `apply_layout_for_session` unconditionally at the end (same
