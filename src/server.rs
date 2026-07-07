@@ -763,8 +763,8 @@ impl Server {
                 self.apply_layout_for_session(&session_name);
             }
         }
-        // TEMP-RED-CHECK
-        // confirm on it must be reset, or its `y` would act on stale state.
+        // The removal above may have invalidated a client's pending confirm;
+        // any confirm on it must be reset, or its `y` would act on stale state.
         self.cancel_stale_confirms();
         true
     }
