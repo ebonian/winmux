@@ -1024,10 +1024,11 @@ impl Server {
     /// CURRENTLY FOCUSED pane (the client's `ClientMode::Copy` then binds to
     /// that pane id for the duration — see the type's doc comment).
     /// `page_up` immediately scrolls up one page (the `PPage` binding);
-    /// `mouse` is stored on... nothing yet (Task 2 has no selection/mouse
-    /// state to carry it on) — accepted and validated but otherwise inert
-    /// until the mouse task wires wheel-triggered entry (SP4 §4).
-    fn exec_copy_mode(&mut self, page_up: bool, _mouse: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+    /// `mouse` (SP4 fix round: now actually wired, previously accepted-but-
+    /// ignored) becomes `CopyState::scroll_exit` directly — true both for an
+    /// explicit `copy-mode -e` and for `mouse_wheel`'s wheel-triggered entry
+    /// (which used to set the field by hand right after this call).
+    fn exec_copy_mode(&mut self, page_up: bool, mouse: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let pane = match self.registry.session_mut(session_name) {
             Some(s) => s.current_window().layout.focused(),
             None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
@@ -1043,7 +1044,7 @@ impl Server {
         } else {
             (0u32, live_cx, live_cy)
         };
-        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false, sel: None, search: None, search_prompt: None });
+        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: mouse, sel: None, search: None, search_prompt: None });
         ExecOutcome::Ok(String::new())
     }
 
@@ -1378,7 +1379,7 @@ impl Server {
                         _ => select_line_at(cs, cols, history_total),
                     }
                 }
-                client.mouse.drag = MouseDrag::Selecting;
+                client.mouse.drag = MouseDrag::Selecting { moved: false };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::None => ExecOutcome::Ok(String::new()),
@@ -1396,7 +1397,10 @@ impl Server {
                 self.mouse_drag_border(ev, pane, vertical, session_name);
                 ExecOutcome::Ok(String::new())
             }
-            MouseDrag::Selecting => {
+            MouseDrag::Selecting { .. } => {
+                // An actual `Drag` event happened: mark `moved` so `mouse_up`
+                // knows this is a real drag-select, not a plain click.
+                client.mouse.drag = MouseDrag::Selecting { moved: true };
                 if let ClientMode::Copy(cs) = &mut client.mode {
                     if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == cs.pane) {
                         cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
@@ -1437,16 +1441,21 @@ impl Server {
 
     /// `Up1`/`Up2`/`Up3`: ends whatever drag was in progress. A border-resize
     /// drag needs no further action (already applied live). A copy-mode
-    /// selection drag copies the selection and exits copy mode -- tmux's
-    /// `MouseDragEnd1Pane` default (`copy-selection-and-cancel`); this also
-    /// covers a plain click with no drag at all (single/double/triple-click
-    /// selection was already set up on `Down`, see `mouse_down`) since SGR
-    /// button-event tracking still sends a release even without any motion
-    /// in between.
+    /// selection drag that saw at least one `Drag` event copies the
+    /// selection and exits copy mode -- tmux's `MouseDragEnd1Pane` default
+    /// (`copy-selection-and-cancel`). A PLAIN click (no `Drag` event at all
+    /// between this `Up` and the preceding `Down`, i.e. `moved == false`) is
+    /// left alone entirely: no copy, no cancel, no selection/buffer touch --
+    /// real tmux's copy-mode table has no default binding for a bare
+    /// `MouseUp1Pane`, only `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of
+    /// which require actual motion). The click's `select-pane`
+    /// (`mouse_down`'s unconditional focus) and, inside copy mode, its
+    /// zero-width point-selection anchor / cursor reposition still stand --
+    /// only the "release" side is a no-op.
     fn mouse_up(&mut self, client: &mut ClientState) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
         match drag {
-            MouseDrag::Selecting if matches!(client.mode, ClientMode::Copy(_)) => {
+            MouseDrag::Selecting { moved: true } if matches!(client.mode, ClientMode::Copy(_)) => {
                 self.exec_copy_action(CopyAction::SelectionAndCancel, client)
             }
             _ => ExecOutcome::Ok(String::new()),
@@ -1516,14 +1525,12 @@ impl Server {
         }
 
         // WheelUp on a live pane: enter copy mode scrolled MOUSE_WHEEL_STEP
-        // lines (tmux's WheelUpPane default), marked scroll_exit so
-        // scrolling back down to the live bottom by wheel auto-exits.
+        // lines (tmux's WheelUpPane default); `mouse: true` sets
+        // `scroll_exit` (via `exec_copy_mode`'s wiring) so scrolling back
+        // down to the live bottom by wheel auto-exits.
         let outcome = self.exec_copy_mode(false, true, client, session_name);
         if matches!(outcome, ExecOutcome::Err(_)) {
             return outcome;
-        }
-        if let ClientMode::Copy(cs) = &mut client.mode {
-            cs.scroll_exit = true;
         }
         for _ in 0..MOUSE_WHEEL_STEP {
             self.exec_copy_action(CopyAction::ScrollUp, client);
@@ -2593,5 +2600,26 @@ mod mouse_dispatch_tests {
         let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(matches!(client.mode, ClientMode::Copy(_)), "wheel over a LIVE pane must enter copy mode");
+    }
+
+    /// Fix-round Minor finding: `exec_copy_mode`'s `mouse` parameter (fed by
+    /// `copy-mode -e` / the wheel-entry call site) must actually be wired to
+    /// `CopyState::scroll_exit`, not silently ignored — this is the same
+    /// flag `mouse_wheel` used to set by hand right after the call.
+    #[test]
+    fn exec_copy_mode_wires_mouse_flag_to_scroll_exit() {
+        let (mut server, session_name, _pane_id) = test_server_with_pane(false);
+
+        let mut client_mouse = test_client(20, 10);
+        let outcome = server.exec_copy_mode(false, true, &mut client_mouse, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        let ClientMode::Copy(cs) = &client_mouse.mode else { panic!("expected Copy mode after copy-mode -e") };
+        assert!(cs.scroll_exit, "copy-mode -e (mouse=true) must set scroll_exit so wheel-down-to-bottom auto-exits");
+
+        let mut client_plain = test_client(20, 10);
+        let outcome = server.exec_copy_mode(false, false, &mut client_plain, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        let ClientMode::Copy(cs) = &client_plain.mode else { panic!("expected Copy mode after plain copy-mode") };
+        assert!(!cs.scroll_exit, "plain copy-mode entry (no -e) must not set scroll_exit");
     }
 }

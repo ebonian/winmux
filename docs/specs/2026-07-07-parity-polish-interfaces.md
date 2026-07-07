@@ -965,7 +965,11 @@ enum MouseDrag {
     #[default]
     None,
     Border { pane: layout::PaneId, vertical: bool },
-    Selecting,
+    // `moved` (fix round, see the `Up` bullet below): starts `false` on
+    // `Down`, flips to `true` on the first `Drag`. Distinguishes a plain
+    // click (no `Drag` event at all before the matching `Up`) from an
+    // actual drag-select.
+    Selecting { moved: bool },
 }
 ```
 
@@ -1028,21 +1032,35 @@ match any branch (degrade to `None`), tolerating a too-small terminal.
   characters using tmux's hardcoded default `word-separators` = `" -_@"`,
   NOT the plain-whitespace rule `copy-next-word`/`copy-previous-word` use);
   3 = `select_line_at` (the whole clicked view row) — then arms
-  `MouseDrag::Selecting`.
+  `MouseDrag::Selecting { moved: false }`.
 - `Drag` → `MouseDrag::Border` re-reads the reference pane's CURRENT rect
   every call (not an accumulated delta since the drag started — robust to
   layout-minimum clamping: the border always ends up exactly at the drag
   position if reachable at all) and calls `Layout::resize_from` with the
   sign/axis implied by the drag delta, then `apply_layout_for_session`.
-  `MouseDrag::Selecting` updates the bound `CopyState`'s `cx`/`cy` to the new
-  cell (clamped into the pane's rect).
+  `MouseDrag::Selecting { .. }` sets `moved = true` (see `Up` below) and
+  updates the bound `CopyState`'s `cx`/`cy` to the new cell (clamped into
+  the pane's rect).
 - `Up` → `MouseDrag::Border` needs no further action (already applied live).
-  `MouseDrag::Selecting` (while still in copy mode) calls
+  `MouseDrag::Selecting { moved: true }` (while still in copy mode) calls
   `exec_copy_action(CopyAction::SelectionAndCancel, ..)` — tmux's
-  `MouseDragEnd1Pane` default — covering a plain click with no drag too
-  (button-event tracking still sends a release even with zero motion in
-  between, so a bare click still ends up copying its 1-cell/word/line
-  selection). Any other combination is a no-op.
+  `MouseDragEnd1Pane` default, which fires only after an actual drag.
+  **Click/drag/release semantics (fix round; matches real tmux's copy-mode
+  binding table exactly):** SGR button-event tracking sends an `Up` after
+  every `Down`, even with zero motion in between — a bare click, no less
+  than a drag, always produces a `Down` immediately followed by an `Up`. A
+  PLAIN click (`Selecting { moved: false }`, i.e. no `Drag` event was ever
+  seen between this `Down` and this `Up`) is therefore explicitly EXCLUDED
+  from `SelectionAndCancel`: it is a no-op on `Up` — no copy, no cancel, no
+  buffer write, copy mode stays entered — because real tmux's copy-mode
+  table has no default binding for a bare `MouseUp1Pane` at all, only
+  `MouseDrag1Pane` (extends selection) and `MouseDragEnd1Pane` (copies and
+  exits), both of which require actual motion; only `MouseDown1Pane`
+  (`select-pane`, focus-only) fires for a plain click. The click's focus-on-
+  `Down` and its zero-width point-selection anchor / cursor reposition still
+  happen regardless — only the `Up`-side copy/cancel is gated on `moved`.
+  Any other `Up` combination (border drag, or `Selecting` outside copy mode)
+  is a no-op.
 - `WheelUp`/`WheelDown` over a pane whose `Grid::alt_screen()` is true →
   ALWAYS 3x synthesized arrow-key presses (`\x1b[A`/`\x1b[B`) written
   straight to the pane via `pty.write_input`, regardless of copy-mode state
@@ -1052,8 +1070,11 @@ match any branch (degrade to `None`), tolerating a too-small terminal.
   `CopyState::scroll_exit` (set true only when copy mode was entered BY a
   wheel — the Task 2 placeholder field's first real consumer) exits copy
   mode back to `Normal`. Over a live pane NOT in copy mode: `WheelUp` enters
-  copy mode (`exec_copy_mode(page_up: false, mouse: true, ..)`, marks
-  `scroll_exit = true`, then applies `MOUSE_WHEEL_STEP` `ScrollUp`s);
+  copy mode (`exec_copy_mode(page_up: false, mouse: true, ..)`, whose
+  `mouse` parameter IS `scroll_exit` directly — fix round: previously
+  accepted-but-ignored [`copy-mode -e`'s `mouse` flag was a documented
+  no-op], now the one place `CopyState::scroll_exit` is actually set — then
+  applies `MOUSE_WHEEL_STEP` `ScrollUp`s);
   `WheelDown` is a no-op (documented v1 decision — there is no "downward"
   scrollback direction to enter copy mode from at the live bottom).
 
@@ -1083,7 +1104,16 @@ brief's own bullet list scopes "Drag1 = selection" to "In copy mode:" only);
 Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
 sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
 `mouse_drag_selects_and_release_copies`, `mouse_status_click_selects_
-window`, `mouse_wheel_status_cycles_windows`, `mouse_border_drag_resizes`.
+window`, `mouse_wheel_status_cycles_windows`, `mouse_border_drag_resizes`,
+`mouse_plain_click_in_copy_mode_keeps_mode_and_buffers` (fix round: the
+Critical regression test — plain click in copy mode must not copy/cancel,
+and must still focus its pane), `pane_default_active_border_follows_focus`
+(fix round: coverage gap closed — the DEFAULT `pane-active-border-style`
+green segment on a 3-pane T-junction border follows focus, not just the
+runtime-restyled case `pane_active_border_style_runtime` already covered).
+Unit tests (`src/server/dispatch.rs::mouse_dispatch_tests`):
+`exec_copy_mode_wires_mouse_flag_to_scroll_exit` (fix round: the Minor
+finding — `exec_copy_mode`'s `mouse` parameter is genuinely read now).
 `alt_screen_wheel_sends_arrows` was ATTEMPTED per the task brief's suggested
 approach (a real PowerShell pane self-emitting `CSI ?1049h` via `Write-Host
 -NoNewline "$([char]27)[?1049h"`) and found to be exactly the "too flaky"

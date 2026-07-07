@@ -380,10 +380,15 @@ enum MouseDrag {
     Border { pane: PaneId, vertical: bool },
     /// A `Down1` inside the pane bound to this client's copy mode armed
     /// selection tracking; each subsequent `Drag1` extends the selection's
-    /// cursor endpoint, and the eventual `Up1` copies it
+    /// cursor endpoint and sets `moved`, and the eventual `Up1` copies it
     /// (`copy-selection-and-cancel`, matching tmux's `MouseDragEnd1Pane`
-    /// default).
-    Selecting,
+    /// default) ONLY if `moved` is true. Real tmux's copy-mode binding table
+    /// has no default for a bare `MouseUp1Pane` (release with no prior
+    /// drag) — `Down` always arms `Selecting { moved: false }`, since SGR
+    /// button-event tracking guarantees an `Up` after every `Down` even with
+    /// zero motion, and without this flag a plain click would always look
+    /// like a (zero-width) completed drag.
+    Selecting { moved: bool },
 }
 
 /// Advance `m`'s click-run-length tracker for a `Down` at `(x, y)` with

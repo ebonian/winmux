@@ -1966,6 +1966,76 @@ fn pane_active_border_style_runtime() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Coverage gap closed in the mouse-task fix round: the DEFAULT (no runtime
+/// `set`) `pane-active-border-style` (fg=green) had protocol coverage only
+/// for a runtime restyle (`pane_active_border_style_runtime`, above, sets
+/// fg=red). This drives a 3-pane layout (`%` then `"`, so the vertical
+/// border between the left pane and the right column has a T-junction where
+/// the horizontal split meets it) and asserts the green segment tracks
+/// whichever of the two right-hand panes is actually focused.
+#[test]
+fn pane_default_active_border_follows_focus() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Left pane (full height) | top-right / bottom-right (focused after the
+    // 2nd split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    // Wait for the T-junction glyph ('├': border continues up/down/right,
+    // stops left) where the new horizontal split meets the vertical one.
+    c.recv_output_until(&mut grid, |g| {
+        (0..g.rows().saturating_sub(1)).any(|r| g.cell(border_x, r).ch == '├')
+    });
+    let split_row = (0..grid.rows().saturating_sub(1))
+        .find(|&r| grid.cell(border_x, r).ch == '├')
+        .expect("expected a T-junction on the vertical border after the second split");
+    assert!(
+        split_row >= 1 && split_row + 1 < grid.rows().saturating_sub(1),
+        "split_row {split_row} too close to an edge to test both segments"
+    );
+    let top_row = split_row - 1;
+    let bottom_row = split_row + 1;
+
+    // The bottom-right pane is focused right after the 2nd split: the
+    // border segment adjacent to it is green (default
+    // `pane-active-border-style fg=green`); the segment adjacent to the
+    // top-right (non-focused) pane keeps the default (non-green) fg.
+    assert_eq!(
+        grid.cell(border_x, bottom_row).style.fg,
+        Color::Idx(2),
+        "border adjacent to the focused (bottom-right) pane should be green"
+    );
+    assert_ne!(
+        grid.cell(border_x, top_row).style.fg,
+        Color::Idx(2),
+        "border adjacent to the non-focused (top-right) pane should stay default"
+    );
+
+    // Move focus to the top-right pane (spatial `select-pane -U`) and
+    // confirm the green segment FOLLOWS: it flips to the top segment, and
+    // the formerly-green bottom segment reverts to default.
+    let mut up = vec![0x02];
+    up.extend_from_slice(b"\x1b[A");
+    c.send(&ClientMsg::Stdin(up));
+    c.recv_output_until(&mut grid, |g| g.cell(border_x, top_row).style.fg == Color::Idx(2));
+    assert_ne!(
+        grid.cell(border_x, bottom_row).style.fg,
+        Color::Idx(2),
+        "border adjacent to the now-non-focused (bottom-right) pane should revert to default"
+    );
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `set -g window-status-current-style fg=red,bold` restyles ONLY the
 /// current window's tab; the non-current tab keeps the base style.
 #[test]
@@ -3147,6 +3217,99 @@ fn mouse_drag_selects_and_release_copies() {
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+/// Regression test for the fix-round Critical finding: a PLAIN click
+/// (press then release, no `Drag` frame in between) inside a copy-mode pane
+/// must NOT run `copy-selection-and-cancel` -- real tmux's copy-mode table
+/// only binds `MouseDragEnd1Pane` (fires after an actual drag) to that
+/// action; a bare `MouseUp1Pane` has no default binding at all. Before the
+/// fix, SGR button-event tracking's guaranteed `Up` after every `Down`
+/// meant EVERY plain click inside copy mode silently exited copy mode and
+/// (landing on a non-blank cell) clobbered paste buffer 0 with a
+/// 1-character entry.
+#[test]
+fn mouse_plain_click_in_copy_mode_keeps_mode_and_buffers() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Two panes; split-window focuses the NEW (right) pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli_right_idx = cli_client(&name);
+    cli_right_idx.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (right_idx, _) = expect_cli_done(&cli_right_idx, 0);
+
+    // Known non-blank content, in the (focused) right pane, to click on.
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("hello123")));
+    let (target_row, click_x) = {
+        let text = screen_text(&grid);
+        let row = text.iter().position(|l| l.contains("hello123")).unwrap() as u16;
+        let col = text[row as usize].find("hello123").unwrap() as u16;
+        (row, col)
+    };
+
+    // Enter copy mode bound to the RIGHT pane (still focused).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Move REGISTRY focus away to the LEFT pane via a CLI command -- this
+    // bypasses the attached client's own key routing entirely (which, while
+    // in copy mode, captures arrow keys for cursor movement instead of
+    // `select-pane`), so the plain click below is the ONLY thing that can
+    // move focus back to the right pane.
+    let mut cli_move = cli_client(&name);
+    cli_move.send(&ClientMsg::Cli(vec!["select-pane".into(), "-L".into()]));
+    expect_cli_done(&cli_move, 0);
+    let mut cli_before = cli_client(&name);
+    cli_before.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (before_click_idx, _) = expect_cli_done(&cli_before, 0);
+    assert_ne!(before_click_idx, right_idx, "select-pane -L must have moved focus off the right pane");
+
+    // Plain click (press + release, NO drag frame at all) on a non-blank
+    // cell of the copy-mode-bound right pane.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, true)));
+
+    // Piggy-back the assertions as `Cli` frames on the SAME connection as
+    // the click frames above: a single connection's reader thread feeds the
+    // server's event queue strictly in send order, so by the time these
+    // `CliDone` responses arrive, the Down/Up frames are guaranteed to have
+    // already been fully processed -- no arbitrary sleep needed. Any
+    // intervening `Output` frames (e.g. the periodic clock tick) are drained
+    // into `grid` rather than tripping up the wait.
+    fn next_cli_done(c: &Client, grid: &mut Grid) -> (u8, String, String) {
+        loop {
+            match c.recv() {
+                ServerMsg::Output(bytes) => grid.feed(&bytes),
+                ServerMsg::CliDone { code, out, err } => return (code, out, err),
+                other => panic!("unexpected message waiting for CliDone: {other:?}"),
+            }
+        }
+    }
+
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "plain click in copy mode must not create a paste buffer: {out:?}");
+
+    // Copy mode must still be active -- the fix's core assertion.
+    assert!(has_indicator(&grid, "[0/"), "plain click in copy mode must not exit copy mode");
+
+    c.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (code, after_click_idx, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(after_click_idx, right_idx, "plain click must still focus the clicked (right) pane");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
 }
 
 /// Attach, enable mouse, create a second window, and rename both windows to
