@@ -1065,6 +1065,24 @@ mod key_machine_tests {
     }
 
     #[test]
+    fn double_prefix_reports_prefix_table_key() {
+        // Legacy analog: Ctrl-b Ctrl-b forwarded a literal Ctrl-b. In the
+        // table-driven machine the second prefix press reports as an
+        // ordinary Key{Prefix, C-b} -- whose default binding is send-prefix,
+        // reproducing the same end result through the bindings table.
+        let now = Instant::now();
+        let mut m = km();
+        assert_eq!(
+            m.feed(b"\x02\x02", now),
+            vec![KeyInputEvent::Key {
+                table: WhichTable::Prefix,
+                key: keys::Key { code: KeyCode::Char('b'), ctrl: true, meta: false, shift: false },
+                raw: b"\x02".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
     fn root_table_keys_report_root() {
         let now = Instant::now();
         let mut m = km();

@@ -175,7 +175,12 @@ pub enum ParsedCmd {
     ResizePane { dir: Option<Direction>, zoom: bool, count: i32 },
     RenameWindow { target: Option<String>, name: String },
     RenameSession { target: Option<String>, name: String },
-    DetachClient { target: String },
+    /// `detach-client [-s target]`. `target: None` = detach the ACTING
+    /// client (tmux's bare `detach-client`); `Some(s)` = detach every client
+    /// attached to session `s`. The Task 6 dispatcher rejects the bare form
+    /// when there is no acting client (CLI/config context) with the SP2
+    /// verbatim usage error -- `resolve` itself accepts both forms.
+    DetachClient { target: Option<String> },
     SendKeys { literal: bool, target: Option<String>, keys: Vec<String> },
     SendPrefix,
     /// `switch-client -p`/`-n` (previous/next session). SP3 only supports
@@ -481,8 +486,12 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             if !p.is_empty() {
                 return Err(bad());
             }
-            let Some(target) = value_of(&v, "-s") else { return Err(bad()) };
-            Ok(ParsedCmd::DetachClient { target })
+            // -s is optional at the parse level: bare `detach-client`
+            // detaches the acting client (tmux behavior; the default
+            // prefix-d binding relies on this). The Task 6 dispatcher -- not
+            // resolve -- rejects the bare form when no client context
+            // exists, with the SP2 verbatim usage error.
+            Ok(ParsedCmd::DetachClient { target: value_of(&v, "-s") })
         }
         "send-keys" => {
             let Ok((b, v, p)) = scan_flags(&raw.args, &["-l"], &["-t"]) else { return Err(bad()) };
@@ -1038,8 +1047,16 @@ mod tests {
         );
         assert_eq!(
             resolve(&raw("detach-client", &["-s", "work"])).unwrap(),
-            ParsedCmd::DetachClient { target: "work".to_string() }
+            ParsedCmd::DetachClient { target: Some("work".to_string()) }
         );
+    }
+
+    #[test]
+    fn detach_client_bare_is_current_client() {
+        // Bare `detach-client` (tmux: detach the acting client) resolves;
+        // the "no client context" rejection is the dispatcher's job (Task
+        // 6), not resolve's. The default prefix-d binding depends on this.
+        assert_eq!(resolve(&raw("detach-client", &[])).unwrap(), ParsedCmd::DetachClient { target: None });
     }
 
     #[test]

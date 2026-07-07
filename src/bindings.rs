@@ -211,39 +211,75 @@ mod tests {
         keys::parse_key(s).unwrap()
     }
 
+    /// The equivalence contract Task 6 leans on: EVERY default binding is
+    /// asserted with its exact RawCmd name+args and repeat flag, matching
+    /// the legacy hardcoded `InputMachine` behavior 1:1 — plus "nothing
+    /// else": the prefix table is exactly this set and the root table is
+    /// empty.
     #[test]
     fn defaults_cover_current_behavior() {
         let b = Bindings::default();
 
-        let split_h = b.lookup(WhichTable::Prefix, &key("%")).unwrap();
-        assert_eq!(split_h.cmds, vec![RawCmd { name: "split-window".to_string(), args: vec!["-h".to_string()] }]);
-        assert!(!split_h.repeat);
+        // (key, expected cmd name, expected args, repeat)
+        let expected: &[(&str, &str, &[&str], bool)] = &[
+            ("%", "split-window", &["-h"], false),
+            ("\"", "split-window", &["-v"], false),
+            ("Up", "select-pane", &["-U"], false),
+            ("Down", "select-pane", &["-D"], false),
+            ("Left", "select-pane", &["-L"], false),
+            ("Right", "select-pane", &["-R"], false),
+            ("o", "select-pane", &["-t", ":.+"], false),
+            (";", "last-pane", &[], false),
+            ("x", "confirm-before", &["-p", "kill-pane #P? (y/n)", "kill-pane"], false),
+            ("z", "resize-pane", &["-Z"], false),
+            ("C-Up", "resize-pane", &["-U"], true),
+            ("C-Down", "resize-pane", &["-D"], true),
+            ("C-Left", "resize-pane", &["-L"], true),
+            ("C-Right", "resize-pane", &["-R"], true),
+            ("c", "new-window", &[], false),
+            ("n", "next-window", &[], false),
+            ("p", "previous-window", &[], false),
+            ("l", "last-window", &[], false),
+            ("0", "select-window", &["-t", ":=0"], false),
+            ("1", "select-window", &["-t", ":=1"], false),
+            ("2", "select-window", &["-t", ":=2"], false),
+            ("3", "select-window", &["-t", ":=3"], false),
+            ("4", "select-window", &["-t", ":=4"], false),
+            ("5", "select-window", &["-t", ":=5"], false),
+            ("6", "select-window", &["-t", ":=6"], false),
+            ("7", "select-window", &["-t", ":=7"], false),
+            ("8", "select-window", &["-t", ":=8"], false),
+            ("9", "select-window", &["-t", ":=9"], false),
+            ("&", "confirm-before", &["-p", "kill-window #W? (y/n)", "kill-window"], false),
+            (",", "rename-window", &[], false),
+            ("$", "rename-session", &[], false),
+            ("d", "detach-client", &[], false),
+            ("(", "switch-client", &["-p"], false),
+            (")", "switch-client", &["-n"], false),
+            ("C-b", "send-prefix", &[], false),
+            (":", "command-prompt", &[], false),
+        ];
 
-        let x = b.lookup(WhichTable::Prefix, &key("x")).unwrap();
-        assert_eq!(
-            x.cmds,
-            vec![RawCmd {
-                name: "confirm-before".to_string(),
-                args: vec!["-p".to_string(), "kill-pane #P? (y/n)".to_string(), "kill-pane".to_string()],
-            }]
-        );
-        assert!(!x.repeat);
-
-        let cup = b.lookup(WhichTable::Prefix, &key("C-Up")).unwrap();
-        assert_eq!(cup.cmds, vec![RawCmd { name: "resize-pane".to_string(), args: vec!["-U".to_string()] }]);
-        assert!(cup.repeat);
-
-        let colon = b.lookup(WhichTable::Prefix, &key(":")).unwrap();
-        assert_eq!(colon.cmds, vec![RawCmd { name: "command-prompt".to_string(), args: vec![] }]);
-
-        for (name, flag) in [("Up", "-U"), ("Down", "-D"), ("Left", "-L"), ("Right", "-R")] {
-            let arrow = b.lookup(WhichTable::Prefix, &key(name)).unwrap();
-            assert_eq!(arrow.cmds, vec![RawCmd { name: "select-pane".to_string(), args: vec![flag.to_string()] }]);
-            assert!(!arrow.repeat, "{name} must not be repeatable (only C-arrows are)");
+        for (k, name, args, repeat) in expected {
+            let binding = b
+                .lookup(WhichTable::Prefix, &key(k))
+                .unwrap_or_else(|| panic!("default binding missing for prefix-{k}"));
+            assert_eq!(
+                binding.cmds,
+                vec![RawCmd {
+                    name: name.to_string(),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                }],
+                "wrong command for prefix-{k}"
+            );
+            assert_eq!(binding.repeat, *repeat, "wrong repeat flag for prefix-{k}");
         }
 
+        // ... and nothing else: the prefix table is exactly this set.
+        assert_eq!(b.prefix.len(), expected.len());
+
         // Root table has no defaults in SP3.
-        assert!(b.lookup(WhichTable::Root, &key("%")).is_none());
+        assert!(b.root.is_empty());
     }
 
     #[test]

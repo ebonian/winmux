@@ -315,7 +315,7 @@ pub enum ParsedCmd {
     ResizePane { dir: Option<crate::geom::Direction>, zoom: bool, count: i32 },
     RenameWindow { target: Option<String>, name: String },
     RenameSession { target: Option<String>, name: String },
-    DetachClient { target: String },
+    DetachClient { target: Option<String> },
     SendKeys { literal: bool, target: Option<String>, keys: Vec<String> },
     SendPrefix,
     SwitchClient { next: bool },
@@ -368,7 +368,8 @@ style): tokenizer — `plain_split`, `single_quotes_literal`,
 `usage_lookup_by_alias_and_unknown`, `rename_window_requires_name`,
 `show_options_and_display_message`, `switch_client_prev_and_next`,
 `switch_client_requires_exactly_one_of_p_n`,
-`switch_client_dash_l_is_usage_error` (Task 5 cross-module addition: 38
+`switch_client_dash_l_is_usage_error`,
+`detach_client_bare_is_current_client` (Task 5 cross-module additions: 39
 tests total).
 
 ### Tokenizer (`parse_line`)
@@ -442,7 +443,7 @@ requirement); the rest are new tmux-style lines authored for SP3.
 | `resize-pane` | `resizep` | `usage: resize-pane [-L] [-R] [-U] [-D] [-Z] [count]` |
 | `rename-window` | `renamew` | `usage: rename-window [-t target] new-name` **(verbatim)** |
 | `rename-session` | `rename` | `usage: rename-session [-t target] new-name` **(verbatim)** |
-| `detach-client` | — | `usage: detach-client -s target` **(verbatim — note: `-s` is REQUIRED, not optional; SP2's actual `cli_exec.rs` behavior overrides the design doc's `[-s target]` bracket notation, per the task brief's verbatim-copy instruction)** |
+| `detach-client` | — | `usage: detach-client -s target` **(verbatim usage TEXT — but as of Task 5, `-s` is optional at the `resolve()` level: `DetachClient { target: Option<String> }`. tmux's bare `detach-client` detaches the CURRENT client — the default `prefix-d` binding depends on this. Dispatch rule (Task 6): client context + no `-s` = detach the acting client; CLI/config context (no attached client) + no `-s` = the DISPATCHER emits this verbatim SP2 usage error, not `resolve()`. SP2's `cli_exec.rs` keeps enforcing `-s` itself until Task 6 absorbs it.)** |
 | `send-keys` | `send` | `usage: send-keys [-l] [-t target] key ...` |
 | `send-prefix` | — | `usage: send-prefix` |
 | `switch-client` | `switchc` | `usage: switch-client [-p] [-n]` |
@@ -503,6 +504,13 @@ requirement); the rest are new tmux-style lines authored for SP3.
   name) after flags — zero or more-than-one is a `usage:` error (SP2's
   `cli_exec.rs` takes only the first positional and silently ignores extras;
   this module is stricter, same rationale as above).
+- `detach-client` (amended in the Task 5 fix pass): `-s target` is optional
+  in `resolve()` — bare `detach-client` resolves to `DetachClient { target:
+  None }`, meaning "detach the acting client" (tmux behavior; required for
+  the default `prefix-d` binding to be resolvable at all). The "no `-s` and
+  no client context" error is the dispatcher's responsibility (Task 6), and
+  its message is the SP2 verbatim usage line — the usage TEXT is unchanged,
+  only who enforces it moved. See `detach_client_bare_is_current_client`.
 - `switch-client` (Task 5 cross-module addition, sanctioned by the Task 5
   brief): only `-p` (previous session) and `-n` (next session) are parsed;
   exactly one of the two must be given — neither, or both, is a `usage:`
@@ -762,8 +770,9 @@ knows nothing about bindings or commands.
 Unit-tested (`input::key_machine_tests`, mirrors the legacy module's exact-
 value style): `plain_bytes_forward_coalesced`,
 `prefix_then_key_reports_prefix_table`, `prefix_is_consumed_not_forwarded`,
-`root_table_keys_report_root`, `arm_repeat_window`, `capture_bypasses_prefix`,
-`configurable_prefix` (7 tests).
+`double_prefix_reports_prefix_table_key`, `root_table_keys_report_root`,
+`arm_repeat_window`, `capture_bypasses_prefix`, `configurable_prefix`
+(8 tests).
 
 ### Semantics
 
