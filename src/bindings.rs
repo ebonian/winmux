@@ -206,6 +206,12 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(named("C-g"), "copy-clear-selection", &[]);
     b(char_key('o'), "copy-other-end", &[]);
 
+    // Search (Task 4, sub-project 4).
+    b(named("C-s"), "copy-search-forward", &[]);
+    b(named("C-r"), "copy-search-backward", &[]);
+    b(char_key('n'), "copy-search-again", &[]);
+    b(char_key('N'), "copy-search-reverse", &[]);
+
     t
 }
 
@@ -271,6 +277,12 @@ fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     b(named("Enter"), "copy-selection-and-cancel", &[]);
     b(named("Escape"), "copy-clear-selection", &[]);
     b(char_key('o'), "copy-other-end", &[]);
+
+    // Search (Task 4, sub-project 4).
+    b(char_key('/'), "copy-search-forward", &[]);
+    b(char_key('?'), "copy-search-backward", &[]);
+    b(char_key('n'), "copy-search-again", &[]);
+    b(char_key('N'), "copy-search-reverse", &[]);
 
     t
 }
@@ -508,6 +520,10 @@ mod tests {
             ("R", "copy-rectangle-toggle", &[]),
             ("C-g", "copy-clear-selection", &[]),
             ("o", "copy-other-end", &[]),
+            ("C-s", "copy-search-forward", &[]),
+            ("C-r", "copy-search-backward", &[]),
+            ("n", "copy-search-again", &[]),
+            ("N", "copy-search-reverse", &[]),
         ];
         for (k, name, args) in expected {
             let binding = b
@@ -561,6 +577,10 @@ mod tests {
             ("Enter", "copy-selection-and-cancel", &[]),
             ("Escape", "copy-clear-selection", &[]),
             ("o", "copy-other-end", &[]),
+            ("/", "copy-search-forward", &[]),
+            ("?", "copy-search-backward", &[]),
+            ("n", "copy-search-again", &[]),
+            ("N", "copy-search-reverse", &[]),
         ];
         for (k, name, args) in expected {
             let binding = b

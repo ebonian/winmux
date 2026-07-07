@@ -36,7 +36,7 @@ use crate::protocol::ServerMsg;
 
 use super::{
     anchor_key_now, key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState,
-    ConfigCandidate, CopyState, PromptKind, SelState, Server, MONTHS,
+    ConfigCandidate, CopyState, PromptKind, SearchPrompt, SearchState, SelState, Server, MONTHS,
 };
 use crate::grid::Grid;
 
@@ -296,6 +296,147 @@ fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll:
         lines.push(trim_trailing_blanks(&slice));
     }
     lines.join("\n")
+}
+
+// ---- copy-mode search (Task 4, sub-project 4) ----
+
+/// Repeat the stored search (`cs.search`) in the SAME direction (`n`,
+/// `reverse == false`) or the OPPOSITE direction (`N`, `reverse == true`).
+/// `None` (silent no-op) when no search has ever been committed in this
+/// copy-mode session. Otherwise delegates to `do_search`, whose return value
+/// (`Some(message)` on no match, `None` on a move) is passed straight
+/// through.
+fn repeat_search(grid: &Grid, cs: &mut CopyState, reverse: bool) -> Option<String> {
+    let state = cs.search.clone()?;
+    let backward = if reverse { !state.backward } else { state.backward };
+    do_search(grid, cs, &state.pattern, backward)
+}
+
+/// Perform one literal, case-insensitive, single-row copy-mode search (Task
+/// 4): starting from the current cursor position EXCLUSIVE (a repeat must
+/// advance past the current match, never re-find it), scans `backward`
+/// (toward older content / history top) or forward (toward newer content /
+/// live bottom), wrapping across the WHOLE buffer (history top <-> live
+/// bottom, like tmux). Always records `(pattern, backward)` as the new
+/// repeatable search FIRST -- even a failed search is worth remembering, so
+/// `n`/`N` can retry it later (e.g. after more output arrives, or the pane
+/// resizes). On a match, moves the cursor to the match's first column/row
+/// and scrolls it into view (`key_to_view`) and returns `None`; searching
+/// never touches `cs.sel` (an active selection's anchor is untouched -- the
+/// cursor move alone extends it, same as any other copy-mode motion). On no
+/// match, returns `Some("no match: <pattern>")` for the caller to show as a
+/// transient status message -- tmux itself gives no dedicated "not found"
+/// feedback for copy-mode search; this is a documented winmux addition (see
+/// the task report). Multi-row matches and regex are both out of scope (v1
+/// simplification, matching the task brief).
+fn do_search(grid: &Grid, cs: &mut CopyState, pattern: &str, backward: bool) -> Option<String> {
+    cs.search = Some(SearchState { pattern: pattern.to_string(), backward });
+    let rows = grid.rows();
+    let cur_key = sel_key(cs.scroll, cs.cy);
+    let cur_col = cs.cx as usize;
+    let pat: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
+    match find_search_match(grid, &pat, cur_key, cur_col, backward) {
+        Some((key, col)) => {
+            let (scroll, cy) = key_to_view(key, rows);
+            cs.scroll = scroll;
+            cs.cy = cy;
+            cs.cx = col;
+            None
+        }
+        None => Some(format!("no match: {pattern}")),
+    }
+}
+
+/// The core buffer scan behind `do_search`. Visiting order (forward):
+/// (1) the rest of the CURRENT row strictly after `cur_col`; (2) every OTHER
+/// row in the buffer, nearest first, wrapping past the newest row back to
+/// the oldest; (3) as a last resort, the current row's portion strictly
+/// before `cur_col` (completing the wrap). Backward mirrors this exactly
+/// (nearer/farther swapped, and each row's RIGHTMOST match is preferred over
+/// its leftmost — the natural choice when scanning right-to-left). Returns
+/// the match's `(key, col)` in the `sel_key`/`key_to_view` coordinate system,
+/// or `None` if the pattern appears nowhere in the buffer.
+fn find_search_match(grid: &Grid, pat: &[char], cur_key: i64, cur_col: usize, backward: bool) -> Option<(i64, u16)> {
+    let rows = grid.rows();
+    let history_len = grid.history_len();
+    let min_key = -(history_len as i64);
+    let max_key = rows as i64 - 1;
+    let total = max_key - min_key + 1;
+    if total <= 0 || pat.is_empty() {
+        return None;
+    }
+
+    let row_at = |key: i64| -> Vec<char> {
+        let (sb, r) = key_to_view(key, rows);
+        grid.view_row_text(sb, r).chars().flat_map(|c| c.to_lowercase()).collect()
+    };
+    let wrap = |k: i64| -> i64 { min_key + (k - min_key).rem_euclid(total) };
+    let cur_row = row_at(cur_key);
+
+    if backward {
+        if let Some(c) = find_last_in(&cur_row, pat, None, cur_col) {
+            return Some((cur_key, c as u16));
+        }
+        for off in 1..total {
+            let key = wrap(cur_key - off);
+            let row = row_at(key);
+            if let Some(c) = find_last_in(&row, pat, None, usize::MAX) {
+                return Some((key, c as u16));
+            }
+        }
+        if let Some(c) = find_last_in(&cur_row, pat, Some(cur_col + 1), usize::MAX) {
+            return Some((cur_key, c as u16));
+        }
+    } else {
+        if let Some(c) = find_first_in(&cur_row, pat, cur_col + 1, None) {
+            return Some((cur_key, c as u16));
+        }
+        for off in 1..total {
+            let key = wrap(cur_key + off);
+            let row = row_at(key);
+            if let Some(c) = find_first_in(&row, pat, 0, None) {
+                return Some((key, c as u16));
+            }
+        }
+        if cur_col > 0 {
+            if let Some(c) = find_first_in(&cur_row, pat, 0, Some(cur_col)) {
+                return Some((cur_key, c as u16));
+            }
+        }
+    }
+    None
+}
+
+/// Leftmost match start column `>= from` (and `< to_excl` if given) in one
+/// row. `None` if `pat` is empty, longer than `row`, or absent in range.
+fn find_first_in(row: &[char], pat: &[char], from: usize, to_excl: Option<usize>) -> Option<usize> {
+    if pat.is_empty() || pat.len() > row.len() {
+        return None;
+    }
+    let last_start = row.len() - pat.len();
+    let hi = match to_excl {
+        Some(t) => t.checked_sub(1)?.min(last_start),
+        None => last_start,
+    };
+    if from > hi {
+        return None;
+    }
+    (from..=hi).find(|&s| &row[s..s + pat.len()] == pat)
+}
+
+/// Rightmost match start column `< to_excl` (and `>= from` if given) in one
+/// row. `None` if `pat` is empty, longer than `row`, or absent in range.
+fn find_last_in(row: &[char], pat: &[char], from: Option<usize>, to_excl: usize) -> Option<usize> {
+    if pat.is_empty() || pat.len() > row.len() {
+        return None;
+    }
+    let last_start = row.len() - pat.len();
+    let hi = to_excl.saturating_sub(1).min(last_start);
+    let lo = from.unwrap_or(0);
+    if lo > hi {
+        return None;
+    }
+    (lo..=hi).rev().find(|&s| &row[s..s + pat.len()] == pat)
 }
 
 impl Server {
@@ -735,7 +876,7 @@ impl Server {
         } else {
             (0u32, live_cx, live_cy)
         };
-        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false, sel: None });
+        client.mode = ClientMode::Copy(CopyState { pane, scroll, cx, cy, scroll_exit: false, sel: None, search: None, search_prompt: None });
         ExecOutcome::Ok(String::new())
     }
 
@@ -901,6 +1042,24 @@ impl Server {
             }
             CopyAction::ClearSelection => {
                 cs.sel = None;
+            }
+            CopyAction::SearchForward => {
+                cs.search_prompt = Some(SearchPrompt { backward: false, buf: String::new() });
+                client.key_machine.set_capture(true);
+            }
+            CopyAction::SearchBackward => {
+                cs.search_prompt = Some(SearchPrompt { backward: true, buf: String::new() });
+                client.key_machine.set_capture(true);
+            }
+            CopyAction::SearchAgain => {
+                if let Some(msg) = repeat_search(&p.grid, cs, false) {
+                    return ExecOutcome::Ok(msg);
+                }
+            }
+            CopyAction::SearchReverse => {
+                if let Some(msg) = repeat_search(&p.grid, cs, true) {
+                    return ExecOutcome::Ok(msg);
+                }
             }
             CopyAction::SelectionAndCancel => {
                 let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
@@ -1547,14 +1706,88 @@ impl Server {
     /// letting the caller route it through [`route_outcome`] exactly like a
     /// key-binding dispatch.
     pub(super) fn feed_mode_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) -> (bool, Option<ExecOutcome>) {
+        // Task 4 (search): a copy-mode client with an OPEN search prompt
+        // (`CopyState::search_prompt`) arms capture the same way `Prompt`/
+        // `ConfirmCmd` do, but deliberately stays in `ClientMode::Copy` (see
+        // `SearchPrompt`'s doc comment) -- peek for that case first, since
+        // it isn't one of the `client.mode` variants the match below knows
+        // about. `cs` isn't read past the guard, so this borrow of
+        // `client.mode` ends before the `Captured`/normal-routing path below
+        // (which needs `&mut client.mode` again) runs.
+        if let ClientMode::Copy(cs) = &client.mode {
+            if cs.search_prompt.is_some() {
+                return self.feed_copy_search_byte(client, b);
+            }
+        }
         match client.mode {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
-            // Copy mode (Task 2) never arms raw capture (`set_capture`) —
-            // its keys flow through the normal `KeyInputEvent::Key` path
-            // with a table override (see `handle_stdin`), not `Captured`
-            // bytes. This arm exists only for match-exhaustiveness.
+            // Copy mode (Task 2) without an open search prompt never arms
+            // raw capture (`set_capture`) — its keys flow through the normal
+            // `KeyInputEvent::Key` path with a table override (see
+            // `handle_stdin`), not `Captured` bytes. This arm exists only
+            // for match-exhaustiveness.
             ClientMode::Normal | ClientMode::Copy(_) => (true, None),
+        }
+    }
+
+    /// Route one byte of a copy-mode search prompt's (Task 4) line edit:
+    /// same commit/cancel/printable/backspace rules as `feed_prompt_byte`
+    /// (the task brief's "reuse the existing capture machinery" instruction)
+    /// — only the STORAGE differs, see `SearchPrompt`'s doc comment.
+    fn feed_copy_search_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>) {
+        let commit = matches!(b, b'\r' | b'\n');
+        let cancel = matches!(b, 0x1b | 0x03 | 0x07);
+        if !commit && !cancel {
+            if let ClientMode::Copy(cs) = &mut client.mode {
+                if let Some(sp) = &mut cs.search_prompt {
+                    match b {
+                        0x20..=0x7e => sp.buf.push(b as char),
+                        0x7f | 0x08 => {
+                            sp.buf.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return (false, None);
+        }
+
+        client.key_machine.set_capture(false);
+        // The brief: "handle the client having left copy mode or the pane
+        // having died between prompt open and commit (cancel silently)" --
+        // `cancel_stale_copy_modes` is the primary mechanism (and now also
+        // clears capture, see its Task 4 amendment), but this re-check is
+        // belt-and-braces for the same reason `feed_confirm_byte` re-checks
+        // its snapshot: this client was already removed from `self.clients`
+        // for the duration of `handle_stdin`'s dispatch, unreachable by that
+        // sweep until it's reinserted.
+        let ClientMode::Copy(cs) = &mut client.mode else {
+            return (true, None);
+        };
+        let Some(sp) = cs.search_prompt.take() else {
+            return (true, None);
+        };
+        if cancel {
+            return (true, None);
+        }
+        let Some(p) = self.panes.get(&cs.pane) else {
+            client.mode = ClientMode::Normal;
+            return (true, None);
+        };
+        // Empty commit repeats the previous search (tmux behavior); with no
+        // previous search stored, it's a silent no-op.
+        let pattern = if sp.buf.is_empty() {
+            match &cs.search {
+                Some(s) => s.pattern.clone(),
+                None => return (true, None),
+            }
+        } else {
+            sp.buf
+        };
+        match do_search(&p.grid, cs, &pattern, sp.backward) {
+            Some(msg) => (true, Some(ExecOutcome::Ok(msg))),
+            None => (true, Some(ExecOutcome::Ok(String::new()))),
         }
     }
 

@@ -159,14 +159,13 @@ row `index - history_len`.
   (no scrollback needed — these tests decode client/server output, not
   scrollback UI, which is a later SP4 task).
 
-## `copy-mode` — scrollback navigation core (Task 2) + selection & paste buffers (Task 3)
+## `copy-mode` — scrollback navigation core (Task 2) + selection & paste buffers (Task 3) + search (Task 4)
 
 Implements the design spec's `## 2. Copy mode` movement/scroll/cancel
 subset (Task 2) PLUS selection (`copy-begin-selection`,
 `copy-rectangle-toggle`, `copy-other-end`, `copy-clear-selection`,
-`copy-selection-and-cancel`) and tmux paste buffers (Task 3, sub-project 4,
-`## buffers` section below). Search (`copy-search-*`) remains OUT of scope
-(Task 4) — no `ParsedCmd`/`CopyAction` variants or bindings exist for it yet.
+`copy-selection-and-cancel`), tmux paste buffers (Task 3, sub-project 4,
+`## buffers` section below), and search (`copy-search-*`, Task 4, below).
 
 ### `input` amendment
 
@@ -212,7 +211,7 @@ Default `copy-mode` (emacs) table — movement/scroll/cancel subset only:
 
 `H`/`M`/`L` (top/middle/bottom-line) are NOT bound in the emacs table — the
 design spec flags them "unverified" for emacs; bound in vi only (documented
-deviation). Search bindings (`C-s`/`C-r`, `n`/`N`) are Task 4 and absent.
+deviation).
 
 **Task 3 amendment** — selection, added to the emacs table:
 
@@ -223,6 +222,15 @@ deviation). Search bindings (`C-s`/`C-r`, `n`/`N`) are Task 4 and absent.
 | `R` | `copy-rectangle-toggle` |
 | `C-g` | `copy-clear-selection` |
 | `o` | `copy-other-end` |
+
+**Task 4 amendment** — search, added to the emacs table:
+
+| Key(s) | Command |
+|---|---|
+| `C-s` | `copy-search-forward` |
+| `C-r` | `copy-search-backward` |
+| `n` | `copy-search-again` |
+| `N` | `copy-search-reverse` |
 
 Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 
@@ -239,8 +247,6 @@ Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 | `C-f`/`NPage` | `copy-page-down` |
 | `q` | `copy-cancel` |
 
-`/`/`?`/`n`/`N` (search) are Task 4 and absent.
-
 **Task 3 amendment** — selection, added to the vi table (`Escape`, left
 UNBOUND through Task 2, is now bound):
 
@@ -251,6 +257,15 @@ UNBOUND through Task 2, is now bound):
 | `Enter` | `copy-selection-and-cancel` |
 | `Escape` | `copy-clear-selection` |
 | `o` | `copy-other-end` |
+
+**Task 4 amendment** — search, added to the vi table:
+
+| Key(s) | Command |
+|---|---|
+| `/` | `copy-search-forward` |
+| `?` | `copy-search-backward` |
+| `n` | `copy-search-again` |
+| `N` | `copy-search-reverse` |
 
 **Gotcha (discovered implementing this task, applies to both tables):** the
 live decoder (`keys::classify_single_byte`) NEVER produces
@@ -289,6 +304,8 @@ pub enum CopyAction {
     Cancel,
     // Task 3 additions (selection):
     BeginSelection, RectangleToggle, OtherEnd, ClearSelection, SelectionAndCancel,
+    // Task 4 additions (search):
+    SearchForward, SearchBackward, SearchAgain, SearchReverse,
 }
 ```
 
@@ -322,6 +339,18 @@ master's `window-copy.c` command table) — `resolve` maps the literal string
 `bind-key`/`unbind-key -T` accepts `"copy-mode"`/`"copy-mode-vi"` (see the
 `bindings` amendment above).
 
+**Task 4 amendment** — search. Canonical names `copy-search-forward`,
+`copy-search-backward`, `copy-search-again`, `copy-search-reverse` (all four
+follow the generic `copy-<action>`/no-arguments/`Err("not in a mode")`
+pattern above — no special-casing was needed in `canonical()`/`usage()`/
+`resolve()`, unlike `copy-mode` itself). The `-X` name table grows
+`search-forward`, `search-backward`, `search-again`, `search-reverse`
+(dropping the `copy-` prefix, the normal rule). `SearchForward`/
+`SearchBackward` do NOT take an inline pattern argument (tmux's real
+`search-forward <text>` does) — v1 simplification, prompt-driven only
+(documented deviation, see the task report); `SearchAgain`/`SearchReverse`
+take none either way (repeat the STORED pattern).
+
 ### `options` amendment
 
 Adds `mode-style` (`Style`, default `bg=yellow,fg=black`) and two getters:
@@ -350,6 +379,20 @@ struct CopyState {
     cy: u16,       // view-coordinate cursor row
     scroll_exit: bool, // placeholder for the mouse task; unused in Task 2
     sel: Option<SelState>, // Task 3: the active selection, if any
+    search: Option<SearchState>,       // Task 4: last committed search, for n/N
+    search_prompt: Option<SearchPrompt>, // Task 4: the open `/`?`/C-s`/C-r line edit, if any
+}
+
+// Task 4 additions -- see the "Task 4 amendment -- search" subsection below
+// for the full rationale (in particular WHY these live inside `CopyState`
+// instead of `ClientMode::Prompt`).
+struct SearchState {
+    pattern: String,
+    backward: bool,
+}
+struct SearchPrompt {
+    backward: bool,
+    buf: String,
 }
 
 /// Task 3 addition (amended by the Task 3 review fix). The anchor is
@@ -508,6 +551,92 @@ coherent frame regardless of output captured mid-selection.
   `[min_col..=max_col]` (columns from `min`/`max` of the anchor's and
   cursor's `x`, NOT sorted by which is anchor), same per-row trimming,
   `\n`-joined.
+
+**Task 4 amendment — search** (`src/server.rs` / `src/server/dispatch.rs`).
+`CopyState` gains `search: Option<SearchState>` (the last COMMITTED search —
+pattern + direction — for `n`/`N` to repeat; set on every commit, even a
+failed one, so a retry later can still find something) and `search_prompt:
+Option<SearchPrompt>` (the in-progress `/`/`?`/`C-s`/`C-r` line edit, `Some`
+only while typing).
+
+**Why `search_prompt` lives inside `CopyState` instead of switching
+`client.mode` to the existing `ClientMode::Prompt`** (the brief's suggested
+starting point): `render_one` only paints a pane's SCROLLED copy view,
+frozen cursor, and selection highlight when `client.mode` is literally
+`ClientMode::Copy` (`let copy = match &client.mode { ClientMode::Copy(cs) if
+... }`). Switching to `ClientMode::Prompt` while typing a search would drop
+back to the pane's LIVE view/cursor for the duration of typing — an
+observable regression from tmux, which keeps the copy-mode screen frozen
+under the "Search Down:"/"Search Up:" prompt. The capture MECHANISM is
+identical either way (`client.key_machine.set_capture`, the same printable-
+append/BSpace/Enter-commit/Esc-C-c-C-g-cancel rules as `feed_prompt_byte`) —
+only the storage location differs, so this is not "new capture machinery" in
+the sense the brief was steering away from.
+
+- `exec_copy_action` (Err("not in a mode") outside copy mode, same as every
+  other `CopyAction`):
+  - `SearchForward`/`SearchBackward`: `cs.search_prompt = Some(SearchPrompt{
+    backward, buf: String::new()})` then `client.key_machine.set_capture(true)`.
+    No message; copy mode's normal rendering continues underneath.
+  - `SearchAgain`/`SearchReverse`: delegate to a free `fn repeat_search(grid:
+    &Grid, cs: &mut CopyState, reverse: bool) -> Option<String>` — `None`
+    (silent no-op) if `cs.search` is `None`; otherwise re-runs the stored
+    pattern in the same (`SearchAgain`) or flipped (`SearchReverse`)
+    direction via `do_search` below. A `Some(message)` return is surfaced as
+    `ExecOutcome::Ok(message)`.
+- `Server::feed_mode_byte` peeks `client.mode` for `ClientMode::Copy(cs)` with
+  `cs.search_prompt.is_some()` FIRST (this borrow ends before the existing
+  match, which still handles `ConfirmCmd`/`Prompt`/everything else) and
+  routes to a new `feed_copy_search_byte(client, b)` method when true — same
+  commit/cancel/printable/backspace byte rules as `feed_prompt_byte`. On
+  commit: `client.key_machine.set_capture(false)`; re-checks `client.mode` is
+  still `Copy` and `cs.pane` still exists (belt-and-braces — "handle the
+  client having left copy mode or the pane having died between prompt open
+  and commit" per the brief; `cancel_stale_copy_modes` below is the primary
+  mechanism) — either failure cancels silently. An EMPTY committed buffer
+  repeats `cs.search`'s pattern (in THIS prompt's direction, `sp.backward` —
+  not necessarily the stored search's original direction, matching vim's
+  `/<Enter>`/`?<Enter>`) if one exists, else is a silent no-op. Otherwise
+  dispatches to `do_search`.
+- `fn do_search(grid: &Grid, cs: &mut CopyState, pattern: &str, backward:
+  bool) -> Option<String>` (free fn, `src/server/dispatch.rs`): records
+  `cs.search = Some(SearchState{pattern, backward})` FIRST (even on a miss —
+  worth remembering for a later retry), then delegates to `fn
+  find_search_match(grid, pat: &[char], cur_key: i64, cur_col: usize,
+  backward: bool) -> Option<(i64, u16)>` (lowercased literal single-row
+  match, `sel_key`/`key_to_view` coordinates — the same "combined
+  history+live buffer, one linear key" system Task 3's selection math
+  uses). On a match: `cs.scroll`/`cs.cy` set via `key_to_view(key, rows)`,
+  `cs.cx` set to the match column, returns `None`. On no match: returns
+  `Some("no match: <pattern>")` (a documented winmux addition — tmux itself
+  gives no dedicated "not found" feedback for copy-mode search) without
+  moving the cursor. Never touches `cs.sel` — an active selection's anchor is
+  untouched by a search the same as by any other copy-mode motion.
+  - Visiting order (forward): the rest of the CURRENT row strictly after
+    `cur_col`; then every OTHER row, nearest first, wrapping past the newest
+    row back to the oldest; then, as a last resort, the current row's
+    portion strictly before `cur_col` (completing the wrap) — this is what
+    makes the search EXCLUSIVE of the current position (a repeat cannot
+    re-find the cell the cursor is already on) while still covering the
+    whole buffer if nothing else matches. Backward mirrors this (nearer/
+    farther swapped); each row's RIGHTMOST match is preferred over its
+    leftmost when scanning right-to-left. Multi-row matches and regex are
+    both out of scope (v1 simplification, matching the task brief).
+- `Server::cancel_stale_copy_modes` amendment: now also calls
+  `client.key_machine.set_capture(false)` when resetting a stale client's
+  mode to `Normal` (previously only `cancel_stale_confirms` did this) —
+  covers the pane-dies-while-the-search-prompt-is-open case: without this,
+  capture would stay armed after `client.mode` reverts to `Normal`, so the
+  next keystroke would be silently swallowed as a stray captured byte
+  instead of routing as normal input.
+- `render_one`'s `message` computation: the `ClientMode::Copy(cs)` arm now
+  checks `cs.search_prompt` first — `Some(sp)` renders `"Search Down: "`
+  (`sp.backward == false`) or `"Search Up: "` (`sp.backward == true`) plus
+  `sp.buf` in the status row (exactly like `ClientMode::Prompt`'s `{label}
+  {buf}`, including hiding the pane cursor the same way, since
+  `cursor_visible` is still `message.is_none()`); `None` falls through to the
+  pre-Task-4 behavior (any transient `client.message`, e.g. a "no match:
+  ..." result, showing underneath).
 
 ### `render` amendment
 

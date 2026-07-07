@@ -2655,3 +2655,275 @@ fn set_buffer_named_exempt_from_eviction() {
     expect_cli_done(&cli6, 0);
     server.join().expect("server exits after kill-server");
 }
+
+// ---- copy-mode search (Task 4, sub-project 4) ----
+
+/// After a search moves the copy cursor onto a match, the match always
+/// starts at view column 0 in every test fixture below (each marker is
+/// printed as the ONLY thing on its output line via a `'a'+'b'`-style
+/// PowerShell concatenation expression, so the shell's own typed-command
+/// echo never contains the search pattern as a contiguous substring and
+/// can't accidentally provide a second, unwanted match). This checks the
+/// cursor sits at col 0 of a row that STARTS WITH `text` -- a prefix check,
+/// not full-line equality, because a match landing on view row 0 shares that
+/// row with the `[scroll/history]` position indicator (right-aligned, see
+/// `has_indicator`), which `trim_end()` alone would not strip away.
+fn cursor_on_line(g: &Grid, text: &str) -> bool {
+    let (cx, cy) = g.cursor();
+    let want_len = text.chars().count();
+    cx == 0
+        && screen_text(g)
+            .get(cy as usize)
+            .map(|s| s.chars().take(want_len).collect::<String>())
+            == Some(text.to_string())
+}
+
+/// True once the shell has drawn a fresh prompt on the row immediately
+/// after `marker` -- i.e. the command that produced `marker` has FULLY
+/// finished (no more trailing output, like the next prompt line, still in
+/// flight). Entering copy mode as soon as `marker` merely APPEARS
+/// (without this check) races: a trailing line arriving even one `Output`
+/// frame later would shift every scrolled-back row up by one between when a
+/// search computes its match and when the client renders it, since the
+/// server's `p.grid` (and thus the row a stored `(scroll, cx, cy)` points
+/// at) keeps moving until the shell is truly idle.
+fn shell_idle_after(g: &Grid, marker: &str) -> bool {
+    let lines = screen_text(g);
+    let Some(pos) = lines.iter().position(|l| l.trim_end() == marker) else {
+        return false;
+    };
+    lines.get(pos + 1).map(|l| l.contains("PS ")).unwrap_or(false)
+}
+
+#[test]
+fn copy_search_finds_in_history() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // "needle$_" in the typed command template never collides with a
+    // specific "needle9"-style search pattern (the digit only exists in the
+    // INTERPOLATED output), and "needle9" is not a substring of any other
+    // "needleNN" line in 1..40 (the two-digit lines all have a different
+    // digit before the trailing one).
+    c.send(&ClientMsg::Stdin(b"1..40 | ForEach-Object { \"needle$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "needle40"));
+
+    // Copy mode enters bound to the LIVE cursor position -- the very newest
+    // spot in the whole buffer. A forward search from there must wrap all
+    // the way around to the OLDEST retained line before finding anything,
+    // so landing on "needle9" here proves the match was found up in
+    // history, not just nearby on the live screen.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // The mode-opening key and the subsequently-typed pattern must arrive
+    // in SEPARATE `Stdin` frames (same constraint the existing rename-window
+    // prompt tests already respect): capture only takes effect starting the
+    // NEXT frame `KeyMachine::feed` decodes, not retroactively within the
+    // frame that armed it.
+    c.send(&ClientMsg::Stdin(b"/".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Down: ")));
+    c.send(&ClientMsg::Stdin(b"needle9\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "needle9") && !has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_search_backward() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"1..40 | ForEach-Object { \"needle$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "needle40"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // `?` (vi backward search): ascends directly from the bottom to
+    // "needle23" (unique -- no other 1..40 line contains it as a
+    // substring), no wrap required.
+    c.send(&ClientMsg::Stdin(b"?".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Up: ")));
+    c.send(&ClientMsg::Stdin(b"needle23\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "needle23"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `n` (search-again) both wraps the buffer boundary AND advances past the
+/// current match rather than re-finding it: with exactly two occurrences of
+/// "wrapmark" -- one pushed into history, one still on the live screen --
+/// a forward search from the very bottom must wrap all the way to the
+/// OLDEST one first, and a following `n` must advance to the NEWER one
+/// instead of staying put.
+#[test]
+fn copy_search_next_wraps() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // `'wrap'+'mark'` (string concatenation) prints exactly "wrapmark" as
+    // the sole content of its output line; the TYPED command line
+    // ("'wrap'+'mark'") never contains "wrapmark" contiguously (the `+` and
+    // quotes break it up), so each invocation contributes exactly one match.
+    c.send(&ClientMsg::Stdin(b"'wrap'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "wrapmark"));
+
+    // Push the first occurrence well into history before printing the
+    // second (live) one.
+    c.send(&ClientMsg::Stdin(b"1..35 | ForEach-Object { \"fillmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "fillmark35"));
+    c.send(&ClientMsg::Stdin(b"'wrap'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "wrapmark"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Forward from the very bottom wraps immediately to the OLDEST
+    // occurrence (still in history: scroll != 0).
+    c.send(&ClientMsg::Stdin(b"/".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Down: ")));
+    c.send(&ClientMsg::Stdin(b"wrapmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "wrapmark") && !has_indicator(g, "[0/"));
+
+    // `n`: same direction (forward) again -- advances to the NEWER
+    // occurrence (now back on the live screen: scroll == 0), proving it did
+    // not just re-find the line it's already sitting on.
+    c.send(&ClientMsg::Stdin(b"n".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "wrapmark") && has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `N` repeats the last search in the OPPOSITE direction: backward first
+/// finds the nearer (live) occurrence directly, then `N` reverses to
+/// forward and must wrap to the farther (history) one.
+#[test]
+fn copy_search_capital_n_reverses_direction() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"'rev'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "revmark"));
+    c.send(&ClientMsg::Stdin(b"1..35 | ForEach-Object { \"fillmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "fillmark35"));
+    c.send(&ClientMsg::Stdin(b"'rev'+'mark'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "revmark"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // `?`: backward from the bottom finds the NEARER (live) occurrence.
+    c.send(&ClientMsg::Stdin(b"?".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Up: ")));
+    c.send(&ClientMsg::Stdin(b"revmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "revmark") && has_indicator(g, "[0/"));
+
+    // `N`: reverses to forward, wrapping to the FARTHER (history) occurrence.
+    c.send(&ClientMsg::Stdin(b"N".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "revmark") && !has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn copy_search_case_insensitive() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Output is "MixedCase123"; the typed command never contains that
+    // contiguous substring (broken by the `+`).
+    c.send(&ClientMsg::Stdin(b"'Mixed'+'Case123'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| shell_idle_after(g, "MixedCase123"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // All-lowercase pattern still finds the mixed-case line.
+    c.send(&ClientMsg::Stdin(b"/".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Down: ")));
+    c.send(&ClientMsg::Stdin(b"mixedcase123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| cursor_on_line(g, "MixedCase123"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `C-s` (emacs forward search) with no match anywhere: a transient
+/// "no match: <pattern>" status message appears (a documented winmux
+/// addition -- tmux itself gives no dedicated feedback here).
+#[test]
+fn copy_search_no_match_message() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Default mode-keys is emacs: C-s opens "Search Down: ".
+    c.send(&ClientMsg::Stdin(vec![0x13]));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Search Down: ")));
+
+    c.send(&ClientMsg::Stdin(b"zzznomatchzzz\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("no match: zzznomatchzzz")));
+
+    // Copy mode itself is still active underneath the message.
+    assert!(has_indicator(&grid, "[0/"), "copy mode must still be active after a failed search");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("no match:")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

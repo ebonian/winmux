@@ -284,6 +284,22 @@ pub enum CopyAction {
     /// Extract the current selection's text (if any) into a new automatic
     /// paste buffer, then exit copy mode (the "copy" action).
     SelectionAndCancel,
+    /// Task 4, sub-project 4 (search): open the `/`/`C-s` "Search Down: "
+    /// status-line prompt (forward = toward newer content / the live
+    /// bottom). Committing dispatches the actual search; see the
+    /// `## copy-mode` contract section's Task 4 amendment.
+    SearchForward,
+    /// Task 4: open the `?`/`C-r` "Search Up: " status-line prompt
+    /// (backward = toward older content / history top).
+    SearchBackward,
+    /// Task 4: repeat the last committed search in the SAME direction (`n`).
+    /// A no-op if no search has ever been committed in this copy-mode
+    /// session.
+    SearchAgain,
+    /// Task 4: repeat the last committed search in the OPPOSITE direction
+    /// (`N`). A no-op if no search has ever been committed in this copy-mode
+    /// session.
+    SearchReverse,
 }
 
 /// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
@@ -316,6 +332,10 @@ fn copy_action_name(a: CopyAction) -> &'static str {
         CopyAction::OtherEnd => "copy-other-end",
         CopyAction::ClearSelection => "copy-clear-selection",
         CopyAction::SelectionAndCancel => "copy-selection-and-cancel",
+        CopyAction::SearchForward => "copy-search-forward",
+        CopyAction::SearchBackward => "copy-search-backward",
+        CopyAction::SearchAgain => "copy-search-again",
+        CopyAction::SearchReverse => "copy-search-reverse",
     }
 }
 
@@ -348,6 +368,10 @@ const COPY_ACTIONS: &[CopyAction] = &[
     CopyAction::OtherEnd,
     CopyAction::ClearSelection,
     CopyAction::SelectionAndCancel,
+    CopyAction::SearchForward,
+    CopyAction::SearchBackward,
+    CopyAction::SearchAgain,
+    CopyAction::SearchReverse,
 ];
 
 fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
@@ -387,6 +411,10 @@ fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
         // prefix (unlike every other -X name above) -- verified against
         // tmux master's `cmd-copy-mode.c`/`window-copy.c` command table.
         "copy-selection-and-cancel" => CopyAction::SelectionAndCancel,
+        "search-forward" => CopyAction::SearchForward,
+        "search-backward" => CopyAction::SearchBackward,
+        "search-again" => CopyAction::SearchAgain,
+        "search-reverse" => CopyAction::SearchReverse,
         _ => return None,
     })
 }
@@ -1443,6 +1471,38 @@ mod tests {
         assert_eq!(
             resolve(&raw("send-keys", &["-X", "copy-selection-and-cancel"])).unwrap(),
             ParsedCmd::CopyCmd(CopyAction::SelectionAndCancel)
+        );
+    }
+
+    // ---- search (Task 4, sub-project 4) ----
+
+    #[test]
+    fn copy_search_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-search-forward", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchForward));
+        assert_eq!(resolve(&raw("copy-search-backward", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchBackward));
+        assert_eq!(resolve(&raw("copy-search-again", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchAgain));
+        assert_eq!(resolve(&raw("copy-search-reverse", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchReverse));
+        // No arguments accepted (same rule as every other copy-* command).
+        assert_eq!(resolve(&raw("copy-search-forward", &["x"])).unwrap_err(), usage("copy-search-forward").unwrap());
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_search_names() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-forward"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchForward)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-backward"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchBackward)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-again"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchAgain)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-reverse"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchReverse)
         );
     }
 

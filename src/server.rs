@@ -136,8 +136,10 @@ enum ClientMode {
 /// VIEW coordinates (0-based, within the pane's current `cols`/`rows`).
 /// `scroll_exit` is a placeholder for the mouse task's scroll-past-bottom
 /// auto-exit (SP4 §4) — unused until then. `sel` (Task 3, sub-project 4) is
-/// the active selection, if any; `search` (Task 4) is still deliberately
-/// absent.
+/// the active selection, if any. `search`/`search_prompt` (Task 4) are the
+/// stored repeatable search and the in-progress `/`/`?`/`C-s`/`C-r` line
+/// edit, if any — see their own doc comments for why the search PROMPT is
+/// tracked here rather than by switching `client.mode` to `ClientMode::Prompt`.
 struct CopyState {
     pane: PaneId,
     scroll: u32,
@@ -146,6 +148,41 @@ struct CopyState {
     #[allow(dead_code)]
     scroll_exit: bool,
     sel: Option<SelState>,
+    search: Option<SearchState>,
+    search_prompt: Option<SearchPrompt>,
+}
+
+/// Task 4 (search): the last search a client COMMITTED in this copy-mode
+/// session (pattern + direction), regardless of whether it matched — `n`/`N`
+/// repeat against this, and even a failed search is worth remembering (the
+/// user may scroll/resize and retry). `None` until the first commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchState {
+    pattern: String,
+    backward: bool,
+}
+
+/// Task 4 (search): the active `/`/`?`/`C-s`/`C-r` line edit, `Some` only
+/// while the search prompt is open. Deliberately stored HERE, inside
+/// `CopyState`, rather than by switching `client.mode` to the pre-existing
+/// `ClientMode::Prompt` (which is how `:`/rename prompts work): `render_one`
+/// only paints a pane's SCROLLED copy view, frozen cursor, and selection
+/// highlight when `client.mode` is literally `ClientMode::Copy` (see its
+/// `let copy = match &client.mode { ClientMode::Copy(cs) if ... }` below) —
+/// switching away to `ClientMode::Prompt` while typing a search would drop
+/// back to the pane's LIVE view/cursor for the duration of typing, an
+/// observable regression from tmux (which keeps the copy-mode screen frozen
+/// under the "Search Down:"/"Search Up:" prompt). Capture is armed the exact
+/// same way (`client.key_machine.set_capture`) and the byte-level editing
+/// rules are identical to `feed_prompt_byte` (printable append / BSpace
+/// delete / Enter commit / Esc-Ctrl+c-Ctrl+g cancel, see
+/// `Server::feed_copy_search_byte`) — no new capture MECHANISM, only a new
+/// place for the in-progress buffer to live so the surrounding copy-mode
+/// state survives the round trip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchPrompt {
+    backward: bool,
+    buf: String,
 }
 
 /// A copy-mode selection's anchor + shape (Task 3, sub-project 4). The
@@ -966,6 +1003,16 @@ impl Server {
             if stale {
                 if let Some(client) = self.clients.get_mut(&id) {
                     client.mode = ClientMode::Normal;
+                    // Task 4 review fix: a client can be mid-search-prompt
+                    // (capture armed via `set_capture(true)`, see
+                    // `SearchPrompt`'s doc comment) when its pane dies out
+                    // from under it. `cancel_stale_confirms` already turns
+                    // capture back off for its own case (see that method) --
+                    // do the same here, unconditionally (a harmless no-op
+                    // when no search prompt was open), so the next keystroke
+                    // routes as normal input again instead of being silently
+                    // swallowed as a stray captured byte.
+                    client.key_machine.set_capture(false);
                 }
             }
         }
@@ -1352,10 +1399,20 @@ fn render_one(
         ClientMode::Normal if too_small => Some("terminal too small".to_string()),
         ClientMode::Copy(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::Normal => client.message.as_ref().map(|(msg, _)| msg.clone()),
-        // Copy mode has no message of its own (the position indicator is
-        // painted directly on the pane, not the status row) but a transient
-        // message (e.g. an error) can still be showing underneath it.
-        ClientMode::Copy(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // Copy mode usually has no message of its own (the position
+        // indicator is painted directly on the pane, not the status row),
+        // but a transient message (e.g. "no match: <pattern>") can still be
+        // showing underneath it -- UNLESS a search prompt (Task 4) is
+        // currently open, which takes over the status row exactly like
+        // `ClientMode::Prompt` does (`"Search Down: "`/`"Search Up: "` +
+        // the in-progress buffer), matching tmux's own prompt label text.
+        ClientMode::Copy(cs) => match &cs.search_prompt {
+            Some(sp) => {
+                let label = if sp.backward { "Search Up: " } else { "Search Down: " };
+                Some(format!("{label}{}", sp.buf))
+            }
+            None => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        },
     }
     .map(|m| (m, msg_style));
 
