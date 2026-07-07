@@ -41,10 +41,33 @@ pub struct Registry {
     next_window_id: WindowId,
 }
 
-/// tmux target names reject empty names and the two target separators.
-fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains(':') || name.contains('.') {
-        return Err(format!("bad session name: {name}"));
+/// tmux target names reject empty names, the two target separators, AND
+/// (final-review fix, 2026-07-07) any control character (C0 incl. `\n`
+/// `\r` ESC, plus 0x7f DEL). Control chars are rejected because an
+/// unfiltered name reaches the status-bar span text and is written raw to
+/// the host terminal (frame corruption) and also breaks line-oriented `ls`
+/// output parsing; unlike the interactive rename prompt (which only ever
+/// appends printable ASCII 0x20-0x7e), the CLI path (`new-session -s`,
+/// `rename-session`/`rename-window` argv) passes raw argv strings straight
+/// through, so this check is the only thing standing between a hostile/
+/// careless argv and terminal corruption.
+///
+/// `noun` is `"session"` or `"window"`, shared by both `Registry::
+/// create_session` and `crate::server::cli_exec::validate_target_name` (the
+/// single hardened rule both call sites go through) so the CLI rename paths
+/// and the interactive rename-prompt commit path can never diverge.
+///
+/// The rejected name is echoed back in the error string (`bad session name:
+/// <n>`) for operator-friendliness, but echoing the RAW name would
+/// re-introduce the same injection into the error message itself (which is
+/// also written to a terminal, via `CliDone.err`/status messages) — so the
+/// echo is sanitized separately from the validity check: every control
+/// char is replaced with `?` before formatting the error, regardless of
+/// which rule (empty/separator/control) triggered the rejection.
+pub(crate) fn validate_name(name: &str, noun: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains(':') || name.contains('.') || name.chars().any(|c| c.is_control()) {
+        let sanitized: String = name.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+        return Err(format!("bad {noun} name: {sanitized}"));
     }
     Ok(())
 }
@@ -76,7 +99,7 @@ impl Registry {
     ) -> Result<&mut Session, String> {
         let name = match name {
             Some(n) => {
-                validate_name(n)?;
+                validate_name(n, "session")?;
                 n.to_string()
             }
             None => self.auto_name(),
@@ -430,6 +453,29 @@ mod tests {
         assert_eq!(
             r.create_session(Some("a.b"), 1, SZ).err().unwrap(),
             "bad session name: a.b"
+        );
+    }
+
+    /// Final-review fix (2026-07-07): control chars (C0 incl. `\n`/`\r`/ESC,
+    /// plus 0x7f DEL) must be rejected — an unfiltered name reaches the
+    /// status-bar span text and is written raw to the terminal. The
+    /// rejected name is echoed back in the error, but sanitized (control
+    /// chars -> `?`) so the echo itself can't re-inject the same bytes into
+    /// stderr/status text.
+    #[test]
+    fn names_with_control_chars_rejected() {
+        let mut r = Registry::new();
+        assert_eq!(
+            r.create_session(Some("foo\nbar"), 1, SZ).err().unwrap(),
+            "bad session name: foo?bar"
+        );
+        assert_eq!(
+            r.create_session(Some("a\x1b[31mred"), 1, SZ).err().unwrap(),
+            "bad session name: a?[31mred"
+        );
+        assert_eq!(
+            r.create_session(Some("del\x7f"), 1, SZ).err().unwrap(),
+            "bad session name: del?"
         );
     }
 

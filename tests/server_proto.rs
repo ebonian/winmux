@@ -841,6 +841,35 @@ fn cli_rename_session() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Final-review fix (2026-07-07): an embedded control character (here `\n`)
+/// in a `new-session -s` argv name must be rejected by the CLI path exactly
+/// like `model.rs`'s `names_with_control_chars_rejected` unit test pins at
+/// the `Registry` level — and the name echoed back in the error is
+/// sanitized (control chars -> `?`) so the rejection itself doesn't write
+/// the same control byte into the CLI's stderr text.
+#[test]
+fn cli_rejects_control_char_session_name() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        "foo\nbar".into(),
+    ]));
+    let (out, err) = expect_cli_done(&cli, 1);
+    assert_eq!(out, "");
+    assert_eq!(err, "bad session name: foo?bar");
+
+    // No session was ever created, so the server won't auto-exit; shut it
+    // down explicitly instead of joining on session-empty.
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// Pins the Task 8 empty-target rule on the CLI path: an EXPLICITLY empty
 /// flag value (`-t ""` / `-s ""`) reaches `Registry::find("")` and resolves
 /// to the most recently created session — the same resolution as the

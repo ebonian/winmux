@@ -236,10 +236,26 @@ impl Session {
 
 **Behavior notes:**
 
-- Session/window name validation: reject empty names and names containing
-  `:` or `.` (tmux's target separators) → `Err("bad session name: <n>")`.
-  Applied in `create_session`; there is no rename API yet (deferred to a
-  later task alongside the `,`/`$` prefix bindings).
+- Session/window name validation: reject empty names, names containing `:`
+  or `.` (tmux's target separators), and — final-review fix, 2026-07-07 —
+  any control character (C0 incl. `\n`/`\r`/ESC, plus 0x7f DEL) →
+  `Err("bad session name: <n>")` / `Err("bad window name: <n>")` (`noun` is
+  a parameter of the shared `validate_name(name, noun)` helper). Control
+  chars are rejected because an unvalidated name reaches status-bar span
+  text written raw to the host terminal (frame corruption) and breaks
+  line-oriented `ls` output parsing; the interactive rename prompt already
+  only appends printable ASCII 0x20-0x7e, but the CLI argv path
+  (`new-session -s`, `rename-session`/`rename-window` positional arg) does
+  not, so this is the only enforcement point for that path. The name echoed
+  in the error is sanitized separately from the check itself (every control
+  char -> `?`), so the rejection message can't re-inject the same bytes
+  into stderr/status text. `create_session` calls `validate_name` directly;
+  `crate::server::cli_exec::validate_target_name` (used by the CLI
+  rename-session/rename-window handlers and by `server.rs`'s
+  `feed_prompt_byte` rename-prompt commit) is a thin wrapper over the same
+  function, so all three call sites share one rule. There is no rename API
+  on `Registry`/`Session` itself yet — renames mutate the public `name`
+  field directly from `server`/`cli_exec` after validating.
 - `Registry` allocates `WindowId`s from a single internal `next_window_id`
   counter. `create_session` mints one internally for a session's initial
   window; `mint_window_id` (Task 7) exposes that SAME counter for any other

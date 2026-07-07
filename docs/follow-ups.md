@@ -107,3 +107,67 @@ reviews. None affect the sub-project 2 merge.
     produces output (e.g. a frozen SSH session that hasn't dropped yet) can
     grow that queue's memory without limit. Bounded per the same tradeoff
     reasoning as follow-up #4; not addressed here.
+
+## Accepted debt from the final whole-branch review (2026-07-07)
+
+Ticketed by the final review of `feature/server-client-sessions` (all 10
+plan tasks complete; review verdict "ready to merge with fixes" — the fixes
+are the control-char name validation covered elsewhere in this review round,
+tracked separately from the items below, which are accepted debt rather than
+merge blockers).
+
+14. **Main-loop pane-input writes can block all sessions on one stalled
+    pane.** `InputEvent::Forward` -> `pty.write_input` runs inline on the
+    server's single main-loop thread, unlike pane *output* and per-client
+    writes (both already off the main loop via dedicated threads/channels,
+    see follow-up #13). A pane whose child process stops draining stdin (a
+    hung app, or a huge paste) blocks `write_input`, which blocks the main
+    loop, which blocks rendering and input for EVERY session on the server,
+    not just the stalled pane's. Structural fix (a per-pane writer channel +
+    thread, mirroring the existing per-client writer design) planned as a
+    fast-follow; becomes more urgent once sub-project 3 adds `send-keys`
+    (a scripted/automated way to pump arbitrary-sized input at a pane).
+15. **Named-pipe ACL relies on the default DACL.** `CreateNamedPipeW(...,
+    None)` (in `src/pipe.rs`) passes no explicit `SECURITY_ATTRIBUTES`, so
+    the pipe gets Windows' default DACL. Combined with per-username pipe
+    naming (so a different user's pipe would need to be guessed), this is
+    low-risk in practice: the default DACL grants Everyone read-only connect
+    at most, which isn't sufficient to speak the client/server protocol
+    usefully. Still, an explicit owner-only `SECURITY_ATTRIBUTES` would be a
+    more defensible posture than relying on the platform default; consider
+    for a later hardening pass.
+
+### Review ticket batch (final review, 2026-07-07) — short one-liners, none blocking
+
+16. `client.rs`'s stdin-reader thread panicking leaves the main loop waiting
+    on it forever instead of signaling the main loop to exit non-zero.
+17. `attach -d` (steal) evicted clients get a bare `[detached]` exit message
+    (`src/server.rs:509`); tmux says `[detached (from session <name>)]`.
+    When fixed, also update the `## server contract` table's documented
+    exit-message string in `docs/specs/2026-07-07-server-client-interfaces.md`.
+18. `destroy_session`'s `TerminateProcess` loop over a session's panes runs
+    sequentially on the main thread; bounded by pane count so not a real
+    scaling concern today, but worth a comment noting the assumption.
+19. `kill-server` accept race: a client that connects during the server's
+    teardown window sees `[lost server]` (`src/client.rs:156`) rather than
+    the cleaner `no server running on <pipe>` (`src/main.rs:177`) a client
+    connecting slightly later would get.
+20. `src/input.rs`'s `set_capture(true)` doc comment overstates how much
+    state it clears; the `capture_mode_clears_pending_prefix_state` test
+    name similarly overpromises relative to what it actually asserts.
+21. `src/pipe.rs`'s accept loop has a dead `Ok(())` arm; `finish_attach`
+    does a redundant `Renderer::new` immediately followed by a `resize`
+    that makes the `new` call's initial size irrelevant.
+22. Untested paths: `rename_session` propagation to OTHER attached clients
+    (not just the renaming one); `SwitchClientPrev` as a no-op when only one
+    session exists; `list-windows`' default-target-most-recent-session
+    behavior with no `-t`; the kill-last-pane-via-`Ctrl-b x` cascade in a
+    multi-window session (see also follow-up #11, which is the same gap
+    phrased for the `&`/window-kill path).
+23. CLI unit tests assert against the parsed `cmd` field only, not the full
+    `Invocation`; `unknown_flag_err` only asserts the error string is
+    non-empty rather than pinning its exact text; `-x 0`/`-y 0` is treated
+    as a "use default size" sentinel rather than a literal zero size, which
+    isn't obvious from the test names alone.
+24. `no_console_fails_fast` test naming is inconsistent with the sibling
+    tests around it (naming convention drift, not a behavior issue).

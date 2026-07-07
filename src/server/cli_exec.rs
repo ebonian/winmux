@@ -63,19 +63,21 @@ fn format_ctime(t: SystemTime) -> String {
     )
 }
 
-/// Same name-validation rule `model.rs`'s `create_session` applies (reject
-/// empty names and tmux's two target separators). Used by the CLI
+/// Thin re-export of `model.rs`'s `validate_name` (the SAME hardened rule
+/// `Registry::create_session` applies: empty names, tmux's two target
+/// separators, and — final-review fix, 2026-07-07 — any control character,
+/// with the echoed name in the error sanitized). Used by the CLI
 /// rename-session/rename-window handlers below AND by `server.rs`'s
 /// `feed_prompt_byte` (rename prompt commit) — `pub(super)` so the parent
 /// module can reuse it, since the model has no rename API of its own
 /// (`Session`/`Window` `name` fields are public and mutated directly).
 /// `noun` is `"session"` or `"window"`, matching tmux's `bad session name` /
-/// analogous window-rename error text.
+/// analogous window-rename error text. Kept as a separate function (rather
+/// than every call site importing `crate::model::validate_name` directly)
+/// so both rename call sites and the create-session call site are visibly
+/// going through one rule, not two that happen to agree today.
 pub(super) fn validate_target_name(name: &str, noun: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains(':') || name.contains('.') {
-        return Err(format!("bad {noun} name: {name}"));
-    }
-    Ok(())
+    crate::model::validate_name(name, noun)
 }
 
 /// Per-command usage lines, returned as the `err` of a `CliDone{1, ...}`
