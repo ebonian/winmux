@@ -299,6 +299,19 @@ impl Renderer {
 
 ## `input` — prefix state machine (pure)
 
+**SUPERSEDED (sub-project 3, Task 6):** `Action`/`InputEvent`/`InputMachine`
+below were DELETED from `src/input.rs` once `src/server.rs` was rewired onto
+the table-driven `KeyMachine`/`KeyInputEvent`/`Bindings` pipeline — see the
+`## input-v2` and `## bindings` sections of
+`docs/specs/2026-07-07-command-config-interfaces.md` for the replacement
+(locked) contract, and that same file's `## server-dispatch` section for how
+the server resolves `KeyInputEvent::Key` against the mutable bindings table
+and dispatches the resulting commands. This section is kept for historical
+reference only — every behavior it describes (split/focus/resize/zoom/close/
+window nav/rename/detach/switch-client) is reproduced exactly by
+`crate::bindings::Bindings::default()`'s commands, unit-tested in
+`bindings::tests::defaults_cover_current_behavior`.
+
 ```rust
 use std::time::Instant;
 use crate::geom::Direction;

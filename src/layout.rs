@@ -491,6 +491,18 @@ impl Layout {
         self.zoomed
     }
 
+    /// Move focus directly to `id` (SP3 Task 6: `select-pane -t <pane>` and
+    /// other pane-targeted commands need to focus an arbitrary pane by id,
+    /// not just a relative direction/next/last). `false` (no-op) if `id`
+    /// isn't one of this layout's leaves.
+    pub fn focus_pane(&mut self, id: PaneId) -> bool {
+        if !self.panes().contains(&id) {
+            return false;
+        }
+        self.set_focus(id);
+        true
+    }
+
     // ---- internal helpers (Task 3) ----
 
     /// Change focus, recording the previous focus as last-focused.

@@ -933,3 +933,167 @@ table name first (`"prefix"` < `"root"` ASCII-betically), then by
 Example (`list_keys_format_exact`): a `Bindings` with only `C-Up ->
 resize-pane -U` (repeat: true) bound in the prefix table renders to exactly
 `"bind-key -r -T prefix C-Up resize-pane -U"`.
+
+## `server-dispatch` — unified command dispatcher (Task 6)
+
+Everything in this section is **private** (`src/server.rs` / `src/server/
+dispatch.rs`; `Server`'s only public item remains `pub fn run`), so it
+documents BEHAVIOR RULES rather than locked types/signatures — the shapes
+below (`ExecOutcome`, `dispatch_client`, `execute_headless`, ...) are the
+actual implementation but are free to be refactored as long as every rule
+here still holds and the `server_proto` tests it's pinned by stay green.
+
+### Two execution paths, one command table
+
+`src/server/dispatch.rs` adds `impl Server` methods reached from three entry
+points:
+
+- **CLI** (`ClientMsg::Cli(argv)`): `execute_cli_argv(&mut self, argv)` ->
+  `argv[0]`/`argv[1..]` become one `RawCmd`, resolved via `cmd::resolve`,
+  executed via `execute_headless`. No acting client -- `-t`/`-s`-less
+  targets fall back to `Registry::find("")` (the most-recently-created
+  session, same rule Task 5/8's empty-target amendments already
+  established for the CLI subset).
+- **Key bindings**: `handle_stdin` resolves a `KeyInputEvent::Key{table,
+  key, raw}` via `bindings.lookup(table, &key)`; a hit's `Binding.cmds` go
+  through `dispatch_client`, which loops `cmd::resolve` + `execute_for_client`
+  per `RawCmd` (`;`-chains supported, matching `bind-key`/`confirm-before`'s
+  tail semantics). A miss in `Root` forwards `raw`; a miss in `Prefix` is
+  swallowed (no fallback to CLI-style errors -- matches the design spec).
+- **`:` command-prompt / rename prompts**: share one status-line line editor
+  (`ClientMode::Prompt { label, buf, kind: PromptKind::{RenameWindow,
+  RenameSession, Command} }`); a `Command`-kind commit runs `cmd::parse_line`
+  then `dispatch_client` on the parsed commands.
+
+Both `execute_headless` and `execute_for_client` are big matches over
+`cmd::ParsedCmd` that call small `exec_*` helpers; almost every helper takes
+an `Option<&str>` "acting client's session name" (`None` headlessly) rather
+than a client object, so session/window/pane target resolution
+(`resolve_session_name`/`resolve_window_target`/`resolve_pane_target`) is
+shared verbatim between both paths. A handful of commands only make sense
+with a real client (`confirm-before`, `command-prompt`, `switch-client`, a
+bare `detach-client`) and return a fixed error string headlessly (e.g.
+`"switch-client: only from a client connection"` -- not exercised by any
+CLI test, so not contract-locked, just documented here).
+
+### `-t`/`-s` target grammar (SP3 simplification, documented deviation)
+
+A target string is `[session:][window][.pane]`:
+
+- An optional `session:` prefix is resolved via `Registry::find` (exact,
+  then unambiguous prefix -- same rule as everywhere else `-t session`
+  appears). Absent -> the acting client's own session, or (headlessly, or
+  with no client) the most-recently-created session.
+- The window part: empty/absent -> the session's current window; `=N` or a
+  bare number -> **exact** index match (`"window not found: <n>"` on miss,
+  matching the pre-Task-6 `select-window`/digit-binding message text
+  exactly); otherwise a name, exact-then-unambiguous-prefix.
+- The pane part (only for pane-targeting commands: `split-window`,
+  `select-pane`, `kill-pane`, `send-keys`; NOT `select-window`/
+  `kill-window`/`rename-window`, whose target is a window, and NOT
+  `rename-session`/`kill-session`/`detach-client -s`, whose target is a
+  session): empty/absent -> the window's focused pane; `+`/`-` -> next/
+  previous pane (cyclic); a bare number -> **position** in
+  `Layout::panes()` order (leaf/tree order), per the design spec's own
+  "pane index = position in layout.panes()" note. A bare target with no
+  `:`/`.` (e.g. `-t 0`) is therefore a PANE position in the current window,
+  never a session/window name -- this is what `cli_split_window_command`/
+  `kill_pane_via_command_targets` exercise.
+- Cross-session targeting for pane/window commands is NOT implemented
+  beyond the `session:` prefix picking which session's registry state to
+  read -- `split-window -t othersession:2.1` resolves fully; there is no
+  further per-session-window overlay concern here (that's the `options`
+  module's own documented SP3 simplification, unrelated).
+
+### `ExecOutcome` (the dispatcher's internal return type)
+
+`Ok(String)` (a transient message / CLI stdout -- routed to `client.message`
+or `CliDone.out` by the caller), `Err(String)` (ditto for stderr/message),
+`Detach` (the acting client should be dropped with a `[detached (from
+session <name>)]` exit -- `handle_stdin` already removed it from
+`self.clients` before dispatch, mirroring the pre-Task-6 confirm-handling
+pattern), `Destroy` (the acting client's whole session died as a side
+effect of `kill-pane`/`kill-window` -- `destroy_session` has ALREADY run
+and messaged every OTHER attached client inside the `exec_kill_*_client`
+helper; the caller only sends `Exit{0,"[exited]"}` to its own removed
+client), and `SwitchedSession(String, String)` (`switch-client -p`/`-n`
+moved the acting client -- both sessions' size/layout are recomputed once
+the client is back in `self.clients`). Headlessly (CLI), any `Detach`/
+`Destroy`/`SwitchedSession` collapses to a plain success with empty output
+-- there's no "acting client" to signal for.
+
+### `confirm-before` (replaces `ConfirmKillPane`/`ConfirmKillWindow`)
+
+`ClientMode::ConfirmCmd { prompt: String, cmds: Vec<RawCmd>, pane_snapshot:
+Option<PaneId>, window_snapshot: Option<WindowId> }` -- `prompt` is the `-p`
+argument, ALREADY `expand_format`-expanded at arm-time (so `#P`/`#W`/etc.
+reflect state as of the keypress, not the eventual `y`); `pane_snapshot`/
+`window_snapshot` are the focused pane / current window at arm-time, used
+ONLY for staleness invalidation (both `cancel_stale_confirms`, on every
+pane/window death, and `feed_confirm_byte`, belt-and-braces at `y`-time,
+treat a vanished snapshot as a silent no-op cancel -- this is what the
+pre-Task-6 `stale_confirm_*` tests pin, now generalized). Confirming
+(`y`/`Y`/`Enter`) re-dispatches the stored `cmds` fresh via
+`dispatch_client` -- note this means a wrapped command with no explicit
+target (the default `x`/`&` bindings: `kill-pane`/`kill-window`, no `-t`)
+resolves against whatever is CURRENTLY focused/current at `y`-time, not a
+pinned target id; this only differs observably from "pin the exact
+original pane/window" if some OTHER client moved focus in the same session
+between arm and confirm, which no test exercises (documented
+simplification, matches tmux's own late-binding philosophy for
+`confirm-before`'s wrapped command).
+
+### Bare `rename-window`/`rename-session` (default `,`/`$` bindings)
+
+`dispatch_client` special-cases a `RawCmd` named `rename-window`/`renamew`
+or `rename-session`/`rename` with ZERO args (exactly what
+`Bindings::default()`'s `,`/`$` entries carry) BEFORE calling `cmd::resolve`
+(which would otherwise reject it with a `usage:` error, since `resolve`
+requires exactly one positional): it opens the interactive status-line
+prompt directly (pre-filled with the current window/session name), matching
+the design spec's documented `,`/`$` deviation. Any OTHER invocation
+(including `-t foo` with no name) still goes through `cmd::resolve` and
+hits its usage error normally. This special-case only fires with a client
+context; headlessly (CLI/`source-file`), a bare `rename-window`/
+`rename-session` is a plain `cmd::resolve` usage error (no prompt to open).
+
+### `default-command` / `renumber-windows` / `prefix` / `repeat-time` wiring
+
+Every pane spawn (`split-window`, `new-window`, `new-session`, and the
+initial `Attach`) reads `self.options.default_command()` at spawn time
+(replacing the sub-project 1/2 hardcoded `SHELL` const). `kill-pane`/
+`kill-window`'s shared helpers (`kill_pane_by_id`/`kill_window_by_id`) call
+`Session::renumber()` (new in `model.rs`: reassigns every window's `index`
+to its position in the (index-sorted) `windows` vec) after a successful
+`kill_window` IF `options.renumber_windows()` is on at that moment.
+`set-option prefix`: on an actual value change, unbinds the OLD prefix
+key's `send-prefix` entry in the prefix table and rebinds `send-prefix`
+onto the NEW prefix key, then calls `KeyMachine::set_prefix` on every
+CURRENTLY ATTACHED client (a client that attaches AFTER the `set` sees the
+new prefix from `finish_attach`'s `KeyMachine::new(self.options.prefix())`
+automatically). `set-option repeat-time`: same broadcast pattern via
+`KeyMachine::set_repeat_time`.
+
+### CLI `"unknown command"` compatibility shim
+
+`execute_cli_argv` is the ONLY place that still emits the sub-project 2
+exact string `"unknown command"` (no colon, no name) for an unrecognized
+`argv[0]` -- every other entry point (bindings, `:` prompt, `source-file`)
+surfaces `cmd::resolve`'s real `"unknown command: <name>"`. This is a
+deliberate, narrow compatibility shim: the pinned `cli_unknown_command_err`
+test asserts the SP2-exact string, and the task brief requires it stay
+green UNCHANGED, so `execute_cli_argv` pattern-matches on
+`e.starts_with("unknown command:")` and substitutes the legacy string for
+that one call site only.
+
+### `send-keys` key/literal resolution
+
+Non-`-l`: each argument is tried through `keys::parse_key` then
+`keys::encode_key`; on success its encoded bytes are sent, on EITHER
+failure (unrecognized token, or a recognized-but-unencodable key) the
+argument's own UTF-8 bytes are sent literally instead (no error) -- this
+matches tmux's real behavior of treating a multi-char argument like `"echo
+hi"` as literal text while still letting `Enter`/`C-c`/etc. resolve as key
+presses in the same command. `-l`: every argument is joined with single
+spaces and sent as one literal run (no key parsing at all, no trailing
+Enter).

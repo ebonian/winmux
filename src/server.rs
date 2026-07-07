@@ -12,10 +12,10 @@
 //! - **Confirm race** (follow-ups #2): NOT fixed here. `Ctrl-b x` and a
 //!   following `y` arriving in the SAME `Stdin` frame still race exactly as
 //!   in the MVP (the `y` gets forwarded to the pane instead of confirming),
-//!   because `InputMachine::feed` tokenizes the whole frame before the
-//!   caller (this module) gets a chance to call `set_confirming`. This is
-//!   one of the two sanctioned options in the task brief; documented here
-//!   as still-open rather than half-fixed.
+//!   because `KeyMachine::feed` decodes the whole frame before the caller
+//!   (this module) gets a chance to call `set_capture` to arm the confirm.
+//!   This is one of the two sanctioned options in the task brief; documented
+//!   here as still-open rather than half-fixed.
 //! - **Render strategy**: every dirty turn (i.e. any event at all, after
 //!   coalescing) re-renders ALL attached clients, not just those whose
 //!   session actually changed. Simpler and correct at this scale; a
@@ -25,8 +25,7 @@
 //!   unique pipe name and, where the test's flow naturally destroys every
 //!   session, joins the server thread to prove clean exit-empty shutdown.
 
-mod cli_exec;
-use cli_exec::validate_target_name;
+mod dispatch;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -38,20 +37,19 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
+use crate::bindings::Bindings;
+use crate::cmd::RawCmd;
 use crate::geom::Rect;
 use crate::grid::Grid;
-use crate::input::{Action, InputEvent, InputMachine};
+use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
+use crate::options::Options;
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
 use crate::render::{PaneView, Renderer, Scene};
 use crate::status::{status_spans, WindowEntry};
-
-/// Shell launched in every pane (matches the MVP; sub-project 3 makes this
-/// configurable).
-const SHELL: &str = "powershell.exe -NoLogo";
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -93,22 +91,35 @@ struct PaneRuntime {
     dead: bool,
 }
 
-/// Which status-line prompt is in progress (`,` rename-window vs `$`
-/// rename-session) — determines the label text and what a commit renames.
+/// Which status-line prompt is in progress (`,` rename-window, `$`
+/// rename-session, or `:` command-prompt) — determines the label text and
+/// what a commit does with the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     RenameWindow,
     RenameSession,
+    /// `:` command-prompt (Task 6): commit parses the buffer as a command
+    /// line and dispatches it instead of renaming anything.
+    Command,
 }
 
-/// Per-client confirm/prompt state.
+/// Per-client confirm/prompt state. `ConfirmCmd` (Task 6) generalizes the
+/// legacy `ConfirmKillPane`/`ConfirmKillWindow` variants into a single
+/// "confirm-before"-shaped mode: the wrapped command(s) to dispatch on
+/// y/Y/Enter, plus a snapshot of the pane/window that was live when the
+/// confirm was armed (staleness check — see `cancel_stale_confirms` and
+/// `dispatch::Server::feed_confirm_byte`).
 enum ClientMode {
     Normal,
-    ConfirmKillPane(PaneId),
-    ConfirmKillWindow(WindowId),
-    /// Status-line line editor (rename-window / rename-session). `buf` is the
-    /// live-edited text (pre-filled with the current name); `label` is the
-    /// fixed prefix (`"(rename-window) "` / `"(rename-session) "`).
+    ConfirmCmd {
+        prompt: String,
+        cmds: Vec<RawCmd>,
+        pane_snapshot: Option<PaneId>,
+        window_snapshot: Option<WindowId>,
+    },
+    /// Status-line line editor (rename-window / rename-session / `:`
+    /// command-prompt). `buf` is the live-edited text (pre-filled with the
+    /// current name, or empty/initial for `:`); `label` is the fixed prefix.
     Prompt { label: String, buf: String, kind: PromptKind },
 }
 
@@ -118,7 +129,7 @@ struct ClientState {
     cols: u16,
     rows: u16,
     renderer: Renderer,
-    input: InputMachine,
+    key_machine: KeyMachine,
     mode: ClientMode,
     /// A transient status-line message (e.g. `window not found: 5`) and when
     /// it was set; cleared on the next `Stdin` frame from this client OR
@@ -149,6 +160,13 @@ struct Server {
     had_session: bool,
     clock: String,
     tx: Sender<ServerEvent>,
+    /// Typed tmux option registry (Task 6): `prefix`, `default-command`,
+    /// `renumber-windows`, styles, etc. One global instance (SP3 scope, no
+    /// per-session/window overlays — documented deviation).
+    options: Options,
+    /// Mutable key-bindings table (`bind-key`/`unbind-key`/`list-keys`).
+    /// `Bindings::default()` reproduces every legacy hardcoded binding.
+    bindings: Bindings,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
@@ -182,11 +200,12 @@ fn send_output(tx: &Sender<Vec<u8>>, bytes: Vec<u8>) {
 }
 
 /// Spawn a shell in a fresh ConPTY and wire its two worker threads (output
-/// reader + process-exit waiter) into the shared event channel. Copied from
-/// `app.rs`'s `spawn_pane` (see module docs / CLAUDE.md: `app.rs` remains
-/// the reference implementation for pane plumbing until Task 8).
-fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>) -> std::io::Result<PaneRuntime> {
-    let mut pty = Pty::spawn(SHELL, cols.max(1), rows.max(1))?;
+/// reader + process-exit waiter) into the shared event channel. `shell` is
+/// the `default-command` option's current value (SP3 Task 6: configurable
+/// per `set -g default-command`, replacing the old hardcoded `SHELL`
+/// const).
+fn spawn_pane(id: PaneId, cols: u16, rows: u16, tx: &Sender<ServerEvent>, shell: &str) -> std::io::Result<PaneRuntime> {
+    let mut pty = Pty::spawn(shell, cols.max(1), rows.max(1))?;
     let mut reader = pty.take_reader()?;
 
     let out_tx = tx.clone();
@@ -311,6 +330,8 @@ impl Server {
             had_session: false,
             clock: local_clock(),
             tx,
+            options: Options::new(),
+            bindings: Bindings::default(),
         }
     }
 
@@ -416,7 +437,8 @@ impl Server {
         match mode {
             AttachMode::NewAuto => {
                 let pane_id = self.mint_pane_id();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx) {
+                let shell = self.options.default_command().to_string();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
                         let session_name = self
@@ -438,7 +460,8 @@ impl Server {
                     return;
                 }
                 let pane_id = self.mint_pane_id();
-                match spawn_pane(pane_id, size.0, size.1, &self.tx) {
+                let shell = self.options.default_command().to_string();
+                match spawn_pane(pane_id, size.0, size.1, &self.tx, &shell) {
                     Ok(pr) => {
                         self.panes.insert(pane_id, pr);
                         match self.registry.create_session(Some(&name), pane_id, size) {
@@ -483,7 +506,7 @@ impl Server {
             cols,
             rows,
             renderer,
-            input: InputMachine::new(),
+            key_machine: KeyMachine::new(self.options.prefix()),
             mode: ClientMode::Normal,
             message: None,
             tx,
@@ -544,7 +567,7 @@ impl Server {
         } else {
             return;
         };
-        let (code, out, err) = self.execute_cli(&argv);
+        let (code, out, err) = self.execute_cli_argv(&argv);
         send_msg(&tx, &ServerMsg::CliDone { code, out, err });
     }
 
@@ -559,85 +582,16 @@ impl Server {
         }
     }
 
-    /// Process one raw byte of an `InputEvent::Captured` chunk against
-    /// `client`'s status-line prompt line editor (rename-window /
-    /// rename-session, armed by `Action::RenameWindow`/`RenameSession`):
-    /// printable ASCII (0x20-0x7e) appends, Backspace (0x7f/0x08) deletes the
-    /// last char, Enter (`\r`/`\n`) commits (validated via
-    /// `validate_target_name`, and for session rename, a duplicate-name
-    /// check — either failure becomes a transient status message and the
-    /// prompt is discarded exactly like a cancel), Esc/Ctrl-c/Ctrl-g
-    /// (0x1b/0x03/0x07) cancels outright. Either way capture mode ends and
-    /// `mode` returns to `Normal`. A no-op if `client.mode` isn't `Prompt`
-    /// (defensive; shouldn't happen since capture mode is only armed
-    /// alongside `Prompt`).
-    ///
-    /// Returns `true` when this byte ENDED the prompt (commit or cancel) —
-    /// the caller must then re-feed any remaining bytes of the same
-    /// `Captured` chunk through the `InputMachine` as normal input (capture
-    /// is off again), so pasted input like `web\rls\r` doesn't silently
-    /// drop the tail after the commit.
-    fn feed_prompt_byte(&mut self, client: &mut ClientState, session_name: &mut String, b: u8) -> bool {
-        let commit = matches!(b, b'\r' | b'\n');
-        let cancel = matches!(b, 0x1b | 0x03 | 0x07);
-        if !commit && !cancel {
-            if let ClientMode::Prompt { buf, .. } = &mut client.mode {
-                match b {
-                    0x20..=0x7e => buf.push(b as char),
-                    0x7f | 0x08 => {
-                        buf.pop();
-                    }
-                    _ => {}
-                }
-            }
-            return false;
-        }
-
-        client.input.set_capture(false);
-        let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
-        let ClientMode::Prompt { buf, kind, .. } = mode else {
-            return true;
-        };
-        if cancel {
-            return true;
-        }
-        match kind {
-            PromptKind::RenameWindow => match validate_target_name(&buf, "window") {
-                Ok(()) => {
-                    if let Some(session) = self.registry.session_mut(session_name) {
-                        session.current_window_mut().name = buf;
-                    }
-                }
-                Err(e) => client.message = Some((e, Instant::now())),
-            },
-            PromptKind::RenameSession => {
-                if let Err(e) = validate_target_name(&buf, "session") {
-                    client.message = Some((e, Instant::now()));
-                } else if buf != *session_name && self.registry.sessions().iter().any(|s| s.name == buf) {
-                    client.message = Some((format!("duplicate session: {buf}"), Instant::now()));
-                } else {
-                    if let Some(session) = self.registry.session_mut(session_name) {
-                        session.name = buf.clone();
-                    }
-                    self.rename_session_everywhere(session_name, &buf);
-                    client.session = Some(buf.clone());
-                    *session_name = buf;
-                }
-            }
-        }
-        true
-    }
-
-    /// Cancel any attached client's pending kill confirm whose target pane/
-    /// window no longer exists (it exited naturally, or another client
+    /// Cancel any attached client's pending confirm-before whose snapshotted
+    /// pane/window no longer exists (it exited naturally, or another client
     /// killed it, while the `(y/n)` prompt was up): reset the mode to
-    /// `Normal`, drop the `InputMachine` out of confirming (so the next key
-    /// is normal input again, e.g. a `y` gets FORWARDED to the pane instead
-    /// of confirming), and clear any transient message. The confirm
-    /// handlers in `handle_stdin` ALSO re-validate their target before
-    /// acting (belt and braces — this method can't reach a client currently
-    /// removed from the map mid-`handle_stdin`), but only this path clears
-    /// a stale on-screen prompt without waiting for a keypress.
+    /// `Normal`, drop capture (so the next key is normal input again, e.g. a
+    /// `y` gets FORWARDED to the pane instead of confirming), and clear any
+    /// transient message. `dispatch::Server::feed_confirm_byte` ALSO
+    /// re-validates its target before acting (belt and braces — this method
+    /// can't reach a client currently removed from the map mid-
+    /// `handle_stdin`), but only this path clears a stale on-screen prompt
+    /// without waiting for a keypress.
     fn cancel_stale_confirms(&mut self) {
         let mut live_panes: HashSet<PaneId> = HashSet::new();
         let mut live_windows: HashSet<WindowId> = HashSet::new();
@@ -648,14 +602,16 @@ impl Server {
             }
         }
         for client in self.clients.values_mut() {
-            let stale = match client.mode {
-                ClientMode::ConfirmKillPane(p) => !live_panes.contains(&p),
-                ClientMode::ConfirmKillWindow(w) => !live_windows.contains(&w),
+            let stale = match &client.mode {
+                ClientMode::ConfirmCmd { pane_snapshot, window_snapshot, .. } => {
+                    pane_snapshot.is_some_and(|p| !live_panes.contains(&p))
+                        || window_snapshot.is_some_and(|w| !live_windows.contains(&w))
+                }
                 _ => false,
             };
             if stale {
                 client.mode = ClientMode::Normal;
-                client.input.set_confirming(false);
+                client.key_machine.set_capture(false);
                 client.message = None;
             }
         }
@@ -793,9 +749,14 @@ impl Server {
         }
     }
 
-    /// Route one `Stdin` frame through the client's `InputMachine` and
+    /// Route one `Stdin` frame through the client's `KeyMachine` and
     /// dispatch the resulting events one at a time against live state (see
     /// module docs re: the confirm race — NOT fixed here).
+    /// Route one `Stdin` frame through the client's `KeyMachine` and
+    /// dispatch the resulting events one at a time against live state via
+    /// the command dispatcher (`dispatch.rs`) and the mutable `bindings`
+    /// table (see module docs re: the confirm race — NOT fixed here, same
+    /// as before Task 6).
     fn handle_stdin(&mut self, id: ClientId, bytes: Vec<u8>) {
         let mut client = match self.clients.remove(&id) {
             Some(c) => c,
@@ -814,11 +775,11 @@ impl Server {
         client.message = None;
 
         let now = Instant::now();
-        // A queue (not a plain iterator) because a prompt commit/cancel
+        // A queue (not a plain iterator) because a prompt/confirm commit
         // mid-`Captured`-chunk re-feeds the chunk's REMAINING bytes through
-        // the InputMachine and splices the resulting events in at the front
+        // the KeyMachine and splices the resulting events in at the front
         // (they logically precede everything after the Captured event).
-        let mut queue: VecDeque<InputEvent> = client.input.feed(&bytes, now).into();
+        let mut queue: VecDeque<KeyInputEvent> = client.key_machine.feed(&bytes, now).into();
 
         let mut detach = false;
         let mut destroy = false;
@@ -826,7 +787,7 @@ impl Server {
 
         'events: while let Some(ev) = queue.pop_front() {
             match ev {
-                InputEvent::Forward(data) => {
+                KeyInputEvent::Forward(data) => {
                     if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
@@ -836,280 +797,61 @@ impl Server {
                         }
                     }
                 }
-                InputEvent::Action(action) => match action {
-                    Action::Split(dir) => {
-                        let size = self.registry.session_mut(&session_name).map(|s| s.size);
-                        if let Some(size) = size {
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            let new_id = self.mint_pane_id();
-                            let split_ok = self
-                                .registry
-                                .session_mut(&session_name)
-                                .map(|s| s.current_window_mut().layout.split(dir, new_id, area).is_ok())
-                                .unwrap_or(false);
-                            if split_ok {
-                                let rect = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .and_then(|s| {
-                                        s.current_window().layout.rects(area).into_iter().find(|(pid, _)| *pid == new_id)
-                                    })
-                                    .map(|(_, r)| r)
-                                    .unwrap_or(area);
-                                match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx) {
-                                    Ok(pr) => {
-                                        self.panes.insert(new_id, pr);
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                    Err(_) => {
-                                        if let Some(s) = self.registry.session_mut(&session_name) {
-                                            s.current_window_mut().layout.remove(new_id);
+                KeyInputEvent::Key { table, key, raw } => {
+                    let binding = self.bindings.lookup(table, &key).cloned();
+                    match binding {
+                        Some(b) => {
+                            let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
+                            if b.repeat {
+                                client.key_machine.arm_repeat(now);
+                            }
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
+                            }
+                        }
+                        None => match table {
+                            // Unbound in the root table: forward raw bytes
+                            // (tmux behavior for `bind -n`-less keys).
+                            WhichTable::Root => {
+                                if let Some(session) = self.registry.session_mut(&session_name) {
+                                    let fid = session.current_window().layout.focused();
+                                    if let Some(pane) = self.panes.get_mut(&fid) {
+                                        if let Some(pty) = pane.pty.as_mut() {
+                                            let _ = pty.write_input(&raw);
                                         }
-                                        self.apply_layout_for_session(&session_name);
                                     }
                                 }
                             }
-                        }
+                            // Unbound in the prefix table: swallowed (tmux).
+                            WhichTable::Prefix => {}
+                        },
                     }
-                    Action::Focus(dir) => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let size = session.size;
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            session.current_window_mut().layout.focus_dir(dir, area);
-                        }
-                    }
-                    Action::FocusNext => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.focus_next();
-                        }
-                    }
-                    Action::FocusLast => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.focus_last();
-                        }
-                    }
-                    Action::RequestClose => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let focused = session.current_window().layout.focused();
-                            client.mode = ClientMode::ConfirmKillPane(focused);
-                            client.input.set_confirming(true);
-                        }
-                    }
-                    Action::ToggleZoom => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.current_window_mut().layout.toggle_zoom();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::Resize(dir) => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let size = session.size;
-                            let area = Rect { x: 0, y: 0, w: size.0, h: size.1 };
-                            session.current_window_mut().layout.resize_focused(dir, area, 1);
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::Detach => {
-                        detach = true;
-                        break 'events;
-                    }
-                    Action::NewWindow => {
-                        let size = self.registry.session_mut(&session_name).map(|s| s.size);
-                        if let Some(size) = size {
-                            let pane_id = self.mint_pane_id();
-                            match spawn_pane(pane_id, size.0, size.1, &self.tx) {
-                                Ok(pr) => {
-                                    self.panes.insert(pane_id, pr);
-                                    let wid = self.registry.mint_window_id();
-                                    if let Some(session) = self.registry.session_mut(&session_name) {
-                                        session.new_window(wid, pane_id);
-                                    }
-                                    self.apply_layout_for_session(&session_name);
-                                }
-                                Err(e) => {
-                                    client.message = Some((format!("open terminal failed: {e}"), Instant::now()));
-                                }
-                            }
-                        }
-                    }
-                    Action::NextWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.next_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::PrevWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.prev_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::LastWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            session.last_window();
-                        }
-                        self.apply_layout_for_session(&session_name);
-                    }
-                    Action::SelectWindow(n) => {
-                        let ok = self.registry.session_mut(&session_name).map(|s| s.select_window(n)).unwrap_or(false);
-                        if ok {
-                            self.apply_layout_for_session(&session_name);
-                        } else {
-                            client.message = Some((format!("window not found: {n}"), Instant::now()));
-                        }
-                    }
-                    Action::RequestKillWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let wid = session.current;
-                            client.mode = ClientMode::ConfirmKillWindow(wid);
-                            client.input.set_confirming(true);
-                        }
-                    }
-                    Action::RenameWindow => {
-                        if let Some(session) = self.registry.session_mut(&session_name) {
-                            let current = session.current_window().name.clone();
-                            client.mode = ClientMode::Prompt {
-                                label: "(rename-window) ".to_string(),
-                                buf: current,
-                                kind: PromptKind::RenameWindow,
-                            };
-                            client.input.set_capture(true);
-                        }
-                    }
-                    Action::RenameSession => {
-                        client.mode = ClientMode::Prompt {
-                            label: "(rename-session) ".to_string(),
-                            buf: session_name.clone(),
-                            kind: PromptKind::RenameSession,
-                        };
-                        client.input.set_capture(true);
-                    }
-                    Action::SwitchClientPrev => {
-                        if let Some(pair) = switch_client_session(&mut self.registry, &mut client, &mut session_name, false) {
-                            session_switched = Some(pair);
-                        }
-                    }
-                    Action::SwitchClientNext => {
-                        if let Some(pair) = switch_client_session(&mut self.registry, &mut client, &mut session_name, true) {
-                            session_switched = Some(pair);
-                        }
-                    }
-                    Action::Quit => {
-                        // Never emitted by `InputMachine::feed` (MVP-only hook).
-                    }
-                },
-                InputEvent::Captured(chunk) => {
+                }
+                KeyInputEvent::Captured(chunk) => {
                     let mut i = 0;
                     while i < chunk.len() {
-                        let ended = self.feed_prompt_byte(&mut client, &mut session_name, chunk[i]);
+                        let (ended, outcome) = self.feed_mode_byte(&mut client, &mut session_name, chunk[i]);
                         i += 1;
+                        if let Some(outcome) = outcome {
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        }
+                        if detach || destroy {
+                            break 'events;
+                        }
                         if ended {
                             // Commit/cancel mid-chunk: the rest of the chunk
                             // is normal input again (capture is off) — run it
-                            // through the InputMachine and process its events
+                            // through the KeyMachine and process its events
                             // next, ahead of anything already queued.
                             if i < chunk.len() {
-                                let more = client.input.feed(&chunk[i..], now);
+                                let more = client.key_machine.feed(&chunk[i..], now);
                                 for e in more.into_iter().rev() {
                                     queue.push_front(e);
                                 }
                             }
                             break;
                         }
-                    }
-                }
-                InputEvent::ConfirmClose(confirmed) => {
-                    client.input.set_confirming(false);
-                    let mode = std::mem::replace(&mut client.mode, ClientMode::Normal);
-                    // Both kill confirms RE-VALIDATE their target against
-                    // live state before acting: the target may have vanished
-                    // (natural exit, another client's kill) between arming
-                    // and the `y`, and `cancel_stale_confirms` can't reach
-                    // THIS client mid-`handle_stdin` (it's removed from the
-                    // map). A missing target is a no-op cancel — NEVER
-                    // destroy-session; a `false` from `layout.remove`/
-                    // `kill_window` may only be trusted to mean "was the
-                    // only one" once existence has been established.
-                    match mode {
-                        ClientMode::ConfirmKillPane(target) => {
-                            if confirmed {
-                                // The pane's OWNING window, not blindly the
-                                // current one (another client may have
-                                // switched the session's current window
-                                // while this confirm was up).
-                                let owner_wid = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .and_then(|s| s.window_by_pane(target).map(|w| w.id));
-                                if let Some(wid) = owner_wid {
-                                    let removed = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .and_then(|s| s.windows.iter_mut().find(|w| w.id == wid))
-                                        .map(|w| w.layout.remove(target))
-                                        .unwrap_or(false);
-                                    if removed {
-                                        self.panes.remove(&target);
-                                        self.last_rects.remove(&target);
-                                        self.apply_layout_for_session(&session_name);
-                                    } else {
-                                        // The window's only pane: the window
-                                        // dies; the session only dies with it
-                                        // if it was also the only window.
-                                        let only_window = self
-                                            .registry
-                                            .session_mut(&session_name)
-                                            .map(|s| s.windows.len() == 1)
-                                            .unwrap_or(false);
-                                        if only_window {
-                                            destroy = true;
-                                            break 'events;
-                                        }
-                                        if let Some(s) = self.registry.session_mut(&session_name) {
-                                            s.kill_window(wid);
-                                        }
-                                        self.panes.remove(&target);
-                                        self.last_rects.remove(&target);
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                }
-                                // else: stale target — no-op cancel.
-                            }
-                        }
-                        ClientMode::ConfirmKillWindow(wid) => {
-                            if confirmed {
-                                let exists = self
-                                    .registry
-                                    .session_mut(&session_name)
-                                    .map(|s| s.windows.iter().any(|w| w.id == wid))
-                                    .unwrap_or(false);
-                                if exists {
-                                    let only_window = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .map(|s| s.windows.len() == 1)
-                                        .unwrap_or(false);
-                                    if only_window {
-                                        destroy = true;
-                                        break 'events;
-                                    }
-                                    let pane_ids: Vec<PaneId> = self
-                                        .registry
-                                        .session_mut(&session_name)
-                                        .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()))
-                                        .unwrap_or_default();
-                                    if self.registry.session_mut(&session_name).map(|s| s.kill_window(wid)).unwrap_or(false) {
-                                        for pid in pane_ids {
-                                            self.panes.remove(&pid);
-                                            self.last_rects.remove(&pid);
-                                        }
-                                        self.apply_layout_for_session(&session_name);
-                                    }
-                                }
-                                // else: stale target — no-op cancel.
-                            }
-                        }
-                        ClientMode::Normal | ClientMode::Prompt { .. } => {}
                     }
                 }
             }
@@ -1122,8 +864,12 @@ impl Server {
             return; // client dropped, not reinserted
         }
         if destroy {
+            // `destroy_session` (and messaging every OTHER attached client)
+            // has ALREADY run inside the dispatcher (`kill_pane_by_id`/
+            // `kill_window_by_id`) — this client, removed from `self.clients`
+            // at the top of this function, is the only one destroy_session
+            // couldn't reach.
             send_msg(&client.tx, &ServerMsg::Exit { code: 0, msg: "[exited]".to_string() });
-            self.destroy_session(&session_name); // handles any OTHER attached clients
             return; // client dropped, not reinserted
         }
         self.clients.insert(id, client);
@@ -1165,21 +911,15 @@ fn render_one(client: &mut ClientState, session: &Session, panes: &HashMap<PaneI
     let too_small =
         area.w < MIN_PANE_W || area.h < MIN_PANE_H || rects.iter().any(|(_, r)| r.w < MIN_PANE_W || r.h < MIN_PANE_H);
 
-    // Precedence matches the pre-Task-7 code exactly: `ConfirmKillPane` had
-    // no match guard, so it (and now its Task 7 siblings `ConfirmKillWindow`/
-    // `Prompt`) always won regardless of `too_small` — a confirm/prompt
-    // overlay doesn't depend on pane space, so it stays visible even on a
-    // too-small terminal. `too_small` only applies in `Normal` mode, where it
-    // additionally takes priority over a transient status message.
+    // Precedence matches the pre-Task-6 code exactly: `ConfirmCmd` (the
+    // Task 6 generalization of the legacy `ConfirmKillPane`/`ConfirmKillWindow`
+    // variants) had no match guard, so it (and `Prompt`) always wins
+    // regardless of `too_small` — a confirm/prompt overlay doesn't depend on
+    // pane space, so it stays visible even on a too-small terminal.
+    // `too_small` only applies in `Normal` mode, where it additionally takes
+    // priority over a transient status message.
     let message = match &client.mode {
-        ClientMode::ConfirmKillPane(pid) => {
-            let idx = window.layout.panes().iter().position(|p| p == pid).unwrap_or(0);
-            Some(format!("kill-pane {idx}? (y/n)"))
-        }
-        ClientMode::ConfirmKillWindow(wid) => {
-            let name = session.windows.iter().find(|w| w.id == *wid).map(|w| w.name.as_str()).unwrap_or("?");
-            Some(format!("kill-window {name}? (y/n)"))
-        }
+        ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
         ClientMode::Normal if too_small => Some("terminal too small".to_string()),
         ClientMode::Normal => client.message.as_ref().map(|(msg, _)| msg.clone()),

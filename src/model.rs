@@ -363,6 +363,16 @@ impl Session {
     pub fn window_by_pane(&mut self, pane: PaneId) -> Option<&mut Window> {
         self.windows.iter_mut().find(|w| w.layout.panes().contains(&pane))
     }
+
+    /// tmux `renumber-windows` support (SP3 Task 6): reassign every window's
+    /// `index` to its position in `self.windows` (0..N), preserving relative
+    /// order. `self.windows` is already kept sorted by index by every
+    /// mutator, so this simply closes any gaps left by `kill_window`.
+    pub fn renumber(&mut self) {
+        for (i, w) in self.windows.iter_mut().enumerate() {
+            w.index = i as u32;
+        }
+    }
 }
 
 #[cfg(test)]

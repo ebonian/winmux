@@ -7,6 +7,22 @@ consumer named here (same rule as the MVP contract).
 
 **Parent spec:** [`2026-07-07-server-client-design.md`](2026-07-07-server-client-design.md)
 
+**SUPERSEDED input section (sub-project 3, Task 6):** every reference below
+to `InputMachine`/`InputEvent`/`Action` (the `Server`/`ClientState` "Input
+routing" narrative, `ClientMode::ConfirmKillPane`/`ConfirmKillWindow`, and
+the CLI subset executed by the now-deleted `src/server/cli_exec.rs`)
+describes sub-project 2 behavior ONLY. `src/server.rs` was rewired in Task 6
+onto the table-driven `KeyMachine`/`Bindings`/command-dispatcher pipeline —
+see `docs/specs/2026-07-07-command-config-interfaces.md`'s `## input-v2`,
+`## bindings`, and `## server-dispatch` sections for the current (locked)
+contract. `ClientMode::ConfirmKillPane(PaneId)`/`ConfirmKillWindow(WindowId)`
+became the single `ConfirmCmd { prompt, cmds, pane_snapshot,
+window_snapshot }` variant; the CLI subset's exact output strings/usage
+lines are preserved byte-for-byte (see that file's `execute_cli_argv` and
+`cmd.rs`'s `sp2_usage_strings_match_cli_exec_verbatim` test) but now flow
+through `cmd::resolve` + the unified dispatcher instead of `cli_exec.rs`'s
+hand-rolled `CliArgs` parser. This section is kept for historical reference.
+
 ## `protocol` — client/server frame codec (pure)
 
 ```rust

@@ -1072,3 +1072,382 @@ fn cli_unknown_flag_is_usage_error() {
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after last session dies");
 }
+
+// ---- Task 6: unified command dispatcher (keys, CLI, `:` prompt) -----------
+
+#[test]
+fn cli_split_window_command() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["split-window".into(), "-h".into(), "-t".into(), "0".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_send_keys() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "0".into(), "echo send-keys-marker".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("send-keys-marker")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn cli_send_keys_literal() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    // -l: the whole arg is sent as literal bytes, not parsed key-by-key (in
+    // particular "echo" must NOT be treated as an unrecognized key name and
+    // dropped -- it must reach the shell verbatim).
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-l".into(), "-t".into(), "0".into(), "echo literal-marker".into()]));
+    expect_cli_done(&cli, 0);
+    // -l does not send a trailing Enter: the shell has only echoed the text
+    // onto its input line so far.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("literal-marker")));
+
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().filter(|l| l.contains("literal-marker")).count() >= 2);
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn command_prompt_executes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // Clean up: kill the new (current) window, falls back to window 0.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn command_prompt_error_message() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"badcmd\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("unknown command: badcmd")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn set_prefix_runtime() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "prefix".into(), "C-a".into()]));
+    expect_cli_done(&cli, 0);
+
+    // New prefix (0x01 = C-a) + c makes a new window.
+    c.send(&ClientMsg::Stdin(vec![0x01, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // The OLD prefix (0x02) is no longer special: 0x02 followed by "%" is
+    // just forwarded (0x02 is swallowed by the shell as an ordinary control
+    // byte; "%" types onto the prompt line) -- no split occurs.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.send(&ClientMsg::Stdin(b"\recho old-prefix-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("old-prefix-marker")));
+    assert!(!has_vertical_border(&grid), "old prefix must no longer trigger split-window");
+
+    // Clean up: kill the new (current) window, falls back to window 0.
+    c.send(&ClientMsg::Stdin(vec![0x01, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn bind_custom_key() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["bind".into(), "V".into(), "split-window".into(), "-h".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'V']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn unbind_default() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "%".into()]));
+    expect_cli_done(&cli, 0);
+
+    // `%` is no longer bound in the prefix table: swallowed (tmux behavior
+    // for an unbound prefix-table key) -- no split, and nothing is forwarded
+    // either (unlike an unbound ROOT-table key).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.send(&ClientMsg::Stdin(b"echo unbind-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("unbind-marker")));
+    assert!(!has_vertical_border(&grid), "unbound prefix key must not split");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn confirm_before_custom() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "k".into(),
+        "confirm-before".into(),
+        "-p".into(),
+        "sure? (y/n)".into(),
+        "kill-pane".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'k']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("sure? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    // Only pane of the only window: killing it destroys the session.
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn list_keys_contains_defaults() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["list-keys".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert!(out.contains("bind-key -T prefix % split-window -h"), "out: {out:?}");
+    assert!(out.contains("bind-key -r -T prefix C-Up resize-pane -U"), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn show_options_output() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["show-options".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert!(out.contains("prefix C-b"), "out: {out:?}");
+    assert!(out.contains("repeat-time 500"), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "prefix".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "prefix C-b\n");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn set_default_command() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "default-command".into(), "cmd.exe".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Microsoft Windows [Version")));
+
+    // Clean up: kill the new (cmd.exe) window, falls back to window 0.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'&']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn renumber_windows_on() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "rnum".into()]));
+    expect_cli_done(&cli, 0);
+    // `new-window` has no `-t` target (see `cmd::ParsedCmd::NewWindow`): a
+    // bare call falls back to the most-recently-created session, which is
+    // `rnum` since this test creates no other session.
+    cli.send(&ClientMsg::Cli(vec!["new-window".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["new-window".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "renumber-windows".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Indices are 0,1,2; kill the middle one (1) -> with renumbering on, the
+    // survivors (0, 2) become (0, 1).
+    cli.send(&ClientMsg::Cli(vec!["kill-window".into(), "-t".into(), "rnum:1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "rnum".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.starts_with("0: "), "out: {out:?}");
+    assert!(out.contains("1: "), "out: {out:?}");
+    assert!(!out.contains("2: "), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "rnum".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn display_message_expands() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let _grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["display-message".into(), "#S:#W".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "0:powershell");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn kill_pane_via_command_targets() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["split-window".into(), "-h".into(), "-t".into(), "0".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // -t 1: the second pane by position, addressed directly (no confirm).
+    cli.send(&ClientMsg::Cli(vec!["kill-pane".into(), "-t".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn source_file_runtime() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    let path = std::env::temp_dir().join(format!("winmux-test-source-{}-{}.conf", std::process::id(), unique_pipe_name().len()));
+    std::fs::write(&path, "bind V split-window -h\nset -g base-index 5\n").expect("write temp conf");
+
+    cli.send(&ClientMsg::Cli(vec!["source-file".into(), path.to_string_lossy().into_owned()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["list-keys".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("bind-key -T prefix V split-window -h"), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "base-index".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "base-index 5\n");
+
+    let _ = std::fs::remove_file(&path);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
