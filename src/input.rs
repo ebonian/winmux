@@ -54,6 +54,15 @@ pub enum KeyInputEvent {
     /// Raw capture mode (status-line prompt line editing): uninterpreted
     /// bytes, coalesced per `feed()` call like `Forward`.
     Captured(Vec<u8>),
+    /// A decoded mouse event (Task 5, sub-project 4). Unlike `Key`, this is
+    /// NEVER routed through the prefix/table state machine or the repeat
+    /// window — mouse "bindings" are hardcoded server-side (see the design
+    /// spec's `## 4. Mouse` section), not looked up in
+    /// `crate::bindings::Bindings`. `raw` is kept for symmetry with `Key`
+    /// (currently unused: forwarding a click's raw SGR bytes to the pane's
+    /// own mouse-reporting mode is out of scope for v1, see the task brief's
+    /// documented deferral).
+    Mouse { event: keys::MouseEvent, raw: Vec<u8> },
 }
 
 /// Keys that report directly as `Forward` in `Normal` state with no repeat
@@ -172,8 +181,18 @@ impl KeyMachine {
 
         let mut out: Vec<KeyInputEvent> = Vec::new();
         let mut fwd: Vec<u8> = Vec::new();
-        for dk in self.decoder.feed(bytes) {
-            self.dispatch_key(dk, now, &mut fwd, &mut out);
+        for item in self.decoder.feed(bytes) {
+            match item {
+                keys::DecodedInput::Key(dk) => self.dispatch_key(dk, now, &mut fwd, &mut out),
+                keys::DecodedInput::Mouse { event, raw } => {
+                    // Bypasses prefix/table dispatch entirely (see
+                    // `KeyInputEvent::Mouse`'s doc comment); still flushes
+                    // any pending coalesced Forward run first so ordering
+                    // relative to preceding plain keystrokes is preserved.
+                    flush_key_forward(&mut fwd, &mut out);
+                    out.push(KeyInputEvent::Mouse { event, raw });
+                }
+            }
         }
         flush_key_forward(&mut fwd, &mut out);
         out
@@ -335,6 +354,49 @@ mod key_machine_tests {
         // char now dispatches fresh (coalesced Forward), not Key{Prefix}.
         m.set_capture(false);
         assert_eq!(m.feed(b"x", now), vec![KeyInputEvent::Forward(b"x".to_vec())]);
+    }
+
+    #[test]
+    fn mouse_bypasses_prefix_and_repeat() {
+        let now = Instant::now();
+        let mut m = km();
+        // Arm Prefixed, then feed a mouse sequence: it must report as Mouse
+        // (not consumed as the awaited prefix-table key), and must NOT clear
+        // the still-armed Prefixed state for the key that follows.
+        assert_eq!(m.feed(b"\x02", now), vec![]);
+        let mouse_bytes = b"\x1b[<0;6;11M";
+        let events = m.feed(mouse_bytes, now);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            KeyInputEvent::Mouse { event, raw } => {
+                assert_eq!(event.kind, keys::MouseKind::Down(1));
+                assert_eq!((event.x, event.y), (5, 10));
+                assert_eq!(raw, mouse_bytes);
+            }
+            other => panic!("expected Mouse, got {other:?}"),
+        }
+        // The still-armed prefix state resolves the NEXT key in the prefix
+        // table, proving the mouse event didn't disturb it.
+        assert_eq!(
+            m.feed(b"%", now),
+            vec![KeyInputEvent::Key {
+                table: WhichTable::Prefix,
+                key: keys::Key { code: KeyCode::Char('%'), ctrl: false, meta: false, shift: false },
+                raw: b"%".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_flushes_pending_forward_first() {
+        let now = Instant::now();
+        let mut m = km();
+        let mut bytes = b"hi".to_vec();
+        bytes.extend_from_slice(b"\x1b[<0;1;1M");
+        let events = m.feed(&bytes, now);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0], KeyInputEvent::Forward(b"hi".to_vec()));
+        assert!(matches!(events[1], KeyInputEvent::Mouse { .. }));
     }
 
     #[test]

@@ -404,17 +404,30 @@ impl Layout {
 
     /// Move the focused pane's nearest enclosing split edge in `dir` by
     /// `cells` cells. Clamped so no pane violates minimums within `area`.
-    /// Returns false if nothing changed.
+    /// Returns false if nothing changed. Thin wrapper over [`Self::resize_from`]
+    /// using the currently focused pane as the reference leaf.
     pub fn resize_focused(&mut self, dir: Direction, area: Rect, cells: u16) -> bool {
+        self.resize_from(self.focused, dir, area, cells)
+    }
+
+    /// Move `pane`'s nearest enclosing split edge (in `dir`'s orientation, on
+    /// the side `pane` sits on) by `cells` cells. Clamped so no pane violates
+    /// minimums within `area`. Returns false if nothing changed, or if `pane`
+    /// isn't one of this layout's leaves. Generalizes [`Self::resize_focused`]
+    /// to an arbitrary reference pane (Task 5, sub-project 4: mouse
+    /// border-drag resize needs to move the split adjacent to whichever pane
+    /// borders the dragged cell, independent of which pane currently has
+    /// keyboard focus — unlike `resize_focused`, this never changes focus).
+    pub fn resize_from(&mut self, pane: PaneId, dir: Direction, area: Rect, cells: u16) -> bool {
         let orient = match dir {
             Direction::Left | Direction::Right => SplitDir::Horizontal,
             Direction::Up | Direction::Down => SplitDir::Vertical,
         };
-        // Right/Down grow the split's FIRST child (so the focus must live in
-        // the first child); Left/Up grow the SECOND child.
+        // Right/Down grow the split's FIRST child (so `pane` must live in the
+        // first child); Left/Up grow the SECOND child.
         let want_first = matches!(dir, Direction::Right | Direction::Down);
 
-        let path = match self.path_to(self.focused) {
+        let path = match self.path_to(pane) {
             Some(p) => p,
             None => return false,
         };
@@ -929,6 +942,40 @@ mod tests {
                 (2, Rect { x: 42, y: 0, w: 38, h: 24 }),
             ]
         );
+    }
+
+    #[test]
+    fn resize_from_reference_pane_ignores_focus() {
+        // (1 | 2), focus stays on 1 (the FIRST child) throughout, but
+        // `resize_from` is told to resize relative to pane 2 (the SECOND
+        // child) -- Task 5's mouse border-drag needs this: it must be able
+        // to move a border adjacent to a pane that ISN'T focused, without
+        // changing focus. `Direction::Left` grows the SECOND child (matches
+        // resize_focused's own Left/Up-grows-second-child rule), so a call
+        // relative to pane 2 with Left should shrink pane1/grow pane2 by 1 --
+        // same net rect change as `resize_left_grows_focused` above, but
+        // reached via pane 2 as the reference instead of the focused pane.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        assert_eq!(l.focused(), 2); // split() gives focus to the new pane
+        l.focus_pane(1); // move focus OFF pane 2 before resizing relative to it
+        assert_eq!(l.focused(), 1);
+        assert!(l.resize_from(2, Direction::Left, A, 1));
+        assert_eq!(l.focused(), 1, "resize_from must not change focus");
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 39, h: 24 }),
+                (2, Rect { x: 40, y: 0, w: 40, h: 24 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_from_unknown_pane_is_noop() {
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        assert!(!l.resize_from(99, Direction::Left, A, 1));
     }
 
     #[test]

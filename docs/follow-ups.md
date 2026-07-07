@@ -274,3 +274,66 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     `Char(' ')` semantics for plain-space forwarding to a pane (see
     `input::is_plain_forwardable`, which currently forwards `Char(' ')` as
     ordinary typed input — changing the decode would need to preserve that).
+
+35. **Mouse clicks/drags are never forwarded to the pane application's own
+    mouse-reporting mode** (Task 5, mouse). tmux, when a pane's own
+    application has ALSO requested mouse reporting (e.g. vim/tmux-inside-
+    tmux/htop with mouse support enabled), can forward click/drag events to
+    that application instead of consuming them for pane focus/copy-mode/
+    resize. winmux v1 always consumes a mouse event for its OWN routing
+    (`server::dispatch::dispatch_mouse`) and never re-encodes/forwards the
+    raw SGR bytes to the focused pane's pty — explicitly out of scope per
+    the task brief ("Click also forwards to the application if the pane's
+    program enabled mouse reporting itself — OUT OF SCOPE for this task
+    unless the design spec says otherwise" — it doesn't). A real fix would
+    need per-pane mouse-mode tracking (has THIS pane's own app requested
+    `?1000h`/etc. via its own output stream?) plus a policy for which takes
+    priority when both winmux and the inner app want the same click.
+36. **Drag-to-select only starts inside a pane already in THAT client's copy
+    mode** (Task 5, mouse). Real tmux implicitly enters copy mode on a
+    `Drag1` over a LIVE (non-copy-mode) pane; winmux's `mouse_down` only arms
+    a selection drag when the click lands inside the pane already bound to
+    the client's `ClientMode::Copy` — a plain click-drag on a live pane just
+    focuses on `Down` and does nothing further. Matches the design spec's
+    own bulleted overview, which scopes "Drag1 = selection" under "In copy
+    mode:" specifically; documented as a deliberate v1 scope decision, not
+    an oversight.
+37. **`word-separators` is a hardcoded constant, not a real tmux option**
+    (Task 5, mouse). Double-click word selection (`select_word_at` in
+    `src/server/dispatch.rs`) uses tmux's DEFAULT `word-separators` value
+    (`" -_@"`) as a private `const WORD_SEPARATORS`, matching the task
+    brief's explicit instruction ("hardcode tmux's default set unless the
+    option already exists"). A `set -g word-separators <chars>` line is
+    accepted/stored nowhere and has no effect — no `word-separators` entry
+    exists in `src/options.rs`'s `SPECS` table at all.
+38. **Mouse-during-prompt/confirm is swallowed entirely, not forwarded to
+    the overlay** (Task 5, mouse). `dispatch_mouse` drops (silent no-op) any
+    mouse event while the acting client's `ClientMode` is `ConfirmCmd` or
+    `Prompt`, rather than e.g. letting a click land on the pane underneath
+    or interacting with the prompt/confirm text in any way. The task brief
+    left tmux's own real behavior here undecided ("decide per tmux and
+    document"); winmux's choice prioritizes never letting a stray click race
+    a confirm's y/n capture, or hit-test against pane geometry the overlay
+    is currently hiding, over any interactive mouse behavior during these
+    (rare, short-lived) modal states.
+39. **Status-row click hit-testing doesn't replicate the renderer's final
+    spatial truncation** (Task 5, mouse). `mouse_status_click` rebuilds the
+    same left-prefix + per-window-tab span layout `render_one`/
+    `status::status_spans` draws to hit-test which window a click column
+    belongs to, but does NOT replicate `render::compose_back`'s LAST step —
+    right-truncating when the built left+right strings don't fit the actual
+    terminal width. On an extremely narrow terminal (narrower than the
+    status content), a click past the true truncation point could resolve
+    to a window tab that isn't actually visible there. Low practical impact
+    (`status-left-length`/`status-right-length` already cap the common case;
+    this only matters on terminals narrower than those caps plus every
+    window tab combined).
+40. **Corner-cell border hit-testing tie-break is arbitrary** (Task 5,
+    mouse). `server::dispatch::hit_test` checks vertical-border positions
+    before horizontal-border positions, so the single cell at a 4-way "+"
+    junction between four panes always resolves to a vertical-border drag,
+    never horizontal, with no way for the user to pick the other axis at
+    that exact cell (they can still grab a non-corner cell along the
+    horizontal border one column over). Documented, not treated as a bug —
+    real tmux has the same class of single-cell ambiguity at a "+" junction
+    and doesn't document a resolution rule either.

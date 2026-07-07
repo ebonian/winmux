@@ -330,6 +330,76 @@ struct ClientState {
     /// of the pipe and drains this channel so a slow client never blocks
     /// the main loop).
     tx: Sender<Vec<u8>>,
+    /// Mouse click/drag session state (Task 5, sub-project 4): double/
+    /// triple-click detection and in-progress border-resize/selection
+    /// dragging. See [`MouseClientState`].
+    mouse: MouseClientState,
+}
+
+/// SGR mouse-mode enable sequence (normal tracking `?1000h` + button-event
+/// tracking `?1002h` + SGR extended coordinates `?1006h`) and its `l`
+/// (disable) counterpart. Sent to a client on attach (if `mouse` is already
+/// on) and broadcast to every attached client whenever `set -g mouse`
+/// changes (`dispatch::Server::exec_set_option`). See the design spec's
+/// `## 4. Mouse` section.
+const MOUSE_ENABLE_SEQ: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_DISABLE_SEQ: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1006l";
+
+/// Double/triple-click detection window (tmux-style, ~500ms; the task brief
+/// permits 300-500ms when the spec doesn't pin an exact value — 500ms
+/// matches `input::REPEAT_TIME`, already the project's other user-facing
+/// timing constant).
+const MOUSE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+/// tmux `WheelUpPane`/`WheelDownPane`'s default step: 5 lines per wheel
+/// event.
+const MOUSE_WHEEL_STEP: u32 = 5;
+
+/// Per-client mouse session state (Task 5, sub-project 4): remembers the
+/// last left-button click (for double/triple-click detection, same cell +
+/// button within [`MOUSE_CLICK_WINDOW`]) and what an in-progress drag is
+/// doing (nothing / resizing a pane border / extending a copy-mode
+/// selection). `Default` starts idle.
+#[derive(Default)]
+struct MouseClientState {
+    /// `(when, x, y, button, run_length)`; `run_length` saturates at 3 (tmux
+    /// has no quadruple-click concept — a 4th same-cell click within the
+    /// window is treated the same as a 3rd, i.e. line selection again).
+    last_click: Option<(Instant, u16, u16, u8, u8)>,
+    drag: MouseDrag,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MouseDrag {
+    #[default]
+    None,
+    /// A `Down1` on a pane border armed a live resize: `pane` is the
+    /// reference leaf `Layout::resize_from` resizes relative to, `vertical`
+    /// is `true` for a column border (left|right panes) and `false` for a
+    /// row border (top/bottom panes).
+    Border { pane: PaneId, vertical: bool },
+    /// A `Down1` inside the pane bound to this client's copy mode armed
+    /// selection tracking; each subsequent `Drag1` extends the selection's
+    /// cursor endpoint, and the eventual `Up1` copies it
+    /// (`copy-selection-and-cancel`, matching tmux's `MouseDragEnd1Pane`
+    /// default).
+    Selecting,
+}
+
+/// Advance `m`'s click-run-length tracker for a `Down` at `(x, y)` with
+/// button `btn`, returning the new run length (1 for a fresh click, 2/3 for
+/// a same-cell-same-button double/triple click within
+/// [`MOUSE_CLICK_WINDOW`]). Updates `m.last_click` as a side effect so the
+/// NEXT click chains off this one.
+fn advance_click_run(m: &mut MouseClientState, now: Instant, x: u16, y: u16, btn: u8) -> u8 {
+    let run = match m.last_click {
+        Some((t, lx, ly, lb, r)) if lb == btn && lx == x && ly == y && now.duration_since(t) <= MOUSE_CLICK_WINDOW => {
+            (r + 1).min(3)
+        }
+        _ => 1,
+    };
+    m.last_click = Some((now, x, y, btn, run));
+    run
 }
 
 /// All server state, owned by the single main-loop thread — no locks.
@@ -845,6 +915,15 @@ impl Server {
         // First-attach-only config-error notice (Task 7): `take()` so a
         // SECOND client attaching later never sees it again.
         let message = self.pending_config_message.take().map(|m| (m, Instant::now()));
+        // Task 5 (mouse): a newly-attaching client needs the enable sequence
+        // too if `mouse` is already on (e.g. set in a `.tmux.conf`, or a
+        // second client attaching after a first client turned it on) — sent
+        // directly as its own Output frame rather than waiting for the next
+        // composed render, matching how `exec_set_option`'s runtime toggle
+        // broadcasts it.
+        if self.options.mouse() {
+            send_output(&tx, MOUSE_ENABLE_SEQ.to_vec());
+        }
         let client = ClientState {
             session: Some(session_name.clone()),
             cols,
@@ -854,6 +933,7 @@ impl Server {
             mode: ClientMode::Normal,
             message,
             tx,
+            mouse: MouseClientState::default(),
         };
         self.clients.insert(id, client);
         self.had_session = true;
@@ -1208,7 +1288,20 @@ impl Server {
                         let mut decoded = dec.feed(&data);
                         decoded.extend(dec.flush());
                         let which = if self.options.mode_keys_vi() { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
-                        for dk in decoded {
+                        for item in decoded {
+                            // A coalesced `Forward` blob is built ONLY from
+                            // plain-forwardable KEYS (`is_plain_forwardable`
+                            // in input.rs) -- a mouse event always reports
+                            // its own `KeyInputEvent::Mouse` immediately
+                            // instead (see that type's doc comment), so it
+                            // can never end up inside a byte blob re-decoded
+                            // here. Re-decoding that blob therefore always
+                            // reproduces the exact same Key items that were
+                            // originally coalesced into it.
+                            let crate::keys::DecodedInput::Key(dk) = item else {
+                                debug_assert!(false, "Forward blob decoded to a Mouse item");
+                                continue;
+                            };
                             let binding = self.bindings.lookup(which, &dk.key).cloned();
                             if let Some(b) = binding {
                                 let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
@@ -1305,6 +1398,16 @@ impl Server {
                             }
                             break;
                         }
+                    }
+                }
+                KeyInputEvent::Mouse { event, .. } => {
+                    // Task 5 (mouse): routed entirely outside the prefix/
+                    // binding-table machinery — see `dispatch::dispatch_mouse`
+                    // and the design spec's `## 4. Mouse` section.
+                    let outcome = self.dispatch_mouse(event, &mut client, &session_name);
+                    dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                    if detach || destroy {
+                        break 'events;
                     }
                 }
             }

@@ -2981,3 +2981,290 @@ fn copy_search_no_match_message() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+// ---- mouse (Task 5, sub-project 4) ----
+
+/// Build one SGR mouse frame: `CSI < Cb ; Cx ; Cy (M|m)`, `x`/`y` given
+/// 0-based (converted to the wire's 1-based here).
+fn sgr_mouse(cb: u8, x: u16, y: u16, release: bool) -> Vec<u8> {
+    let final_byte = if release { 'm' } else { 'M' };
+    format!("\x1b[<{};{};{}{}", cb, x + 1, y + 1, final_byte).into_bytes()
+}
+
+const CB_LEFT: u8 = 0; // button 1, plain press/release (no motion, no modifiers)
+const CB_LEFT_DRAG: u8 = 0x20; // button 1 + motion bit
+const CB_WHEEL_UP: u8 = 0x40;
+const CB_WHEEL_DOWN: u8 = 0x41;
+
+fn enable_mouse(name: &str, c: &mut Client) {
+    let mut cli = cli_client(name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mouse".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+    let _ = c.recv_output_bytes_until_contains(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+}
+
+/// The screen row a vertical `│` border occupies at column `col`, over every
+/// row except the bottom (status) row.
+fn has_vertical_border_at(g: &Grid, col: u16) -> bool {
+    let pane_rows = g.rows().saturating_sub(1);
+    pane_rows > 0 && (0..pane_rows).all(|r| g.cell(col, r).ch == '│')
+}
+
+fn find_vertical_border(g: &Grid) -> u16 {
+    (1..g.cols().saturating_sub(1))
+        .find(|&col| has_vertical_border_at(g, col))
+        .expect("expected a vertical split border")
+}
+
+fn row_text(g: &Grid, row: u16) -> String {
+    (0..g.cols()).map(|x| g.cell(x, row).ch).collect()
+}
+
+impl Client {
+    /// Accumulate raw `Output` payload bytes (across as many frames as
+    /// needed) until the running buffer contains `needle` somewhere, or 10s
+    /// elapse. Unlike `recv_output_until` (which feeds bytes through a
+    /// `Grid` VT emulator for screen-content assertions), this is for
+    /// asserting on the EXACT bytes the server sent — e.g. the raw mouse
+    /// enable/disable escape sequences, which a `Grid` would just silently
+    /// consume as unrecognized private-mode CSI sequences.
+    fn recv_output_bytes_until_contains(&self, needle: &[u8]) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = Vec::new();
+        loop {
+            if buf.windows(needle.len()).any(|w| w == needle) {
+                return buf;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for output containing {needle:?}; got {buf:?}");
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(ServerMsg::Output(bytes)) => buf.extend(bytes),
+                Ok(other) => panic!("unexpected message while waiting for output bytes: {other:?}"),
+                Err(_) => panic!("timed out waiting for output containing {needle:?}; got {buf:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn mouse_option_emits_enable_sequences() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let _ = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mouse".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+    let _ = c.recv_output_bytes_until_contains(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mouse".into(), "off".into()]));
+    expect_cli_done(&cli2, 0);
+    let _ = c.recv_output_bytes_until_contains(b"\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn mouse_click_focuses_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    // split-window gives focus to the NEW (right) pane by default.
+    assert!(grid.cursor().0 > border_x, "expected focus on the right pane right after split");
+
+    // Left click (press + release) inside the LEFT pane.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+
+    // Cleanup: kill-server (two live panes).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn mouse_wheel_enters_copy_mode() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Enough scrollback that a 5-line scroll-up isn't clamped to 0.
+    c.send(&ClientMsg::Stdin(b"1..40 | ForEach-Object { \"wheelmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("wheelmark40")));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 5, 5, false)));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[5/"));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[5/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+#[test]
+fn mouse_drag_selects_and_release_copies() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Drag-select "hello123" (columns 0..=7, 8 chars) and release.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("buffer0: 8 bytes: \"hello123\""), "unexpected list-buffers output: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Attach, enable mouse, create a second window, and rename both windows to
+/// fixed short names (`w0`/`w1`) so the status line's exact tab text is
+/// deterministic for hit-testing — window 1 (`w1`) ends up current.
+fn setup_two_named_windows(name: &str) -> (Client, Grid) {
+    let mut c = Client::connect(name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(name, &mut c);
+
+    let mut cli = cli_client(name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "w0".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("1:"));
+
+    let mut cli2 = cli_client(name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "w1".into()]));
+    expect_cli_done(&cli2, 0);
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, g.rows() - 1);
+        row.contains("1:w1*") && row.contains("0:w0-")
+    });
+
+    (c, grid)
+}
+
+#[test]
+fn mouse_status_click_selects_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    let status_row = grid.rows() - 1;
+    let line = row_text(&grid, status_row);
+    let tab0_col = line.find("0:w0-").expect("window0 tab must be on the status line") as u16;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, tab0_col, status_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, tab0_col, status_row, true)));
+
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, status_row);
+        row.contains("0:w0*") && row.contains("1:w1-")
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn mouse_wheel_status_cycles_windows() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    let status_row = grid.rows() - 1;
+
+    // WheelUp on the status row -> previous-window (tmux default
+    // `WheelUpStatus`): w1 (current) -> w0.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 0, status_row, false)));
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:w0*"));
+
+    // WheelDown -> next-window (`WheelDownStatus`): back to w1.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_DOWN, 0, status_row, false)));
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("1:w1*"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn mouse_border_drag_resizes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let target_x = border_x + 10;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x, 5, true)));
+
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x));
+    assert!(!has_vertical_border_at(&grid, border_x), "border must have actually moved");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// `alt_screen_wheel_sends_arrows`: the task brief's suggested e2e approach
+// (a PowerShell one-liner writes the raw `CSI ?1049h` bytes itself,
+// `Write-Host -NoNewline "$([char]27)[?1049h"`) was tried here first and
+// found to be exactly the "too flaky" case the brief anticipated -- real
+// Windows ConPTY does not reliably pass a bare `Write-Host`-emitted
+// `CSI ?1049h` through to the server's read side as the literal
+// alt-screen-enter sequence (observed: the pane visibly cleared and
+// PowerShell's prompt reprinted, consistent with SOME redraw happening, but
+// the server pane's `Grid::alt_screen()` never actually flipped true, so a
+// wheel event dispatched right after still entered copy mode instead of
+// translating to arrows -- a ConPTY passthrough quirk for a synthetic/naive
+// escape injection, not a winmux bug). Per the brief's own documented
+// fallback, alt-screen wheel routing is instead covered at the server
+// dispatch unit level: see `src/server/dispatch.rs`'s
+// `mouse_dispatch_tests::alt_screen_wheel_does_not_enter_copy_mode` /
+// `live_screen_wheel_enters_copy_mode`, which build a real `Server` +
+// `Registry` session/pane directly and feed `\x1b[?1049h` straight into the
+// pane's `Grid` (no ConPTY involved), exercising the exact same
+// `p.grid.alt_screen()` check `dispatch::Server::mouse_wheel` branches on.
+// `grid::tests::alt_screen_getter_tracks_mode` separately covers that the
+// `Grid` itself correctly tracks alt-screen state end to end.

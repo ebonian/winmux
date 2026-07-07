@@ -87,8 +87,10 @@ const SPECS: &[Spec] = &[
     Spec { name: "repeat-time", kind: Kind::Number, choices: &[] },
     Spec { name: "default-command", kind: Kind::Str, choices: &[] },
     Spec { name: "renumber-windows", kind: Kind::Flag, choices: &[] },
-    // Accepted-inert options (SP4): typed, validated, stored, shown; no
-    // getter beyond `show` since nothing consumes them yet.
+    // `mouse` (Task 5, sub-project 4): now LIVE — see the `mouse()` getter's
+    // doc comment. Accepted-inert options (SP4) follow below: typed,
+    // validated, stored, shown; no getter beyond `show` since nothing
+    // consumes them yet.
     Spec { name: "mouse", kind: Kind::Flag, choices: &[] },
     Spec { name: "history-limit", kind: Kind::Number, choices: &[] },
     Spec { name: "escape-time", kind: Kind::Number, choices: &[] },
@@ -402,6 +404,17 @@ impl Options {
 
     pub fn history_limit(&self) -> u32 {
         self.number("history-limit")
+    }
+
+    /// `mouse` (Task 5, sub-project 4): global on/off for xterm mouse
+    /// reporting. tmux default `off`. Reclassifies `mouse` from the
+    /// accepted-inert group (SP4 options review) to a live, consumed option
+    /// — `server::dispatch::exec_set_option` reacts to a change by
+    /// broadcasting the SGR mouse-mode enable/disable escape sequences to
+    /// every attached client, and `server::Server::finish_attach` sends the
+    /// enable sequence to a newly-attaching client when this is already on.
+    pub fn mouse(&self) -> bool {
+        self.flag("mouse")
     }
 
     /// Copy mode's key table selector: `true` = `mode-keys vi`
@@ -800,6 +813,16 @@ mod tests {
             o.set("default-terminal", Some("scr\teen"), false, false),
             Err("bad value: scr?een".to_string())
         );
+    }
+
+    #[test]
+    fn mouse_defaults_off_and_toggles() {
+        let mut o = Options::new();
+        assert!(!o.mouse(), "tmux default: mouse off");
+        o.set("mouse", Some("on"), false, false).unwrap();
+        assert!(o.mouse());
+        o.set("mouse", None, false, false).unwrap(); // no value on a Flag toggles
+        assert!(!o.mouse());
     }
 
     #[test]

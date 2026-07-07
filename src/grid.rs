@@ -853,6 +853,18 @@ impl Grid {
     pub fn cursor_visible(&self) -> bool {
         self.state.cursor_visible
     }
+
+    /// `true` while the pane's application has switched to the alternate
+    /// screen (`CSI ?1049h`/`?47h`/`?1047h`), `false` on the primary screen.
+    /// Mouse wheel routing (Task 5, sub-project 4) uses this to decide
+    /// whether a wheel event should scroll winmux's own scrollback/copy-mode
+    /// (primary screen) or be translated into synthesized arrow-key presses
+    /// sent to the pane (alt screen — tmux's own wheel-in-alt-screen
+    /// behavior, since alt-screen apps like `less`/vim have no scrollback of
+    /// their own to reveal).
+    pub fn alt_screen(&self) -> bool {
+        self.state.alt_screen
+    }
 }
 
 #[cfg(test)]
@@ -1284,6 +1296,16 @@ mod tests {
         assert_eq!(row_str(&g, 1), "xxx");
         assert_eq!(row_str(&g, 2), "xxx");
         assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn alt_screen_getter_tracks_mode() {
+        let mut g = Grid::new(3, 3, 0);
+        assert!(!g.alt_screen());
+        g.feed(b"\x1b[?1049h");
+        assert!(g.alt_screen());
+        g.feed(b"\x1b[?1049l");
+        assert!(!g.alt_screen());
     }
 
     #[test]

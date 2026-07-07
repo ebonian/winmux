@@ -116,6 +116,27 @@ named keys with full CSI-modifier support in SP3).
 
 ### `KeyDecoder` (input direction: client keystroke bytes to `Key`)
 
+**Amendment (sub-project 4, Task 5 — mouse):** `KeyDecoder::feed`/`flush` now
+return `Vec<DecodedInput>` instead of `Vec<DecodedKey>` —
+`DecodedInput::{Key(DecodedKey), Mouse { event: keys::MouseEvent, raw:
+Vec<u8> }}` — so the same incremental byte stream can carry decoded SGR mouse
+events (`CSI < Cb ; Cx ; Cy M|m`) alongside decoded keys, in the arrival
+order both were seen. This is the minimal-churn option this section's
+original text called out ("`DecodedKey` generalizes to
+`DecodedInput::{Key(DecodedKey), Mouse{event, raw}}`... pick minimal churn,
+contract it"). Every table/example below that still says "`DecodedKey`" is
+unchanged in its own right — a plain key decodes exactly as documented, just
+wrapped in `DecodedInput::Key(..)` — this amendment only adds the sibling
+`Mouse` variant and a new SGR-recognition branch in `classify_csi` (checked
+BEFORE the generic CSI final-byte scan, since a mouse sequence's `<`
+introducer byte is not itself a valid CSI final byte). Full mouse decoding
+contract (the `MouseEvent`/`MouseKind` shapes, the SGR wire-format decode
+table, and the RAW-BYTE FIDELITY "always consume when decodable, regardless
+of the `mouse` option" decision) lives in the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md),
+alongside the rest of Task 5's cross-module surface, rather than duplicated
+here.
+
 Incremental: `feed()` pushes one byte at a time into an internal buffer and
 attempts to classify the buffer as a complete token after every byte;
 whatever completes is emitted (in order) as a `DecodedKey` with `raw` set
@@ -763,7 +784,24 @@ note). Unknown `#{...}` forms and unrecognized `#<c>` codes are silent
 (empty), matching the design spec's "anything else renders empty"
 directive — `expand_format` never returns an `Err`.
 
-## `input-v2` — table-driven key machine (Task 5)
+## `input-v2` — table-driven key machine (Task 5, sub-project 3)
+
+**Amendment (sub-project 4, Task 5 — mouse):** `KeyInputEvent` gains a
+`Mouse { event: keys::MouseEvent, raw: Vec<u8> }` variant. Unlike `Key`, a
+`Mouse` event is NEVER routed through the prefix/table state machine or the
+repeat window — it bypasses `dispatch_key` entirely (`KeyMachine::feed`
+matches `keys::DecodedInput::Mouse { .. }` before it would ever reach the
+prefix-armed / repeat-window / plain-forwardable checks) — mouse "bindings"
+are hardcoded server-side (`server::dispatch::dispatch_mouse`), not looked up
+in `crate::bindings::Bindings`. A pending coalesced `Forward` run is flushed
+first so ordering relative to preceding plain keystrokes is preserved. During
+`set_capture(true)` (a prompt/confirm/copy-mode-search line editor), the
+capture short-circuit at the top of `feed()` still applies unchanged: a mouse
+sequence arriving mid-capture is swallowed into the raw `Captured` blob like
+any other byte (capture never decodes at all, mouse or otherwise). See the
+`## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
+for the full server-side routing this feeds into.
 
 ```rust
 // src/input.rs additions -- land ALONGSIDE the legacy InputMachine/Action/

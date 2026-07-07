@@ -29,14 +29,16 @@ use crate::bindings::Binding;
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
+use crate::keys::{MouseEvent, MouseKind};
 use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    anchor_key_now, key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId, ClientMode, ClientState,
-    ConfigCandidate, CopyState, PromptKind, SearchPrompt, SearchState, SelState, Server, MONTHS,
+    advance_click_run, anchor_key_now, key_to_view, sel_key, send_msg, spawn_pane, system_time_parts, ClientId,
+    ClientMode, ClientState, ConfigCandidate, CopyState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState,
+    Server, MONTHS, MOUSE_WHEEL_STEP,
 };
 use crate::grid::Grid;
 
@@ -507,6 +509,101 @@ fn edit_line_buf(buf: &mut String, b: u8) -> LineEdit {
         }
         _ => LineEdit::Editing,
     }
+}
+
+// ---- mouse (Task 5, sub-project 4) ----
+
+/// tmux's default `word-separators` option value (` -_@`), hardcoded per the
+/// task brief -- no `word-separators` option exists in the registry yet (a
+/// documented v1 simplification, alongside the existing `copy-next-word`/
+/// `copy-previous-word` motions' own whitespace-only word notion above,
+/// which double-click word selection intentionally does NOT reuse: tmux's
+/// real double-click uses `word-separators`, not the plain-whitespace rule
+/// those cursor motions use).
+const WORD_SEPARATORS: &str = " -_@";
+
+fn is_word_sep(c: char) -> bool {
+    WORD_SEPARATORS.contains(c)
+}
+
+/// Hit-test result for a mouse event's `(x, y)` against a window's current
+/// pane rects.
+enum MouseHit {
+    Pane(PaneId),
+    /// A vertical (column) border between two side-by-side panes; `left` is
+    /// the pane whose RIGHT edge sits at the border column -- the
+    /// `Layout::resize_from` reference leaf for a Left/Right resize.
+    VBorder { left: PaneId },
+    /// A horizontal (row) border between two stacked panes; `top` is the
+    /// pane whose BOTTOM edge sits at the border row -- the
+    /// `Layout::resize_from` reference leaf for an Up/Down resize.
+    HBorder { top: PaneId },
+    None,
+}
+
+/// Hit-test `(x, y)` against `rects` (a window's current pane rects, as
+/// returned by `Layout::rects`): pane interior first, then a vertical
+/// border, then a horizontal border. A cell that is simultaneously a valid
+/// vertical- AND horizontal-border position (the single cell at a 4-way "+"
+/// junction between four panes) resolves to the vertical border -- an
+/// arbitrary but documented tie-break (Task 5 self-review note; real tmux
+/// has the same kind of single-cell ambiguity at a "+" junction and doesn't
+/// document a preference either). Zero-size rects (a too-small terminal)
+/// simply never match any of these conditions, so they degrade to `None`
+/// rather than panicking or matching spuriously.
+fn hit_test(rects: &[(PaneId, Rect)], x: u16, y: u16) -> MouseHit {
+    for (id, r) in rects {
+        if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+            return MouseHit::Pane(*id);
+        }
+    }
+    for (id, r) in rects {
+        if r.x + r.w == x && y >= r.y && y < r.y + r.h {
+            return MouseHit::VBorder { left: *id };
+        }
+    }
+    for (id, r) in rects {
+        if r.y + r.h == y && x >= r.x && x < r.x + r.w {
+            return MouseHit::HBorder { top: *id };
+        }
+    }
+    MouseHit::None
+}
+
+/// Double-click word selection (`DoubleClick1Pane` -> `select-word`): expand
+/// from the clicked cell to the maximal run of same-class characters (word
+/// chars, or [`WORD_SEPARATORS`] chars) on that view row, using
+/// [`WORD_SEPARATORS`] as the separator class -- NOT the plain-whitespace
+/// rule `copy-next-word`/`copy-previous-word` use (see [`WORD_SEPARATORS`]'s
+/// doc comment). A blank row (`n == 0`) clears any selection instead of
+/// panicking on an out-of-range index.
+fn select_word_at(cs: &mut CopyState, grid: &Grid, history_total: u64) {
+    let text = grid.view_row_text(cs.scroll, cs.cy);
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        cs.sel = None;
+        return;
+    }
+    let ci = (cs.cx as usize).min(n - 1);
+    let sep = is_word_sep(chars[ci]);
+    let mut start = ci;
+    let mut end = ci;
+    while start > 0 && is_word_sep(chars[start - 1]) == sep {
+        start -= 1;
+    }
+    while end + 1 < n && is_word_sep(chars[end + 1]) == sep {
+        end += 1;
+    }
+    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: start as u16, anchor_y: cs.cy, anchor_total: history_total, rect: false });
+    cs.cx = end as u16;
+}
+
+/// Triple-click line selection (`TripleClick1Pane` -> `select-line`): the
+/// whole clicked view row, column 0 through the last column.
+fn select_line_at(cs: &mut CopyState, cols: u16, history_total: u64) {
+    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: 0, anchor_y: cs.cy, anchor_total: history_total, rect: false });
+    cs.cx = cols.saturating_sub(1);
 }
 
 impl Server {
@@ -1147,6 +1244,380 @@ impl Server {
         ExecOutcome::Ok(String::new())
     }
 
+    // ---- mouse (Task 5, sub-project 4) ----
+
+    /// Route one decoded [`MouseEvent`] for `client` (already resolved to
+    /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
+    /// option is off (design spec: "mouse events with mouse off are
+    /// dropped"), or while `client` has an active confirm/prompt overlay
+    /// (Task 5 decision, undecided by the brief: real tmux's mouse-during-
+    /// prompt behavior is a can of worms out of scope here -- winmux
+    /// swallows mouse events in those modes so a stray click can never race
+    /// a confirm's y/n capture or act on pane geometry the overlay is
+    /// currently hiding; documented deviation, see `docs/follow-ups.md`).
+    pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if !self.options.mouse() {
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(client.mode, ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. }) {
+            return ExecOutcome::Ok(String::new());
+        }
+
+        if let Some(sy) = self.mouse_status_row(client) {
+            if ev.y == sy {
+                return self.dispatch_mouse_status(ev, client, session_name);
+            }
+        }
+
+        let Some((area, rects)) = self.mouse_pane_rects(session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if ev.x >= area.w || ev.y < area.y || ev.y >= area.y + area.h {
+            // Outside the pane area entirely (e.g. a blank gap row on a
+            // client taller than the session's shared size): no-op, and end
+            // any in-progress drag so it can't keep resizing/selecting based
+            // on an off-screen position.
+            client.mouse.drag = MouseDrag::None;
+            return ExecOutcome::Ok(String::new());
+        }
+
+        match ev.kind {
+            MouseKind::Down(btn) => self.mouse_down(ev, btn, &rects, client, session_name),
+            MouseKind::Drag(_) => self.mouse_drag(ev, &rects, client, session_name),
+            MouseKind::Up(_) => self.mouse_up(client),
+            MouseKind::WheelUp => self.mouse_wheel(ev, true, &rects, client, session_name),
+            MouseKind::WheelDown => self.mouse_wheel(ev, false, &rects, client, session_name),
+        }
+    }
+
+    /// Status row's y coordinate on THIS client's own screen (mirrors
+    /// `render_one`/`render::compose_back`'s `status_y` rule: row 0 if
+    /// `status-position top`, else the client's own last row), or `None`
+    /// when `status` is off.
+    fn mouse_status_row(&self, client: &ClientState) -> Option<u16> {
+        if !self.options.status_on() || client.rows == 0 {
+            return None;
+        }
+        Some(if self.options.status_position_top() { 0 } else { client.rows - 1 })
+    }
+
+    /// The shared pane area rect and the acting session's CURRENT window's
+    /// pane rects within it (mirrors `render_one`'s own area computation, so
+    /// hit-testing always agrees with what was actually drawn last).
+    /// `None` if `session_name` doesn't currently exist.
+    fn mouse_pane_rects(&self, session_name: &str) -> Option<(Rect, Vec<(PaneId, Rect)>)> {
+        let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
+        let area = Rect { x: 0, y: self.pane_area_y(), w: session.size.0, h: session.size.1 };
+        Some((area, session.current_window().layout.rects(area)))
+    }
+
+    fn mouse_focus_pane(&mut self, session_name: &str, pane_id: PaneId) {
+        if let Some(session) = self.registry.session_mut(session_name) {
+            session.current_window_mut().layout.focus_pane(pane_id);
+        }
+    }
+
+    /// `Down1`/`Down2`/`Down3` inside the pane area: a border press arms a
+    /// live resize drag; a pane press always focuses that pane (tmux
+    /// `select-pane`), and additionally arms a selection drag when it's a
+    /// LEFT click landing inside the pane bound to `client`'s OWN copy mode
+    /// (clicking on some other pane, or any click while not in copy mode at
+    /// all, only focuses -- see the design spec's "Down1 on pane -> focus"
+    /// bullet; forwarding the click to the pane's own mouse-reporting
+    /// application is out of scope for v1, documented deferral).
+    fn mouse_down(
+        &mut self,
+        ev: MouseEvent,
+        btn: u8,
+        rects: &[(PaneId, Rect)],
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        match hit_test(rects, ev.x, ev.y) {
+            MouseHit::VBorder { left } => {
+                client.mouse.drag = MouseDrag::Border { pane: left, vertical: true };
+                ExecOutcome::Ok(String::new())
+            }
+            MouseHit::HBorder { top } => {
+                client.mouse.drag = MouseDrag::Border { pane: top, vertical: false };
+                ExecOutcome::Ok(String::new())
+            }
+            MouseHit::Pane(pane_id) => {
+                self.mouse_focus_pane(session_name, pane_id);
+                let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
+                if btn != 1 || !in_copy_here {
+                    client.mouse.drag = MouseDrag::None;
+                    return ExecOutcome::Ok(String::new());
+                }
+                let Some(rect) = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r) else {
+                    return ExecOutcome::Ok(String::new());
+                };
+                let now = Instant::now();
+                let run = advance_click_run(&mut client.mouse, now, ev.x, ev.y, btn);
+                let cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
+                let cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+                let Some(p) = self.panes.get(&pane_id) else {
+                    return ExecOutcome::Ok(String::new());
+                };
+                let history_total = p.grid.history_total();
+                let cols = p.grid.cols();
+                if let ClientMode::Copy(cs) = &mut client.mode {
+                    cs.cx = cx;
+                    cs.cy = cy;
+                    match run {
+                        1 => {
+                            cs.sel = Some(SelState {
+                                anchor_scroll: cs.scroll,
+                                anchor_x: cx,
+                                anchor_y: cy,
+                                anchor_total: history_total,
+                                rect: false,
+                            });
+                        }
+                        2 => select_word_at(cs, &p.grid, history_total),
+                        _ => select_line_at(cs, cols, history_total),
+                    }
+                }
+                client.mouse.drag = MouseDrag::Selecting;
+                ExecOutcome::Ok(String::new())
+            }
+            MouseHit::None => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// `Drag1`/`Drag2`/`Drag3` (button-motion tracking): extends whatever
+    /// `client.mouse.drag` was armed to on the preceding `Down` (border
+    /// resize or copy-mode selection); a no-op if no drag is in progress
+    /// (e.g. the button went down outside the pane area, or on a border
+    /// while `mouse` was toggled off mid-drag).
+    fn mouse_drag(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        match client.mouse.drag {
+            MouseDrag::Border { pane, vertical } => {
+                self.mouse_drag_border(ev, pane, vertical, session_name);
+                ExecOutcome::Ok(String::new())
+            }
+            MouseDrag::Selecting => {
+                if let ClientMode::Copy(cs) = &mut client.mode {
+                    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == cs.pane) {
+                        cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
+                        cs.cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+                    }
+                }
+                ExecOutcome::Ok(String::new())
+            }
+            MouseDrag::None => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// Live-resize the border `pane` sits on (per `vertical`) so it tracks
+    /// the drag position: re-reads the pane's CURRENT rect every call (not
+    /// an accumulated delta since the drag started) so this is robust to
+    /// clamping at layout minimums -- the border always ends up exactly at
+    /// `ev.x`/`ev.y` if that position is reachable at all, rather than
+    /// drifting from a stale accumulated offset.
+    fn mouse_drag_border(&mut self, ev: MouseEvent, pane: PaneId, vertical: bool, session_name: &str) {
+        let Some((area, rects)) = self.mouse_pane_rects(session_name) else { return };
+        let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) else { return };
+        let (current, target, positive_dir, negative_dir) = if vertical {
+            (rect.x + rect.w, ev.x, Direction::Right, Direction::Left)
+        } else {
+            (rect.y + rect.h, ev.y, Direction::Down, Direction::Up)
+        };
+        let delta = target as i32 - current as i32;
+        if delta == 0 {
+            return;
+        }
+        let dir = if delta > 0 { positive_dir } else { negative_dir };
+        let cells = delta.unsigned_abs() as u16;
+        if let Some(session) = self.registry.session_mut(session_name) {
+            session.current_window_mut().layout.resize_from(pane, dir, area, cells);
+        }
+        self.apply_layout_for_session(session_name);
+    }
+
+    /// `Up1`/`Up2`/`Up3`: ends whatever drag was in progress. A border-resize
+    /// drag needs no further action (already applied live). A copy-mode
+    /// selection drag copies the selection and exits copy mode -- tmux's
+    /// `MouseDragEnd1Pane` default (`copy-selection-and-cancel`); this also
+    /// covers a plain click with no drag at all (single/double/triple-click
+    /// selection was already set up on `Down`, see `mouse_down`) since SGR
+    /// button-event tracking still sends a release even without any motion
+    /// in between.
+    fn mouse_up(&mut self, client: &mut ClientState) -> ExecOutcome {
+        let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
+        match drag {
+            MouseDrag::Selecting if matches!(client.mode, ClientMode::Copy(_)) => {
+                self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+            }
+            _ => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// `WheelUp`/`WheelDown` inside the pane area.
+    fn mouse_wheel(
+        &mut self,
+        ev: MouseEvent,
+        up: bool,
+        rects: &[(PaneId, Rect)],
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        let Some(pane_id) = rects
+            .iter()
+            .find(|(_, r)| ev.x >= r.x && ev.x < r.x + r.w && ev.y >= r.y && ev.y < r.y + r.h)
+            .map(|(id, _)| *id)
+        else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(p) = self.panes.get(&pane_id) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if p.grid.alt_screen() {
+            // tmux's alternate-screen wheel translation: an alt-screen app
+            // (`less`, vim, ...) has its own scrollback/paging concept, not
+            // winmux's, so each wheel event becomes 3 arrow-key presses sent
+            // straight to the pane instead of entering copy mode.
+            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+            let mut data = Vec::with_capacity(arrow.len() * 3);
+            for _ in 0..3 {
+                data.extend_from_slice(arrow);
+            }
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                if let Some(pty) = pane.pty.as_mut() {
+                    let _ = pty.write_input(&data);
+                }
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+
+        let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
+        if in_copy_here {
+            let action = if up { CopyAction::ScrollUp } else { CopyAction::ScrollDown };
+            for _ in 0..MOUSE_WHEEL_STEP {
+                self.exec_copy_action(action, client);
+            }
+            if !up {
+                // tmux's scroll-to-bottom auto-exit: only when THIS copy-mode
+                // session was entered by the wheel (`CopyState::scroll_exit`,
+                // a Task 2 placeholder whose first consumer is Task 5).
+                let should_exit = matches!(&client.mode, ClientMode::Copy(cs) if cs.scroll == 0 && cs.scroll_exit);
+                if should_exit {
+                    client.mode = ClientMode::Normal;
+                }
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+
+        if !up {
+            // WheelDown on a live (non-copy-mode) pane: no-op (design spec's
+            // documented v1 decision -- there is no "downward" scrollback
+            // direction to enter copy mode from at the live bottom).
+            return ExecOutcome::Ok(String::new());
+        }
+
+        // WheelUp on a live pane: enter copy mode scrolled MOUSE_WHEEL_STEP
+        // lines (tmux's WheelUpPane default), marked scroll_exit so
+        // scrolling back down to the live bottom by wheel auto-exits.
+        let outcome = self.exec_copy_mode(false, true, client, session_name);
+        if matches!(outcome, ExecOutcome::Err(_)) {
+            return outcome;
+        }
+        if let ClientMode::Copy(cs) = &mut client.mode {
+            cs.scroll_exit = true;
+        }
+        for _ in 0..MOUSE_WHEEL_STEP {
+            self.exec_copy_action(CopyAction::ScrollUp, client);
+        }
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// A click or wheel event on the status row (tmux default status-table
+    /// bindings: `MouseDown1Status` -> select the clicked window tab;
+    /// `WheelUpStatus`/`WheelDownStatus` -> previous-window/next-window).
+    fn dispatch_mouse_status(&mut self, ev: MouseEvent, _client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        // No client-mode state is needed for status-row routing today; the
+        // parameter is kept (unused) so the call site in `dispatch_mouse`
+        // stays symmetric with the pane-area dispatch methods.
+        match ev.kind {
+            MouseKind::Down(1) => self.mouse_status_click(ev.x, session_name),
+            MouseKind::WheelUp => wrap(self.exec_step_window(false, Some(session_name))),
+            MouseKind::WheelDown => wrap(self.exec_step_window(true, Some(session_name))),
+            _ => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// Left click on the status row at column `x`: select the window tab
+    /// under it, if any. A click on the `status-left` prefix, a separator
+    /// space, or past the last tab is a no-op (design spec: "Down-click on a
+    /// status-line area with no window: no-op"). Rebuilds the SAME left-
+    /// prefix-width-then-per-window-span layout `render_one`/`status_spans`
+    /// draws (one space between tabs, none after the last) so hit-testing
+    /// always agrees with what's actually on screen; deliberately does NOT
+    /// replicate `render::compose_back`'s final spatial truncation when
+    /// left+right don't fit the terminal width (a click past the truncation
+    /// point on an extremely narrow terminal may resolve to a tab that isn't
+    /// actually drawn there -- documented v1 gap, `docs/follow-ups.md`).
+    fn mouse_status_click(&mut self, x: u16, session_name: &str) -> ExecOutcome {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let window = session.current_window();
+        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32;
+        let mut window_flags = String::from("*");
+        if window.layout.is_zoomed() {
+            window_flags.push('Z');
+        }
+        let fctx = FormatCtx {
+            session: &session.name,
+            window_index: window.index,
+            window_name: &window.name,
+            window_flags: &window_flags,
+            pane_index,
+            hostname: &self.hostname,
+            now: system_time_parts(),
+        };
+        let left = crate::options::expand_format(self.options.status_left(), &fctx);
+        let left_len = left.chars().count().min(self.options.status_left_length() as usize) as u16;
+        if x < left_len {
+            return ExecOutcome::Ok(String::new());
+        }
+
+        let mut cursor = left_len;
+        let last_idx = session.windows.len().saturating_sub(1);
+        let mut target: Option<WindowId> = None;
+        for (i, w) in session.windows.iter().enumerate() {
+            let mut flags = String::new();
+            if w.id == session.current {
+                flags.push('*');
+            } else if Some(w.id) == session.last {
+                flags.push('-');
+            }
+            if w.layout.is_zoomed() {
+                flags.push('Z');
+            }
+            let text_len = format!("{}:{}{}", w.index, w.name, flags).chars().count() as u16;
+            if x >= cursor && x < cursor + text_len {
+                target = Some(w.id);
+                break;
+            }
+            cursor += text_len;
+            if i != last_idx {
+                cursor += 1; // separator space
+            }
+        }
+        let Some(wid) = target else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if let Some(session) = self.registry.session_mut(session_name) {
+            if wid != session.current {
+                session.last = Some(session.current);
+                session.current = wid;
+            }
+        }
+        self.apply_layout_for_session(session_name);
+        ExecOutcome::Ok(String::new())
+    }
+
     // ---- paste buffers (Task 3, sub-project 4) ----
 
     /// `paste-buffer` (client-aware like `send-keys`: `-t` resolves via
@@ -1266,6 +1737,21 @@ impl Server {
             let rt = self.options.repeat_time();
             for c in self.clients.values_mut() {
                 c.key_machine.set_repeat_time(rt);
+            }
+        } else if name == "mouse" {
+            // Task 5: broadcast the SGR mouse-mode enable/disable escape
+            // sequences to every CURRENTLY attached client immediately (a
+            // raw Output frame, not waiting for the next composed render —
+            // `mouse` is a global option so this affects every session, not
+            // just the acting client's). A client attaching AFTER this point
+            // gets the enable sequence from `finish_attach` instead. The
+            // client's own terminal restore path (`host::apply_restore`)
+            // unconditionally writes the disable sequence on exit regardless
+            // of what the server ever sent, so a crashed/killed server can't
+            // leave a client's real terminal with mouse reporting stuck on.
+            let seq = if self.options.mouse() { super::MOUSE_ENABLE_SEQ } else { super::MOUSE_DISABLE_SEQ };
+            for c in self.clients.values() {
+                super::send_output(&c.tx, seq.to_vec());
             }
         } else if matches!(name.as_str(), "status" | "status-position") {
             // The status row's on/off state and position change every
@@ -1993,5 +2479,119 @@ mod copy_search_tests {
         let pat: Vec<char> = "hello".chars().map(fold_char).collect();
         let got = find_search_match(&grid, &pat, 0, 0, false);
         assert_eq!(got, Some((0, 1)), "match column must equal the true screen column (1), not a naive-fold-shifted index");
+    }
+}
+
+/// Unit-level coverage for the alt-screen wheel routing decision (Task 5).
+///
+/// The task brief's suggested e2e approach — have a real PowerShell pane
+/// print the raw `CSI ?1049h` bytes itself (`Write-Host -NoNewline
+/// "$([char]27)[?1049h"`) and drive a full `server::run` instance under
+/// `tests/server_proto.rs` — was tried FIRST and found to be exactly the
+/// "too flaky" case the brief anticipated: real Windows ConPTY does not
+/// reliably pass a bare `Write-Host`-emitted `CSI ?1049h` through to the
+/// server's read side as the literal alt-screen-enter sequence (observed
+/// behavior: the pane visibly cleared and PowerShell's prompt reprinted —
+/// consistent with SOME redraw happening — but the server pane's
+/// `Grid::alt_screen()` never actually flipped true, so a wheel event
+/// dispatched right after still entered copy mode instead of translating to
+/// arrows). This is a ConPTY passthrough quirk for a synthetic/naive escape
+/// injection, not a bug in winmux's own alt-screen tracking (which the
+/// dedicated `grid::tests::alt_screen_getter_tracks_mode` test — driven by
+/// feeding the escape DIRECTLY into a `Grid`, no ConPTY involved — already
+/// covers) or in the routing logic under test here.
+///
+/// Per the brief's own documented fallback, this instead builds a real
+/// `Server` + `Registry` session/pane directly (no ConPTY, no background
+/// threads: `PaneRuntime.pty` is `None`, which is fine — `dispatch_mouse`'s
+/// alt-screen branch only ever calls `pty.write_input`, gated behind an `if
+/// let Some(pty) = ..`, so a `None` pty just makes the arrow-writes a silent
+/// no-op instead of a panic) and feeds `\x1b[?1049h` straight into the
+/// pane's `Grid` via its own public `feed` — exercising the EXACT same
+/// `p.grid.alt_screen()` check `mouse_wheel` branches on, with no
+/// ConPTY-passthrough uncertainty anywhere in the test.
+#[cfg(test)]
+mod mouse_dispatch_tests {
+    use super::*;
+    use crate::grid::Grid;
+    use crate::keys::{MouseEvent, MouseKind};
+    use crate::render::Renderer;
+    use std::sync::mpsc::channel;
+
+    /// A minimal but real `ClientState` — no writer thread needed since the
+    /// test never reads off `tx`'s receiver, it just needs somewhere for
+    /// `send`s to land harmlessly.
+    fn test_client(cols: u16, rows: u16) -> ClientState {
+        let (tx, _rx) = channel::<Vec<u8>>();
+        ClientState {
+            session: Some("0".to_string()),
+            cols,
+            rows,
+            renderer: Renderer::new(cols, rows),
+            key_machine: crate::input::KeyMachine::new(crate::keys::parse_key("C-b").unwrap()),
+            mode: ClientMode::Normal,
+            message: None,
+            tx,
+            mouse: super::super::MouseClientState::default(),
+        }
+    }
+
+    /// Build a `Server` with one session/window/pane (`mouse` on), returning
+    /// `(server, session_name, pane_id)`. `alt_screen`: whether to feed
+    /// `\x1b[?1049h` into the pane's grid before returning.
+    fn test_server_with_pane(alt_screen: bool) -> (Server, String, PaneId) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        server.options.set("mouse", Some("on"), false, false).unwrap();
+        let pane_id = server.mint_pane_id();
+        let mut grid = Grid::new(20, 10, 100);
+        if alt_screen {
+            grid.feed(b"\x1b[?1049h");
+            assert!(grid.alt_screen(), "test setup: grid must report alt_screen after CSI ?1049h");
+        }
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false });
+        let session_name = server
+            .registry
+            .create_session(Some("0"), pane_id, (20, 10), 0)
+            .expect("create_session")
+            .name
+            .clone();
+        (server, session_name, pane_id)
+    }
+
+    fn wheel_up_at(x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind: MouseKind::WheelUp, ctrl: false, meta: false, shift: false, x, y }
+    }
+
+    #[test]
+    fn alt_screen_wheel_does_not_enter_copy_mode() {
+        let (mut server, session_name, _pane_id) = test_server_with_pane(true);
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            matches!(client.mode, ClientMode::Normal),
+            "wheel over an alt-screen pane must NOT enter copy mode, got {:?}",
+            match &client.mode {
+                ClientMode::Normal => "Normal",
+                ClientMode::Copy(_) => "Copy",
+                ClientMode::Prompt { .. } => "Prompt",
+                ClientMode::ConfirmCmd { .. } => "ConfirmCmd",
+            }
+        );
+    }
+
+    #[test]
+    fn live_screen_wheel_enters_copy_mode() {
+        // Same setup, but WITHOUT feeding the alt-screen escape: proves the
+        // routing genuinely depends on `alt_screen()` rather than always
+        // skipping copy-mode entry regardless of pane state.
+        let (mut server, session_name, _pane_id) = test_server_with_pane(false);
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(matches!(client.mode, ClientMode::Copy(_)), "wheel over a LIVE pane must enter copy mode");
     }
 }

@@ -294,8 +294,65 @@ pub struct DecodedKey {
     pub raw: Vec<u8>,
 }
 
-/// Incremental VT-input decoder: turns a stream of client keystroke bytes
-/// into [`DecodedKey`] values. Escape sequences (and partial UTF-8
+/// A decoded mouse event (Task 5, sub-project 4): SGR mouse reporting
+/// (`CSI < Cb ; Cx ; Cy M` for press/drag/wheel, `CSI < Cb ; Cx ; Cy m` for
+/// release), the only mouse protocol winmux enables (`\x1b[?1000h\x1b[?1002h
+/// \x1b[?1006h` — normal + button-event tracking + SGR extended coordinates).
+/// `x`/`y` are 0-based cell coordinates (SGR wire format is 1-based;
+/// [`KeyDecoder`] converts on decode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub shift: bool,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// Which mouse action occurred, and which button (1 = left, 2 = middle,
+/// 3 = right — SGR/xterm's 1-based button numbering, kept as-is rather than
+/// 0-based to match wire values directly in tests/debug output).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseKind {
+    Down(u8),
+    Up(u8),
+    /// Motion while a button is held (`?1002h` button-event tracking never
+    /// reports motion with NO button down, so `Drag` always carries the
+    /// held button number).
+    Drag(u8),
+    WheelUp,
+    WheelDown,
+}
+
+/// One item [`KeyDecoder::feed`]/[`KeyDecoder::flush`] can produce: either a
+/// decoded keystroke or a decoded mouse event, each carrying the exact raw
+/// bytes it came from (contract change, Task 5 — see the `## input-v2`
+/// section of `docs/specs/2026-07-07-command-config-interfaces.md`: this
+/// generalizes the pre-Task-5 `Vec<DecodedKey>` return type. Minimal-churn
+/// choice over a parallel `Vec<MouseEvent>` output, since callers already
+/// process decoder output as one ordered stream of "things that happened",
+/// and interleaving order between keys and mouse events matters (e.g. a
+/// click followed immediately by a keystroke)).
+///
+/// RAW-BYTE FIDELITY / consume-always decision: any complete SGR mouse
+/// sequence the decoder recognizes (`buf[2] == b'<'` right after `ESC [`) is
+/// ALWAYS decoded as `Mouse`, regardless of whether winmux's `mouse` option
+/// is currently on. The client only ever emits these bytes because winmux
+/// itself sent the xterm mouse-mode enable sequences to it, so a decodable
+/// mouse sequence arriving is never a coincidental byte collision with
+/// something the user typed — dropping/ignoring a decoded `Mouse` event when
+/// `mouse` is off is the SERVER's job (`server::dispatch::dispatch_mouse`),
+/// not the decoder's; the decoder's contract is purely "what bytes did this
+/// decode to", independent of any runtime option.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DecodedInput {
+    Key(DecodedKey),
+    Mouse { event: MouseEvent, raw: Vec<u8> },
+}
+
+/// Incremental VT-input decoder: turns a stream of client keystroke/mouse
+/// bytes into [`DecodedInput`] values. Escape sequences (and partial UTF-8
 /// sequences) split across [`KeyDecoder::feed`] calls are buffered until
 /// complete; [`KeyDecoder::flush`] drains an incomplete trailing buffer as
 /// best-effort keys (a lone `ESC` becomes an `Escape` key).
@@ -316,13 +373,14 @@ impl KeyDecoder {
         }
     }
 
-    /// Feed more input bytes, returning every key that became complete as a
-    /// result (zero or more; an in-progress escape/UTF-8 sequence produces
-    /// none until it completes). Buffering is bounded: a sequence that grows
-    /// past [`MAX_PENDING`] bytes without completing has its head byte peeled
-    /// off as a best-effort key and the remainder reprocessed, so a
-    /// misbehaving byte stream can never stall the decoder forever.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<DecodedKey> {
+    /// Feed more input bytes, returning every key/mouse item that became
+    /// complete as a result (zero or more; an in-progress escape/UTF-8/mouse
+    /// sequence produces none until it completes). Buffering is bounded: a
+    /// sequence that grows past [`MAX_PENDING`] bytes without completing has
+    /// its head byte peeled off as a best-effort key and the remainder
+    /// reprocessed, so a misbehaving byte stream can never stall the decoder
+    /// forever.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<DecodedInput> {
         let mut out = Vec::new();
         // Worklist rather than a plain iterator: a bound-exceeded peel
         // re-queues the buffered remainder at the FRONT so it is reprocessed
@@ -330,21 +388,18 @@ impl KeyDecoder {
         let mut queue: std::collections::VecDeque<u8> = bytes.iter().copied().collect();
         while let Some(b) = queue.pop_front() {
             self.pending.push(b);
-            if let Some(key) = classify(&self.pending) {
-                out.push(DecodedKey {
-                    key,
-                    raw: std::mem::take(&mut self.pending),
-                });
+            if let Some(item) = classify(&self.pending) {
+                out.push(finish(item, std::mem::take(&mut self.pending)));
             } else if self.pending.len() > MAX_PENDING {
                 // Runaway sequence (e.g. a CSI that never gets a final
                 // byte): peel the head byte as a best-effort key and
                 // reprocess the rest as fresh tokens.
                 let mut rest = std::mem::take(&mut self.pending);
                 let first = rest.remove(0);
-                out.push(DecodedKey {
+                out.push(DecodedInput::Key(DecodedKey {
                     key: peel_byte_key(first),
                     raw: vec![first],
-                });
+                }));
                 for &rb in rest.iter().rev() {
                     queue.push_front(rb);
                 }
@@ -359,38 +414,50 @@ impl KeyDecoder {
     /// silently vanishing.
     ///
     /// Works exactly like an incremental re-feed of the leftover bytes: the
-    /// shortest classifiable prefix is emitted as a key (raw = exactly its
+    /// shortest classifiable prefix is emitted as an item (raw = exactly its
     /// own bytes); when the head byte can make no progress it is peeled
     /// alone (lone `ESC` -> `Escape`, anything else -> its single-byte
     /// classification). The concatenation of all emitted `raw`s — across
     /// `feed` and `flush` — is always exactly the input byte stream.
-    pub fn flush(&mut self) -> Vec<DecodedKey> {
+    pub fn flush(&mut self) -> Vec<DecodedInput> {
         let mut out = Vec::new();
         while !self.pending.is_empty() {
             // Shortest prefix that classifies == what feed() would have
             // emitted had these bytes arrived one at a time.
             let matched = (1..=self.pending.len())
-                .find_map(|end| classify(&self.pending[..end]).map(|k| (k, end)));
+                .find_map(|end| classify(&self.pending[..end]).map(|c| (c, end)));
             match matched {
-                Some((key, end)) => {
+                Some((item, end)) => {
                     let rest = self.pending.split_off(end);
-                    out.push(DecodedKey {
-                        key,
-                        raw: std::mem::replace(&mut self.pending, rest),
-                    });
+                    let raw = std::mem::replace(&mut self.pending, rest);
+                    out.push(finish(item, raw));
                 }
                 None => {
                     // Head token can't complete with no more bytes coming:
                     // peel exactly one byte and keep draining the rest.
                     let first = self.pending.remove(0);
-                    out.push(DecodedKey {
+                    out.push(DecodedInput::Key(DecodedKey {
                         key: peel_byte_key(first),
                         raw: vec![first],
-                    });
+                    }));
                 }
             }
         }
         out
+    }
+}
+
+/// Internal classification result before the raw bytes (known only to the
+/// `feed`/`flush` callers, which own `self.pending`) are attached.
+enum Classified {
+    Key(Key),
+    Mouse(MouseEvent),
+}
+
+fn finish(c: Classified, raw: Vec<u8>) -> DecodedInput {
+    match c {
+        Classified::Key(key) => DecodedInput::Key(DecodedKey { key, raw }),
+        Classified::Mouse(event) => DecodedInput::Mouse { event, raw },
     }
 }
 
@@ -410,15 +477,16 @@ fn peel_byte_key(b: u8) -> Key {
     }
 }
 
-/// Try to decode a complete key from `buf` (which always starts at a fresh
-/// token boundary). `None` means "valid so far, need more bytes".
-fn classify(buf: &[u8]) -> Option<Key> {
+/// Try to decode a complete key or mouse event from `buf` (which always
+/// starts at a fresh token boundary). `None` means "valid so far, need more
+/// bytes".
+fn classify(buf: &[u8]) -> Option<Classified> {
     match buf[0] {
         0x1b => classify_escape(buf),
-        0xc0..=0xdf => classify_utf8(buf, 2),
-        0xe0..=0xef => classify_utf8(buf, 3),
-        0xf0..=0xf7 => classify_utf8(buf, 4),
-        b => Some(classify_single_byte(b)),
+        0xc0..=0xdf => classify_utf8(buf, 2).map(Classified::Key),
+        0xe0..=0xef => classify_utf8(buf, 3).map(Classified::Key),
+        0xf0..=0xf7 => classify_utf8(buf, 4).map(Classified::Key),
+        b => Some(Classified::Key(classify_single_byte(b))),
     }
 }
 
@@ -453,7 +521,7 @@ fn classify_utf8(buf: &[u8], needed: usize) -> Option<Key> {
     }
 }
 
-fn classify_escape(buf: &[u8]) -> Option<Key> {
+fn classify_escape(buf: &[u8]) -> Option<Classified> {
     if buf.len() == 1 {
         return None; // lone ESC so far: wait (or flush() resolves it)
     }
@@ -468,9 +536,9 @@ fn classify_escape(buf: &[u8]) -> Option<Key> {
                 b'Q' => KeyCode::F(2),
                 b'R' => KeyCode::F(3),
                 b'S' => KeyCode::F(4),
-                other => return Some(plain(KeyCode::Char(other as char))),
+                other => return Some(Classified::Key(plain(KeyCode::Char(other as char)))),
             };
-            Some(plain(code))
+            Some(Classified::Key(plain(code)))
         }
         _ => {
             // ESC <token>: Meta + whatever the WHOLE remainder decodes to
@@ -481,28 +549,103 @@ fn classify_escape(buf: &[u8]) -> Option<Key> {
             // permanently stalling the decoder. `None` here means the
             // remainder is still incomplete: keep buffering; it may
             // complete on a later feed() or get peeled by flush()/the
-            // MAX_PENDING bound.
-            classify(&buf[1..]).map(|mut k| {
-                k.meta = true;
-                k
+            // MAX_PENDING bound. A mouse sequence is never legitimately
+            // ESC-prefixed on the wire, but Meta is applied uniformly for
+            // defensiveness rather than dropping the event.
+            classify(&buf[1..]).map(|c| match c {
+                Classified::Key(mut k) => {
+                    k.meta = true;
+                    Classified::Key(k)
+                }
+                Classified::Mouse(mut m) => {
+                    m.meta = true;
+                    Classified::Mouse(m)
+                }
             })
         }
     }
 }
 
-fn classify_csi(buf: &[u8]) -> Option<Key> {
+fn classify_csi(buf: &[u8]) -> Option<Classified> {
+    // SGR mouse reporting: `CSI < Cb ; Cx ; Cy (M|m)`. Must be checked before
+    // the generic final-byte scan below, since `<` (0x3C) is not itself a
+    // CSI final byte -- without this special case the scan would run past it
+    // looking for M/m and misparse the whole sequence as a bogus `Char('M')`/
+    // `Char('m')` key carrying the entire mouse sequence as `raw`.
+    if buf.len() >= 3 && buf[2] == b'<' {
+        return classify_sgr_mouse(buf).map(Classified::Mouse);
+    }
     let mut idx = 2;
     while idx < buf.len() {
         let b = buf[idx];
         if (0x40..=0x7e).contains(&b) {
             let params_str = std::str::from_utf8(&buf[2..idx]).unwrap_or("");
-            return Some(
+            return Some(Classified::Key(
                 parse_csi(params_str, b).unwrap_or_else(|| plain(KeyCode::Char(b as char))),
-            );
+            ));
         }
         idx += 1;
     }
     None // no final byte yet: still incomplete
+}
+
+/// Decode `CSI < Cb ; Cx ; Cy (M|m)` (buf[0..3] == `ESC [ <`) into a
+/// [`MouseEvent`]. `None` while no `M`/`m` final byte has arrived yet (still
+/// incomplete — keep buffering). A malformed body (non-digit/`;` byte before
+/// a final byte, or unparseable numbers) degrades to `None` forever for that
+/// exact buffer state; the caller's [`MAX_PENDING`] bound guarantees this
+/// can't stall the decoder — a malformed sequence eventually gets peeled byte
+/// by byte like any other runaway sequence.
+fn classify_sgr_mouse(buf: &[u8]) -> Option<MouseEvent> {
+    let mut idx = 3;
+    while idx < buf.len() {
+        let b = buf[idx];
+        if b == b'M' || b == b'm' {
+            let params = std::str::from_utf8(&buf[3..idx]).ok()?;
+            let mut parts = params.split(';');
+            let cb: i64 = parts.next()?.parse().ok()?;
+            let cx: i64 = parts.next()?.parse().ok()?;
+            let cy: i64 = parts.next()?.parse().ok()?;
+            if parts.next().is_some() {
+                return None; // unexpected extra field: malformed
+            }
+            let released = b == b'm';
+            let kind = mouse_kind_from_cb(cb, released)?;
+            return Some(MouseEvent {
+                kind,
+                shift: cb & 0x04 != 0,
+                meta: cb & 0x08 != 0,
+                ctrl: cb & 0x10 != 0,
+                x: (cx - 1).max(0) as u16,
+                y: (cy - 1).max(0) as u16,
+            });
+        }
+        if !(b.is_ascii_digit() || b == b';') {
+            return None; // malformed body: never completes from here
+        }
+        idx += 1;
+    }
+    None // no M/m yet: still incomplete
+}
+
+/// xterm/SGR `Cb` decoding: bit 0x40 marks a wheel event (low 2 bits pick
+/// up/down); bit 0x20 marks motion (a held-button drag); otherwise low 2
+/// bits + 1 give the 1-based button number, and press vs release comes from
+/// the caller's `M`/`m` final byte.
+fn mouse_kind_from_cb(cb: i64, released: bool) -> Option<MouseKind> {
+    let low = (cb & 0x3) as u8;
+    if cb & 0x40 != 0 {
+        Some(if low == 0 { MouseKind::WheelUp } else { MouseKind::WheelDown })
+    } else {
+        let button = low + 1;
+        if cb & 0x20 != 0 {
+            Some(MouseKind::Drag(button))
+        } else if released {
+            Some(MouseKind::Up(button))
+        } else {
+            Some(MouseKind::Down(button))
+        }
+    }
 }
 
 fn mods_from_param(p: i64) -> (bool, bool, bool) {
@@ -731,12 +874,24 @@ mod tests {
             let mut decoded = dec.feed(&bytes);
             decoded.extend(dec.flush());
             assert_eq!(decoded.len(), 1, "encoding of {k:?} -> {bytes:?} decoded to {decoded:?}");
-            assert_eq!(decoded[0].key, k, "round-trip of {k:?}");
-            assert_eq!(decoded[0].raw, bytes);
+            match &decoded[0] {
+                DecodedInput::Key(dk) => {
+                    assert_eq!(dk.key, k, "round-trip of {k:?}");
+                    assert_eq!(dk.raw, bytes);
+                }
+                other => panic!("expected a Key item, got {other:?}"),
+            }
         }
     }
 
     // ---- KeyDecoder ----
+
+    /// Helper: build the `DecodedInput::Key` wrapper most decoder tests
+    /// assert against (raw bytes come along for the ride, so an unbound key
+    /// can still be forwarded verbatim).
+    fn dk(key: Key, raw: &[u8]) -> DecodedInput {
+        DecodedInput::Key(DecodedKey { key, raw: raw.to_vec() })
+    }
 
     #[test]
     fn decode_plain_bytes() {
@@ -745,8 +900,8 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                DecodedKey { key: plain(KeyCode::Char('a')), raw: vec![b'a'] },
-                DecodedKey { key: plain(KeyCode::Char('b')), raw: vec![b'b'] },
+                dk(plain(KeyCode::Char('a')), b"a"),
+                dk(plain(KeyCode::Char('b')), b"b"),
             ]
         );
     }
@@ -756,26 +911,14 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(&[0x03]),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Char('c'), ctrl: true, meta: false, shift: false },
-                raw: vec![0x03],
-            }]
+            vec![dk(Key { code: KeyCode::Char('c'), ctrl: true, meta: false, shift: false }, &[0x03])]
         );
         let mut dec = KeyDecoder::new();
-        assert_eq!(
-            dec.feed(&[0x0d]),
-            vec![DecodedKey { key: plain(KeyCode::Enter), raw: vec![0x0d] }]
-        );
+        assert_eq!(dec.feed(&[0x0d]), vec![dk(plain(KeyCode::Enter), &[0x0d])]);
         let mut dec = KeyDecoder::new();
-        assert_eq!(
-            dec.feed(&[0x09]),
-            vec![DecodedKey { key: plain(KeyCode::Tab), raw: vec![0x09] }]
-        );
+        assert_eq!(dec.feed(&[0x09]), vec![dk(plain(KeyCode::Tab), &[0x09])]);
         let mut dec = KeyDecoder::new();
-        assert_eq!(
-            dec.feed(&[0x7f]),
-            vec![DecodedKey { key: plain(KeyCode::BSpace), raw: vec![0x7f] }]
-        );
+        assert_eq!(dec.feed(&[0x7f]), vec![dk(plain(KeyCode::BSpace), &[0x7f])]);
     }
 
     #[test]
@@ -783,10 +926,7 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(&[0x02]),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Char('b'), ctrl: true, meta: false, shift: false },
-                raw: vec![0x02],
-            }]
+            vec![dk(Key { code: KeyCode::Char('b'), ctrl: true, meta: false, shift: false }, &[0x02])]
         );
     }
 
@@ -799,11 +939,7 @@ mod tests {
             (&b"\x1b[D"[..], KeyCode::Left),
         ] {
             let mut dec = KeyDecoder::new();
-            assert_eq!(
-                dec.feed(bytes),
-                vec![DecodedKey { key: plain(code), raw: bytes.to_vec() }],
-                "bytes {bytes:?}"
-            );
+            assert_eq!(dec.feed(bytes), vec![dk(plain(code), bytes)], "bytes {bytes:?}");
         }
     }
 
@@ -812,26 +948,17 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(b"\x1b[1;5A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: true, meta: false, shift: false },
-                raw: b"\x1b[1;5A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: true, meta: false, shift: false }, b"\x1b[1;5A")]
         );
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(b"\x1b[1;2A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: false, meta: false, shift: true },
-                raw: b"\x1b[1;2A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: false, meta: false, shift: true }, b"\x1b[1;2A")]
         );
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(b"\x1b[1;3A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false },
-                raw: b"\x1b[1;3A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false }, b"\x1b[1;3A")]
         );
     }
 
@@ -844,10 +971,7 @@ mod tests {
             (&b"\x1bOS"[..], 4),
         ] {
             let mut dec = KeyDecoder::new();
-            assert_eq!(
-                dec.feed(bytes),
-                vec![DecodedKey { key: plain(KeyCode::F(n)), raw: bytes.to_vec() }]
-            );
+            assert_eq!(dec.feed(bytes), vec![dk(plain(KeyCode::F(n)), bytes)]);
         }
     }
 
@@ -870,18 +994,14 @@ mod tests {
             (&b"\x1b[4~"[..], KeyCode::End),
         ] {
             let mut dec = KeyDecoder::new();
-            assert_eq!(
-                dec.feed(bytes),
-                vec![DecodedKey { key: plain(code), raw: bytes.to_vec() }],
-                "bytes {bytes:?}"
-            );
+            assert_eq!(dec.feed(bytes), vec![dk(plain(code), bytes)], "bytes {bytes:?}");
         }
         let mut dec = KeyDecoder::new();
-        assert_eq!(dec.feed(b"\x1b[H"), vec![DecodedKey { key: plain(KeyCode::Home), raw: b"\x1b[H".to_vec() }]);
+        assert_eq!(dec.feed(b"\x1b[H"), vec![dk(plain(KeyCode::Home), b"\x1b[H")]);
         let mut dec = KeyDecoder::new();
-        assert_eq!(dec.feed(b"\x1b[F"), vec![DecodedKey { key: plain(KeyCode::End), raw: b"\x1b[F".to_vec() }]);
+        assert_eq!(dec.feed(b"\x1b[F"), vec![dk(plain(KeyCode::End), b"\x1b[F")]);
         let mut dec = KeyDecoder::new();
-        assert_eq!(dec.feed(b"\x1b[Z"), vec![DecodedKey { key: plain(KeyCode::BTab), raw: b"\x1b[Z".to_vec() }]);
+        assert_eq!(dec.feed(b"\x1b[Z"), vec![dk(plain(KeyCode::BTab), b"\x1b[Z")]);
     }
 
     #[test]
@@ -889,10 +1009,7 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(b"\x1bx"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Char('x'), ctrl: false, meta: true, shift: false },
-                raw: b"\x1bx".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Char('x'), ctrl: false, meta: true, shift: false }, b"\x1bx")]
         );
     }
 
@@ -904,10 +1021,7 @@ mod tests {
         assert_eq!(dec.feed(b"1;5"), vec![]);
         assert_eq!(
             dec.feed(b"A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: true, meta: false, shift: false },
-                raw: b"\x1b[1;5A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: true, meta: false, shift: false }, b"\x1b[1;5A")]
         );
     }
 
@@ -915,10 +1029,7 @@ mod tests {
     fn decode_lone_escape_flush() {
         let mut dec = KeyDecoder::new();
         assert_eq!(dec.feed(b"\x1b"), vec![]);
-        assert_eq!(
-            dec.flush(),
-            vec![DecodedKey { key: plain(KeyCode::Escape), raw: vec![0x1b] }]
-        );
+        assert_eq!(dec.flush(), vec![dk(plain(KeyCode::Escape), &[0x1b])]);
     }
 
     #[test]
@@ -929,17 +1040,11 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(
             dec.feed(b"\x1b\x1b[A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false },
-                raw: b"\x1b\x1b[A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false }, b"\x1b\x1b[A")]
         );
         // Decoder must be fully usable afterwards (regression: the old code
         // stalled forever after ESC ESC).
-        assert_eq!(
-            dec.feed(b"a"),
-            vec![DecodedKey { key: plain(KeyCode::Char('a')), raw: vec![b'a'] }]
-        );
+        assert_eq!(dec.feed(b"a"), vec![dk(plain(KeyCode::Char('a')), b"a")]);
     }
 
     #[test]
@@ -948,10 +1053,7 @@ mod tests {
         assert_eq!(dec.feed(b"\x1b\x1b"), vec![]); // incomplete: keep buffering
         assert_eq!(
             dec.feed(b"[A"),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false },
-                raw: b"\x1b\x1b[A".to_vec(),
-            }]
+            vec![dk(Key { code: KeyCode::Up, ctrl: false, meta: true, shift: false }, b"\x1b\x1b[A")]
         );
     }
 
@@ -963,10 +1065,7 @@ mod tests {
         assert_eq!(dec.feed(&bytes[..2]), vec![]); // ESC + UTF-8 lead: buffer
         assert_eq!(
             dec.feed(&bytes[2..]),
-            vec![DecodedKey {
-                key: Key { code: KeyCode::Char('é'), ctrl: false, meta: true, shift: false },
-                raw: bytes.clone(),
-            }]
+            vec![dk(Key { code: KeyCode::Char('é'), ctrl: false, meta: true, shift: false }, &bytes)]
         );
     }
 
@@ -979,18 +1078,27 @@ mod tests {
         assert_eq!(
             dec.flush(),
             vec![
-                DecodedKey { key: plain(KeyCode::Escape), raw: vec![0x1b] },
-                DecodedKey { key: plain(KeyCode::Char('[')), raw: vec![b'['] },
-                DecodedKey { key: plain(KeyCode::Char('1')), raw: vec![b'1'] },
-                DecodedKey { key: plain(KeyCode::Char(';')), raw: vec![b';'] },
-                DecodedKey { key: plain(KeyCode::Char('5')), raw: vec![b'5'] },
+                dk(plain(KeyCode::Escape), &[0x1b]),
+                dk(plain(KeyCode::Char('[')), b"["),
+                dk(plain(KeyCode::Char('1')), b"1"),
+                dk(plain(KeyCode::Char(';')), b";"),
+                dk(plain(KeyCode::Char('5')), b"5"),
             ]
         );
     }
 
+    /// Extract the raw bytes of a [`DecodedInput`] item, regardless of
+    /// variant — used by the raw-byte-fidelity property tests below.
+    fn item_raw(item: &DecodedInput) -> &[u8] {
+        match item {
+            DecodedInput::Key(dk) => &dk.raw,
+            DecodedInput::Mouse { raw, .. } => raw,
+        }
+    }
+
     #[test]
     fn flush_preserves_raw_concatenation() {
-        // Property: for any input, the concatenation of every emitted key's
+        // Property: for any input, the concatenation of every emitted item's
         // raw bytes (feed + flush) is exactly the input — nothing dropped.
         let nasty: &[&[u8]] = &[
             b"\x1b[1;5",        // truncated modified-CSI
@@ -1001,12 +1109,14 @@ mod tests {
             &[0xc3],            // lone partial UTF-8
             b"\x1b[1;5A\x1b[2", // complete key then truncated tail
             b"abc\x1b",         // text then lone ESC
+            b"\x1b[<0;5;10M",   // complete SGR mouse press
+            b"\x1b[<0;5",       // truncated SGR mouse
         ];
         for input in nasty {
             let mut dec = KeyDecoder::new();
-            let mut keys = dec.feed(input);
-            keys.extend(dec.flush());
-            let concat: Vec<u8> = keys.iter().flat_map(|k| k.raw.clone()).collect();
+            let mut items = dec.feed(input);
+            items.extend(dec.flush());
+            let concat: Vec<u8> = items.iter().flat_map(|i| item_raw(i).to_vec()).collect();
             assert_eq!(&concat, input, "raw bytes dropped for input {input:?}");
         }
     }
@@ -1019,10 +1129,10 @@ mod tests {
         let mut dec = KeyDecoder::new();
         let mut input = b"\x1b[".to_vec();
         input.extend(std::iter::repeat_n(b';', 64));
-        let mut keys = dec.feed(&input);
-        keys.extend(dec.flush());
-        assert!(!keys.is_empty(), "runaway CSI produced no keys at all");
-        let concat: Vec<u8> = keys.iter().flat_map(|k| k.raw.clone()).collect();
+        let mut items = dec.feed(&input);
+        items.extend(dec.flush());
+        assert!(!items.is_empty(), "runaway CSI produced no items at all");
+        let concat: Vec<u8> = items.iter().flat_map(|i| item_raw(i).to_vec()).collect();
         assert_eq!(concat, input, "runaway CSI dropped bytes");
     }
 
@@ -1032,9 +1142,83 @@ mod tests {
         let bytes = "é".as_bytes();
         // Feed one byte at a time: no key until the sequence completes.
         assert_eq!(dec.feed(&bytes[..1]), vec![]);
+        assert_eq!(dec.feed(&bytes[1..]), vec![dk(plain(KeyCode::Char('é')), bytes)]);
+    }
+
+    // ---- SGR mouse decoding (Task 5, sub-project 4) ----
+
+    fn dm(kind: MouseKind, x: u16, y: u16, raw: &[u8]) -> DecodedInput {
+        DecodedInput::Mouse {
+            event: MouseEvent { kind, ctrl: false, meta: false, shift: false, x, y },
+            raw: raw.to_vec(),
+        }
+    }
+
+    #[test]
+    fn decode_sgr_mouse_press() {
+        // Button 1 (left) press at 1-based (6,11) -> 0-based (5,10).
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<0;6;11M"), vec![dm(MouseKind::Down(1), 5, 10, b"\x1b[<0;6;11M")]);
+
+        // Button 3 (right) press.
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<2;1;1M"), vec![dm(MouseKind::Down(3), 0, 0, b"\x1b[<2;1;1M")]);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_release() {
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<0;6;11m"), vec![dm(MouseKind::Up(1), 5, 10, b"\x1b[<0;6;11m")]);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_drag() {
+        // Bit 0x20 set on top of button 1 (Cb = 32) marks button-motion.
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<32;10;5M"), vec![dm(MouseKind::Drag(1), 9, 4, b"\x1b[<32;10;5M")]);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_wheel() {
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<64;3;3M"), vec![dm(MouseKind::WheelUp, 2, 2, b"\x1b[<64;3;3M")]);
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<65;3;3M"), vec![dm(MouseKind::WheelDown, 2, 2, b"\x1b[<65;3;3M")]);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_modifiers() {
+        // Cb = button 1 (0) | shift(0x04) | meta(0x08) | ctrl(0x10) = 0x1c = 28.
+        let mut dec = KeyDecoder::new();
+        let got = dec.feed(b"\x1b[<28;1;1M");
         assert_eq!(
-            dec.feed(&bytes[1..]),
-            vec![DecodedKey { key: plain(KeyCode::Char('é')), raw: bytes.to_vec() }]
+            got,
+            vec![DecodedInput::Mouse {
+                event: MouseEvent { kind: MouseKind::Down(1), ctrl: true, meta: true, shift: true, x: 0, y: 0 },
+                raw: b"\x1b[<28;1;1M".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn decode_sgr_mouse_split_across_feeds() {
+        let mut dec = KeyDecoder::new();
+        assert_eq!(dec.feed(b"\x1b[<"), vec![]);
+        assert_eq!(dec.feed(b"0;6;"), vec![]);
+        assert_eq!(dec.feed(b"11"), vec![]);
+        assert_eq!(dec.feed(b"M"), vec![dm(MouseKind::Down(1), 5, 10, b"\x1b[<0;6;11M")]);
+    }
+
+    #[test]
+    fn decode_sgr_mouse_then_key_in_same_feed() {
+        // A mouse sequence immediately followed by an ordinary key in the
+        // same feed() call: both must decode, in order, as separate items.
+        let mut dec = KeyDecoder::new();
+        let mut input = b"\x1b[<0;6;11M".to_vec();
+        input.push(b'a');
+        assert_eq!(
+            dec.feed(&input),
+            vec![dm(MouseKind::Down(1), 5, 10, b"\x1b[<0;6;11M"), dk(plain(KeyCode::Char('a')), b"a")]
         );
     }
 }

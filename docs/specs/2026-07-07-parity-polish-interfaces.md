@@ -66,6 +66,15 @@ impl Grid {
     /// has changed, then false until it changes again. Intended to be
     /// polled by the server after each `feed`.
     pub fn take_title_changed(&mut self) -> bool;
+    /// Task 5 (mouse) addition: `true` while the pane is showing the
+    /// alternate screen (`CSI ?1049h` seen more recently than a matching
+    /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide
+    /// whether a wheel event scrolls winmux's own copy-mode/scrollback
+    /// (primary screen) or is translated into 3 synthesized arrow-key
+    /// presses sent to the pane (alt screen — tmux's own alt-screen wheel
+    /// translation, since alt-screen apps like `less`/vim have their own
+    /// paging, not winmux's). See the `## mouse` section below.
+    pub fn alt_screen(&self) -> bool;
 }
 ```
 
@@ -810,3 +819,288 @@ scopes buffers server-wide too, not per-session). No wire-protocol change:
 buffers are purely a dispatch-time server concern, never sent to clients
 directly (their effects are observed through `paste-buffer`'s pty write and
 `list-buffers`' text/message output).
+
+## `mouse` — SGR mouse decoding, routing, and mode management (Task 5)
+
+Implements the design spec's `## 4. Mouse` section (`set -g mouse on/off`,
+click-to-focus, border-drag resize, wheel-to-copy-mode with alt-screen
+translation, copy-mode click/drag/double/triple-click selection, status-line
+click/wheel). Mouse "bindings" are HARDCODED — there is no `MouseDown1Pane`-
+style binding table; `server::dispatch::dispatch_mouse` and its helpers ARE
+the routing table. Cross-module amendments already documented elsewhere and
+only cross-referenced here: `keys`/`input` (`## keys`/`## input-v2` sections
+of
+[`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md)),
+`grid::alt_screen()` (`## grid-v2` section above), `layout::resize_from`
+(`## layout` section of
+[`2026-07-06-mvp-interfaces.md`](2026-07-06-mvp-interfaces.md)), and the
+`host` restore-path mouse-off amendment (`## host` section of the same file).
+
+### `keys` amendment (full mouse decoding contract)
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub shift: bool,
+    pub x: u16, // 0-based cell column (wire is 1-based; KeyDecoder converts)
+    pub y: u16, // 0-based cell row
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseKind {
+    Down(u8),  // 1 = left, 2 = middle, 3 = right (SGR/xterm 1-based numbering)
+    Up(u8),
+    Drag(u8),  // motion while `u8`'s button is held (?1002h button-event tracking)
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DecodedInput {
+    Key(DecodedKey),
+    Mouse { event: MouseEvent, raw: Vec<u8> },
+}
+```
+
+`KeyDecoder::feed`/`flush` return `Vec<DecodedInput>` (see the `##
+input-v2`/`KeyDecoder` amendment in `2026-07-07-command-config-interfaces.md`
+for the full decoder-shape change). SGR mouse recognition: `classify_csi`
+checks `buf[2] == b'<'` FIRST (before its generic CSI final-byte scan, since
+`<` is not itself a valid CSI final byte and the generic scan would
+otherwise misparse the whole sequence as a bogus `Char('M')`/`Char('m')` key
+carrying the entire sequence's bytes as `raw`) and hands off to
+`classify_sgr_mouse`, which scans for an `M` (press/drag/wheel) or `m`
+(release) final byte, parsing the `Cb;Cx;Cy` parameter string once found;
+`None` (incomplete, keep buffering) while no `M`/`m` byte has arrived yet, OR
+while a malformed body byte (not an ASCII digit or `;`) is seen before one —
+the latter never completes for THAT exact buffer state, but the decoder's
+existing `MAX_PENDING`-bound peel (unrelated to this feature, pre-existing)
+still guarantees the stream can't stall forever on a malformed/never-
+terminating sequence.
+
+`Cb` decoding (`mouse_kind_from_cb`): bit `0x40` marks a wheel event (low 2
+bits: `0` = up, else down); bit `0x20` marks motion (a held-button drag,
+requiring `?1002h`, which winmux always enables alongside `?1000h`); otherwise
+`(low 2 bits) + 1` gives the 1-based button number, and press vs release
+comes from the `M`/`m` final byte, not `Cb`. Modifier bits: `shift = Cb &
+0x04`, `meta = Cb & 0x08`, `ctrl = Cb & 0x10` (same bit-shape as
+`keys::mods_from_param`'s CSI-modifier decoding elsewhere in this module,
+different base — not reused, since the two encodings' bit MEANINGS happen to
+overlap but their SOURCE parameter is different (`Cb` vs the CSI `<mod>`
+field), and conflating them would be a coincidence-driven false
+abstraction).
+
+**Consume-always decision (RAW-BYTE FIDELITY invariant):** a complete,
+recognized SGR mouse sequence ALWAYS decodes as `DecodedInput::Mouse`,
+regardless of whether the `mouse` option is currently on. The client only
+ever emits these bytes because winmux itself sent the enable sequence to it
+(`MOUSE_ENABLE_SEQ`, below) — a decodable mouse sequence arriving is never a
+coincidental collision with literal typed text. Dropping a decoded `Mouse`
+event when `mouse` is off is `dispatch_mouse`'s job (a silent `Ok`), not the
+decoder's — the decoder's contract is "what did these bytes decode to",
+independent of any runtime option.
+
+Unit tests (`keys::tests`): `decode_sgr_mouse_press`, `_release`, `_drag`,
+`_wheel`, `_modifiers`, `_split_across_feeds` (incremental delivery, same
+pattern as the existing CSI-arrow split test), `_then_key_in_same_feed`
+(ordering with an adjacent decoded key in one `feed()` call);
+`flush_preserves_raw_concatenation`/`decode_runaway_csi_is_bounded` extended
+with SGR-mouse cases (via a new `item_raw` helper covering both
+`DecodedInput` variants).
+
+### `input` amendment
+
+```rust
+pub enum KeyInputEvent {
+    Forward(Vec<u8>),
+    Key { table: WhichTable, key: crate::keys::Key, raw: Vec<u8> },
+    Captured(Vec<u8>),
+    Mouse { event: crate::keys::MouseEvent, raw: Vec<u8> }, // NEW
+}
+```
+
+See the `## input-v2` amendment in `2026-07-07-command-config-interfaces.md`
+for the bypass/ordering/capture-mode semantics. Unit tests
+(`input::key_machine_tests`): `mouse_bypasses_prefix_and_repeat` (a mouse
+event arriving with `Prefixed` state armed reports `Mouse` immediately AND
+leaves the armed state intact for the NEXT key), `mouse_flushes_pending_
+forward_first` (ordering: `Forward` then `Mouse`, not merged/reordered).
+
+### `options` amendment
+
+`mouse` (`Flag`, default `off`) already existed as an SP4-accepted-inert
+option (SPECS/default_value unchanged); this task adds its first consumer, a
+typed getter:
+
+```rust
+pub fn mouse(&self) -> bool;
+```
+
+### `server`/`server::dispatch` amendment
+
+```rust
+// src/server.rs
+
+const MOUSE_ENABLE_SEQ: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_DISABLE_SEQ: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1006l";
+const MOUSE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const MOUSE_WHEEL_STEP: u32 = 5; // tmux WheelUpPane/WheelDownPane default
+
+struct ClientState {
+    // ...existing fields unchanged...
+    mouse: MouseClientState, // NEW
+}
+
+#[derive(Default)]
+struct MouseClientState {
+    last_click: Option<(std::time::Instant, u16, u16, u8, u8)>, // (when, x, y, button, run_length 1..=3)
+    drag: MouseDrag,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MouseDrag {
+    #[default]
+    None,
+    Border { pane: layout::PaneId, vertical: bool },
+    Selecting,
+}
+```
+
+**Enable/disable sequence delivery** (design spec: "the server appends
+`\x1b[?1000h...` to the next composed output per client... and `l` variants
+when turned off / on client Exit"): implemented as DIRECT raw `Output`
+frames (`send_output`), not woven into `render::Scene`/`Renderer::compose` —
+simpler, and satisfies the same observable contract (the client's next
+`Output` frame(s) contain the sequence) without adding a scene field.
+- `Server::finish_attach`: if `options.mouse()` is already on, sends
+  `MOUSE_ENABLE_SEQ` to the newly-attaching client's `tx` before inserting it
+  into `self.clients`.
+- `dispatch::Server::exec_set_option`, `name == "mouse"` branch: broadcasts
+  `MOUSE_ENABLE_SEQ`/`MOUSE_DISABLE_SEQ` (whichever the new value implies) to
+  EVERY currently-attached client (mouse is a global option).
+- Client-side unconditional disable-on-exit is `host::apply_restore`'s job
+  (see the `## host` amendment in `2026-07-06-mvp-interfaces.md`), not
+  server-messaged per-exit — simpler and strictly stronger (covers a crashed
+  server too).
+
+**Routing (`dispatch::Server::dispatch_mouse`, `pub(super)`, called from
+`server::handle_stdin`'s `KeyInputEvent::Mouse` arm):**
+1. `!options.mouse()` → dropped (`Ok`, no-op) — see the `keys` amendment's
+   "consume-always" note for why this drop happens here, not at decode time.
+2. `client.mode` is `ConfirmCmd`/`Prompt` → dropped (documented deviation:
+   real tmux's mouse-during-prompt behavior was left undecided by the task
+   brief; winmux swallows mouse events during these overlays so a stray
+   click/drag can never race a confirm's y/n capture or act on pane geometry
+   the overlay is hiding).
+3. `y` equals the status row for THIS client (`mouse_status_row`: row 0 if
+   `status-position top` else `client.rows - 1`, `None` if `status` off) →
+   `dispatch_mouse_status`.
+4. Otherwise hit-tested against the shared pane area (`mouse_pane_rects`:
+   `Rect { x: 0, y: pane_area_y(), w: session.size.0, h: session.size.1 }`,
+   THIS session's CURRENT window's `Layout::rects`) — outside that area
+   (including a blank gap row on a client taller than the session's shared
+   size) is a no-op that also clears any in-progress drag.
+
+**Hit-testing (`hit_test`, pure, tested indirectly via the `tests/
+server_proto.rs` mouse suite):** pane interior first; then a vertical
+(column) border (`r.x + r.w == x`, `y` within `r`'s row range) — `left` is
+the `resize_from` reference leaf for a Left/Right resize; then a horizontal
+(row) border (`r.y + r.h == y`, `x` within `r`'s column range) — `top` is the
+reference leaf for an Up/Down resize. A cell that is simultaneously a valid
+vertical- and horizontal-border position (a 4-way "+" junction) resolves to
+the vertical border — documented, arbitrary tie-break. Zero-size rects never
+match any branch (degrade to `None`), tolerating a too-small terminal.
+
+**Pane-area routing:**
+- `Down` on a border → arms `MouseDrag::Border { pane, vertical }` (no other
+  action).
+- `Down` on a pane → ALWAYS focuses it (`Layout::focus_pane`), any button.
+  Additionally, when it's button 1 landing inside the pane bound to this
+  CLIENT's OWN `ClientMode::Copy` (clicking a DIFFERENT pane, or clicking
+  while not in copy mode at all, only focuses — documented v1 scope,
+  matches the design spec's bulleted overview): `advance_click_run` (500ms
+  same-cell-same-button window, capped at run length 3) decides
+  single/double/triple-click semantics — 1 = `BeginSelection` at the clicked
+  view cell; 2 = `select_word_at` (expands to the maximal run of same-class
+  characters using tmux's hardcoded default `word-separators` = `" -_@"`,
+  NOT the plain-whitespace rule `copy-next-word`/`copy-previous-word` use);
+  3 = `select_line_at` (the whole clicked view row) — then arms
+  `MouseDrag::Selecting`.
+- `Drag` → `MouseDrag::Border` re-reads the reference pane's CURRENT rect
+  every call (not an accumulated delta since the drag started — robust to
+  layout-minimum clamping: the border always ends up exactly at the drag
+  position if reachable at all) and calls `Layout::resize_from` with the
+  sign/axis implied by the drag delta, then `apply_layout_for_session`.
+  `MouseDrag::Selecting` updates the bound `CopyState`'s `cx`/`cy` to the new
+  cell (clamped into the pane's rect).
+- `Up` → `MouseDrag::Border` needs no further action (already applied live).
+  `MouseDrag::Selecting` (while still in copy mode) calls
+  `exec_copy_action(CopyAction::SelectionAndCancel, ..)` — tmux's
+  `MouseDragEnd1Pane` default — covering a plain click with no drag too
+  (button-event tracking still sends a release even with zero motion in
+  between, so a bare click still ends up copying its 1-cell/word/line
+  selection). Any other combination is a no-op.
+- `WheelUp`/`WheelDown` over a pane whose `Grid::alt_screen()` is true →
+  ALWAYS 3x synthesized arrow-key presses (`\x1b[A`/`\x1b[B`) written
+  straight to the pane via `pty.write_input`, regardless of copy-mode state
+  (tmux's alt-screen wheel translation). Over a LIVE pane bound to this
+  client's OWN copy mode → `MOUSE_WHEEL_STEP` (5) `ScrollUp`/`ScrollDown`
+  `CopyAction`s; a `WheelDown` that lands exactly on `scroll == 0` AND
+  `CopyState::scroll_exit` (set true only when copy mode was entered BY a
+  wheel — the Task 2 placeholder field's first real consumer) exits copy
+  mode back to `Normal`. Over a live pane NOT in copy mode: `WheelUp` enters
+  copy mode (`exec_copy_mode(page_up: false, mouse: true, ..)`, marks
+  `scroll_exit = true`, then applies `MOUSE_WHEEL_STEP` `ScrollUp`s);
+  `WheelDown` is a no-op (documented v1 decision — there is no "downward"
+  scrollback direction to enter copy mode from at the live bottom).
+
+**Status-row routing (`dispatch_mouse_status`):** `Down(1)` →
+`mouse_status_click`, which rebuilds the SAME left-prefix-width-then-per-
+window-span layout `render_one`/`status::status_spans` draws (one separator
+space between tabs, none after the last) to hit-test which window tab (if
+any) column `x` falls in — a click on the `status-left` prefix, a separator,
+or past the last tab is a no-op (design spec: "Down-click on a status-line
+area with no window: no-op"); a hit selects that window
+(`session.current`/`session.last` updated directly, then
+`apply_layout_for_session`). Does NOT replicate `render::compose_back`'s
+final spatial right-truncation (when left+right don't fit the terminal
+width) — documented v1 gap, `docs/follow-ups.md`. `WheelUp`/`WheelDown` on
+the status row → `exec_step_window(false, ..)` / `exec_step_window(true,
+..)` (previous-window / next-window — tmux's default `WheelUpStatus`/
+`WheelDownStatus` bindings).
+
+**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
+forwarding a click/drag to the pane's own mouse-reporting application (the
+design spec's "v1: NOT forwarded" note); drag-to-select on a LIVE (non-
+copy-mode) pane (real tmux implicitly enters copy mode on such a drag; the
+brief's own bullet list scopes "Drag1 = selection" to "In copy mode:" only);
+`word-separators` as a real, settable option (hardcoded tmux default
+`" -_@"` instead).
+
+Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
+sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
+`mouse_drag_selects_and_release_copies`, `mouse_status_click_selects_
+window`, `mouse_wheel_status_cycles_windows`, `mouse_border_drag_resizes`.
+`alt_screen_wheel_sends_arrows` was ATTEMPTED per the task brief's suggested
+approach (a real PowerShell pane self-emitting `CSI ?1049h` via `Write-Host
+-NoNewline "$([char]27)[?1049h"`) and found to be exactly the "too flaky"
+case the brief anticipated: real Windows ConPTY does not reliably pass a
+bare `Write-Host`-emitted `?1049h` through to the server's read side as the
+literal alt-screen-enter sequence (the pane visibly cleared and PowerShell's
+prompt reprinted — consistent with SOME redraw happening — but the server
+pane's `Grid::alt_screen()` never actually flipped true, so a wheel event
+dispatched right after still entered copy mode instead of translating to
+arrows; a ConPTY passthrough quirk for a synthetic escape injection, not a
+winmux bug). Per the brief's documented fallback, alt-screen wheel routing
+is instead covered by two unit-level tests in `src/server/dispatch.rs`
+(`mouse_dispatch_tests::alt_screen_wheel_does_not_enter_copy_mode` /
+`live_screen_wheel_enters_copy_mode`) that build a real `Server` + one
+session/pane directly (`PaneRuntime.pty: None` — fine, since the alt-screen
+branch's `pty.write_input` call is already `if let Some(pty) = ..`-gated)
+and feed `\x1b[?1049h` straight into the pane's `Grid`, no ConPTY involved —
+exercising the exact same `p.grid.alt_screen()` check with no passthrough
+uncertainty. `grid::tests::alt_screen_getter_tracks_mode` separately covers
+that `Grid` itself correctly tracks alt-screen state end to end.

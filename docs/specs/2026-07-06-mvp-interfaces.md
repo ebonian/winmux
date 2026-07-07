@@ -67,6 +67,15 @@ grows downward.
 
 ## `layout` — split tree (pure)
 
+**Amendment (sub-project 4, Task 5 — mouse):** `resize_focused` is now a thin
+wrapper over a new, more general `resize_from(&mut self, pane: PaneId, dir:
+Direction, area: Rect, cells: u16) -> bool`, which takes an explicit
+reference leaf instead of always using `self.focused` — needed for mouse
+border-drag resize, which must be able to move a border adjacent to a pane
+that ISN'T currently focused, without changing focus. `resize_focused`'s own
+signature/behavior is unchanged. See the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md).
+
 ```rust
 pub type PaneId = u32;
 
@@ -123,6 +132,11 @@ impl Layout {
     /// `cells` cells (tmux Ctrl-arrow = 1 cell). Clamped so no pane violates
     /// minimums within `area`. Returns false if nothing changed.
     pub fn resize_focused(&mut self, dir: Direction, area: Rect, cells: u16) -> bool;
+
+    /// Task 5 (mouse) addition: generalizes `resize_focused` to an explicit
+    /// reference pane instead of `self.focused` (see the amendment note
+    /// above). Never changes focus.
+    pub fn resize_from(&mut self, pane: PaneId, dir: Direction, area: Rect, cells: u16) -> bool;
 
     /// Toggle zoom on the focused pane. Zoom auto-clears on split/remove.
     pub fn toggle_zoom(&mut self);
@@ -491,6 +505,24 @@ pseudoconsole and unblocks the reader thread.
 
 ## `host` — host terminal control
 
+**Amendment (sub-project 4, Task 5 — mouse):** the shared restore sequence
+(`apply_restore`, run by both `Drop for Host` and the panic hook) now writes
+`CSI ?1000l ?1002l ?1006l` (disable xterm mouse reporting: normal tracking +
+button-motion + SGR extended coordinates) UNCONDITIONALLY, ahead of the
+pre-existing `CSI ?1049l ?25h 0m` (leave alt screen, show cursor, reset SGR)
+— i.e. every exit path (normal exit, error, panic) now ALSO disables mouse
+reporting on the real terminal, regardless of whether the server ever told
+this client to enable it. Terminal-restore invariant (extended): a
+crashed/killed server, or a bug that forgot to send the `l` sequences before
+a client detached, can never leave the user's real terminal with mouse
+reporting stuck on — writing the disable sequences to a terminal that never
+had them enabled is a harmless no-op (per the SGR mouse protocol, an `l` for
+a mode that was never `h`'d does nothing). No signature change; `Host::enter`/
+`Host::write`/`Drop`'s documented byte sequence is otherwise unchanged. See
+the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
+for the enable-sequence (server) side of this feature.
+
 **Amendment (sub-project 2, Task 8):**
 
 - `Host::enter()`'s internal ordering changed (follow-up #3): every value
@@ -525,8 +557,10 @@ impl Host {
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>; // write + flush stdout
 }
 impl Drop for Host {
-    // Leave alt screen (CSI ?1049l), show cursor (CSI ?25h), reset SGR,
-    // restore saved console modes. Must be infallible (ignore errors).
+    // Disable xterm mouse reporting (CSI ?1000l ?1002l ?1006l — Task 5,
+    // sub-project 4, unconditional), leave alt screen (CSI ?1049l), show
+    // cursor (CSI ?25h), reset SGR, restore saved console modes. Must be
+    // infallible (ignore errors).
 }
 
 /// Install a panic hook that performs the same restoration as Drop before
