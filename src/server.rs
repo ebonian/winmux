@@ -62,6 +62,11 @@ const MONTHS: [&str; 12] = [
 /// Transient status-line message lifetime (tmux `display-time` default).
 const MESSAGE_LIFETIME: Duration = Duration::from_millis(750);
 
+/// automatic-rename throttle (Task 9, sub-project 4): tmux `NAME_INTERVAL`
+/// -- at most one automatic rename per window per this duration, even if its
+/// active pane's title keeps changing faster than that.
+const AUTO_RENAME_THROTTLE: Duration = Duration::from_millis(500);
+
 /// Server-global, monotonically increasing client id (distinct id space
 /// from `PaneId`/`WindowId`).
 type ClientId = u32;
@@ -91,6 +96,13 @@ struct PaneRuntime {
     pty: Option<Pty>,
     grid: Grid,
     dead: bool,
+    /// `#T`/`#{pane_title}` (Task 9, sub-project 4): a cached copy of
+    /// `grid.title()`, refreshed whenever `grid.take_title_changed()` fires
+    /// on an `Output` feed (see `Server::handle_event`'s `Output` arm) — kept
+    /// as a plain `String` (default empty, not `Option`) so every format-ctx
+    /// call site can hand out `&str` directly without an `unwrap_or("")` at
+    /// every use.
+    title: String,
 }
 
 /// Which status-line prompt is in progress (`,` rename-window, `$`
@@ -722,7 +734,32 @@ fn spawn_pane(
     });
 
     let grid = Grid::new(cols.max(1), rows.max(1), history_limit);
-    Ok(PaneRuntime { pty: Some(pty), grid, dead: false })
+    Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new() })
+}
+
+/// Derive an automatic-rename candidate from a pane's OSC title (Task 9,
+/// sub-project 4; design spec `## 9. automatic-rename`): strip a path prefix
+/// down to its basename (last component split on either `\` or `/`), cut at
+/// the first space (tmux's automatic-rename takes just the leading
+/// "command" token, not the whole title), cap at 20 chars, and re-strip
+/// control characters defensively (`grid::Grid`'s own OSC handler already
+/// does this for the title it hands out, but this function doesn't assume
+/// its caller is always that one guaranteed-clean source). Returns `None`
+/// if the result is empty (caller keeps the window's existing name) OR
+/// fails `model::validate_name` -- a title containing a `:` or `.` (a full
+/// file path, or a bare `foo.exe` basename) can't become a window name at
+/// all, since window names double as `session:window`/`session.window`
+/// target syntax; skipping the rename is safer than mangling the name
+/// further to force it through.
+fn derive_auto_name(title: &str) -> Option<String> {
+    let basename = title.rsplit(['\\', '/']).next().unwrap_or(title);
+    let first_token = basename.split(' ').next().unwrap_or("");
+    let cleaned: String = first_token.chars().filter(|c| !c.is_control()).take(20).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    crate::model::validate_name(&cleaned, "window").ok()?;
+    Some(cleaned)
 }
 
 /// Resize every pane whose computed rect changed (pty + grid), caching the
@@ -916,6 +953,15 @@ impl Server {
             ServerEvent::Output(id, bytes) => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.grid.feed(&bytes);
+                    // automatic-rename (Task 9, sub-project 4): OSC 0/2
+                    // titles are edge-triggered (`take_title_changed`) --
+                    // refresh the cached `#T` value and, if this pane is the
+                    // ACTIVE pane of some window, consider renaming it.
+                    if p.grid.take_title_changed() {
+                        let title = p.grid.title().unwrap_or("").to_string();
+                        p.title = title.clone();
+                        self.maybe_auto_rename(id, &title);
+                    }
                 }
                 true
             }
@@ -938,7 +984,12 @@ impl Server {
                     false
                 };
                 let deadline = Instant::now();
-                for client in self.clients.values_mut() {
+                // escape-time (Task 9, sub-project 4): collected during the
+                // borrow-checked `iter_mut` pass below (can't remove a
+                // client from `self.clients` mid-iteration) and processed
+                // just after it ends.
+                let mut escape_flush: Vec<ClientId> = Vec::new();
+                for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
                         if deadline.duration_since(set_at) >= MESSAGE_LIFETIME {
                             client.message = None;
@@ -953,10 +1004,77 @@ impl Server {
                         client.mode = ClientMode::Normal;
                         dirty = true;
                     }
+                    if client.key_machine.escape_ready(deadline) {
+                        escape_flush.push(*cid);
+                    }
+                }
+                // escape-time flush: a lone/partial pending ESC older than
+                // `escape-time` is force-drained through
+                // `KeyMachine::flush_now` and its resulting events processed
+                // through the SAME pipeline a live `Stdin` frame uses
+                // (`process_key_events`) -- this is what finally delivers a
+                // bare Escape keypress the decoder alone can never resolve
+                // (see that method's doc comment and the design spec's `## 8.
+                // escape-time` section).
+                for cid in escape_flush {
+                    let Some(mut client) = self.clients.remove(&cid) else { continue };
+                    let Some(session_name) = client.session.clone() else {
+                        self.clients.insert(cid, client);
+                        continue;
+                    };
+                    let events = client.key_machine.flush_now(deadline);
+                    if events.is_empty() {
+                        self.clients.insert(cid, client);
+                        continue;
+                    }
+                    dirty = true;
+                    let queue: VecDeque<KeyInputEvent> = events.into();
+                    self.process_key_events(cid, client, queue, session_name, deadline);
                 }
                 dirty
             }
         }
+    }
+
+    /// automatic-rename (Task 9, sub-project 4): if `pane_id` is the ACTIVE
+    /// pane of some window (`window.layout.focused() == pane_id`), and both
+    /// the global `automatic-rename` option and that window's own
+    /// `auto_rename` flag are on, rename the window from `title` (via
+    /// `derive_auto_name`), throttled to at most one rename per window per
+    /// [`AUTO_RENAME_THROTTLE`]. A no-op if the pane isn't any window's
+    /// active pane (a background pane's title changing never renames
+    /// anything -- matches tmux, and naturally makes "switching active pane
+    /// switches the tracked title source" fall out for free: the next
+    /// title-change event on whichever pane IS active at the time is what
+    /// gets read here). Does NOT touch `window.last_auto_rename` unless an
+    /// actual rename happens, so a title that keeps re-deriving to the
+    /// SAME name never gets throttled against a later, genuinely different
+    /// one.
+    fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str) {
+        if !self.options.automatic_rename() {
+            return;
+        }
+        let Some(name) = derive_auto_name(title) else { return };
+        let target = self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.focused() == pane_id)
+                .map(|w| (s.name.clone(), w.id))
+        });
+        let Some((session_name, wid)) = target else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        if !window.auto_rename || window.name == name {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = window.last_auto_rename {
+            if now.duration_since(last) < AUTO_RENAME_THROTTLE {
+                return;
+            }
+        }
+        window.name = name;
+        window.last_auto_rename = Some(now);
     }
 
     fn handle_connected(&mut self, conn: PipeConn) {
@@ -1093,12 +1211,21 @@ impl Server {
         if self.options.mouse() {
             send_output(&tx, MOUSE_ENABLE_SEQ.to_vec());
         }
+        let mut key_machine = KeyMachine::new(self.options.prefix());
+        // Escape-time (Task 9, sub-project 4): seed from the CURRENT option
+        // value (e.g. already set by a `.tmux.conf` loaded at startup) --
+        // mirrors `prefix`'s existing at-creation seeding above. Unlike
+        // `repeat-time` (a pre-existing gap: only re-synced by a runtime
+        // `set`, never at attach time), escape-time getting this wrong would
+        // silently break Escape-key delivery for a client that attaches
+        // after config already changed it.
+        key_machine.set_escape_time(self.options.escape_time());
         let client = ClientState {
             session: Some(session_name.clone()),
             cols,
             rows,
             renderer,
-            key_machine: KeyMachine::new(self.options.prefix()),
+            key_machine,
             mode: ClientMode::Normal,
             message,
             tx,
@@ -1431,34 +1558,47 @@ impl Server {
         }
     }
 
-    /// Route one `Stdin` frame through the client's `KeyMachine` and
-    /// dispatch the resulting events one at a time against live state via
-    /// the command dispatcher (`dispatch.rs`) and the mutable `bindings`
-    /// table (see module docs re: the confirm race — NOT fixed here, same
-    /// as before Task 6).
+    /// Route one `Stdin` frame through the client's `KeyMachine` and hand the
+    /// resulting events to [`Server::process_key_events`].
     fn handle_stdin(&mut self, id: ClientId, bytes: Vec<u8>) {
         let mut client = match self.clients.remove(&id) {
             Some(c) => c,
             None => return,
         };
-        let mut session_name = match client.session.clone() {
+        let session_name = match client.session.clone() {
             Some(n) => n,
             None => {
                 self.clients.insert(id, client);
                 return;
             }
         };
-
-        // Any input byte from this client clears its transient status
-        // message (the other clear path is 750ms elapsing, on Tick).
-        client.message = None;
-
         let now = Instant::now();
-        // A queue (not a plain iterator) because a prompt/confirm commit
-        // mid-`Captured`-chunk re-feeds the chunk's REMAINING bytes through
-        // the KeyMachine and splices the resulting events in at the front
-        // (they logically precede everything after the Captured event).
-        let mut queue: VecDeque<KeyInputEvent> = client.key_machine.feed(&bytes, now).into();
+        let queue: VecDeque<KeyInputEvent> = client.key_machine.feed(&bytes, now).into();
+        self.process_key_events(id, client, queue, session_name, now);
+    }
+
+    /// Dispatch one batch of already-decoded key/mouse events against live
+    /// state via the command dispatcher (`dispatch.rs`) and the mutable
+    /// `bindings` table (see module docs re: the confirm race — NOT fixed
+    /// here, same as before Task 6), then re-insert the client (unless it
+    /// detached or its session was destroyed). Shared by `handle_stdin` (a
+    /// live `Stdin` frame, decoded by `KeyMachine::feed`) and the `Tick`
+    /// handler's escape-time flush (Task 9, sub-project 4: a lone pending
+    /// ESC older than `escape-time`, decoded by `KeyMachine::flush_now`) —
+    /// both just hand this method a `VecDeque<KeyInputEvent>` and the
+    /// `Instant` that produced it.
+    fn process_key_events(
+        &mut self,
+        id: ClientId,
+        mut client: ClientState,
+        mut queue: VecDeque<KeyInputEvent>,
+        mut session_name: String,
+        now: Instant,
+    ) {
+        // Any input byte (or flushed escape) from this client clears its
+        // transient status message (the other clear path is 750ms elapsing,
+        // on Tick).
+        client.message = None;
 
         let mut detach = false;
         let mut destroy = false;
@@ -1872,6 +2012,7 @@ fn render_one(
             window_flags.push('Z');
         }
         let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32;
+        let pane_title = panes.get(&focused).map(|p| p.title.as_str()).unwrap_or("");
         let fctx = FormatCtx {
             session: &session.name,
             window_index: window.index,
@@ -1880,6 +2021,7 @@ fn render_one(
             pane_index,
             hostname,
             now: system_time_parts(),
+            pane_title,
         };
         // Option-length caps apply while building the strings (tmux
         // truncates left/right to status-left/right-length); the renderer's

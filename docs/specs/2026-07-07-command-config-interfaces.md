@@ -38,6 +38,10 @@ impl KeyDecoder {
     pub fn new() -> KeyDecoder;
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<DecodedKey>;
     pub fn flush(&mut self) -> Vec<DecodedKey>;
+    /// Sub-project 4, Task 9 (escape-time). Pure query, no clock (see
+    /// "Not implemented in SP3" below, now superseded by the `## input-v2`
+    /// section's Task 9 amendment for the actual timing decision).
+    pub fn pending_starts_with_escape(&self) -> bool;
 }
 ```
 
@@ -56,7 +60,10 @@ Unit-tested with exact expected `Key`/byte-vector values (mirrors
 `decode_prefix_byte_is_ctrl_b`, `decode_csi_arrows`, `decode_csi_modified`,
 `decode_ss3_fkeys`, `decode_csi_tilde_keys`, `decode_meta_char`,
 `decode_split_sequence_across_feeds`, `decode_lone_escape_flush`,
-`decode_utf8_multibyte_char` (24 tests total).
+`decode_utf8_multibyte_char` (24 tests total; sub-project 4 adds mouse-
+decoding tests documented in the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md),
+plus Task 9's `pending_starts_with_escape_tracks_buffer_state`).
 
 ### Notation rules (`parse_key` / `key_name`)
 
@@ -209,15 +216,29 @@ as `Char(<final byte>)` (best-effort fallback, not real tmux notation) once
 the CSI sequence is structurally complete — decoding never blocks forever on
 an unrecognized-but-well-formed sequence.
 
-**Not implemented in SP3** (ticketed, matches the design spec's stated
-deviations): no escape-time disambiguation timer — a lone `ESC` not
-followed by anything in the same `feed()` call is simply left buffered
-until the next `feed()` or a `flush()`; there is no way to distinguish "the
-user pressed Escape" from "an escape sequence is still arriving" without
-one. `encode_key`/`KeyDecoder` only cover the arrow CSI-modifier form for
-combining modifiers with a named key — other named keys (Home/End/PPage/
-NPage/IC/DC/F-keys) do not support ctrl/meta/shift combinations at all in
-SP3, on either the encode or decode side, beyond what's in the tables above.
+**Amendment (sub-project 4, Task 9 — escape-time):** `KeyDecoder` gains
+`pending_starts_with_escape(&self) -> bool`, a pure query (no clock — this
+module stays clock-free per its own docs) reporting whether the current
+pending buffer's first byte is `ESC` (0x1b): an outstanding escape-
+introduced sequence, including a bare trailing `ESC` with nothing after it
+yet, that `feed()` hasn't been able to complete. This is the primitive the
+CALLER (`input::KeyMachine`, which already threads an `Instant` through
+`feed()`) builds its own escape-time timer on top of — see the `## input-v2`
+section's matching Task 9 amendment for `flush_now`/`escape_ready`. What was
+previously "not implemented in SP3" (below) is now implemented, one layer
+up: the decoder itself is still clock-free; `KeyMachine` is what decides
+"has enough time passed to force-flush this."
+
+**Historical note (was "Not implemented in SP3", now resolved by the Task 9
+amendment above):** SP3 shipped with no escape-time disambiguation timer — a
+lone `ESC` not followed by anything in the same `feed()` call was simply
+left buffered until the next `feed()` or a `flush()`; there was no way to
+distinguish "the user pressed Escape" from "an escape sequence is still
+arriving" without one. `encode_key`/`KeyDecoder` only cover the arrow
+CSI-modifier form for combining modifiers with a named key — other named
+keys (Home/End/PPage/NPage/IC/DC/F-keys) do not support ctrl/meta/shift
+combinations at all, on either the encode or decode side, beyond what's in
+the tables above (still true; unrelated to escape-time).
 
 ## `style` — tmux style-string grammar onto `grid::Style` (Task 2)
 
@@ -796,6 +817,58 @@ directive — `expand_format` never returns an `Err`.
 
 ## `input-v2` — table-driven key machine (Task 5, sub-project 3)
 
+**Amendment (sub-project 4, Task 9 — escape-time):** `KeyMachine` gains an
+`escape_time: Duration` field (default `input::ESCAPE_TIME`, 500ms — mirrors
+`repeat_time`'s existing shape) plus three methods:
+
+```rust
+impl KeyMachine {
+    pub fn set_escape_time(&mut self, d: std::time::Duration);
+    /// `true` once an outstanding pending ESC (tracked internally via
+    /// `keys::KeyDecoder::pending_starts_with_escape`, checked at the end
+    /// of every `feed()`) has aged past `escape_time` as of `now`.
+    pub fn escape_ready(&self, now: std::time::Instant) -> bool;
+    /// Force-drains the decoder's pending buffer (`keys::KeyDecoder::flush`)
+    /// through the SAME `dispatch_key` path `feed` uses, producing whatever
+    /// `KeyInputEvent`s result; clears the pending-escape timer.
+    pub fn flush_now(&mut self, now: std::time::Instant) -> Vec<KeyInputEvent>;
+}
+```
+
+`feed()` itself is unchanged in signature; internally, after decoding, it
+now also updates a private `pending_escape_since: Option<Instant>` — set the
+first time `decoder.pending_starts_with_escape()` goes true, cleared the
+moment it goes false (sequence completed, OR force-flushed by `flush_now`)
+— so the "clock" never restarts just because more bytes of the SAME
+still-incomplete sequence keep arriving. `set_capture` (both directions)
+also clears `pending_escape_since`, matching its existing "discard any
+incomplete decoder buffer on the transition" rule.
+
+**Server wiring** (`src/server.rs`, not part of this module's own contract
+but documented here since it's the ONLY consumer): the `Tick` handler (every
+50ms, per the design spec's `## 8. escape-time` section) calls
+`escape_ready(Instant::now())` on every attached client's `KeyMachine`;
+for each one that fires, `flush_now` is called and its resulting events are
+run through `Server::process_key_events` — the SAME dispatch path
+`handle_stdin` uses for a live `Stdin` frame (extracted into that shared
+method by this task specifically so the two callers — a real `Stdin` frame,
+and a `Tick`-triggered flush — don't duplicate the ~250-line event-dispatch
+loop). A freshly-attaching client's `KeyMachine` seeds `escape_time` from
+`Options::escape_time()` at `finish_attach` time (mirrors how `prefix` is
+already seeded there); `set -g escape-time <ms>` at runtime additionally
+broadcasts `set_escape_time` to every ALREADY-attached client's
+`KeyMachine` (mirrors the existing `repeat-time` runtime-propagation
+branch in `server/dispatch.rs::exec_set_option`).
+
+Tests: `input::key_machine_tests::lone_escape_flushes_after_escape_time`,
+`burst_csi_within_one_feed_never_reports_escape_ready`,
+`escape_pending_resolved_by_later_bytes_before_ready`; end to end,
+`tests/server_proto.rs::escape_key_reaches_pane_via_escape_time_flush`
+(opens choose-tree, cancels it with a literal bare ESC byte after a
+shrunk `escape-time`, then proves the flush didn't stall/merge decoder
+state by typing `[A` immediately after and confirming it lands as two
+ordinary literal characters).
+
 **Amendment (sub-project 4, Task 5 — mouse):** `KeyInputEvent` gains a
 `Mouse { event: keys::MouseEvent, raw: Vec<u8> }` variant. Unlike `Key`, a
 `Mouse` event is NEVER routed through the prefix/table state machine or the
@@ -828,7 +901,7 @@ pub enum KeyInputEvent {
     Captured(Vec<u8>),
 }
 
-pub struct KeyMachine { /* opaque: KeyDecoder + prefix + repeat/capture state */ }
+pub struct KeyMachine { /* opaque: KeyDecoder + prefix + repeat/capture/escape-time state */ }
 impl KeyMachine {
     pub fn new(prefix: crate::keys::Key) -> Self;
     pub fn feed(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<KeyInputEvent>;
@@ -836,6 +909,11 @@ impl KeyMachine {
     pub fn set_repeat_time(&mut self, d: std::time::Duration);
     pub fn arm_repeat(&mut self, now: std::time::Instant);
     pub fn set_capture(&mut self, on: bool);
+    // Task 9, sub-project 4 (escape-time) -- see this section's matching
+    // amendment note above for the full contract.
+    pub fn set_escape_time(&mut self, d: std::time::Duration);
+    pub fn escape_ready(&self, now: std::time::Instant) -> bool;
+    pub fn flush_now(&mut self, now: std::time::Instant) -> Vec<KeyInputEvent>;
 }
 ```
 
@@ -850,8 +928,12 @@ Unit-tested (`input::key_machine_tests`, mirrors the legacy module's exact-
 value style): `plain_bytes_forward_coalesced`,
 `prefix_then_key_reports_prefix_table`, `prefix_is_consumed_not_forwarded`,
 `double_prefix_reports_prefix_table_key`, `root_table_keys_report_root`,
-`arm_repeat_window`, `capture_bypasses_prefix`, `configurable_prefix`
-(8 tests).
+`arm_repeat_window`, `capture_bypasses_prefix`, `configurable_prefix`,
+plus mouse tests (documented in the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md))
+and Task 9's `lone_escape_flushes_after_escape_time`,
+`burst_csi_within_one_feed_never_reports_escape_ready`,
+`escape_pending_resolved_by_later_bytes_before_ready`.
 
 ### Semantics
 

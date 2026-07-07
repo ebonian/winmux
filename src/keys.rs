@@ -445,6 +445,20 @@ impl KeyDecoder {
         }
         out
     }
+
+    /// `true` iff there is a nonempty pending (not-yet-classified) buffer
+    /// whose FIRST byte is `ESC` (0x1b) — an outstanding escape-introduced
+    /// sequence (including a bare trailing `ESC` with nothing after it yet)
+    /// that `feed()` hasn't been able to complete. Pure query, no clock: the
+    /// decoder itself has no notion of time (per this module's docs) — this
+    /// is the primitive `input::KeyMachine`'s escape-time flush logic
+    /// (sub-project 4, Task 9) is built on: the CALLER records when this
+    /// first became true and, once its own clock says `escape-time` has
+    /// elapsed with no further bytes arriving, calls [`KeyDecoder::flush`]
+    /// (indirectly, via `KeyMachine::flush_now`) to force-resolve it.
+    pub fn pending_starts_with_escape(&self) -> bool {
+        self.pending.first() == Some(&0x1b)
+    }
 }
 
 /// Internal classification result before the raw bytes (known only to the
@@ -1030,6 +1044,27 @@ mod tests {
         let mut dec = KeyDecoder::new();
         assert_eq!(dec.feed(b"\x1b"), vec![]);
         assert_eq!(dec.flush(), vec![dk(plain(KeyCode::Escape), &[0x1b])]);
+    }
+
+    #[test]
+    fn pending_starts_with_escape_tracks_buffer_state() {
+        let mut dec = KeyDecoder::new();
+        assert!(!dec.pending_starts_with_escape(), "fresh decoder has no pending buffer");
+        assert_eq!(dec.feed(b"\x1b"), vec![]);
+        assert!(dec.pending_starts_with_escape(), "lone ESC left pending");
+        // A burst that completes within the SAME feed() call never leaves a
+        // pending ESC behind.
+        let mut dec2 = KeyDecoder::new();
+        assert_eq!(dec2.feed(b"\x1b[A").len(), 1);
+        assert!(!dec2.pending_starts_with_escape());
+        // A non-ESC pending buffer (e.g. a still-buffering UTF-8 lead byte)
+        // must not report true.
+        let mut dec3 = KeyDecoder::new();
+        assert_eq!(dec3.feed(&[0xc3]), vec![]);
+        assert!(!dec3.pending_starts_with_escape());
+        // flush() drains the pending buffer, clearing the flag.
+        assert_eq!(dec.flush().len(), 1);
+        assert!(!dec.pending_starts_with_escape());
     }
 
     #[test]

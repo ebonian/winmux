@@ -492,6 +492,25 @@ impl Options {
         style::parse_color(&self.str_ref("display-panes-active-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(1))
     }
 
+    /// `escape-time` (Task 9, sub-project 4): how long a pending lone/
+    /// partial ESC sequence (`input::KeyMachine::escape_ready`) may sit
+    /// unresolved before the server force-flushes it as a bare `Escape` key.
+    /// tmux default 500ms; reclassifies `escape-time` from the
+    /// accepted-inert group to a live, consumed option (see the design
+    /// spec's `## 8. escape-time` section).
+    pub fn escape_time(&self) -> Duration {
+        Duration::from_millis(self.number("escape-time") as u64)
+    }
+
+    /// `automatic-rename` (Task 9, sub-project 4): global on/off for
+    /// tracking a window's name to its active pane's OSC title. tmux default
+    /// on. ANDed with the per-window `model::Window::auto_rename` flag by
+    /// `server::Server::maybe_auto_rename` — see that method's doc comment
+    /// and the design spec's `## 9. automatic-rename` section.
+    pub fn automatic_rename(&self) -> bool {
+        self.flag("automatic-rename")
+    }
+
     fn number(&self, name: &str) -> u32 {
         match self.values.get(name) {
             Some(Value::Number(n)) => *n,
@@ -602,6 +621,11 @@ pub struct FormatCtx<'a> {
     pub pane_index: u32,
     pub hostname: &'a str,
     pub now: SystemTimeParts,
+    /// `#T`/`#{pane_title}` (Task 9, sub-project 4): the focused pane's OSC
+    /// 0/2 title (`server::PaneRuntime::title`), empty until the pane's
+    /// program ever sets one. Already control-char-clean and length-capped
+    /// by `grid::Grid`'s OSC handler — no further sanitizing needed here.
+    pub pane_title: &'a str,
 }
 
 const MONTHS: [&str; 12] = [
@@ -613,7 +637,8 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /// `display-message`:
 ///
 /// - `#S` session name, `#I` window index, `#W` window name, `#F` window
-///   flags, `#P` pane index, `#H` hostname, `##` literal `#`.
+///   flags, `#P` pane index, `#H` hostname, `#T` pane title (Task 9,
+///   sub-project 4), `##` literal `#`.
 /// - `#{session_name}`, `#{window_index}`, `#{window_name}` (long forms of
 ///   the three most common `#`-codes); any other `#{...}` -> empty
 ///   (documented SP3 simplification — the full tmux format-expression
@@ -656,6 +681,10 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                     chars.next();
                     out.push_str(ctx.hostname);
                 }
+                Some('T') => {
+                    chars.next();
+                    out.push_str(ctx.pane_title);
+                }
                 Some('{') => {
                     chars.next();
                     let mut name = String::new();
@@ -672,6 +701,7 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                             "session_name" => out.push_str(ctx.session),
                             "window_index" => out.push_str(&ctx.window_index.to_string()),
                             "window_name" => out.push_str(ctx.window_name),
+                            "pane_title" => out.push_str(ctx.pane_title),
                             _ => {} // unknown long form -> empty
                         }
                     }
@@ -770,6 +800,7 @@ mod tests {
             pane_index: 0,
             hostname: "HOST",
             now,
+            pane_title: "",
         }
     }
 
@@ -1074,8 +1105,21 @@ mod tests {
     #[test]
     fn expand_unknown_long_empty() {
         let c = ctx("s", sample_time());
-        assert_eq!(expand_format("<#{pane_title}>", &c), "<>");
+        assert_eq!(expand_format("<#{nonsense}>", &c), "<>");
         assert_eq!(expand_format("<#Z>", &c), "<>");
+    }
+
+    #[test]
+    fn expand_pane_title() {
+        // #T / #{pane_title} (Task 9, sub-project 4).
+        let mut c = ctx("s", sample_time());
+        c.pane_title = "vim";
+        assert_eq!(expand_format("#T", &c), "vim");
+        assert_eq!(expand_format("<#{pane_title}>", &c), "<vim>");
+        // Empty (never-titled pane) is the common case -- expands to nothing,
+        // same as an unset `#{...}` form, not a literal placeholder.
+        let empty = ctx("s", sample_time());
+        assert_eq!(expand_format("#T", &empty), "");
     }
 
     #[test]

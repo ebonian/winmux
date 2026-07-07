@@ -715,11 +715,11 @@ impl Server {
         Ok((session_name, wid, pid))
     }
 
-    /// `(session_name, window_index, window_name, window_flags, pane_index)`
-    /// for the acting client's (or most-recent, headlessly) focused pane —
-    /// the context `expand_format` needs for `display-message`/
-    /// `confirm-before -p`.
-    fn format_values(&mut self, client_session: Option<&str>) -> Result<(String, u32, String, String, u32), String> {
+    /// `(session_name, window_index, window_name, window_flags, pane_index,
+    /// pane_title)` for the acting client's (or most-recent, headlessly)
+    /// focused pane — the context `expand_format` needs for
+    /// `display-message`/`confirm-before -p`.
+    fn format_values(&mut self, client_session: Option<&str>) -> Result<(String, u32, String, String, u32, String), String> {
         let (session_name, wid, pane_id) = self.resolve_pane_target(client_session, None)?;
         let session = self.registry.session_mut(&session_name).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let window = session.windows.iter().find(|w| w.id == wid).ok_or_else(|| "window not found".to_string())?;
@@ -734,12 +734,13 @@ impl Server {
         }
         .to_string();
         let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32;
-        Ok((session_name, window_index, window_name, flags, pane_index))
+        let pane_title = self.panes.get(&pane_id).map(|p| p.title.clone()).unwrap_or_default();
+        Ok((session_name, window_index, window_name, flags, pane_index, pane_title))
     }
 
     fn expand_with_ctx(&mut self, fmt: &str, client_session: Option<&str>) -> String {
         match self.format_values(client_session) {
-            Ok((session, window_index, window_name, window_flags, pane_index)) => {
+            Ok((session, window_index, window_name, window_flags, pane_index, pane_title)) => {
                 let fctx = FormatCtx {
                     session: &session,
                     window_index,
@@ -748,6 +749,7 @@ impl Server {
                     pane_index,
                     hostname: &self.hostname,
                     now: system_time_parts(),
+                    pane_title: &pane_title,
                 };
                 crate::options::expand_format(fmt, &fctx)
             }
@@ -952,6 +954,9 @@ impl Server {
                     let w = session.new_window(wid, pane_id);
                     if let Some(n) = name {
                         w.name = n;
+                        // An explicit `-n name` at creation is manual naming
+                        // too (Task 9) -- matches `exec_rename_window`.
+                        w.auto_rename = false;
                     }
                 }
                 self.apply_layout_for_session(&session_name);
@@ -987,6 +992,13 @@ impl Server {
         if let Some(session) = self.registry.session_mut(&session_name) {
             if let Some(w) = session.windows.iter_mut().find(|w| w.id == wid) {
                 w.name = name;
+                // automatic-rename (Task 9, sub-project 4): ANY manual
+                // rename -- CLI/config `rename-window`, and the `,` prompt
+                // commit, which also funnels through this one function --
+                // permanently stops this window's name from tracking its
+                // active pane's title. See `model::Window::auto_rename`'s
+                // doc comment for the "permanently" precedent.
+                w.auto_rename = false;
             }
         }
         Ok(String::new())
@@ -1217,6 +1229,9 @@ impl Server {
             let w = session.new_window(new_wid, pane_id);
             if let Some(n) = name {
                 w.name = n;
+                // Explicit naming at creation is manual naming too (Task 9)
+                // -- matches `exec_rename_window`/`exec_new_window`.
+                w.auto_rename = false;
             }
             // `new_window` always makes the new window current -- `-d`
             // (`detached`) means focus should stay in the SOURCE window
@@ -1883,6 +1898,7 @@ impl Server {
         if window.layout.is_zoomed() {
             window_flags.push('Z');
         }
+        let pane_title = self.panes.get(&window.layout.focused()).map(|p| p.title.clone()).unwrap_or_default();
         let fctx = FormatCtx {
             session: &session.name,
             window_index: window.index,
@@ -1891,6 +1907,7 @@ impl Server {
             pane_index,
             hostname: &self.hostname,
             now: system_time_parts(),
+            pane_title: &pane_title,
         };
         let left = crate::options::expand_format(self.options.status_left(), &fctx);
         let left_len = left.chars().count().min(self.options.status_left_length() as usize) as u16;
@@ -2053,6 +2070,17 @@ impl Server {
             let rt = self.options.repeat_time();
             for c in self.clients.values_mut() {
                 c.key_machine.set_repeat_time(rt);
+            }
+        } else if name == "escape-time" {
+            // Task 9: propagate to every attached client's KeyMachine
+            // immediately (same pattern as `repeat-time` just above) -- a
+            // pending ESC that's ALREADY outstanding is not retroactively
+            // re-evaluated (see `KeyMachine::set_escape_time`'s doc
+            // comment), only the duration used for the NEXT `escape_ready`
+            // check changes.
+            let et = self.options.escape_time();
+            for c in self.clients.values_mut() {
+                c.key_machine.set_escape_time(et);
             }
         } else if name == "mouse" {
             // Task 5: broadcast the SGR mouse-mode enable/disable escape
@@ -3281,7 +3309,7 @@ mod mouse_dispatch_tests {
             grid.feed(b"\x1b[?1049h");
             assert!(grid.alt_screen(), "test setup: grid must report alt_screen after CSI ?1049h");
         }
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false });
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new() });
         let session_name = server
             .registry
             .create_session(Some("0"), pane_id, (20, 10), 0)
@@ -3379,7 +3407,7 @@ mod choose_tree_dispatch_tests {
 
     fn insert_blank_pane(server: &mut Server) -> PaneId {
         let pane_id = server.mint_pane_id();
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false });
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false, title: String::new() });
         pane_id
     }
 

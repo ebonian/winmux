@@ -4200,17 +4200,16 @@ fn choose_tree_s_sessions() {
 /// nothing after it can NEVER decode through `KeyDecoder`'s normal (non-
 /// capture) path within a single `feed()` call: `classify_escape` returns
 /// `None` ("wait for more bytes, could be the start of a CSI/SS3/meta
-/// sequence") and `KeyMachine::feed` never calls `decoder.flush()` itself,
-/// so the byte sits in the decoder's pending buffer forever absent the
-/// `escape-time` flush timer (design spec `## 8. escape-time`) -- NOT YET
-/// implemented (a separate, later piece of work). This is a pre-existing
-/// harness/architecture limitation, not a Task 8 regression: the project's
-/// OWN copy-mode test suite hits the identical wall and works around it the
-/// identical way (`copy_mode_q_exits` tests `q`, never a bare `Escape`,
-/// despite `Escape -> copy-cancel` being a real default binding too). `q`
-/// and `Escape` share the exact same `ChooseTreeAction::Cancel` dispatch
-/// path (`resolve_choose_tree_key`), so this still proves the cancel
-/// behavior end-to-end.
+/// sequence") and (at the time this test was written) `KeyMachine::feed`
+/// never called `decoder.flush()` itself, so the byte sat in the decoder's
+/// pending buffer forever absent an `escape-time` flush timer. That timer is
+/// now implemented (sub-project 4, Task 9 -- see
+/// `escape_key_reaches_pane_via_escape_time_flush` below, which exercises
+/// the literal bare-ESC byte this comment used to say was impossible). This
+/// test is kept as-is (using `q`) since it's still a valid, independent
+/// regression check of the SAME `ChooseTreeAction::Cancel` dispatch path,
+/// matching how the project's copy-mode test suite also keeps its `q`-based
+/// `copy_mode_q_exits` alongside `Escape`-specific coverage elsewhere.
 #[test]
 fn choose_tree_escape_cancels() {
     let name = unique_pipe_name();
@@ -4224,6 +4223,56 @@ fn choose_tree_escape_cancels() {
     c.send(&ClientMsg::Stdin(b"q".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
 
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task 9 (sub-project 4): escape-time disambiguation. A lone ESC byte with
+/// nothing following it can never resolve through `KeyDecoder`'s normal
+/// path within one `feed()` call -- only the `Tick`-driven escape-time
+/// flush (design spec `## 8. escape-time`; `input::KeyMachine::flush_now`)
+/// delivers it, once it has aged past the (here shrunk-for-the-test)
+/// `escape-time` option. This test proves TWO things end to end, per the
+/// task brief: (1) the flushed ESC actually reaches dispatch and has its
+/// real effect (canceling the still-open choose-tree overlay -- a clean,
+/// observable "Escape did something" signal); (2) the flush doesn't stall
+/// or corrupt decoder state afterward -- the very next bytes (`[A`, sent
+/// once the cancel has already been observed) decode as two ordinary
+/// literal characters, not merged with the already-consumed ESC into some
+/// leftover Meta-prefixed sequence (which would never show up as literal
+/// text on the pane's line).
+#[test]
+fn escape_key_reaches_pane_via_escape_time_flush() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    // Shrink well below tmux's 500ms default (still well above the 50ms
+    // Tick granularity) so the test doesn't need to block for the default.
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "escape-time".into(), "150".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    // A lone ESC, nothing after it: buffered until the escape-time flush
+    // resolves it on a later Tick.
+    c.send(&ClientMsg::Stdin(vec![0x1b]));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    // The flush already ran (proven by the overlay closing above) and
+    // cleared its own pending-escape state -- these bytes must decode
+    // completely fresh.
+    c.send(&ClientMsg::Stdin(b"[A".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[A")));
+
+    // Submit (and discard) that literal "[A" as its own (invalid, harmless)
+    // command line before cleanly exiting the shell.
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
@@ -4413,4 +4462,85 @@ fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+/// automatic-rename (Task 9, sub-project 4): PowerShell's
+/// `$Host.UI.RawUI.WindowTitle` assignment round-trips through ConPTY as an
+/// OSC 0/2 title, which `Grid` captures (`grid-v2`, Task 1) and the server
+/// polls (`take_title_changed`) after every pane `Output` feed. The window
+/// (auto-named "0" for its session, name "powershell" at creation, both
+/// tmux/winmux defaults) tracks the title within the 500ms throttle window.
+#[test]
+fn pane_title_updates_window_name() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"$Host.UI.RawUI.WindowTitle='mytool'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:mytool*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// automatic-rename precedence (Task 9): a MANUAL `rename-window` (CLI here;
+/// the `,` prompt commit funnels through the exact same
+/// `exec_rename_window`, so this covers both call sites) permanently clears
+/// the window's `auto_rename` flag -- a later OSC title change must NOT
+/// override the manual name. The title-setting command and the
+/// `done-manual-check` marker run as ONE PowerShell statement list so the
+/// marker appearing on screen proves the OSC has already had its chance to
+/// reach and be processed by the server before the assertion below runs.
+#[test]
+fn manual_rename_disables_auto() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "manual".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:manual*")));
+
+    c.send(&ClientMsg::Stdin(b"$Host.UI.RawUI.WindowTitle='mytool'; echo done-manual-check\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-manual-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:manual*")),
+        "manual rename must survive a later title change; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `#T`/`display-message` (Task 9): the pane's FULL OSC title (not the
+/// derived-and-truncated window name automatic-rename applies) is available
+/// via the new `#T` format code. Using a multi-word title distinguishes the
+/// two: the window name derives to just its first token ("mytool"), while
+/// `#T` expands to the whole thing.
+#[test]
+fn pane_title_format_expands() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"$Host.UI.RawUI.WindowTitle='mytool title here'\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:mytool*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["display-message".into(), "#T".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "mytool title here");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
 }

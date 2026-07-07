@@ -1753,3 +1753,150 @@ switches`, `choose_tree_s_sessions`, `choose_tree_escape_cancels` (see the
 `q`-not-`Escape` note above), `choose_tree_x_kills_with_confirm` (`x` ->
 confirm text appears -> `y` -> the killed row is gone AND the overlay stays
 open with the refreshed list -> `q` closes it).
+
+## `naming` — escape-time disambiguation + automatic-rename (Task 9)
+
+Implements the design spec's `## 8. escape-time` and `## 9.
+automatic-rename` sections. The `keys`/`input-v2` amendment
+(`KeyDecoder::pending_starts_with_escape`, `KeyMachine::set_escape_time`/
+`escape_ready`/`flush_now`, and the `server.rs` `Tick`/`process_key_events`
+wiring) is documented directly in the base contract's `## keys` and
+`## input-v2` sections (`2026-07-07-command-config-interfaces.md`) —
+following the same precedent Task 5 (mouse) set for `DecodedInput`/
+`KeyInputEvent::Mouse` — rather than duplicated here. This section covers
+everything automatic-rename touches: `model::Window`, `options`, and
+`server`/`server::dispatch`.
+
+### `model` amendment
+
+`Window` gains two fields:
+
+```rust
+pub struct Window {
+    // ...unchanged...
+    /// `true` (tmux default) while this window's name should track its
+    /// ACTIVE pane's OSC title. Any MANUAL naming -- `rename-window`/the `,`
+    /// prompt commit (both funnel through the SAME `exec_rename_window`), or
+    /// an explicit `-n`/name given to `new-window`/`break-pane` -- sets this
+    /// `false` PERMANENTLY for this window. A later global `set -g
+    /// automatic-rename on` resumes auto-renaming for windows that are
+    /// still eligible, but never reactivates a window whose name was set
+    /// explicitly (real tmux has a genuine per-window `set-window-option
+    /// automatic-rename on` escape hatch for that; out of scope here since
+    /// winmux has no per-window option overlays -- see the `## options`
+    /// SP3 scope note).
+    pub auto_rename: bool,
+    /// Throttle bookkeeping (tmux `NAME_INTERVAL`, 500ms): the last time
+    /// this window's name was actually CHANGED by the auto-rename path
+    /// (not touched on a no-op "re-derived to the same name" check) --
+    /// `None` until the first automatic rename.
+    pub last_auto_rename: Option<std::time::Instant>,
+}
+```
+
+Both `Window`-constructing call sites (`Registry::create_session`'s first
+window, `Session::new_window`) initialize `auto_rename: true, last_auto_
+rename: None`. No new `Registry`/`Session` methods — `server::Server::
+maybe_auto_rename` (below) scans `Registry::sessions()` (already public)
+itself rather than adding a by-active-pane lookup API, since the existing
+`Session::window_by_pane` matches ANY pane in a window's layout (not
+specifically the active/focused one) and doesn't fit.
+
+### `options` amendment
+
+Two options move from the accepted-inert group to live, consumed options
+(same reclassification pattern `mouse` and `history-limit` went through in
+earlier SP4 tasks) — no `SPECS`/default changes, they already existed:
+
+```rust
+impl Options {
+    /// `escape-time`, ms, tmux default 500.
+    pub fn escape_time(&self) -> std::time::Duration;
+    /// `automatic-rename`, tmux default on. ANDed with the per-window
+    /// `model::Window::auto_rename` flag by `maybe_auto_rename`.
+    pub fn automatic_rename(&self) -> bool;
+}
+```
+
+`FormatCtx` (`expand_format`'s context) gains one field, and `expand_format`
+one new short/long code:
+
+```rust
+pub struct FormatCtx<'a> {
+    // ...unchanged...
+    /// `#T`/`#{pane_title}`: the focused pane's OSC 0/2 title
+    /// (`server::PaneRuntime::title`), empty until ever set. Already
+    /// control-char-clean and length-capped by `grid::Grid`'s OSC handler
+    /// (Task 1) -- no further sanitizing needed in `expand_format`.
+    pub pane_title: &'a str,
+}
+```
+
+`#T` -> `ctx.pane_title` (short form); `#{pane_title}` -> the same (long
+form), added alongside the existing `session_name`/`window_index`/
+`window_name` long forms. All FOUR `FormatCtx`-constructing call sites
+(`server.rs`'s `render_one` status-bar expansion, `server/dispatch.rs`'s
+`expand_with_ctx` for `display-message`/`confirm-before -p` and
+`mouse_status_click` for status-row hit-testing, `options.rs`'s own test
+helper) were updated.
+
+### `server`/`server::dispatch` amendment
+
+`PaneRuntime` (private struct) gains a `title: String` field (default
+empty), refreshed in `Server::handle_event`'s `Output` arm whenever
+`grid.take_title_changed()` fires (edge-triggered, per `Grid`'s own doc
+comment) — a plain cached `String` rather than re-deriving `Option<&str>` ->
+`&str` at every `#T`/auto-rename call site.
+
+```rust
+// server.rs
+const AUTO_RENAME_THROTTLE: std::time::Duration = /* 500ms, tmux NAME_INTERVAL */;
+
+/// Basename (strip path, split on `\`/`/`) -> first token (cut at first
+/// space) -> cap 20 chars -> control-strip (defensive; Grid's OSC handler
+/// already does this for its own output) -> `model::validate_name` gate.
+/// `None` if empty after derivation OR the candidate fails validation (a
+/// title containing `:`/`.` -- a full path, or a bare `foo.exe` basename --
+/// can't become a window name at all, since window names double as
+/// `session:window`/`session.window` target syntax; skipping the rename is
+/// safer than mangling it further to force it through).
+fn derive_auto_name(title: &str) -> Option<String>;
+
+impl Server {
+    /// If `pane_id` is the ACTIVE pane of some window (`window.layout.
+    /// focused() == pane_id`) and both `options.automatic_rename()` and
+    /// that window's own `auto_rename` are on, rename it from `title` via
+    /// `derive_auto_name`, throttled to `AUTO_RENAME_THROTTLE`. A no-op for
+    /// a background pane's title change -- this is also how "switching
+    /// active pane switches the tracked title source" falls out for free,
+    /// with no extra bookkeeping: the next title-change event on whichever
+    /// pane IS active at the time is what gets read here.
+    fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str);
+}
+```
+
+Manual-naming call sites that now also clear `auto_rename` (in addition to
+setting `w.name`): `dispatch::Server::exec_rename_window` (the ONE function
+both CLI/config `rename-window` and the `,` prompt commit funnel through —
+see the `server-dispatch` contract section), `exec_new_window` (`-n name`
+given), `exec_break_pane` (`-n name`/positional name given, Task 7's
+`window-ops` section). `exec_set_option`'s `escape-time` branch (documented
+in the base contract's `## input-v2` amendment, not repeated here) is the
+only OTHER option-reactive branch this task adds.
+
+### TDD evidence (test names)
+
+Unit: `input::key_machine_tests::lone_escape_flushes_after_escape_time` /
+`burst_csi_within_one_feed_never_reports_escape_ready` /
+`escape_pending_resolved_by_later_bytes_before_ready`;
+`keys::tests::pending_starts_with_escape_tracks_buffer_state`;
+`options::tests::expand_pane_title`. End to end (`server_proto.rs`):
+`escape_key_reaches_pane_via_escape_time_flush` (choose-tree open -> lone
+ESC byte -> shrunk `escape-time` -> overlay cancels -> immediately typing
+`[A` lands as two ordinary literal characters, proving no stall/merge),
+`pane_title_updates_window_name` (PowerShell `$Host.UI.RawUI.WindowTitle`
+assignment -> status bar shows the derived name within the throttle
+window), `manual_rename_disables_auto` (CLI `rename-window` -> a later OSC
+title change is ignored), `pane_title_format_expands` (`display-message
+'#T'` returns the FULL title, distinguishing it from the derived-and-
+truncated window name).

@@ -17,6 +17,12 @@ use crate::keys;
 /// reconfigured via `set_repeat_time` (`set -g repeat-time`).
 pub const REPEAT_TIME: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Default escape-time window (tmux default, `options::escape-time`'s
+/// default too — sub-project 4, Task 9): a per-client `KeyMachine` starts
+/// with this and can be reconfigured via `set_escape_time` (`set -g
+/// escape-time`). See `escape_ready`/`flush_now`'s doc comments.
+pub const ESCAPE_TIME: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Which binding table a decoded key should be looked up against. The
 /// server owns the actual [`crate::bindings::Bindings`] table and resolves
 /// `KeyInputEvent::Key` events through it.
@@ -130,6 +136,19 @@ pub struct KeyMachine {
     state: TableState,
     repeat_until: Option<Instant>,
     capturing: bool,
+    /// Escape-time (sub-project 4, Task 9): how long an outstanding pending
+    /// ESC (`keys::KeyDecoder::pending_starts_with_escape`) may sit
+    /// unresolved before the server force-flushes it as a bare `Escape` key.
+    /// tmux default 500ms; `set -g escape-time 0` flushes on the very next
+    /// `Tick` (50ms server granularity — see `escape_ready`'s doc comment).
+    escape_time: std::time::Duration,
+    /// When the CURRENT pending-ESC buffer first appeared (`None` while no
+    /// ESC-led sequence is outstanding). Set the first time a `feed()` call
+    /// leaves `decoder.pending_starts_with_escape()` true, cleared the
+    /// moment it goes false again (sequence completed or was force-flushed)
+    /// — so it never "restarts the clock" just because more bytes of the
+    /// SAME still-incomplete sequence keep arriving.
+    pending_escape_since: Option<Instant>,
 }
 
 impl KeyMachine {
@@ -141,6 +160,8 @@ impl KeyMachine {
             state: TableState::Normal,
             repeat_until: None,
             capturing: false,
+            escape_time: ESCAPE_TIME,
+            pending_escape_since: None,
         }
     }
 
@@ -150,6 +171,14 @@ impl KeyMachine {
 
     pub fn set_repeat_time(&mut self, d: std::time::Duration) {
         self.repeat_time = d;
+    }
+
+    /// `set -g escape-time <ms>` (sub-project 4, Task 9). Does NOT
+    /// retroactively re-evaluate an already-outstanding pending ESC's age —
+    /// the new duration applies to the next `escape_ready` check, same as
+    /// `set_repeat_time`.
+    pub fn set_escape_time(&mut self, d: std::time::Duration) {
+        self.escape_time = d;
     }
 
     /// Arm the repeat window starting at `now`; see the type-level doc
@@ -164,6 +193,7 @@ impl KeyMachine {
         // transition -- mirrors the legacy machine's `pending.clear()`.
         let _ = self.decoder.flush();
         self.capturing = on;
+        self.pending_escape_since = None;
         if !on {
             self.state = TableState::Normal;
             self.repeat_until = None;
@@ -195,6 +225,61 @@ impl KeyMachine {
             }
         }
         flush_key_forward(&mut fwd, &mut out);
+        self.update_pending_escape(now);
+        out
+    }
+
+    /// Escape-time bookkeeping (sub-project 4, Task 9), run at the end of
+    /// every `feed()`: start the clock the first time a pending ESC-led
+    /// buffer appears, clear it the moment none remains.
+    fn update_pending_escape(&mut self, now: Instant) {
+        if self.decoder.pending_starts_with_escape() {
+            if self.pending_escape_since.is_none() {
+                self.pending_escape_since = Some(now);
+            }
+        } else {
+            self.pending_escape_since = None;
+        }
+    }
+
+    /// `true` once an outstanding pending ESC has aged past `escape_time` as
+    /// of `now` (sub-project 4, Task 9). The server's `Tick` handler polls
+    /// this per client (50ms granularity, matching the design spec's `## 8.
+    /// escape-time` section) and calls [`KeyMachine::flush_now`] when it
+    /// fires. `escape_time` 0 means "ready as soon as any tick observes the
+    /// pending ESC" — there is no sub-tick immediate flush, so a burst CSI
+    /// sequence that arrives split across `feed()` calls within the same
+    /// 50ms tick still completes normally rather than racing the flush.
+    pub fn escape_ready(&self, now: Instant) -> bool {
+        matches!(
+            self.pending_escape_since,
+            Some(since) if now.saturating_duration_since(since) >= self.escape_time
+        )
+    }
+
+    /// Force-drain any incomplete pending decoder buffer
+    /// (`keys::KeyDecoder::flush`) through the SAME dispatch path `feed`
+    /// uses, producing whatever `KeyInputEvent`s result — a lone pending ESC
+    /// becomes one `Key` event carrying `KeyCode::Escape`; a truncated
+    /// multi-byte sequence peels byte by byte, exactly like
+    /// `KeyDecoder::flush`'s own doc comment describes (sub-project 4, Task
+    /// 9). Called by the server's `Tick` handler once `escape_ready` reports
+    /// the pending ESC is older than `escape-time`; also clears the
+    /// pending-escape timer. A no-op (empty result) if nothing is pending.
+    pub fn flush_now(&mut self, now: Instant) -> Vec<KeyInputEvent> {
+        let mut out: Vec<KeyInputEvent> = Vec::new();
+        let mut fwd: Vec<u8> = Vec::new();
+        for item in self.decoder.flush() {
+            match item {
+                keys::DecodedInput::Key(dk) => self.dispatch_key(dk, now, &mut fwd, &mut out),
+                keys::DecodedInput::Mouse { event, raw } => {
+                    flush_key_forward(&mut fwd, &mut out);
+                    out.push(KeyInputEvent::Mouse { event, raw });
+                }
+            }
+        }
+        flush_key_forward(&mut fwd, &mut out);
+        self.pending_escape_since = None;
         out
     }
 
@@ -397,6 +482,77 @@ mod key_machine_tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0], KeyInputEvent::Forward(b"hi".to_vec()));
         assert!(matches!(events[1], KeyInputEvent::Mouse { .. }));
+    }
+
+    #[test]
+    fn lone_escape_flushes_after_escape_time() {
+        let base = Instant::now();
+        let mut m = km();
+        m.set_escape_time(Duration::from_millis(200));
+
+        // A lone ESC decodes to nothing yet -- it's buffered pending more
+        // bytes (could be the start of a CSI/SS3/meta sequence).
+        assert_eq!(m.feed(b"\x1b", base), vec![]);
+        assert!(!m.escape_ready(base + Duration::from_millis(100)), "not aged past escape-time yet");
+        assert!(m.escape_ready(base + Duration::from_millis(200)), "aged exactly to escape-time");
+
+        // The Tick handler would call flush_now once escape_ready is true;
+        // it force-resolves the pending ESC to a bare Escape key event.
+        let flushed = m.flush_now(base + Duration::from_millis(200));
+        assert_eq!(
+            flushed,
+            vec![KeyInputEvent::Key {
+                table: WhichTable::Root,
+                key: keys::Key { code: KeyCode::Escape, ctrl: false, meta: false, shift: false },
+                raw: vec![0x1b],
+            }]
+        );
+        // The pending-escape timer is cleared: no longer ready, and further
+        // input decodes fresh (not stuck mid-sequence).
+        assert!(!m.escape_ready(base + Duration::from_secs(10)));
+        assert_eq!(m.feed(b"a", base), vec![KeyInputEvent::Forward(b"a".to_vec())]);
+    }
+
+    #[test]
+    fn burst_csi_within_one_feed_never_reports_escape_ready() {
+        // The common case (SSH sends an escape sequence as one write): a
+        // complete CSI arriving in a SINGLE feed() call must decode as the
+        // arrow key, never leaving a pending ESC behind for escape-time to
+        // misfire on.
+        let base = Instant::now();
+        let mut m = km();
+        m.set_escape_time(Duration::from_millis(0));
+        assert_eq!(
+            m.feed(b"\x1b[A", base),
+            vec![KeyInputEvent::Key {
+                table: WhichTable::Root,
+                key: keys::Key { code: KeyCode::Up, ctrl: false, meta: false, shift: false },
+                raw: b"\x1b[A".to_vec(),
+            }]
+        );
+        assert!(!m.escape_ready(base + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn escape_pending_resolved_by_later_bytes_before_ready() {
+        // ESC arrives, then (before escape-time elapses) the REST of a CSI
+        // arrow arrives in a later feed() call: it must complete normally as
+        // Up, not get force-flushed as a bare Escape.
+        let base = Instant::now();
+        let mut m = km();
+        m.set_escape_time(Duration::from_millis(200));
+        assert_eq!(m.feed(b"\x1b", base), vec![]);
+        let mid = base + Duration::from_millis(50);
+        assert!(!m.escape_ready(mid));
+        assert_eq!(
+            m.feed(b"[A", mid),
+            vec![KeyInputEvent::Key {
+                table: WhichTable::Root,
+                key: keys::Key { code: KeyCode::Up, ctrl: false, meta: false, shift: false },
+                raw: b"\x1b[A".to_vec(),
+            }]
+        );
+        assert!(!m.escape_ready(base + Duration::from_secs(1)), "sequence completed -- nothing pending");
     }
 
     #[test]

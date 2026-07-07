@@ -178,12 +178,17 @@ Documented deviations from real tmux, accepted for SP3's scope (global-only
 options, one dispatcher shared by all four entry points) and carried forward
 as sub-project 4 ("parity polish") candidates rather than merge blockers.
 
-25. **`escape-time` is parsed and stored but not honored.** The option
-    exists in the registry (`src/options.rs`) with tmux's default (500ms)
-    and round-trips through `set`/`show`, but nothing reads it back to
-    govern the actual Escape-vs-Alt-sequence disambiguation window in
-    `src/keys.rs`'s input decoder or `src/input.rs`'s `KeyMachine` — that
-    timing is currently a fixed constant, not configurable.
+25. **RESOLVED** (sub-project 4, Task 9). `escape-time` is parsed and
+    stored but not honored. The option exists in the registry
+    (`src/options.rs`) with tmux's default (500ms) and round-trips through
+    `set`/`show`, but nothing reads it back to govern the actual
+    Escape-vs-Alt-sequence disambiguation window in `src/keys.rs`'s input
+    decoder or `src/input.rs`'s `KeyMachine` — that timing is currently a
+    fixed constant, not configurable. Now wired end to end: `KeyDecoder::
+    pending_starts_with_escape` + `KeyMachine::set_escape_time`/
+    `escape_ready`/`flush_now`, driven by the server's `Tick` handler — see
+    `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## naming`
+    section.
 26. **No per-session/per-window option scopes.** `Options` (Task 4) is one
     global instance on `Server`, matching tmux's `-g` (global) scope only;
     real tmux allows session- and window-level overlays (`set -w`,
@@ -198,10 +203,20 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (`#{?...}`), no arithmetic/string format functions. `status-right`'s
     real tmux default (`#{=21:pane_title}`-bearing) is out of reach for this
     reason (documented deviation in `src/options.rs`'s `default_value`).
-28. **`automatic-rename` is inert.** The option is registered with tmux's
-    default (`on`) and round-trips through `set`/`show`, but no code path
-    actually renames a window based on its running command — window names
-    only ever change via explicit `rename-window`/the `,` prompt/config.
+28. **RESOLVED** (sub-project 4, Task 9). `automatic-rename` is inert. The
+    option is registered with tmux's default (`on`) and round-trips through
+    `set`/`show`, but no code path actually renames a window based on its
+    running command — window names only ever change via explicit
+    `rename-window`/the `,` prompt/config. Now wired: a window's active
+    pane's OSC title (`grid::Grid`'s Task 1 capture) drives
+    `Server::maybe_auto_rename`, gated by the global option AND a new
+    per-window `model::Window::auto_rename` flag (permanently cleared by
+    any manual rename) — see the `## naming` section referenced above.
+    Documented divergence (unchanged from the design spec): the name
+    derives from the console title (ConPTY surfaces `SetConsoleTitle` as
+    OSC 0), not the foreground process, and `allow-rename`/ESC k remains
+    deferred (item still tracked implicitly via the design spec's
+    "Documented deferrals" list, not separately itemized here).
 29. **`status-interval` is stored but unused for a general refresh timer.**
     The status-right clock still only re-renders on a minute-granularity
     change-detector (`server.rs`'s `local_clock`/Tick handling, inherited

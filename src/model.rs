@@ -8,7 +8,7 @@
 //! `## model` section of the sibling interfaces contract).
 
 use crate::layout::{Layout, PaneId};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// Server-global, monotonically increasing window id — NOT the tmux window
 /// index (`Window::index`), which is per-session and reused after gaps.
@@ -28,6 +28,26 @@ pub struct Window {
     /// -- manual splits/resizes never touch this field, so `next-layout`
     /// still resumes from wherever the cycle last landed, matching tmux).
     pub last_layout: Option<u8>,
+    /// `automatic-rename` (Task 9, sub-project 4): `true` (tmux default)
+    /// while this window's name should keep tracking its ACTIVE pane's OSC
+    /// title. Any MANUAL naming — `rename-window`/the `,` prompt commit, or
+    /// an explicit `-n`/name given to `new-window`/`break-pane` — sets this
+    /// `false` PERMANENTLY for this window (tmux precedence: a later global
+    /// `set -g automatic-rename on` resumes auto-renaming for windows that
+    /// are still eligible, but never reactivates a window whose name was
+    /// set explicitly — real tmux has a genuine per-window
+    /// `set-window-option automatic-rename on` escape hatch for that; out of
+    /// scope here since winmux has no per-window option overlays, see
+    /// `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## naming`
+    /// section). Whether a rename actually FIRES also requires the global
+    /// `automatic-rename` option to be on (`server::Server::maybe_auto_rename`
+    /// ANDs both).
+    pub auto_rename: bool,
+    /// Throttle bookkeeping for automatic-rename (tmux `NAME_INTERVAL`,
+    /// 500ms): the last time this window's name was actually changed by the
+    /// auto-rename path, so a chatty pane can't rename it more than once per
+    /// throttle window. `None` until the first automatic rename.
+    pub last_auto_rename: Option<Instant>,
 }
 
 pub struct Session {
@@ -139,6 +159,8 @@ impl Registry {
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
             last_layout: None,
+            auto_rename: true,
+            last_auto_rename: None,
         };
         let session = Session {
             name,
@@ -262,6 +284,8 @@ impl Session {
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
             last_layout: None,
+            auto_rename: true,
+            last_auto_rename: None,
         };
         let pos = self
             .windows
