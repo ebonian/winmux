@@ -253,6 +253,46 @@ fn attach_missing_session_error() {
     );
 }
 
+/// `attach-session` with no `-t` sends `AttachMode::Existing` with an empty
+/// name; the server (`Registry::find`, Task 8 amendment) resolves that to
+/// the most recently created session, or `"no sessions"` if the registry is
+/// empty — never an (always-matching) empty-string prefix.
+#[test]
+fn attach_empty_target_picks_most_recent() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    // No sessions yet: empty target is an error, not an ambiguous match.
+    let mut probe = Client::connect(&name);
+    attach(&mut probe, AttachMode::Existing, "", 80, 24);
+    assert_eq!(probe.recv(), ServerMsg::Exit { code: 1, msg: "no sessions".to_string() });
+
+    let mut c1 = Client::connect(&name);
+    attach(&mut c1, AttachMode::NewNamed, "e1", 80, 24);
+    let mut g1 = Grid::new(80, 24);
+    c1.recv_output_until(&mut g1, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut c2 = Client::connect(&name);
+    attach(&mut c2, AttachMode::NewNamed, "e2", 80, 24);
+    let mut g2 = Grid::new(80, 24);
+    c2.recv_output_until(&mut g2, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // Empty target attaches to "e2" (most recently created), not "e1".
+    let mut c3 = Client::connect(&name);
+    attach(&mut c3, AttachMode::Existing, "", 80, 24);
+    let mut g3 = Grid::new(80, 24);
+    c3.recv_output_until(&mut g3, |g| screen_text(g).iter().any(|l| l.contains("[e2] ")));
+
+    // Clean up via a one-shot CLI kill-server so the server thread exits.
+    let mut cli = Client::connect(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".to_string()]));
+    match cli.recv() {
+        ServerMsg::CliDone { code, .. } => assert_eq!(code, 0),
+        other => panic!("expected CliDone, got {other:?}"),
+    }
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn detach_frame_returns_message() {
     let name = unique_pipe_name();

@@ -75,10 +75,33 @@ fn process_exited(raw: isize) -> bool {
     unsafe { WaitForSingleObject(HANDLE(raw as *mut core::ffi::c_void), 0) == WAIT_OBJECT_0 }
 }
 
+/// Kills any server left on `socket` when dropped (best-effort; tolerates
+/// failure — e.g. the test already killed it via `kill-server`, or the
+/// server never actually started). winmux now auto-starts a detached server
+/// process on bare invocation (server/client split, sub-project 2); without
+/// this guard a test failure partway through could leave that process
+/// running indefinitely on a real pipe name.
+struct ServerGuard {
+    socket: String,
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_winmux"))
+            .args(["-L", &self.socket, "kill-server"])
+            .status();
+    }
+}
+
 #[test]
 fn e2e_split_kill_exit() {
+    // Unique -L socket per test run so no server outlives this test and no
+    // two runs collide on the default pipe name.
+    let socket = format!("e2e-mvp-{}", std::process::id());
+    let _guard = ServerGuard { socket: socket.clone() };
+
     // Quote the exe path (it may contain spaces) for the ConPTY command line.
-    let cmdline = format!("\"{}\"", env!("CARGO_BIN_EXE_winmux"));
+    let cmdline = format!("\"{}\" -L {}", env!("CARGO_BIN_EXE_winmux"), socket);
     let mut pty = Pty::spawn(&cmdline, COLS, ROWS).expect("spawn winmux under ConPTY");
     let proc_raw = pty.process_handle_raw();
     let mut reader = pty.take_reader().expect("take winmux output reader");
@@ -102,14 +125,17 @@ fn e2e_split_kill_exit() {
 
     let mut grid = Grid::new(COLS, ROWS);
 
-    // 1. Status bar appears.
+    // 1. Status bar appears. Bare `winmux` now attaches to an auto-named
+    //    session ("0", the lowest unused non-negative integer) instead of
+    //    the MVP's hardcoded "[winmux]" — check for the window tab instead,
+    //    which is stable regardless of the session name.
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
         wait_until(deadline, || {
             pump(&mut grid, &rx);
-            screen_text(&grid).iter().any(|l| l.contains("[winmux]"))
+            screen_text(&grid).iter().any(|l| l.contains("0:powershell*"))
         }),
-        "status-bar marker '[winmux]' never appeared; screen:\n{}",
+        "status-bar window tab '0:powershell*' never appeared; screen:\n{}",
         screen_text(&grid).join("\n")
     );
 

@@ -428,6 +428,26 @@ pseudoconsole and unblocks the reader thread.
 
 ## `host` — host terminal control
 
+**Amendment (sub-project 2, Task 8):**
+
+- `Host::enter()`'s internal ordering changed (follow-up #3): every value
+  needed to restore the console (code pages via `Get*`, console modes via
+  `GetConsoleMode`) is now gathered FIRST, the `RESTORE` snapshot is
+  published, and only THEN do the `Set*` mutations (UTF-8 code pages, VT
+  processing / raw stdin mode) run. Previously the code pages were mutated
+  before `RESTORE` was published, so a panic between those two steps would
+  have left the panic hook/`Drop` restoring a snapshot that didn't yet
+  reflect the just-mutated code pages. Observable behavior of `enter()`
+  (final modes, alt-screen entry) is unchanged; only the failure-window
+  ordering is tightened.
+- New free function `pub fn console_size() -> std::io::Result<(u16, u16)>`:
+  queries `GetConsoleScreenBufferInfo` against `STD_OUTPUT_HANDLE` directly
+  (shares its `srWindow`-based calculation with `Host::size` via a private
+  `query_size` helper), without constructing a `Host` — no mode changes, no
+  alt-screen entry. Used by `main.rs` to size the initial `Attach` frame
+  (and as an 80x24 fallback source) before deciding whether to become an
+  attached client at all.
+
 ```rust
 pub struct Host { /* private: saved stdin/stdout modes */ }
 
@@ -459,6 +479,15 @@ Host resize detection: no event in the byte stream — the app polls
 `host.size()` on its tick (see below) and compares.
 
 ## `app` — event loop
+
+**Superseded (sub-project 2, Task 8):** `src/app.rs` and its `pub mod app;`
+declaration are DELETED. The single-process event loop described below was
+replaced wholesale by the server/client split — `src/server.rs` owns the
+loop shape server-side (headless, multi-session/window) and `src/client.rs`
++ `src/cli.rs` + `src/main.rs` are the thin client/CLI side. See
+[`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md)'s
+`## server`, `## cli`, and `## client` sections. This section is kept only
+as a historical record of the MVP's shape.
 
 ```rust
 pub enum Event {

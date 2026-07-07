@@ -109,8 +109,16 @@ impl Registry {
     /// an exact match wins outright, then an unambiguous prefix match;
     /// anything else (no match, or an ambiguous prefix) is
     /// `Err("can't find session: <target>")` (using the target with any `=`
-    /// sigil already stripped).
+    /// sigil already stripped). An EMPTY target is a special case (Task 8
+    /// amendment, for `attach-session` with no `-t`, i.e. no "current
+    /// client" to fall back on the way the interactive prefix-key bindings
+    /// do): it resolves to the most recently created session
+    /// (`sessions().last()`), or `Err("no sessions")` if the registry is
+    /// empty — never treated as an (always-matching) empty-string prefix.
     pub fn find(&mut self, target: &str) -> Result<&mut Session, String> {
+        if target.is_empty() {
+            return self.sessions.last_mut().ok_or_else(|| "no sessions".to_string());
+        }
         if let Some(name) = target.strip_prefix('=') {
             return self
                 .sessions
@@ -375,6 +383,20 @@ mod tests {
         assert_eq!(r.find("fo").err().unwrap(), "can't find session: fo");
         // No match at all.
         assert_eq!(r.find("zzz").err().unwrap(), "can't find session: zzz");
+    }
+
+    #[test]
+    fn find_empty_target_picks_most_recent() {
+        let mut r = Registry::new();
+        r.create_session(Some("foo"), 1, SZ).unwrap();
+        r.create_session(Some("bar"), 2, SZ).unwrap();
+        assert_eq!(r.find("").unwrap().name, "bar");
+    }
+
+    #[test]
+    fn find_empty_target_no_sessions_is_error() {
+        let mut r = Registry::new();
+        assert_eq!(r.find("").err().unwrap(), "no sessions");
     }
 
     #[test]

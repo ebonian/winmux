@@ -236,6 +236,20 @@ impl Session {
 - Exact name match always wins over prefix matching, even when the exact
   name is itself a prefix of another session's name (e.g. sessions "foo"
   and "foobar": `find("foo")` returns "foo", not an ambiguity error).
+- **Amendment (Task 8):** an EMPTY `target` is a special case checked before
+  anything else in `find` — it resolves to the most recently created
+  session (`sessions().last()`, i.e. `Registry`'s creation-order `Vec`), or
+  `Err("no sessions")` if the registry is empty. This is NOT the same as an
+  always-matching empty-string prefix (which the old prefix-matching branch
+  would otherwise produce when 2+ sessions exist — an ambiguity error).
+  Added to support `attach-session`/`Attach{mode: Existing, ...}` with no
+  `-t`/target: the CLI has no "current client" context to fall back on
+  (unlike the interactive prefix-key bindings), so the server picks the
+  newest session instead. Test: `Registry`'s own
+  `find_empty_target_picks_most_recent` /
+  `find_empty_target_no_sessions_is_error` (`src/model.rs`), plus
+  `tests/server_proto.rs::attach_empty_target_picks_most_recent` exercising
+  it end-to-end over the wire.
 - `kill_session`/`session_mut` are exact-name-only (no prefix rules, no `=`
   handling) — `find` is the only tmux-target-resolving entry point.
 - `Session::kill_window` on the only remaining window is a no-op returning
@@ -587,6 +601,148 @@ unchanged. Regression coverage:
 **Implementation module:** `src/server.rs`. Consumes `protocol`, `pipe`,
 `model`, `input`, `render`, `status`, `pty`, `grid`, `layout`; produces only
 `pub fn run`. Integration-tested end to end (no console, no ConPTY on the
-client side) by `tests/server_proto.rs`'s 28 tests (9 from Task 6 plus 19
-added in Task 7: window ops, prompts, transient messages, switch-client,
-pane-exit auto-close, and the CLI subset).
+client side) by `tests/server_proto.rs`'s 32 tests: 9 from Task 6, 19 added
+in Task 7 (window ops, prompts, transient messages, switch-client,
+pane-exit auto-close, and the CLI subset) plus a few more added during
+Task 7's review-fix passes, and Task 8's
+`attach_empty_target_picks_most_recent` covering the empty-target
+`Existing` attach amendment above.
+
+## `cli` — argv parser (pure, Task 8)
+
+```rust
+pub struct Invocation { pub socket: String /* -L, default "default" */, pub cmd: Command }
+
+pub enum Command {
+    NewSession { name: Option<String>, detached: bool, cols: u16, rows: u16 },
+    Attach { target: Option<String>, detach_others: bool },
+    Control(Vec<String>),
+    ServerRole { pipe: String },
+    Help,
+}
+
+pub fn parse(args: &[String]) -> Result<Invocation, String>; // Err = usage message
+pub fn usage_text() -> &'static str; // printed by main.rs for `Help`, exit 0
+```
+
+**Behavior:**
+
+- `-L <name>` is extracted from ANYWHERE in `args` (before or after the
+  subcommand token), leaving the remaining tokens in order; none of the
+  supported subcommands has a flag of its own named `-L`, so this can't
+  collide with a passed-through `Control` argv. Missing value after `-L` is
+  a usage error.
+- Empty `args` (bare `winmux`) → `NewSession { name: None, detached: false,
+  cols: 0, rows: 0 }`. `cols`/`rows` are `0` when not given on the command
+  line (by `-x`/`-y` or the bare-defaults case) — NOT the real terminal
+  size; `main.rs` fills that in afterward (console probe for an attached
+  session, `80x24` for a detached one), per the "CLAMP dims: `-x`/`-y`
+  override" rule in the design spec.
+- `new-session`/`new [-d] [-s name] [-x cols] [-y rows]` → `NewSession`;
+  `-x`/`-y` values that don't parse as `u16` are a usage error. Any token
+  not matching one of the four flags is a usage error (flags are never
+  silently demoted to positionals, mirroring `server.rs`'s own CLI-argv
+  convention).
+- `attach-session`/`attach`/`a [-d] [-t target]` → `Attach`. Note `-d` here
+  means `detach_others` (tmux's attach `-d`, "detach every other client
+  already on that session") — a DIFFERENT meaning from `new-session -d`'s
+  "detached" (don't attach a client at all). Any token other than `-d`/`-t`
+  is a usage error.
+- `__server --pipe <full-pipe-name>` → `ServerRole { pipe }`; anything else
+  after `__server` (missing `--pipe`, missing value, extra tokens) is a
+  usage error. This is a hidden role — never advertised in `usage_text()`.
+- `--help` / `-h` / `help` (as the first non-`-L` token) → `Help`.
+- Any other token starting with `-` as the first non-`-L` token → a usage
+  error (`Err`) — there is no bare top-level flag other than `-L`/`-h`.
+- Everything else (first token doesn't match any of the above, and doesn't
+  start with `-`) → `Control(rest)`, the ENTIRE remaining token list
+  (including that first token) forwarded verbatim — `ls`, `list-sessions`,
+  `has-session`/`has`, `kill-session`, `kill-server`, `rename-session`,
+  `rename-window`, `list-windows`/`lsw`, `detach-client`, and any unknown
+  command name are all routed here; `cli.rs` does not validate them further
+  — `server.rs`'s `execute_cli`/`CliArgs` (see `## server` above) owns that,
+  replying `CliDone{1, "", "unknown command"}` for anything it doesn't
+  recognize.
+
+**Implementation module:** `src/cli.rs`, pure (`&[String]` in, no I/O, no
+Windows APIs) — unit-tested directly: `bare_is_new_session`, `new_flags`,
+`ls_alias`, `attach_t`, `attach_dashd`, `dash_l_socket`, `server_role_parse`,
+`unknown_flag_err`, `kill_session_passthrough`, `help_parses`.
+
+## `client` — thin attach client + server autostart (Task 8)
+
+```rust
+pub fn attach(pipe_full_name: &str, first: protocol::ClientMsg) -> Result<i32, Box<dyn std::error::Error>>;
+pub fn autostart_server(socket: &str) -> std::io::Result<()>;
+```
+
+**`attach`:** connects to `pipe_full_name`, sends `first` (an `Attach`
+frame, already built by the caller with the right `AttachMode`/size/name),
+then `Host::enter()`s and runs until the server sends a terminal message:
+
+- A stdin-reader thread (its own `PipeConn::try_clone`) blocks in
+  `host::read_stdin`, forwarding each chunk as a `Stdin` frame; on read
+  failure or EOF (console closing) it sends a best-effort `Detach` frame
+  before exiting. This thread is NEVER joined or cancelled — `main.rs`'s
+  `std::process::exit` after `attach` returns is what reclaims it (see
+  below).
+- A second reader thread (another `try_clone`) decodes `ServerMsg` frames
+  and relays them to the main loop over an `mpsc` channel, so the main loop
+  can ALSO wake up on a 50ms tick (a plain blocking read on the main thread
+  can't do both).
+- Main loop: `recv_timeout(50ms)`. `Output` → `host.write`. `Exit{code,
+  msg}` → drop `Host` FIRST (restores the console), THEN print `msg`
+  (stdout if `code == 0`, else stderr), THEN return `code as i32` — this
+  ordering is load-bearing, not cosmetic: the message must land on the
+  restored normal screen, not the alt screen the pane content was drawn
+  into. `CliDone` is ignored (not expected on an attached connection).
+  Reader error/EOF without an `Exit`, or the reader thread hanging up
+  (`RecvTimeoutError::Disconnected`) → drop `Host`, print `"[lost server]"`
+  to stderr, return `1`. On `RecvTimeoutError::Timeout`: poll `host.size()`;
+  if changed since the last known size, send a `Resize` frame over the
+  ORIGINAL connection (not a clone — the reader/writer split only needs two
+  of the three duplicates to be independent, since only the main thread
+  ever writes `Resize`/the initial `Attach`, and only the stdin thread ever
+  writes `Stdin`/`Detach`).
+- **Documented caveat** (task brief, verified true): `host::read_stdin` has
+  no clean cancellation — it blocks in `ReadFile` until the NEXT keystroke
+  even after `attach` has returned. This is fine ONLY because every caller
+  (`main.rs`) immediately calls `std::process::exit` with `attach`'s return
+  code, which tears down the whole process (and that leaked thread) right
+  away; `attach` must never be called from a context that expects to keep
+  running afterward.
+
+**`autostart_server`:** builds `pipe::pipe_name(socket)`, spawns
+`std::env::current_exe()` as `<exe> __server --pipe <full-name>` with
+`creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)` (`0x8 |
+0x200`, via `std::os::windows::process::CommandExt`) so the server has no
+console of its own and outlives the spawning client's console, then polls
+`PipeConn::connect` on that same pipe every 50ms for up to 5s. Returns
+`Ok(())` the first time a connect succeeds (the connection itself is
+dropped immediately — this call is purely a readiness probe); the CALLER
+does its own real `PipeConn::connect` afterward. Times out as the last
+`NotFound` error if 5s elapses without success; any OTHER connect error
+(not `NotFound`) is returned immediately without waiting out the timeout.
+
+**`main.rs` routing** (not part of the locked interface, but the only
+caller, so documented here for context): `ServerRole` installs a SECOND,
+file-logging panic hook (chained in front of `host::install_panic_hook`'s
+console-restoring one via `take_hook`/`set_hook`, appending to
+`%LOCALAPPDATA%\winmux\server.log`) before calling `server::run`, since the
+server process has no console to print to. `NewSession{detached: false}`
+probes-then-autostarts (`PipeConn::connect`; `NotFound` →
+`client::autostart_server`), sizes the `Attach` frame from
+`host::console_size()` (fallback `80x24`, overridden by nonzero `-x`/`-y`),
+and calls `client::attach`. `NewSession{detached: true}` probes-then-
+autostarts the same way, then sends a one-shot `new-session -d [-s name] -x
+<cols> -y <rows>` `Control` command (defaulting unset `-x`/`-y` to `80`/`24`
+directly, since there's no console to probe for a session nobody is
+attaching to). `Attach` and `Control` both connect WITHOUT autostarting —
+`NotFound` prints `no server running on <pipe>` and exits 1 — matching the
+design spec's "pure queries... error... auto-start: new-session... starts
+the server" rule.
+
+**Implementation module:** `src/client.rs`. No unit tests (pure I/O glue:
+threads, a live named pipe, a live console) — coverage is
+`tests/e2e.rs::e2e_split_kill_exit` (drives the real attached-client path
+through `client::attach` end to end under a ConPTY) plus manual runs.

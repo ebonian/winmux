@@ -1,4 +1,12 @@
-use winmux::{app, host};
+use std::env;
+use std::io::{self, Write};
+
+use winmux::cli::{self, Command};
+use winmux::client;
+use winmux::host;
+use winmux::pipe::{self, PipeConn};
+use winmux::protocol::{self, AttachMode, ClientMsg, ServerMsg};
+use winmux::server;
 
 fn main() {
     // Drop PSModulePath from our environment so pane shells inherit a clean
@@ -11,13 +19,221 @@ fn main() {
     // edition reconstructs its own correct default module path. (Trade-off:
     // a user-customized PSModulePath is not forwarded to panes.)
     //
-    // Must happen before any pane spawns and while still single-threaded
-    // (mutating the environment is not thread-safe on Windows).
-    std::env::remove_var("PSModulePath");
+    // Must happen before any pane spawns (including server-spawned ones, so
+    // this must run in every role, not just the attached-client path) and
+    // while still single-threaded (mutating the environment is not
+    // thread-safe on Windows).
+    env::remove_var("PSModulePath");
 
     host::install_panic_hook();
-    if let Err(e) = app::run() {
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    let invocation = match cli::parse(&args) {
+        Ok(inv) => inv,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
+    let code = match invocation.cmd {
+        Command::Help => {
+            print!("{}", cli::usage_text());
+            0
+        }
+        Command::ServerRole { pipe } => run_server_role(&pipe),
+        Command::NewSession { name, detached, cols, rows } => {
+            run_new_session(&invocation.socket, name, detached, cols, rows)
+        }
+        Command::Attach { target, detach_others } => {
+            run_attach(&invocation.socket, target, detach_others)
+        }
+        Command::Control(argv) => run_control(&invocation.socket, argv),
+    };
+    std::process::exit(code);
+}
+
+/// Connect to `pipe`; if nothing is bound there yet (`NotFound`), autostart
+/// the server on `socket` and wait for it to come up. Any other connect
+/// error is propagated as-is.
+fn ensure_server(pipe: &str, socket: &str) -> io::Result<()> {
+    match PipeConn::connect(pipe) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => client::autostart_server(socket),
+        Err(e) => Err(e),
+    }
+}
+
+fn run_new_session(
+    socket: &str,
+    name: Option<String>,
+    detached: bool,
+    cols: u16,
+    rows: u16,
+) -> i32 {
+    let pipe_full_name = pipe::pipe_name(socket);
+    if let Err(e) = ensure_server(&pipe_full_name, socket) {
+        eprintln!("winmux: failed to start server: {e}");
+        return 1;
+    }
+
+    if detached {
+        let cols = if cols != 0 { cols } else { 80 };
+        let rows = if rows != 0 { rows } else { 24 };
+        let mut argv = vec!["new-session".to_string(), "-d".to_string()];
+        if let Some(n) = &name {
+            argv.push("-s".to_string());
+            argv.push(n.clone());
+        }
+        argv.push("-x".to_string());
+        argv.push(cols.to_string());
+        argv.push("-y".to_string());
+        argv.push(rows.to_string());
+        return send_cli(&pipe_full_name, argv);
+    }
+
+    let (probe_cols, probe_rows) = host::console_size().unwrap_or((80, 24));
+    let cols = if cols != 0 { cols } else { probe_cols };
+    let rows = if rows != 0 { rows } else { probe_rows };
+    let mode = if name.is_some() { AttachMode::NewNamed } else { AttachMode::NewAuto };
+    let first = ClientMsg::Attach {
+        mode,
+        detach_others: false,
+        cols,
+        rows,
+        name: name.unwrap_or_default(),
+    };
+    run_attach_client(&pipe_full_name, first)
+}
+
+fn run_attach(socket: &str, target: Option<String>, detach_others: bool) -> i32 {
+    let pipe_full_name = pipe::pipe_name(socket);
+    // NO autostart: a pure attach against a missing server is an error.
+    if let Err(e) = probe_running(&pipe_full_name) {
+        return report_connect_error(&pipe_full_name, e);
+    }
+
+    let (cols, rows) = host::console_size().unwrap_or((80, 24));
+    let first = ClientMsg::Attach {
+        mode: AttachMode::Existing,
+        detach_others,
+        cols,
+        rows,
+        name: target.unwrap_or_default(),
+    };
+    run_attach_client(&pipe_full_name, first)
+}
+
+fn run_control(socket: &str, argv: Vec<String>) -> i32 {
+    let pipe_full_name = pipe::pipe_name(socket);
+    // NO autostart: a pure query/control command against a missing server
+    // is an error (only `new-session`, including bare, auto-starts).
+    send_cli(&pipe_full_name, argv)
+}
+
+/// `Ok(())` if a server is already listening on `pipe`; otherwise the
+/// connect error (including `NotFound`) is returned for the caller to report.
+fn probe_running(pipe: &str) -> io::Result<()> {
+    PipeConn::connect(pipe).map(|_| ())
+}
+
+fn report_connect_error(pipe: &str, e: io::Error) -> i32 {
+    if e.kind() == io::ErrorKind::NotFound {
+        eprintln!("no server running on {pipe}");
+    } else {
         eprintln!("winmux: {e}");
-        std::process::exit(1);
+    }
+    1
+}
+
+fn run_attach_client(pipe_full_name: &str, first: ClientMsg) -> i32 {
+    match client::attach(pipe_full_name, first) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("winmux: {e}");
+            1
+        }
+    }
+}
+
+/// One-shot control round trip: connect (no autostart), send `Cli(argv)`,
+/// print the `CliDone` reply, exit with its code.
+fn send_cli(pipe_full_name: &str, argv: Vec<String>) -> i32 {
+    let mut conn = match PipeConn::connect(pipe_full_name) {
+        Ok(c) => c,
+        Err(e) => return report_connect_error(pipe_full_name, e),
+    };
+    if let Err(e) = protocol::write_client_msg(&mut conn, &ClientMsg::Cli(argv)) {
+        eprintln!("winmux: {e}");
+        return 1;
+    }
+    match protocol::read_server_msg(&mut conn) {
+        Ok(ServerMsg::CliDone { code, out, err }) => {
+            if !out.is_empty() {
+                print!("{out}");
+            }
+            if !err.is_empty() {
+                eprint!("{err}");
+            }
+            code as i32
+        }
+        Ok(other) => {
+            eprintln!("winmux: unexpected server reply: {other:?}");
+            1
+        }
+        Err(e) => {
+            eprintln!("winmux: {e}");
+            1
+        }
+    }
+}
+
+// ---- server role: headless, logs to a file instead of a console ----------
+
+fn server_log_dir() -> Option<std::path::PathBuf> {
+    let base = env::var_os("LOCALAPPDATA")?;
+    let mut p = std::path::PathBuf::from(base);
+    p.push("winmux");
+    Some(p)
+}
+
+/// Best-effort append of one line to `%LOCALAPPDATA%\winmux\server.log`. The
+/// server has no console to print to, so this is its only diagnostic output.
+fn log_line(msg: &str) {
+    let Some(dir) = server_log_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// Chain a file-logging panic hook in front of whatever's already installed
+/// (`host::install_panic_hook`, from `main`) — the server is headless, so
+/// the console-restoration hook underneath is harmless but the panic must
+/// also be recorded somewhere a developer can find it.
+fn install_server_log_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log_line(&format!("panic: {info}"));
+        previous(info);
+    }));
+}
+
+fn run_server_role(pipe: &str) -> i32 {
+    log_line("server starting");
+    install_server_log_panic_hook();
+    match server::run(pipe) {
+        Ok(()) => {
+            log_line("server exited cleanly (exit-empty)");
+            0
+        }
+        Err(e) => {
+            log_line(&format!("server error: {e}"));
+            1
+        }
     }
 }
