@@ -611,3 +611,18 @@ None block the sub-project 4 merge.
     contract-surgery scope to the items it was already touching; genuinely
     safe to delete whenever someone picks this up (no consumer anywhere
     reads it).
+
+64. **Stale `MouseDrag` state when an overlay opens mid-drag** (found in the
+    final SP4 fix-wave re-review). The overlay mouse guard in
+    `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse events while
+    choose-tree/display-panes are open but does not clear
+    `client.mouse.drag`, unlike the sibling "outside pane area" guard which
+    explicitly resets it. A drag armed before an overlay opens (keyboard-
+    triggered overlay mid-drag, or a `display-panes -d` timer expiry) can
+    leave stale `Border`/`Selecting` state alive across the overlay's
+    lifetime, revivable by a later out-of-sequence `Drag`/`Up` frame with no
+    intervening `Down`. Not reachable from a conformant terminal's mouse
+    protocol (real terminals always send Down before Drag/Up), hence LOW and
+    non-blocking; fix is a one-liner (`client.mouse.drag = MouseDrag::None`
+    in the overlay guard arm) plus a test that arms a drag, opens an
+    overlay, and asserts the drag state is cleared.
