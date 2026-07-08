@@ -73,13 +73,30 @@ previous and is independently useful.
 | **1** | **Multiplexing MVP** — DELIVERED | ConPTY-spawned PowerShell panes, VT parsing, a split-tree layout, panes + borders + status bar drawn into the host terminal, prefix-key handling, split/switch/resize/close panes. **One session, one window, one attached client, no detach.** |
 | **2** | **Server/client split + sessions + detach** — DELIVERED | Daemonized background server, named-pipe client↔server protocol, multiple sessions and windows, detach/attach, tmux CLI subset, survives SSH disconnect. |
 | **3** | **Command layer + config compatibility** — DELIVERED | One command dispatcher (`cmd`/`options`/`keys`/`style`/`bindings` modules) powering all four entry points: keybindings, the `winmux <cmd>` CLI, the `prefix-:` command prompt, and a real `.tmux.conf`/`-f`/`.winmux.conf` config loader — `set-option`/`set`, `bind-key`/`bind`, `unbind-key`, styles/colors, `status-left`/`status-right` formatting, `base-index`/`pane-base-index`, prefix remapping, and option-driven status/border/message styling. |
-| **4** | **Parity polish** | Copy mode, mouse support, per-session/window option scopes, a fuller format-string engine, the long tail. |
+| **4** | **Parity polish** — DELIVERED | Copy mode (emacs+vi tables, selection incl. rectangle, search), paste buffers, mouse (click/drag/wheel/status), layout presets + swap/rotate, break/move/find-window, choose-tree + display-panes overlays, escape-time, automatic-rename. |
 
 **Build order:** sub-project 1 first (visible, motivating, proves the hardest
 rendering/ConPTY problems), then 2 → 3 → 4.
+
+## PROJECT COMPLETE
+
+All four planned sub-projects are delivered as of sub-project 4's merge. The
+originally scoped tmux-alternative feature set — multiplexing, server/client
+split with detach/attach, real `.tmux.conf` config compatibility, and the
+parity-polish long tail (copy mode, mouse, layouts, overlays) — is done.
+`tests/e2e_copy_mouse.rs` is the full-stack proof for sub-project 4's two
+biggest features (copy-mode roundtrip and mouse), driving the real binary
+under a test-owned ConPTY exactly like the sub-project 1–3 e2e suites.
+Known/deferred gaps (documented, non-blocking divergences from real tmux)
+live in `docs/follow-ups.md`.
+
+A further sub-project — TPM-style plugin support — has been researched but
+is future work, not part of the planned scope above: see
+[`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`](superpowers/plans/2026-07-08-tpm-plugin-support.md).
 
 ## Specs
 
 - [`specs/2026-07-06-multiplexing-mvp-design.md`](specs/2026-07-06-multiplexing-mvp-design.md) — sub-project 1 (delivered); companion interface contract [`specs/2026-07-06-mvp-interfaces.md`](specs/2026-07-06-mvp-interfaces.md)
 - [`specs/2026-07-07-server-client-design.md`](specs/2026-07-07-server-client-design.md) — sub-project 2 (delivered); companion interface contract [`specs/2026-07-07-server-client-interfaces.md`](specs/2026-07-07-server-client-interfaces.md)
 - [`specs/2026-07-07-command-config-design.md`](specs/2026-07-07-command-config-design.md) — sub-project 3 (delivered); companion interface contract [`specs/2026-07-07-command-config-interfaces.md`](specs/2026-07-07-command-config-interfaces.md)
+- [`specs/2026-07-07-parity-polish-design.md`](specs/2026-07-07-parity-polish-design.md) — sub-project 4 (delivered); companion interface contract [`specs/2026-07-07-parity-polish-interfaces.md`](specs/2026-07-07-parity-polish-interfaces.md)

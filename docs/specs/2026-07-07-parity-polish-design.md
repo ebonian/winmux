@@ -1,6 +1,12 @@
 # Sub-project 4 — Parity polish: copy mode, mouse, overlays, layouts, the long tail
 
-Status: **Active design spec.** Companion contract:
+Status: **Delivered.** All ten tasks (grid v2, copy-mode core, selection +
+paste buffers, copy-mode search, mouse, layout presets, window ops,
+overlays, escape-time + automatic-rename, and this closeout task) are merged
+as of `feature/parity-polish`; `tests/e2e_copy_mouse.rs` is the full-stack
+proof for copy mode and mouse. Sub-project 4 completes the planned four
+sub-project roadmap (see `docs/overview.md`'s "PROJECT COMPLETE" section).
+Companion contract:
 [`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
 (created/extended task-by-task, same lock rules). Behavioral ground truth
 below was verified against tmux master source (2026-07-07); classic (≤3.5)

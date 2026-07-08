@@ -428,3 +428,107 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (design spec `## 7. Overlays`), `find-window` could route multi-match
     results through it instead of the deterministic first-match jump —
     tracked here so that follow-up wiring has a home.
+
+## Deferred from sub-project 4 (parity polish, closeout — 2026-07-08)
+
+Ticketed by Task 10 (e2e + docs closeout) from `docs/specs/2026-07-07-parity-polish-design.md`'s
+"## Documented deferrals" list (its closing line: "ticket in follow-ups.md at
+closeout"). Every item below was a DELIBERATE v1 scope decision documented in
+the design spec at the time its owning task shipped, not a bug discovered
+after the fact — cross-referenced against follow-ups #34-46 above to avoid
+duplicates (mouse-forwarding-to-pane-apps is already #35; automatic-rename's
+`allow-rename`/ESC k gap was noted inline at #28 but explicitly left
+"not separately itemized" there, so it gets its own ticket here as promised).
+None block the sub-project 4 merge.
+
+47. **Scrollback does not reflow on terminal resize** (Task 1, grid v2). Real
+    tmux (≥1.9) reflows scrollback content to the new width on resize;
+    winmux's `VecDeque<Vec<Cell>>` scrollback lines are clipped/padded to the
+    new width lazily on READ instead (design spec `## 1. Grid`: "NO reflow
+    on resize ... documented winmux divergence, ticket"). A resize mid-copy-
+    mode-scroll can therefore show ragged/truncated historical lines that
+    don't match what a reflowing terminal would show.
+48. **`choose-buffer` (`=`) is not implemented** (Task 3, paste buffers). The
+    design spec explicitly deferred a picker UI for selecting among multiple
+    named/automatic paste buffers; `paste-buffer`/`delete-buffer` always
+    default to the newest buffer (or an explicit `-b name`) with no
+    interactive chooser.
+49. **`D` (choose-client) is not implemented** (Task 7, window ops; design
+    spec `## 6. Window ops`: "`D` choose-client: DEFERRED"). There is
+    no way to list and switch/detach OTHER attached clients from within a
+    session; only `switch-client`'s session-level `(`/`)` and the CLI's
+    `detach-client` exist.
+50. **`choose-tree` has no preview, tagging, filtering, or sort options**
+    (Task 8, overlays). The design spec's `## 7. Overlays` section is
+    explicit ("No preview, no tagging (documented)"); winmux's `w`/`s`
+    overlay is a flat, unfilterable, untaggable list with plain up/down
+    navigation and no session/window content preview pane, unlike real
+    tmux's `choose-tree`.
+51. **No right-click context menus** (mouse, Task 5). Real tmux (recent
+    versions) can show a right-click menu over a pane/status-line/border;
+    winmux's mouse routing has no menu concept at all — every mouse event
+    resolves to a direct action (focus/resize/select/scroll) or is dropped,
+    never a menu.
+52. **`allow-rename` (`ESC k` / the `#{automatic-rename}` toggle escape) is
+    not implemented** (Task 9, automatic-rename; see also follow-up #28,
+    which noted this gap inline but deferred the formal ticket to this
+    closeout). `automatic-rename` is a global/window flag only
+    (`set -g automatic-rename off` / `rename-window` disabling it
+    permanently for that window); there is no per-pane-application escape
+    sequence to toggle it transiently the way real tmux's `allow-rename`
+    plus `ESC k` support.
+53. **`paste-buffer -p`'s bracketed-paste flag is accepted but has no
+    effect** (Task 3, paste buffers). Real tmux's `-p` wraps the pasted
+    bytes in `ESC[200~`/`ESC[201~` bracketed-paste markers so a
+    bracketed-paste-aware application (e.g. a shell with `bracketed-paste`
+    support) can distinguish pasted text from typed keystrokes; winmux's
+    `-p` is parsed and accepted but the write is always a plain byte dump
+    (design spec `## 3. Paste buffers`: "`-p` accepted and ignored,
+    documented").
+54. **`find-window` matching is plain case-insensitive substring, not
+    regex** (Task 7, window ops; design spec `## 6. Window ops`: "v1 no
+    regex"). A pattern like `^foo` or `bar$` is matched LITERALLY (including
+    the `^`/`$` characters) rather than as an anchor, unlike real tmux's
+    `-r`-capable regex matching.
+55. **No `copy-pipe`/OSC 52 clipboard integration in copy mode** (Tasks 2-4,
+    copy mode). Copying in copy mode only ever writes to winmux's own
+    internal paste-buffer store; there is no way to pipe a copy-mode
+    selection to an external command (tmux's `copy-pipe`/`copy-pipe-and-cancel`)
+    or to emit an OSC 52 sequence so the selection also lands on the REAL
+    system clipboard (some tmux configs wire this up for clipboard
+    integration over SSH).
+56. **Emacs copy-mode table omits `C-k` (copy-to-end-of-line-and-cancel) and
+    `M-m` (back-to-indentation)** (Task 2, copy mode; design spec `## 2. Copy
+    mode`: "`C-k` copy to end of line and cancel (defer, not in v1 tables)").
+    Both are real tmux emacs-table bindings; winmux's emacs copy-mode table
+    covers the more commonly used subset only.
+57. **Mouse bindings have no bindable NAMES** (`MouseDown1Pane`,
+    `MouseDrag1Border`, etc.) **in `bind-key`** (Task 5, mouse; design spec
+    `## 4. Mouse`: "Mouse \"bindings\" are HARDCODED v1 ... the bindings
+    table stays keyboard-only"). Every mouse behavior (click-focus,
+    border-drag-resize, wheel-scroll, etc.) is wired directly in
+    `server::dispatch::dispatch_mouse`/`mouse_down`/`mouse_wheel` rather than
+    going through the `Bindings` table, so a user cannot `bind-key -T
+    root MouseDown1Pane <command>` to customize mouse behavior the way real
+    tmux allows.
+
+## Test-flakiness follow-up (Task 10 closeout verification, 2026-07-08)
+
+58. **Concurrent-output copy-mode/selection tests in `tests/server_proto.rs`
+    have flaked under full-parallelism `cargo test`.** During Task 10's own
+    pre-merge verification, `selection_survives_concurrent_output` was
+    reported to have flaked twice previously (passing standalone and at
+    `--test-threads=4`), and in this task's own repeated `cargo test` runs
+    `other_end_survives_concurrent_output` (same shape: asserts a
+    content-pinned copy-mode endpoint stays correct while a background
+    thread concurrently feeds the pane new output) flaked once out of three
+    full-suite runs — also confirmed to pass standalone and at
+    `--test-threads=4` immediately after. Both tests are inherently
+    timing-sensitive (they race a real background writer thread against the
+    main assertion under whatever scheduling a fully-parallel `cargo test`
+    run gives the process), consistent with the project's existing
+    documented `server_proto` flakiness class (CLAUDE.md's "Commands"
+    section, `docs/follow-ups.md` general framing). Candidate fixes: widen
+    the tests' timing margins, or run the affected tests (or all of
+    `server_proto`) at a capped thread count in CI rather than full
+    default parallelism.
