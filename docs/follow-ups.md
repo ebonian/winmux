@@ -626,3 +626,14 @@ None block the sub-project 4 merge.
     non-blocking; fix is a one-liner (`client.mouse.drag = MouseDrag::None`
     in the overlay guard arm) plus a test that arms a drag, opens an
     overlay, and asserts the drag state is cleared.
+
+65. **Directional focus MRU tie-break is a single-slot approximation** (from
+    the focus-nav hotfix `6e6ff4d`, its review). When multiple panes are
+    valid candidates for `select-pane -L/-R/-U/-D`, real tmux picks the most
+    recently used; winmux uses the window's single last-pane slot if it is
+    among the candidates, else the first candidate in pane-index order.
+    Correct for the 2-candidate case and deterministic otherwise; a full
+    per-window MRU ordering would make 3+-candidate columns match tmux
+    exactly. Also noted by the review: no test drives the pre-fix bug via
+    Left/Up specifically (fix is symmetric per axis pair), and none
+    exercises focus_dir while zoomed — coverage niceties.
