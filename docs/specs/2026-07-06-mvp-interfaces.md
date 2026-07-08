@@ -180,10 +180,25 @@ impl Layout {
 
     pub fn focused(&self) -> PaneId;
 
-    /// Geometric navigation: move focus to the pane adjacent in `dir`
-    /// (the pane whose rect borders the focused rect in that direction,
-    /// picking the one overlapping the focused pane's cursor axis midpoint).
-    /// Returns false (no change) if there is no pane in that direction.
+    /// Geometric navigation: move focus to the pane adjacent in `dir`, per
+    /// tmux `select-pane -L/-R/-U/-D` semantics. A candidate is any pane
+    /// whose rect borders the focused rect in that direction (adjacent
+    /// across the single border cell) AND whose cross-axis range genuinely
+    /// OVERLAPS the focused pane's cross-axis range (a real interval-overlap
+    /// test). Among multiple candidates, tmux picks the most-recently-used
+    /// pane; winmux approximates this with its single "last pane" state
+    /// (`last_focused`, the `prefix ;` toggle target): prefer `last_focused`
+    /// if it is itself a candidate, else fall back to the first candidate in
+    /// leaf-tree order. Returns false (no change) if there is no candidate.
+    //
+    // Hotfix note (2026-07-08): the original implementation tested only
+    // whether the focused pane's cross-axis MIDPOINT fell inside a
+    // candidate's range. When the focused pane spans the full cross-axis
+    // length opposite a split column/row (e.g. a full-height pane next to a
+    // top/bottom split), that midpoint could land exactly on the border
+    // between two candidates and match neither, so directional navigation
+    // silently no-op'd. Replaced with the real interval-overlap + MRU
+    // tie-break described above; signature unchanged.
     pub fn focus_dir(&mut self, dir: Direction, area: Rect) -> bool;
 
     /// Cycle focus to the next pane in leaf (tree, left-to-right) order,

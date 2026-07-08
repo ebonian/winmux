@@ -2036,6 +2036,136 @@ fn pane_default_active_border_follows_focus() {
     server.join().expect("server exits after kill-server");
 }
 
+/// User-reported bug: `Layout::focus_dir` used to probe only the focused
+/// pane's cross-axis MIDPOINT against each candidate's range. Left pane
+/// (full height, `%` then `"` on the right pane) | top-right / bottom-right:
+/// from the tall left pane, the midpoint of its own y-range (0..24 -> 12)
+/// lands EXACTLY on the horizontal border between top-right (0..12) and
+/// bottom-right (13..24), matching neither -- `prefix-Right` silently no-op'd.
+/// Fixed to use a real interval-overlap test between the two panes' ranges,
+/// with tmux's most-recently-used tie-break (approximated here via
+/// `last_focused`, winmux's single "last pane" state) when both candidates
+/// overlap.
+#[test]
+fn focus_right_into_split_column() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // H(1, V(2,3)): pane1 {0,0,40,24} (tall, full height); pane2
+    // {41,0,39,12} (top-right); pane3 {41,13,39,11} (bottom-right, focused
+    // right after the 2nd split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    // prefix-Left from pane3: single candidate (pane1) -- this direction
+    // already worked before the fix.
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40);
+
+    // prefix-Right from the tall pane1: BEFORE the fix this was a no-op.
+    // Candidates are pane2 and pane3; `last_focused` is pane3 (focused
+    // immediately before the Left move above), so tmux's MRU tie-break
+    // picks pane3 -- the cursor must land back in the bottom-right pane.
+    let mut right = vec![0x02];
+    right.extend_from_slice(b"\x1b[C");
+    c.send(&ClientMsg::Stdin(right));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Symmetric direction to `focus_right_into_split_column`: from the
+/// top-right pane, `prefix-Left` must land back in the tall left pane. This
+/// direction was never buggy (a single-pane target's range already contains
+/// any midpoint drawn from a smaller source pane's range), but is pinned
+/// here as a no-regression guard on the same layout.
+#[test]
+fn focus_left_from_split_column() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    // prefix-Up: bottom-right (pane3) -> top-right (pane2).
+    let mut up = vec![0x02];
+    up.extend_from_slice(b"\x1b[A");
+    c.send(&ClientMsg::Stdin(up));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 < 13);
+
+    // prefix-Left from pane2 (top-right) -> pane1 (tall left pane).
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Vertical-axis variant of the same bug: a full-width tall pane on top of a
+/// row that's been split left/right (`"` then `%` on the bottom pane).
+/// `prefix-Down` from the full-width pane used to no-op for the same reason
+/// -- the source pane's x-midpoint landing exactly on the vertical border
+/// between the two candidates below.
+#[test]
+fn focus_down_into_split_row() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // V(1, H(2,3)): pane1 {0,0,80,12} (full-width top); pane2 {0,13,40,11}
+    // (bottom-left); pane3 {41,13,39,11} (bottom-right, focused right after
+    // the 2nd split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, has_horizontal_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    // prefix-Left: pane3 -> pane2 (single candidate, already worked).
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40 && g.cursor().1 >= 13);
+
+    // prefix-Up: pane2 -> pane1, the full-width tall pane (single
+    // candidate, already worked).
+    let mut up = vec![0x02];
+    up.extend_from_slice(b"\x1b[A");
+    c.send(&ClientMsg::Stdin(up));
+    c.recv_output_until(&mut grid, |g| g.cursor().1 < 12);
+
+    // prefix-Down from pane1: BEFORE the fix this was a no-op. Candidates
+    // are pane2 and pane3; `last_focused` is pane2 (focused immediately
+    // before the Up move above), so MRU picks pane2 -- cursor lands
+    // bottom-left.
+    let mut down = vec![0x02];
+    down.extend_from_slice(b"\x1b[B");
+    c.send(&ClientMsg::Stdin(down));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `set -g window-status-current-style fg=red,bold` restyles ONLY the
 /// current window's tab; the non-current tab keeps the base style.
 #[test]

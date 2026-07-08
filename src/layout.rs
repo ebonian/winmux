@@ -302,17 +302,25 @@ fn area_at(root: &Node, path: &[bool], area: Rect) -> Rect {
 // ---- public API (Task 3) -------------------------------------------------
 
 impl Layout {
-    /// Geometric navigation: move focus to the pane adjacent in `dir` (the
-    /// pane whose rect borders the focused rect in that direction, picking the
-    /// one overlapping the focused pane's cross-axis midpoint). Returns false
-    /// (no change) if there is no pane in that direction.
+    /// Geometric navigation: move focus to the pane adjacent in `dir`, per
+    /// tmux `select-pane -L/-R/-U/-D` semantics. A *candidate* is any pane
+    /// whose rect borders the focused rect in that direction (adjacent
+    /// across the single border cell) AND whose cross-axis range genuinely
+    /// OVERLAPS the focused pane's cross-axis range (a real interval
+    /// overlap test, not a single midpoint probe -- see the bugfix note
+    /// below). Among multiple candidates, tmux picks the most-recently-used
+    /// pane; winmux only tracks a single "last pane" (`last_focused`, the
+    /// `prefix ;` toggle target) rather than a full MRU stack, so this is
+    /// approximated as: prefer `last_focused` if it is itself a candidate,
+    /// else fall back to the first candidate in leaf-tree (pane) order.
+    /// Returns false (no change) if there is no candidate in that direction.
     pub fn focus_dir(&mut self, dir: Direction, area: Rect) -> bool {
         let rects = self.all_rects(area);
         let f = match rects.iter().find(|(id, _)| *id == self.focused) {
             Some((_, r)) => *r,
             None => return false,
         };
-        let mut chosen: Option<PaneId> = None;
+        let mut candidates: Vec<PaneId> = Vec::new();
         for (id, r) in &rects {
             if *id == self.focused {
                 continue;
@@ -331,21 +339,39 @@ impl Layout {
             if !adjacent {
                 continue;
             }
+            // BUGFIX: this used to test only whether the focused pane's
+            // cross-axis MIDPOINT fell inside the candidate's range. When
+            // the focused pane spans the full cross-axis length opposite a
+            // split column/row (e.g. a full-height pane next to a
+            // top/bottom split), that midpoint can land exactly on the
+            // border row/column between the two candidates and match
+            // NEITHER -- navigation silently no-op'd. A real half-open
+            // interval overlap test (excluding degenerate zero-size rects,
+            // and saturating to stay total near u16::MAX) fixes this and
+            // matches tmux, which considers every pane whose range overlaps
+            // at all, not just one whose range contains a single point.
             let overlaps = match dir {
                 Direction::Left | Direction::Right => {
-                    let mid = f.y + f.h / 2;
-                    r.y <= mid && mid < r.y + r.h
+                    r.h > 0
+                        && f.h > 0
+                        && r.y < f.y.saturating_add(f.h)
+                        && f.y < r.y.saturating_add(r.h)
                 }
                 Direction::Up | Direction::Down => {
-                    let mid = f.x + f.w / 2;
-                    r.x <= mid && mid < r.x + r.w
+                    r.w > 0
+                        && f.w > 0
+                        && r.x < f.x.saturating_add(f.w)
+                        && f.x < r.x.saturating_add(r.w)
                 }
             };
             if overlaps {
-                chosen = Some(*id);
-                break;
+                candidates.push(*id);
             }
         }
+        let chosen = match self.last_focused {
+            Some(last) if candidates.contains(&last) => Some(last),
+            _ => candidates.first().copied(),
+        };
         match chosen {
             Some(id) => {
                 self.set_focus(id);
@@ -1155,6 +1181,69 @@ mod tests {
         // pane3 = 13 + 11/2 = 18, inside pane1 y-range [0,24) -> 1.
         assert!(l.focus_dir(Direction::Left, A));
         assert_eq!(l.focused(), 1);
+    }
+
+    #[test]
+    fn focus_dir_right_from_full_height_pane_reaches_split_column() {
+        // User-reported bug. H(1, V(2,3)) on A (80x24): pane1 {0,0,40,24}
+        // (tall, full height); pane2 {41,0,39,12} (top-right); pane3
+        // {41,13,39,11} (bottom-right, focused after the 2nd split). The old
+        // code probed only pane1's y-midpoint (0 + 24/2 = 12) against each
+        // candidate's range: 12 is exactly the border row between pane2
+        // (0..12) and pane3 (13..24), so it matched NEITHER and `Right`
+        // silently no-op'd. A real interval-overlap test must find both as
+        // candidates.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        l.split(SplitDir::Vertical, 3, A).unwrap();
+        assert_eq!(l.focused(), 3);
+        assert!(l.focus_dir(Direction::Left, A)); // -> 1; last_focused becomes 3
+        assert_eq!(l.focused(), 1);
+        assert!(l.focus_dir(Direction::Right, A));
+        // Both pane2 and pane3 overlap pane1's full range; last_focused (3)
+        // is among the candidates, so tmux's MRU tie-break lands on 3.
+        assert_eq!(l.focused(), 3);
+    }
+
+    #[test]
+    fn focus_dir_down_from_full_width_pane_reaches_split_row() {
+        // Vertical-axis mirror of the bug above. V(1, H(2,3)) on A (80x24):
+        // pane1 {0,0,80,12} (full width, top); pane2 {0,13,40,11}
+        // (bottom-left); pane3 {41,13,39,11} (bottom-right, focused after
+        // the 2nd split). pane1's x-midpoint (0 + 80/2 = 40) is exactly the
+        // border column between pane2 (0..40) and pane3 (41..80).
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Vertical, 2, A).unwrap();
+        l.split(SplitDir::Horizontal, 3, A).unwrap();
+        assert_eq!(l.focused(), 3);
+        assert!(l.focus_dir(Direction::Left, A)); // -> 2; last_focused becomes 3
+        assert_eq!(l.focused(), 2);
+        assert!(l.focus_dir(Direction::Up, A)); // -> 1; last_focused becomes 2
+        assert_eq!(l.focused(), 1);
+        assert!(l.focus_dir(Direction::Down, A));
+        // Both pane2 and pane3 overlap pane1's full range; last_focused (2)
+        // is among the candidates, so the MRU tie-break lands back on 2.
+        assert_eq!(l.focused(), 2);
+    }
+
+    #[test]
+    fn focus_dir_falls_back_to_first_candidate_when_last_focused_not_among_them() {
+        // V(H(1, V(2,3)), 5): pane1 and the (2,3) column share the top
+        // region's full height; pane5 is an unrelated bottom region.
+        // Multiple Right candidates {2,3} exist for pane1, but
+        // `last_focused` is deliberately steered to pane5 (not a
+        // candidate) -- the MRU tie-break must fall back to the first
+        // candidate in leaf-tree order (pane2) instead of panicking or
+        // picking arbitrarily.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Vertical, 5, A).unwrap(); // V(1,5); focus 5, last 1
+        l.focus_pane(1); // focus 1, last 5
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // V(H(1,2),5); focus 2, last 1
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // V(H(1,V(2,3)),5); focus 3, last 2
+        l.focus_pane(5); // focus 5, last 3
+        l.focus_pane(1); // focus 1, last 5 -- NOT a Right candidate for pane1
+        assert!(l.focus_dir(Direction::Right, A));
+        assert_eq!(l.focused(), 2, "fallback must pick the first candidate in leaf order");
     }
 
     #[test]
