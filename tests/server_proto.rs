@@ -4070,6 +4070,39 @@ fn quote_prompt_rejects_non_numeric() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Final SP4 review, MUST-FIX #2: an all-ASCII-digit `'`-prompt input that
+/// OVERFLOWS `u32` (e.g. 11 nines) must still get the numeric-index miss
+/// wording (`window not found: <buf>`), not fall through to the bare-token
+/// "try session name first" path and produce `can't find session: <buf>`.
+/// Before the fix, `looks_like_index` used `parse::<u32>().is_ok()`, which
+/// is `false` for an overflowing all-digit string, so
+/// `resolve_window_target`'s bare-token fallback treated the digits as a
+/// session name instead of a window index.
+#[test]
+fn quote_prompt_overflow_digits_window_not_found() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'\'']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("index")));
+    c.send(&ClientMsg::Stdin(b"99999999999\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("window not found: 99999999999")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("can't find session")),
+        "overflowing digits must not be treated as a session name"
+    );
+
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 // ---- overlays: choose-tree + display-panes (Task 8, sub-project 4) --------
 
 /// `true` if any cell in `[x0,x1) x [y0,y1)` has background colour `bg` --
@@ -4223,6 +4256,82 @@ fn choose_tree_escape_cancels() {
     c.send(&ClientMsg::Stdin(b"q".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
 
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Final SP4 review, MUST-FIX NEW-1: mouse events must be swallowed while
+/// an overlay (choose-tree or display-panes) is open, exactly like the
+/// pre-existing `ConfirmCmd`/`Prompt` guard -- a click landing on a HIDDEN
+/// pane underneath the overlay must never focus it. Splits the window so
+/// the right pane is focused and a left pane exists to be mis-focused by a
+/// leaking click; opens choose-tree (which draws full-screen, hiding the
+/// split); clicks where the left pane would be; then dismisses the overlay
+/// with `q` and asserts focus is STILL the right pane.
+#[test]
+fn mouse_ignored_under_choose_tree_overlay() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    assert!(grid.cursor().0 > border_x, "expected focus on the right pane right after split");
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    // Click where the LEFT (unfocused, now-hidden) pane would be.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+
+    // Dismiss the overlay via the keyboard and confirm focus is unchanged --
+    // the click must not have silently refocused the hidden left pane.
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    assert!(grid.cursor().0 > border_x, "mouse click under choose-tree overlay must not move focus");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Display-panes variant of `mouse_ignored_under_choose_tree_overlay`
+/// (cheap given the existing `has_bg` helper): a click under the
+/// full-screen digit overlay must not focus the hidden left pane either.
+#[test]
+fn mouse_ignored_under_display_panes_overlay() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    assert!(grid.cursor().0 > border_x, "expected focus on the right pane right after split");
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'q']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(1), 0, 80, 0, 23) && has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Click where the LEFT (unfocused, now-hidden) pane would be.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+
+    // Dismiss with a non-digit key (space) and confirm focus is unchanged.
+    c.send(&ClientMsg::Stdin(b" ".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(1), 0, 80, 0, 23) && !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+    assert!(grid.cursor().0 > border_x, "mouse click under display-panes overlay must not move focus");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");

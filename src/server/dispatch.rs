@@ -119,11 +119,22 @@ fn split_session_prefix(t: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// `true` if `s` (optionally `=`-prefixed) parses as a window/pane index --
+/// `true` if `s` (optionally `=`-prefixed) LOOKS like a window/pane index --
 /// i.e. keeps its TODAY meaning (index in the contextual session/window)
 /// rather than falling back to session-name resolution for a bare token.
+/// Final SP4 review, MUST-FIX #2: this is an all-ASCII-digit shape check,
+/// NOT `parse::<u32>().is_ok()` -- an all-digit token that overflows `u32`
+/// (e.g. 11 nines) must still be treated as an index attempt so it reaches
+/// `resolve_window`'s numeric-miss path (`window not found: <buf>`) rather
+/// than falling through to `Registry::find`'s session-name lookup
+/// (`can't find session: <buf>`, the wrong wording for what is clearly a
+/// numeric-looking token). `resolve_window`'s own `s2.parse::<u32>()` also
+/// fails on the same overflowing string, but it degrades gracefully into
+/// its name/prefix-match miss branch (`Err(format!("window not found:
+/// {s}"))`) rather than panicking, so no change was needed there.
 fn looks_like_index(s: &str) -> bool {
-    s.strip_prefix('=').unwrap_or(s).parse::<u32>().is_ok()
+    let s = s.strip_prefix('=').unwrap_or(s);
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Resolve a window spec (the part of a target after any `session:` prefix,
@@ -1523,8 +1534,11 @@ impl Server {
                         // Above the current view: scroll so it lands on row 0.
                         (((-key) as u32).min(history_len), 0)
                     } else {
-                        // Below the live view under scroll 0 (only reachable
-                        // after a pane shrink): clamp to the last live row.
+                        // Below the live view under scroll 0 -- reachable
+                        // after a pane shrink, or after `copy-history-top`
+                        // (`g`) then `copy-other-end` (`o`) scrolls far from
+                        // the anchor with no shrink involved at all: clamp
+                        // to the last live row.
                         (0, (key as u16).min(rows.saturating_sub(1)))
                     };
                     cs.scroll = new_scroll;
@@ -1574,17 +1588,32 @@ impl Server {
     /// Route one decoded [`MouseEvent`] for `client` (already resolved to
     /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
     /// option is off (design spec: "mouse events with mouse off are
-    /// dropped"), or while `client` has an active confirm/prompt overlay
-    /// (Task 5 decision, undecided by the brief: real tmux's mouse-during-
-    /// prompt behavior is a can of worms out of scope here -- winmux
-    /// swallows mouse events in those modes so a stray click can never race
-    /// a confirm's y/n capture or act on pane geometry the overlay is
-    /// currently hiding; documented deviation, see `docs/follow-ups.md`).
+    /// dropped"), or while `client` has an active confirm/prompt/choose-
+    /// tree/display-panes overlay (Task 5 decision, undecided by the brief:
+    /// real tmux's mouse-during-prompt behavior is a can of worms out of
+    /// scope here -- winmux swallows mouse events in those modes so a stray
+    /// click can never race a confirm's y/n capture or act on pane geometry
+    /// the overlay is currently hiding; documented deviation, see
+    /// `docs/follow-ups.md` #38). `ChooseTree`/`DisplayPanes` (Task 8,
+    /// added later) joined this guard in the final SP4 review fix round --
+    /// both draw full-screen, so the exact same "hidden pane geometry" risk
+    /// applies: a click/drag/wheel would otherwise focus/resize/copy-mode a
+    /// pane the user cannot currently see. Dismissal policy mirrors the
+    /// keyboard policy documented in `## overlays` of
+    /// `docs/specs/2026-07-07-parity-polish-interfaces.md`: mouse events
+    /// never dismiss either overlay (unlike display-panes' "any non-digit
+    /// KEY dismisses" rule) and never navigate/select a choose-tree row --
+    /// they are swallowed outright, same as `ConfirmCmd`/`Prompt`. Real
+    /// tmux-style mouse routing into choose-tree (click selects a row,
+    /// wheel scrolls the list) is ticketed, `docs/follow-ups.md` #61.
     pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         if !self.options.mouse() {
             return ExecOutcome::Ok(String::new());
         }
-        if matches!(client.mode, ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. }) {
+        if matches!(
+            client.mode,
+            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
+        ) {
             return ExecOutcome::Ok(String::new());
         }
 

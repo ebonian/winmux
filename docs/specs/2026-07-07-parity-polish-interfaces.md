@@ -994,11 +994,24 @@ simpler, and satisfies the same observable contract (the client's next
 `server::handle_stdin`'s `KeyInputEvent::Mouse` arm):**
 1. `!options.mouse()` → dropped (`Ok`, no-op) — see the `keys` amendment's
    "consume-always" note for why this drop happens here, not at decode time.
-2. `client.mode` is `ConfirmCmd`/`Prompt` → dropped (documented deviation:
-   real tmux's mouse-during-prompt behavior was left undecided by the task
-   brief; winmux swallows mouse events during these overlays so a stray
-   click/drag can never race a confirm's y/n capture or act on pane geometry
-   the overlay is hiding).
+2. `client.mode` is `ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` →
+   dropped (documented deviation: real tmux's mouse-during-prompt behavior
+   was left undecided by the task brief; winmux swallows mouse events during
+   these overlays so a stray click/drag can never race a confirm's y/n
+   capture or act on pane geometry the overlay is hiding). **Final SP4
+   review, MUST-FIX (NEW-1):** `ChooseTree`/`DisplayPanes` (Task 8, added
+   after this guard was written) joined the match arm in the merge-gate fix
+   round — both overlays draw full-screen exactly like `ConfirmCmd`/
+   `Prompt`, so the identical "hidden pane geometry" risk applies (a click
+   would silently focus, a border-drag would silently resize, a wheel would
+   silently enter copy mode on a pane the user cannot currently see). See
+   the `## overlays` section's "server::dispatch amendment: key routing"
+   subsection for the analogous KEYBOARD dismissal policy this mirrors —
+   mouse dismisses NEITHER overlay and never navigates/selects a
+   choose-tree row (a pure swallow, matching `ConfirmCmd`/`Prompt` exactly,
+   not display-panes' "any non-digit KEY dismisses" rule). Real tmux-style
+   mouse routing into choose-tree is out of scope here, ticketed
+   `docs/follow-ups.md` #61 (amends #38's scope to all four modal states).
 3. `y` equals the status row for THIS client (`mouse_status_row`: row 0 if
    `status-position top` else `client.rows - 1`, `None` if `status` off) →
    `dispatch_mouse_status`.
@@ -1427,8 +1440,15 @@ non-empty `buf` produces `window not found: <buf>` directly (matching
 at all. An empty or all-digit `buf` calls the PRE-EXISTING
 `exec_select_window(format!(":{buf}"), Some(session_name.as_str()))`
 directly (no new command, no new dispatch table entry): `resolve_window`'s
-existing bare-numeric-index handling already produces the exact required
-`window not found: <n>` wording for a numeric miss, and an empty `buf`
+existing bare-numeric-index handling produces the exact required `window
+not found: <n>` wording for a numeric miss, PROVIDED `looks_like_index`
+(`resolve_window_target`'s gate deciding whether a bare token even reaches
+`resolve_window` at all) recognizes the token as index-shaped in the first
+place — final SP4 review, MUST-FIX #2: an all-digit `buf` that overflows
+`u32` (e.g. 11 nines) is still index-SHAPED, so `looks_like_index` is an
+all-ASCII-digit check, not `parse::<u32>().is_ok()`, which would be `false`
+on overflow and misroute the token into the bare-token session-name
+fallback (`can't find session: <buf>`) instead. An empty `buf`
 resolves to the session's current window (a no-op).
 
 ### `bindings` amendment
@@ -1666,6 +1686,22 @@ one difference from copy mode's own precedent, below.
   is consulted; the rest of the blob is discarded (design spec's documented
   "not reprocessed" simplification).
 
+**Mouse dismissal policy while either overlay is open (final SP4 review,
+MUST-FIX NEW-1):** `server::dispatch::dispatch_mouse`'s modal guard (see the
+`## mouse` section's routing-step-2 amendment above) swallows EVERY mouse
+event — click, drag, wheel — outright while `client.mode` is `ChooseTree`
+or `DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
+handling. This is deliberately NOT the same policy as the keyboard rules
+just above: a click never dismisses either overlay (unlike display-panes'
+"any non-digit KEY dismisses" rule) and never navigates or selects a
+choose-tree row (unlike an unbound key, which is silently ignored but at
+least leaves the possibility of a future bound mouse action open — today
+there is none). The simplest, safest policy given the brief left real
+tmux's mouse-during-overlay behavior undecided: a stray click/drag/wheel
+can never act on the pane geometry either overlay is currently hiding.
+Real tmux-style routing (click selects a choose-tree row, wheel scrolls the
+list) is out of scope here — ticketed `docs/follow-ups.md` #61.
+
 **Task 8 review fix (Important #2) — interception applies to EVERY `Key`
 event, not just `table: Root`:** the original `Key{table, ..}` arm gated
 both branches above on `table == WhichTable::Root`, mirroring copy mode's
@@ -1752,7 +1788,12 @@ keypress, confirmed by the colours disappearing), `choose_tree_w_lists_and_
 switches`, `choose_tree_s_sessions`, `choose_tree_escape_cancels` (see the
 `q`-not-`Escape` note above), `choose_tree_x_kills_with_confirm` (`x` ->
 confirm text appears -> `y` -> the killed row is gone AND the overlay stays
-open with the refreshed list -> `q` closes it).
+open with the refreshed list -> `q` closes it). Final SP4 review, MUST-FIX
+NEW-1: `mouse_ignored_under_choose_tree_overlay` / `mouse_ignored_under_
+display_panes_overlay` (`tests/server_proto.rs`, split so a hidden left
+pane exists, open the overlay, click where that pane would be, dismiss via
+the keyboard, assert focus is STILL the right pane — proving the click
+never reached the hidden pane's geometry).
 
 ## `naming` — escape-time disambiguation + automatic-rename (Task 9)
 
@@ -1859,10 +1900,11 @@ const AUTO_RENAME_THROTTLE: std::time::Duration = /* 500ms, tmux NAME_INTERVAL *
 
 /// Basename (strip path, split on `\`/`/`) -> first token (cut at first
 /// space) -> strip ONE recognized trailing extension (`.exe`/`.cmd`/`.bat`/
-/// `.ps1`, case-insensitive) -> cap 20 chars -> control-strip (defensive;
-/// Grid's OSC handler already does this for its own output) -> sanitize any
-/// REMAINING `:`/`.` by replacing with `-` -> `model::validate_name` gate
-/// (now a defensive double-check, not the primary gate). `None` only if the
+/// `.ps1`, case-insensitive) -> control-strip (defensive; Grid's OSC
+/// handler already does this for its own output) -> sanitize any REMAINING
+/// `:`/`.` by replacing with `-` -> cap 20 chars LAST (so the cap can never
+/// truncate mid-sanitization) -> `model::validate_name` gate (now a
+/// defensive double-check, not the primary gate). `None` only if the
 /// result is empty after derivation.
 ///
 /// **Amended, fix round (review finding 2):** originally the candidate was

@@ -329,16 +329,22 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     option already exists"). A `set -g word-separators <chars>` line is
     accepted/stored nowhere and has no effect — no `word-separators` entry
     exists in `src/options.rs`'s `SPECS` table at all.
-38. **Mouse-during-prompt/confirm is swallowed entirely, not forwarded to
-    the overlay** (Task 5, mouse). `dispatch_mouse` drops (silent no-op) any
-    mouse event while the acting client's `ClientMode` is `ConfirmCmd` or
-    `Prompt`, rather than e.g. letting a click land on the pane underneath
-    or interacting with the prompt/confirm text in any way. The task brief
-    left tmux's own real behavior here undecided ("decide per tmux and
-    document"); winmux's choice prioritizes never letting a stray click race
-    a confirm's y/n capture, or hit-test against pane geometry the overlay
-    is currently hiding, over any interactive mouse behavior during these
-    (rare, short-lived) modal states.
+38. **Mouse-during-prompt/confirm/choose-tree/display-panes is swallowed
+    entirely, not forwarded to the overlay** (Task 5, mouse; scope widened
+    in the final SP4 review's merge-gate fix round). `dispatch_mouse` drops
+    (silent no-op) any mouse event while the acting client's `ClientMode` is
+    `ConfirmCmd`, `Prompt`, `ChooseTree`, or `DisplayPanes`, rather than
+    e.g. letting a click land on the pane underneath or interacting with the
+    overlay's own content in any way. The task brief left tmux's own real
+    behavior here undecided ("decide per tmux and document"); winmux's
+    choice prioritizes never letting a stray click race a confirm's y/n
+    capture, or hit-test against pane geometry an overlay is currently
+    hiding, over any interactive mouse behavior during these (rare,
+    short-lived) modal states. `ChooseTree`/`DisplayPanes` originally
+    shipped (Task 8) without joining this guard at all — a real bug, not a
+    documented deviation, fixed in the same review round; see
+    `docs/follow-ups.md` #61 for the follow-on "real tmux-style mouse
+    routing into choose-tree" ticket this fix deferred.
 39. **Status-row click hit-testing doesn't replicate the renderer's final
     spatial truncation** (Task 5, mouse). `mouse_status_click` rebuilds the
     same left-prefix + per-window-tab span layout `render_one`/
@@ -532,3 +538,76 @@ None block the sub-project 4 merge.
     the tests' timing margins, or run the affected tests (or all of
     `server_proto`) at a capped thread count in CI rather than full
     default parallelism.
+
+## Follow-ups from the final whole-branch review (sub-project 4, 2026-07-08)
+
+59. **`'` index-prompt empty-commit is a silent no-op; `MoveWindow`/
+    `RenameWindow`/`RenameSession` siblings all error on empty instead**
+    (Task 7/8, prompt commit handling). `PromptKind::Index`'s empty-buffer
+    commit is a deliberate, comment-documented silent no-op
+    (`src/server/dispatch.rs`, matching `PromptKind::Command`'s own
+    empty-commit-is-silent-cancel precedent), whereas `RenameWindow`/
+    `RenameSession` error via `model::validate_name` rejecting an empty
+    name, and `MoveWindow` errors via a failed `u32` parse on an empty
+    target. Verified by the final SP4 review as a real inconsistency
+    between sibling prompts, but a reasoned judgment call (empty `'` input
+    genuinely means "stay on the current window," unlike an empty rename/
+    move target, which has no sensible default) rather than a defect.
+    Ticketed so the deliberateness is durable and revisitable if the
+    inconsistency ever surprises a user.
+60. **`swap-pane -t` first/last wraparound has no dedicated test**
+    (Task 6, layout presets). The wrap arithmetic
+    (`src/server/dispatch.rs`, `(pos+n-1)%n` / `(pos+1)%n`) is standard and
+    the same pattern is already pretested via `rotate`, but no test
+    exercises `pos == 0` swapping `Up` (should wrap to the last pane) or
+    `pos == n-1` swapping `Down` (should wrap to pane 0) for `n >= 3` panes.
+    Low-risk coverage gap, not a known bug -- add a
+    `swap_pane_wraps_at_ends` (or similar) `server_proto` test.
+61. **Choose-tree ignores mouse entirely -- no click-to-select or
+    wheel-to-scroll routing** (Task 8, overlays; amends #38's scope). The
+    final SP4 review's merge-gate fix made `dispatch_mouse` swallow every
+    mouse event while `ChooseTree`/`DisplayPanes` is open (fixing the
+    hidden-pane-focus leak, see #38), but real tmux lets the mouse interact
+    WITH an open choose-tree: a click on a row selects it, wheel scrolls
+    the list. winmux v1 has no such routing at all -- a deliberate scope
+    cut for this fix round, not a regression (there was never any
+    choose-tree mouse routing to begin with; the bug fixed here was mouse
+    leaking THROUGH the overlay to the hidden panes underneath, not a
+    missing choose-tree mouse feature). Candidate follow-on: hit-test the
+    overlay's own row rects (mirroring `mouse_status_row`'s pattern) and
+    map a click to `ChooseTreeAction::Commit`-equivalent behavior, wheel to
+    `Up`/`Down`.
+62. **`Window::name`/`Session::name` field safety relies on an unstated
+    invariant** (Task 9, naming; security audit finding). Both fields are
+    plain `String`s with no type-level guarantee that every write went
+    through `model::validate_name` -- the invariant holds today only
+    because every call site that sets a name (`exec_rename_window`,
+    `exec_rename_session`, `derive_auto_name`'s caller) happens to be
+    gated by it, and choose-tree row rendering (`src/server/dispatch.rs`,
+    `TreeRow` text building) plus the status bar trust that transitively
+    when interpolating names into rendered VT output with no further
+    escaping. No exploit exists today (verified in the final SP4 review's
+    security pass), but the invariant is easy to silently break in a
+    future refactor that adds a new direct-assignment call site. Add a doc
+    comment on `Window::name`/`Session::name` pinning "only ever set via a
+    `validate_name`-gated setter" so the risk is documented at the field,
+    not just at today's call sites.
+63. **`render::CopyView::cursor` is a dead field** (Task 2/3, copy mode;
+    security audit finding). `server::render_one` populates
+    `CopyView { scroll, cursor: (cs.cx, cs.cy), sel }` for the pane bound
+    to a client's `ClientMode::Copy`, but `render.rs`'s
+    `Renderer::compose_back` never reads `cv.cursor` -- only `cv.scroll`
+    (view-cell lookups, position indicator) and `cv.sel` (selection
+    highlight) are consumed. The actual terminal cursor placement during
+    copy mode is computed independently in `server::render_one`'s own
+    `(cursor, cursor_visible)` match on `client.mode` (clamping
+    `cs.cx`/`cs.cy` into the pane rect directly), not through `CopyView` at
+    all. `CopyView` is part of the locked render interface contract
+    (`docs/specs/2026-07-06-mvp-interfaces.md` and the `## copy-mode`
+    section of `docs/specs/2026-07-07-parity-polish-interfaces.md`), so
+    removing the field requires a contract amendment in both files plus
+    updating the one construction site (`src/server.rs`) -- deferred here
+    rather than folded into this fix commit to keep that commit's
+    contract-surgery scope to the items it was already touching; genuinely
+    safe to delete whenever someone picks this up (no consumer anywhere
+    reads it).

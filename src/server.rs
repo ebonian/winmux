@@ -762,11 +762,12 @@ fn strip_known_extension(token: &str) -> &str {
 /// down to its basename (last component split on either `\` or `/`), cut at
 /// the first space (tmux's automatic-rename takes just the leading
 /// "command" token, not the whole title), strip one recognized trailing
-/// extension (`.exe`/`.cmd`/`.bat`/`.ps1`, case-insensitive), cap at 20
-/// chars, and re-strip control characters defensively (`grid::Grid`'s own
-/// OSC handler already does this for the title it hands out, but this
-/// function doesn't assume its caller is always that one guaranteed-clean
-/// source).
+/// extension (`.exe`/`.cmd`/`.bat`/`.ps1`, case-insensitive), re-strip
+/// control characters defensively (`grid::Grid`'s own OSC handler already
+/// does this for the title it hands out, but this function doesn't assume
+/// its caller is always that one guaranteed-clean source), sanitize any
+/// residual `:`/`.`, and cap at 20 chars LAST (so the cap never truncates
+/// mid-sanitization).
 ///
 /// **Fix round, review finding 2**: the original implementation rejected
 /// the WHOLE candidate via `model::validate_name` the instant it contained
