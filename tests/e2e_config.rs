@@ -74,7 +74,7 @@ fn e2e_tmux_conf_roundtrip() {
     let _guard = ServerGuard { socket: socket.clone() };
 
     let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", conf.path_str()]);
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(COLS, ROWS, 0);
     let mut raw: Vec<u8> = Vec::new();
 
     // status-left "[cfg-#S] " expands #S to the auto-assigned session name
@@ -162,7 +162,7 @@ fn e2e_tmux_conf_roundtrip() {
     // Reattach: `winmux -L <sock> attach` (no `-t`, resolves to the sole
     // session) -- the pre-detach marker is still on screen.
     let (mut pty_b, proc_b, rx_b) = spawn_winmux_pty(&["-L", &socket, "attach"]);
-    let mut grid_b = Grid::new(COLS, ROWS);
+    let mut grid_b = Grid::new(COLS, ROWS, 0);
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
         wait_until(deadline, || {
@@ -192,7 +192,7 @@ fn e2e_command_prompt() {
     let _guard = ServerGuard { socket: socket.clone() };
 
     let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", "-"]);
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(COLS, ROWS, 0);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
@@ -249,7 +249,7 @@ fn e2e_send_keys_cli() {
     let _guard = ServerGuard { socket: socket.clone() };
 
     let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", "-"]);
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(COLS, ROWS, 0);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(

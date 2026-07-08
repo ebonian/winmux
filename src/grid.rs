@@ -1,5 +1,6 @@
 //! Per-pane terminal emulator: `Cell`/`Style`/`Color` types plus a vte-driven `Grid`.
 
+use std::collections::VecDeque;
 use vte::{Params, Parser, Perform};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,10 +70,35 @@ struct TermState {
     scroll_top: u16,
     scroll_bottom: u16,
     saved: Option<SavedCursor>,
+    /// True while the alternate screen (`CSI ?1049h`) is active.
+    alt_screen: bool,
+    /// The primary screen's cells + cursor state (position, SGR pen,
+    /// autowrap -- DECSC/DECRC scope, per xterm's documentation of 1049),
+    /// saved on entering the alt screen and restored on leaving it.
+    /// `None` when not in alt-screen mode.
+    saved_primary: Option<(Vec<Cell>, SavedCursor)>,
+    /// Scrollback: oldest line at the front. Each line is exactly `cols`
+    /// wide AT CAPTURE TIME -- width changes since capture are clipped/
+    /// padded lazily on read (`view_cell`), not reflowed.
+    history: VecDeque<Vec<Cell>>,
+    /// 0 = scrollback disabled (nothing is ever captured).
+    history_limit: u32,
+    /// Monotonic count of lines EVER pushed into scrollback (never
+    /// decremented by eviction) — the stable "lines-ever-captured"
+    /// coordinate system copy-mode selection anchors are pinned to (Task 3
+    /// review fix): `history_len()` alone can't measure how far content has
+    /// shifted between two moments, because chunked eviction lowers it
+    /// without moving any surviving line's view position.
+    history_total: u64,
+    /// Pane title captured from OSC 0/2, if any has ever been set.
+    title: Option<String>,
+    /// Edge-triggered flag: set whenever `title` changes, cleared by
+    /// `Grid::take_title_changed`.
+    title_changed: bool,
 }
 
 impl TermState {
-    fn new(cols: u16, rows: u16) -> Self {
+    fn new(cols: u16, rows: u16, history_limit: u32) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         TermState {
@@ -88,6 +114,13 @@ impl TermState {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             saved: None,
+            alt_screen: false,
+            saved_primary: None,
+            history: VecDeque::new(),
+            history_limit,
+            history_total: 0,
+            title: None,
+            title_changed: false,
         }
     }
 
@@ -95,13 +128,70 @@ impl TermState {
         row as usize * self.cols as usize + col as usize
     }
 
+    /// Push one scrolled-off line into the scrollback, evicting the oldest
+    /// `max(1, history_limit/10)` lines in one chunk once the buffer reaches
+    /// capacity (tmux `grid_collect_history`). No-op when scrollback is
+    /// disabled (`history_limit == 0`). Degenerate `history_limit == 1`:
+    /// every push immediately hits the limit and evicts the line just
+    /// pushed, so `history_len()` stays 0 -- effectively disabled.
+    fn push_history(&mut self, line: Vec<Cell>) {
+        if self.history_limit == 0 {
+            return;
+        }
+        self.history_total += 1;
+        self.history.push_back(line);
+        if self.history.len() as u32 >= self.history_limit {
+            let chunk = (self.history_limit / 10).max(1) as usize;
+            for _ in 0..chunk.min(self.history.len()) {
+                self.history.pop_front();
+            }
+        }
+    }
+
+    /// View-coordinate cell lookup: `scroll_back` lines scrolled up from the
+    /// live bottom (0 = live screen), clamped to `history_len()`.
+    /// Out-of-range `row`/`col` (against the CURRENT dimensions -- so a
+    /// history line captured wider than the current width is clipped to it,
+    /// and columns beyond a narrower captured line read as blank) returns a
+    /// blank default cell.
+    fn view_cell(&self, scroll_back: u32, col: u16, row: u16) -> Cell {
+        if row >= self.rows || col >= self.cols {
+            return Cell::default();
+        }
+        let history_len = self.history.len() as u32;
+        let scroll_back = scroll_back.min(history_len);
+        // Combined buffer = history (oldest first) followed by the live
+        // screen; `combined_index` is where view row `row` lands in it.
+        let combined_index = history_len - scroll_back + row as u32;
+        if combined_index < history_len {
+            self.history[combined_index as usize].get(col as usize).copied().unwrap_or_default()
+        } else {
+            let live_row = (combined_index - history_len) as u16;
+            self.cells[self.idx(col, live_row)]
+        }
+    }
+
     /// Scroll the region [scroll_top, scroll_bottom] up by `n`, blanking the
-    /// vacated bottom rows.
+    /// vacated bottom rows. Lines pushed off the top are captured into
+    /// scrollback, but ONLY when the region is the FULL screen
+    /// (`scroll_top == 0 && scroll_bottom == rows - 1` -- covering both
+    /// LF-at-bottom via `line_feed` and `CSI S` with no DECSTBM region set;
+    /// tmux never captures partial-region scrolls, even top-anchored ones)
+    /// and the grid is not currently showing the alt screen.
     fn scroll_up(&mut self, n: u16) {
         let top = self.scroll_top as usize;
         let bottom = self.scroll_bottom as usize;
         let cols = self.cols as usize;
         let n = n as usize;
+        let full_screen = top == 0 && bottom == self.rows as usize - 1;
+        if full_screen && !self.alt_screen && self.history_limit > 0 {
+            let capture_n = n.min(bottom - top + 1);
+            for row in 0..capture_n {
+                let start = row * cols;
+                let line = self.cells[start..start + cols].to_vec();
+                self.push_history(line);
+            }
+        }
         for row in top..=bottom {
             let src = row + n;
             if src <= bottom {
@@ -394,18 +484,19 @@ impl TermState {
         }
     }
 
+    /// Resize the active buffer, clipping/padding cell content. While in
+    /// alt-screen mode the saved primary buffer is ALSO resized (clipped/
+    /// padded) in lockstep, per spec, so a subsequent leave-alt restores a
+    /// primary screen consistent with the new dimensions.
     fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let mut new_cells = vec![Cell::default(); cols as usize * rows as usize];
-        let copy_cols = cols.min(self.cols) as usize;
-        let copy_rows = rows.min(self.rows) as usize;
-        for r in 0..copy_rows {
-            for c in 0..copy_cols {
-                new_cells[r * cols as usize + c] = self.cells[r * self.cols as usize + c];
-            }
+        self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
+        if let Some((primary, saved)) = &mut self.saved_primary {
+            *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
+            saved.col = saved.col.min(cols.saturating_sub(1));
+            saved.row = saved.row.min(rows.saturating_sub(1));
         }
-        self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
@@ -414,6 +505,22 @@ impl TermState {
         self.scroll_bottom = rows.saturating_sub(1);
         self.wrap_pending = false;
     }
+}
+
+/// Clip (shrink) or pad (grow) a `old_cols`x`old_rows` cell buffer into a new
+/// `new_cols`x`new_rows` one, preserving the overlapping top-left region.
+/// Shared by `TermState::resize` for both the active buffer and (while in
+/// alt-screen mode) the saved primary buffer.
+fn resize_cells(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16) -> Vec<Cell> {
+    let mut new_cells = vec![Cell::default(); new_cols as usize * new_rows as usize];
+    let copy_cols = new_cols.min(old_cols) as usize;
+    let copy_rows = new_rows.min(old_rows) as usize;
+    for r in 0..copy_rows {
+        for c in 0..copy_cols {
+            new_cells[r * new_cols as usize + c] = old[r * old_cols as usize + c];
+        }
+    }
+    new_cells
 }
 
 /// Read subparameter 0 of CSI param `idx`, or `default` if absent/empty.
@@ -477,7 +584,28 @@ impl Perform for TermState {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// OSC 0 (icon+title) and OSC 2 (title) capture the pane title: UTF-8
+    /// (lossy), control characters stripped, capped at 256 chars. OSC 1
+    /// (icon-only) and any other OSC are ignored. The terminator (BEL vs
+    /// `ESC \`) makes no difference here -- `vte` already normalizes both
+    /// into this single callback. `vte` splits the OSC buffer on EVERY
+    /// `;`, so a title containing semicolons arrives as params[1..N] and
+    /// must be re-joined with `;` (tmux and vte's own ansi.rs reference
+    /// consumer both do this), not truncated at params[1].
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() < 2 {
+            return;
+        }
+        if params[0] != b"0" && params[0] != b"2" {
+            return;
+        }
+        let joined: Vec<u8> = params[1..].join(&b';');
+        let raw = String::from_utf8_lossy(&joined);
+        let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(256).collect();
+        self.title = Some(cleaned);
+        self.title_changed = true;
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
@@ -493,11 +621,48 @@ impl Perform for TermState {
                         Some(7) => self.autowrap = set,   // DECAWM
                         Some(25) => self.cursor_visible = set, // DECTCEM
                         Some(1049) => {
-                            // Alt screen enter/leave: both clear + home (MVP).
-                            self.erase_display(2);
-                            self.cursor_col = 0;
-                            self.cursor_row = 0;
-                            self.wrap_pending = false;
+                            if set {
+                                // Enter: save the primary screen (cells +
+                                // cursor position, SGR pen, and autowrap --
+                                // DECSC/DECRC scope per xterm's docs for
+                                // 1049) the FIRST time only -- a redundant
+                                // ?1049h while already in alt mode must not
+                                // clobber the saved primary with alt-screen
+                                // content. Either way, entering always
+                                // clears the (now-active) alt buffer and
+                                // homes the cursor (visible behavior
+                                // preserved from the MVP).
+                                if !self.alt_screen {
+                                    self.saved_primary = Some((
+                                        self.cells.clone(),
+                                        SavedCursor {
+                                            col: self.cursor_col,
+                                            row: self.cursor_row,
+                                            style: self.style,
+                                            autowrap: self.autowrap,
+                                        },
+                                    ));
+                                    self.alt_screen = true;
+                                }
+                                self.erase_display(2);
+                                self.cursor_col = 0;
+                                self.cursor_row = 0;
+                                self.wrap_pending = false;
+                            } else if self.alt_screen {
+                                // Leave: restore the primary screen exactly
+                                // (cells + cursor position/pen/autowrap),
+                                // no clearing. A spurious ?1049l while not
+                                // in alt mode is a no-op.
+                                if let Some((primary, saved)) = self.saved_primary.take() {
+                                    self.cells = primary;
+                                    self.cursor_col = saved.col.min(self.cols.saturating_sub(1));
+                                    self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
+                                    self.style = saved.style;
+                                    self.autowrap = saved.autowrap;
+                                }
+                                self.alt_screen = false;
+                                self.wrap_pending = false;
+                            }
                         }
                         _ => {}
                     }
@@ -602,15 +767,59 @@ pub struct Grid {
 
 impl Grid {
     /// Create a grid. Dimensions are clamped to a 1x1 minimum: a grid is
-    /// never zero-sized.
-    pub fn new(cols: u16, rows: u16) -> Self {
-        Grid { parser: Parser::new(), state: TermState::new(cols, rows) }
+    /// never zero-sized. `history_limit` caps the scrollback line count;
+    /// 0 disables scrollback entirely (nothing is ever captured).
+    pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self {
+        Grid { parser: Parser::new(), state: TermState::new(cols, rows, history_limit) }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.parser.advance(&mut self.state, b);
         }
+    }
+
+    /// Number of scrollback lines currently captured (<= the `history_limit`
+    /// passed to `new`).
+    pub fn history_len(&self) -> u32 {
+        self.state.history.len() as u32
+    }
+
+    /// Monotonic count of lines EVER captured into scrollback — never
+    /// decremented by eviction (unlike `history_len()`). The difference
+    /// between two `history_total()` readings is exactly how many view rows
+    /// the pane's content has shifted up between them (each capture shifts
+    /// the view by one; eviction shifts nothing) — the coordinate system
+    /// copy-mode selection anchors are pinned to (Task 3 review fix; see
+    /// the `## grid-v2` contract amendment).
+    pub fn history_total(&self) -> u64 {
+        self.state.history_total
+    }
+
+    /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
+    /// from the live bottom (0 = live screen, clamped to `history_len()`).
+    /// Out-of-range `row`/`col` returns a blank default-style cell.
+    pub fn view_cell(&self, scroll_back: u32, col: u16, row: u16) -> Cell {
+        self.state.view_cell(scroll_back, col, row)
+    }
+
+    /// Convenience: collect a whole view row into a `String` (e.g. for
+    /// copy-mode search).
+    pub fn view_row_text(&self, scroll_back: u32, row: u16) -> String {
+        (0..self.cols()).map(|c| self.view_cell(scroll_back, c, row).ch).collect()
+    }
+
+    /// The pane's title as last captured via OSC 0/2, if any.
+    pub fn title(&self) -> Option<&str> {
+        self.state.title.as_deref()
+    }
+
+    /// Edge-triggered: true the first time this is called after the title
+    /// has changed, then false until it changes again.
+    pub fn take_title_changed(&mut self) -> bool {
+        let changed = self.state.title_changed;
+        self.state.title_changed = false;
+        changed
     }
 
     /// Resize the grid, preserving the overlapping region. Dimensions are
@@ -644,6 +853,18 @@ impl Grid {
     pub fn cursor_visible(&self) -> bool {
         self.state.cursor_visible
     }
+
+    /// `true` while the pane's application has switched to the alternate
+    /// screen (`CSI ?1049h`/`?47h`/`?1047h`), `false` on the primary screen.
+    /// Mouse wheel routing (Task 5, sub-project 4) uses this to decide
+    /// whether a wheel event should scroll winmux's own scrollback/copy-mode
+    /// (primary screen) or be translated into synthesized arrow-key presses
+    /// sent to the pane (alt screen — tmux's own wheel-in-alt-screen
+    /// behavior, since alt-screen apps like `less`/vim have no scrollback of
+    /// their own to reveal).
+    pub fn alt_screen(&self) -> bool {
+        self.state.alt_screen
+    }
 }
 
 #[cfg(test)]
@@ -659,7 +880,7 @@ mod tests {
     fn print_autowrap_deferred() {
         // 5 cols: "hello" fills the row; the last 'o' arms deferred wrap,
         // cursor stays parked at the last column until the NEXT printable char.
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"hello");
         assert_eq!(row_str(&g, 0), "hello");
         assert_eq!(g.cursor(), (4, 0));
@@ -672,7 +893,7 @@ mod tests {
     #[test]
     fn autowrap_disabled() {
         // CSI ?7l turns DECAWM off: last-column prints overwrite in place.
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"\x1b[?7lhello!");
         assert_eq!(row_str(&g, 0), "hell!");
         assert_eq!(g.cursor(), (4, 0));
@@ -682,7 +903,7 @@ mod tests {
     #[test]
     fn backspace_overwrites() {
         // a,b -> BS moves back over b -> c overwrites it.
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"ab\x08c");
         assert_eq!(row_str(&g, 0), "ac   ");
         assert_eq!(g.cursor(), (2, 0));
@@ -690,7 +911,7 @@ mod tests {
 
     #[test]
     fn cr_lf() {
-        let mut g = Grid::new(5, 3);
+        let mut g = Grid::new(5, 3, 0);
         g.feed(b"abc\r");
         assert_eq!(g.cursor(), (0, 0));
         g.feed(b"\n");
@@ -701,7 +922,7 @@ mod tests {
     #[test]
     fn horizontal_tab() {
         // 8-col tab stops, clamped to the last column.
-        let mut g = Grid::new(20, 1);
+        let mut g = Grid::new(20, 1, 0);
         g.feed(b"\t");
         assert_eq!(g.cursor(), (8, 0));
         g.feed(b"\t");
@@ -713,7 +934,7 @@ mod tests {
     #[test]
     fn line_feed_scrolls_at_bottom() {
         // Two CRLFs: the second is issued at the bottom row -> scroll up.
-        let mut g = Grid::new(3, 2);
+        let mut g = Grid::new(3, 2, 0);
         g.feed(b"a\r\nb\r\n");
         assert_eq!(row_str(&g, 0), "b  ");
         assert_eq!(row_str(&g, 1), "   ");
@@ -724,7 +945,7 @@ mod tests {
 
     #[test]
     fn cursor_movement() {
-        let mut g = Grid::new(10, 5);
+        let mut g = Grid::new(10, 5, 0);
         g.feed(b"\x1b[3;4H"); // CUP row3 col4 -> (3,2) 0-based
         assert_eq!(g.cursor(), (3, 2));
         g.feed(b"\x1b[2A");   // CUU
@@ -739,7 +960,7 @@ mod tests {
 
     #[test]
     fn cup_and_hvp() {
-        let mut g = Grid::new(10, 5);
+        let mut g = Grid::new(10, 5, 0);
         g.feed(b"\x1b[H");     // home
         assert_eq!(g.cursor(), (0, 0));
         g.feed(b"\x1b[2;3f");  // HVP row2 col3 -> (2,1)
@@ -748,7 +969,7 @@ mod tests {
 
     #[test]
     fn cnl_cpl_cha() {
-        let mut g = Grid::new(10, 5);
+        let mut g = Grid::new(10, 5, 0);
         g.feed(b"\x1b[5;5H"); // (4,4)
         assert_eq!(g.cursor(), (4, 4));
         g.feed(b"\x1b[2F");   // CPL -> col0, up 2
@@ -761,7 +982,7 @@ mod tests {
 
     #[test]
     fn erase_display_below() {
-        let mut g = Grid::new(3, 3);
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"xxxxxxxxx");        // fills 3x3 via autowrap
         g.feed(b"\x1b[2;2H\x1b[0J"); // cursor (1,1); clear to end
         assert_eq!(row_str(&g, 0), "xxx");
@@ -771,7 +992,7 @@ mod tests {
 
     #[test]
     fn erase_display_above() {
-        let mut g = Grid::new(3, 3);
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"xxxxxxxxx");
         g.feed(b"\x1b[2;2H\x1b[1J"); // clear start..=cursor
         assert_eq!(row_str(&g, 0), "   ");
@@ -781,7 +1002,7 @@ mod tests {
 
     #[test]
     fn erase_display_all() {
-        let mut g = Grid::new(3, 3);
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"xxxxxxxxx");
         g.feed(b"\x1b[2J");
         assert_eq!(row_str(&g, 0), "   ");
@@ -791,7 +1012,7 @@ mod tests {
 
     #[test]
     fn erase_line_right() {
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[1;3H\x1b[0K"); // cursor col3(0-based 2); clear to eol
         assert_eq!(row_str(&g, 0), "ab   ");
@@ -799,7 +1020,7 @@ mod tests {
 
     #[test]
     fn erase_line_left() {
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[1;3H\x1b[1K"); // clear col0..=col2
         assert_eq!(row_str(&g, 0), "   de");
@@ -807,7 +1028,7 @@ mod tests {
 
     #[test]
     fn erase_line_all() {
-        let mut g = Grid::new(5, 2);
+        let mut g = Grid::new(5, 2, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[2K");
         assert_eq!(row_str(&g, 0), "     ");
@@ -815,7 +1036,7 @@ mod tests {
 
     #[test]
     fn sgr_basic() {
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"\x1b[1;31mA");
         let a = g.cell(0, 0);
         assert_eq!(a.ch, 'A');
@@ -829,7 +1050,7 @@ mod tests {
 
     #[test]
     fn sgr_attrs_and_bg() {
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"\x1b[4;7;42mX"); // underline, reverse, bg green(idx2)
         let x = g.cell(0, 0);
         assert!(x.style.underline);
@@ -846,13 +1067,13 @@ mod tests {
     fn cell_panic_message_includes_coordinates_and_dimensions() {
         // Follow-up #6: the panic message must include both the requested
         // coordinates AND the grid's actual dimensions.
-        let g = Grid::new(80, 24);
+        let g = Grid::new(80, 24, 0);
         g.cell(90, 5);
     }
 
     #[test]
     fn zero_size_new_clamps_to_1x1() {
-        let mut g = Grid::new(0, 0);
+        let mut g = Grid::new(0, 0, 0);
         assert_eq!(g.cols(), 1);
         assert_eq!(g.rows(), 1);
         g.feed(b"\x1b[5;5Hx"); // must not panic
@@ -861,7 +1082,7 @@ mod tests {
 
     #[test]
     fn zero_size_resize_clamps_to_1x1() {
-        let mut g = Grid::new(5, 5);
+        let mut g = Grid::new(5, 5, 0);
         g.resize(0, 5);
         assert_eq!(g.cols(), 1);
         assert_eq!(g.rows(), 5);
@@ -870,7 +1091,7 @@ mod tests {
 
     #[test]
     fn dectcem_visibility() {
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         assert!(g.cursor_visible());
         g.feed(b"\x1b[?25l");
         assert!(!g.cursor_visible());
@@ -881,7 +1102,7 @@ mod tests {
     #[test]
     fn insert_chars() {
         // "abcde", cursor at col1, ICH 2: 'a' | 2 blanks | 'b','c' (d,e drop off)
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[1;2H\x1b[2@");
         assert_eq!(row_str(&g, 0), "a  bc");
@@ -890,7 +1111,7 @@ mod tests {
     #[test]
     fn delete_chars() {
         // "abcde", cursor at col1, DCH 2: 'a' + shift 'd','e' left, blanks fill
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[1;2H\x1b[2P");
         assert_eq!(row_str(&g, 0), "ade  ");
@@ -899,7 +1120,7 @@ mod tests {
     #[test]
     fn erase_chars() {
         // "abcde", cursor at col1, ECH 2: blank col1,col2 in place (no shift)
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"abcde");
         g.feed(b"\x1b[1;2H\x1b[2X");
         assert_eq!(row_str(&g, 0), "a  de");
@@ -907,7 +1128,7 @@ mod tests {
 
     #[test]
     fn insert_lines() {
-        let mut g = Grid::new(3, 4);
+        let mut g = Grid::new(3, 4, 0);
         g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
         g.feed(b"\x1b[2;1H\x1b[L"); // cursor row1 (0-based); insert 1 blank line
         assert_eq!(row_str(&g, 0), "aaa");
@@ -918,7 +1139,7 @@ mod tests {
 
     #[test]
     fn delete_lines() {
-        let mut g = Grid::new(3, 4);
+        let mut g = Grid::new(3, 4, 0);
         g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
         g.feed(b"\x1b[2;1H\x1b[M"); // cursor row1; delete 1 line
         assert_eq!(row_str(&g, 0), "aaa");
@@ -929,7 +1150,7 @@ mod tests {
 
     #[test]
     fn scroll_up_su() {
-        let mut g = Grid::new(3, 3);
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"aaa\r\nbbb\r\nccc");
         g.feed(b"\x1b[S");
         assert_eq!(row_str(&g, 0), "bbb");
@@ -939,7 +1160,7 @@ mod tests {
 
     #[test]
     fn scroll_down_sd() {
-        let mut g = Grid::new(3, 3);
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"aaa\r\nbbb\r\nccc");
         g.feed(b"\x1b[T");
         assert_eq!(row_str(&g, 0), "   ");
@@ -951,7 +1172,7 @@ mod tests {
     fn scroll_region_linefeed() {
         // Region rows 2..3 (1-based) => indices 1..2. LF at region bottom
         // scrolls only that region.
-        let mut g = Grid::new(3, 4);
+        let mut g = Grid::new(3, 4, 0);
         g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
         g.feed(b"\x1b[2;3r"); // DECSTBM
         g.feed(b"\x1b[3;1H"); // cursor to index (0,2) = region bottom
@@ -965,7 +1186,7 @@ mod tests {
     #[test]
     fn reverse_index_at_top() {
         // RI at region top scrolls the region down.
-        let mut g = Grid::new(3, 4);
+        let mut g = Grid::new(3, 4, 0);
         g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
         g.feed(b"\x1b[2;3r"); // region indices 1..2
         g.feed(b"\x1b[2;1H"); // cursor to index (0,1) = region top
@@ -978,7 +1199,7 @@ mod tests {
 
     #[test]
     fn save_restore_cursor_esc() {
-        let mut g = Grid::new(10, 5);
+        let mut g = Grid::new(10, 5, 0);
         g.feed(b"\x1b[3;4H\x1b7\x1b[H"); // to (3,2), save, home
         assert_eq!(g.cursor(), (0, 0));
         g.feed(b"\x1b8");
@@ -987,7 +1208,7 @@ mod tests {
 
     #[test]
     fn save_restore_cursor_csi() {
-        let mut g = Grid::new(10, 5);
+        let mut g = Grid::new(10, 5, 0);
         g.feed(b"\x1b[3;4H\x1b[s\x1b[H");
         assert_eq!(g.cursor(), (0, 0));
         g.feed(b"\x1b[u");
@@ -996,7 +1217,7 @@ mod tests {
 
     #[test]
     fn sgr_extended_colors() {
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"\x1b[38;5;196mA");        // 256-color fg
         assert_eq!(g.cell(0, 0).style.fg, Color::Idx(196));
         g.feed(b"\x1b[48;2;10;20;30mB");   // truecolor bg
@@ -1005,7 +1226,7 @@ mod tests {
 
     #[test]
     fn sgr_bright_and_reset_attrs() {
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"\x1b[90;103mA"); // bright fg -> Idx(8), bright bg -> Idx(11)
         let a = g.cell(0, 0);
         assert_eq!(a.style.fg, Color::Idx(8));
@@ -1024,7 +1245,7 @@ mod tests {
     fn sgr_truncated_extended_colors_ignored() {
         // Truncated extended-color sequences must be discarded, not
         // reinterpreted: [38,2,30] is NOT "dim + fg black".
-        let mut g = Grid::new(5, 1);
+        let mut g = Grid::new(5, 1, 0);
         g.feed(b"\x1b[38;2;30mA"); // truecolor fg missing g,b
         let a = g.cell(0, 0);
         assert!(!a.style.dim);
@@ -1043,7 +1264,7 @@ mod tests {
     #[test]
     fn il_dl_noop_outside_scroll_region() {
         // IL/DL with the cursor outside the DECSTBM region must not move rows.
-        let mut g = Grid::new(3, 4);
+        let mut g = Grid::new(3, 4, 0);
         g.feed(b"aaa\r\nbbb\r\nccc\r\nddd");
         g.feed(b"\x1b[2;3r"); // region indices 1..2
         g.feed(b"\x1b[4;1H"); // cursor row index 3, outside region
@@ -1057,32 +1278,233 @@ mod tests {
 
     #[test]
     fn alt_screen_clears_and_homes() {
-        let mut g = Grid::new(3, 3);
+        // Real alt-screen save/restore (SP4): entering still clears + homes
+        // (visible behavior preserved from the MVP); leaving now RESTORES
+        // the primary screen's content and cursor exactly, rather than
+        // clearing it a second time.
+        let mut g = Grid::new(3, 3, 0);
         g.feed(b"xxxxxxxxx");
+        g.feed(b"\x1b[2;2H"); // primary cursor -> (1,1) before entering alt
         g.feed(b"\x1b[?1049h");
         assert_eq!(row_str(&g, 0), "   ");
         assert_eq!(row_str(&g, 1), "   ");
         assert_eq!(row_str(&g, 2), "   ");
         assert_eq!(g.cursor(), (0, 0));
         g.feed(b"yyy");
-        g.feed(b"\x1b[?1049l"); // leave also clears + homes in MVP
-        assert_eq!(row_str(&g, 0), "   ");
-        assert_eq!(g.cursor(), (0, 0));
+        g.feed(b"\x1b[?1049l"); // leave: primary restored exactly, not cleared
+        assert_eq!(row_str(&g, 0), "xxx");
+        assert_eq!(row_str(&g, 1), "xxx");
+        assert_eq!(row_str(&g, 2), "xxx");
+        assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn alt_screen_getter_tracks_mode() {
+        let mut g = Grid::new(3, 3, 0);
+        assert!(!g.alt_screen());
+        g.feed(b"\x1b[?1049h");
+        assert!(g.alt_screen());
+        g.feed(b"\x1b[?1049l");
+        assert!(!g.alt_screen());
+    }
+
+    #[test]
+    fn osc_title_captured() {
+        let mut g = Grid::new(5, 1, 0);
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1b]0;hello\x07"); // OSC 0 (icon+title), BEL-terminated
+        assert_eq!(g.title(), Some("hello"));
+        assert!(g.take_title_changed()); // edge-triggered: true once
+        assert!(!g.take_title_changed()); // cleared on read
+        g.feed(b"\x1b]2;world\x07"); // OSC 2 (title) also captured
+        assert_eq!(g.title(), Some("world"));
+        assert!(g.take_title_changed());
+    }
+
+    #[test]
+    fn osc_title_with_semicolons() {
+        // vte splits the OSC buffer on EVERY ';' -- a title containing
+        // semicolons arrives as params[1..N] and must be re-joined, not
+        // truncated at params[1] (tmux and vte's own ansi.rs reference
+        // consumer both reconstruct the full title).
+        let mut g = Grid::new(5, 1, 0);
+        g.feed(b"\x1b]0;a;b;c\x07");
+        assert_eq!(g.title(), Some("a;b;c"));
+        assert!(g.take_title_changed());
+    }
+
+    #[test]
+    fn region_scroll_top_anchored_not_captured() {
+        // A top-anchored but PARTIAL scroll region (DECSTBM rows 1-10 on a
+        // 24-row grid: top=0, bottom=9 < rows-1) must NOT capture scrolled
+        // lines -- tmux only captures full-screen scrolls into history.
+        let mut g = Grid::new(3, 24, 10);
+        g.feed(b"\x1b[1;10r"); // region indices 0..=9, homes cursor
+        g.feed(b"\x1b[10;1H"); // cursor to index (0,9) = region bottom
+        g.feed(b"top\r\n"); // LF at region bottom scrolls the region only
+        assert_eq!(g.history_len(), 0);
+        // CSI S inside the same partial region: also not captured.
+        g.feed(b"\x1b[S");
+        assert_eq!(g.history_len(), 0);
+        // Restoring the full-screen region re-enables capture.
+        g.feed(b"\x1b[r\x1b[24;1H\n");
+        assert_eq!(g.history_len(), 1);
+    }
+
+    #[test]
+    fn alt_screen_restores_pen_state() {
+        // xterm documents 1049 as save/restore "as in DECSC/DECRC": the SGR
+        // pen and autowrap flag must be restored on leave, not leaked from
+        // the alt-screen app into the primary screen.
+        let mut g = Grid::new(5, 2, 0);
+        g.feed(b"\x1b[?1049h");
+        g.feed(b"\x1b[31m\x1b[?7l"); // alt app: red fg, autowrap off
+        g.feed(b"\x1b[?1049l");
+        g.feed(b"X");
+        assert_eq!(g.cell(0, 0).style, Style::default()); // pen restored
+        g.feed(b"YZAB!"); // 6th char on a 5-col row: wraps only if DECAWM is back on
+        assert_eq!(g.cell(0, 1).ch, '!');
+    }
+
+    #[test]
+    fn osc2_and_st_terminator() {
+        // ST (`ESC \`) terminator behaves identically to BEL.
+        let mut g = Grid::new(5, 1, 0);
+        g.feed(b"\x1b]2;via-st\x1b\\");
+        assert_eq!(g.title(), Some("via-st"));
+        assert!(g.take_title_changed());
     }
 
     #[test]
     fn osc_and_unknown_ignored() {
-        let mut g = Grid::new(5, 1);
-        g.feed(b"\x1b]0;my title\x07A"); // OSC set-title then print 'A'
+        let mut g = Grid::new(5, 1, 0);
+        g.feed(b"\x1b]1;icon only\x07A"); // OSC 1 (icon-only) NOT captured as title
         assert_eq!(g.cell(0, 0).ch, 'A');
-        g.feed(b"\x1b[99;99Z");           // unknown CSI final byte -> ignored
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1b[99;99Z"); // unknown CSI final byte -> ignored
         assert_eq!(g.cell(0, 0).ch, 'A');
         assert_eq!(g.cursor(), (1, 0));
     }
 
     #[test]
+    fn scrollback_captures_scrolled_lines() {
+        // 3 cols x 2 rows: each of the three CRLFs but the first triggers a
+        // full-screen (scroll_top == 0) scroll, capturing the row pushed
+        // off the top before it's overwritten.
+        let mut g = Grid::new(3, 2, 10);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\n");
+        assert_eq!(g.history_len(), 2);
+        assert_eq!(row_str(&g, 0), "ccc");
+        assert_eq!(row_str(&g, 1), "   ");
+        // scroll_back 1: one line up from the live bottom shows the state
+        // just before the last scroll.
+        assert_eq!(g.view_row_text(1, 0), "bbb");
+        assert_eq!(g.view_row_text(1, 1), "ccc");
+        // scroll_back == history_len: fully scrolled back to the earliest
+        // captured state.
+        assert_eq!(g.view_row_text(2, 0), "aaa");
+        assert_eq!(g.view_row_text(2, 1), "bbb");
+    }
+
+    #[test]
+    fn scrollback_eviction_chunked() {
+        // rows=1 so every LF forces a scroll, capturing exactly one line of
+        // history per iteration. history_limit=20 -> eviction chunk =
+        // max(1, 20/10) = 2.
+        let mut g = Grid::new(3, 1, 20);
+        for i in 0..20 {
+            let label = format!("{i:03}");
+            g.feed(label.as_bytes());
+            g.feed(b"\r\n");
+        }
+        // The 20th push hit the limit and evicted a full chunk of 2 in one
+        // go (not just 1) -- len is 18, not 19.
+        assert_eq!(g.history_len(), 18);
+        // The two oldest lines ("000", "001") are gone; "002" now survives
+        // as the oldest entry.
+        assert_eq!(g.view_row_text(18, 0), "002");
+    }
+
+    /// Task 3 review fix: `history_total()` counts lines EVER captured,
+    /// monotonically -- eviction lowers `history_len()` but never
+    /// `history_total()`, making the latter a stable coordinate origin for
+    /// copy-mode selection anchors.
+    #[test]
+    fn history_total_monotonic_across_eviction() {
+        // Same setup as scrollback_eviction_chunked: 20 captures against
+        // limit 20 evict a chunk of 2, so len (18) < total (20).
+        let mut g = Grid::new(3, 1, 20);
+        assert_eq!(g.history_total(), 0);
+        for i in 0..20 {
+            g.feed(format!("{i:03}\r\n").as_bytes());
+        }
+        assert_eq!(g.history_len(), 18);
+        assert_eq!(g.history_total(), 20);
+        // Further captures keep counting from 20, never reset by eviction.
+        g.feed(b"x\r\n");
+        assert_eq!(g.history_total(), 21);
+        // history_limit == 0 never captures: total stays 0 too.
+        let mut off = Grid::new(3, 1, 0);
+        off.feed(b"a\r\nb\r\n");
+        assert_eq!(off.history_total(), 0);
+    }
+
+    #[test]
+    fn alt_screen_saves_and_restores_primary() {
+        let mut g = Grid::new(4, 2, 0);
+        g.feed(b"prim"); // row0 = "prim", fills the row
+        g.feed(b"\x1b[2;2H"); // primary cursor -> (1,1)
+        g.feed(b"\x1b[?1049h"); // enter alt: cleared + homed
+        assert_eq!(row_str(&g, 0), "    ");
+        g.feed(b"alt!"); // write into the alt buffer only
+        assert_eq!(row_str(&g, 0), "alt!");
+        g.feed(b"\x1b[?1049l"); // leave: primary restored exactly, alt content gone
+        assert_eq!(row_str(&g, 0), "prim");
+        assert_eq!(row_str(&g, 1), "    ");
+        assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn alt_screen_no_history() {
+        // Scrolling while in the alt screen must never capture scrollback,
+        // even though it's a scroll_top == 0 full-screen scroll.
+        let mut g = Grid::new(3, 1, 10);
+        g.feed(b"\x1b[?1049h");
+        for i in 0..5 {
+            let label = format!("{i:03}");
+            g.feed(label.as_bytes());
+            g.feed(b"\r\n");
+        }
+        assert_eq!(g.history_len(), 0);
+        g.feed(b"\x1b[?1049l");
+        assert_eq!(g.history_len(), 0);
+    }
+
+    #[test]
+    fn view_cell_clamps() {
+        let mut g = Grid::new(3, 2, 10);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\n"); // history_len == 2, see scrollback_captures_scrolled_lines
+        // scroll_back beyond history_len clamps to history_len.
+        assert_eq!(g.view_row_text(999, 0), g.view_row_text(2, 0));
+        assert_eq!(g.view_row_text(999, 1), g.view_row_text(2, 1));
+        // Out-of-range row/col -> blank default cell.
+        assert_eq!(g.view_cell(0, 0, 99), Cell::default());
+        assert_eq!(g.view_cell(0, 99, 0), Cell::default());
+    }
+
+    #[test]
+    fn history_limit_zero_disables() {
+        let mut g = Grid::new(3, 2, 0);
+        g.feed(b"aaa\r\nbbb\r\nccc\r\n");
+        assert_eq!(g.history_len(), 0);
+        // Any scroll_back clamps to 0 (no history) -> always the live screen.
+        assert_eq!(g.view_row_text(5, 0), row_str(&g, 0));
+        assert_eq!(g.view_row_text(5, 1), row_str(&g, 1));
+    }
+
+    #[test]
     fn resize_clips_and_clamps() {
-        let mut g = Grid::new(5, 3);
+        let mut g = Grid::new(5, 3, 0);
         g.feed(b"abc"); // cursor at (3,0)
         g.resize(2, 2);
         assert_eq!(g.cols(), 2);
@@ -1094,7 +1516,7 @@ mod tests {
 
     #[test]
     fn resize_grows_and_pads() {
-        let mut g = Grid::new(2, 2);
+        let mut g = Grid::new(2, 2, 0);
         g.feed(b"ab");
         g.resize(4, 3);
         assert_eq!(g.cell(0, 0).ch, 'a');

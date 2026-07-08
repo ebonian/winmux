@@ -205,11 +205,299 @@ pub enum ParsedCmd {
     HasSession { target: String },
     KillSession { target: Option<String> },
     KillServer,
+    /// `copy-mode [-u] [-e]` (Task 2, sub-project 4): enter copy mode on the
+    /// acting client's focused pane. `page_up` (`-u`) additionally scrolls up
+    /// one page immediately (the `PPage` binding). `mouse` (`-e`) is stored
+    /// but unused until the mouse task (SP4 §4) wires wheel-triggered entry.
+    CopyMode { page_up: bool, mouse: bool },
+    /// One internal `copy-*` movement/scroll/cancel/selection command (Task
+    /// 2/3 scope). Dispatched only with an acting client currently in
+    /// `ClientMode::Copy`; see the `## copy-mode` contract section. Also
+    /// reachable via tmux's `send-keys -X <name>` spelling (`resolve`'s
+    /// `send-keys` arm maps the `-X` name to this).
+    CopyCmd(CopyAction),
+    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3):
+    /// write a buffer's contents to a pane's pty. `name: None` = the newest
+    /// buffer. `no_replace` (`-r`, tmux "do not replace LF with CR") default
+    /// `false` -- the DEFAULT behavior replaces every `\n` in the buffer with
+    /// `\r` before writing (tmux's own default; shells expect `\r` to submit
+    /// a line). `-p` (bracketed-paste passthrough) is accepted and IGNORED
+    /// (v1 simplification, documented in the design spec's deferrals list).
+    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+    /// `list-buffers|lsb` (Task 3): `<name>: <size> bytes: "<sample>"` lines,
+    /// oldest first. Full multi-line text via the CLI/headless path;
+    /// dispatched from a CLIENT (a key binding, or the `:` prompt) instead
+    /// shows just the first line plus a `(N buffers)` suffix as a transient
+    /// message (documented simplification -- tmux shows a pager).
+    ListBuffers,
+    /// `delete-buffer|deleteb [-b name]` (Task 3): `name: None` = the newest
+    /// buffer.
+    DeleteBuffer { name: Option<String> },
+    /// `set-buffer|setb [-b name] data...` (Task 3): `name: None` creates a
+    /// new AUTOMATIC buffer (same `buffer-limit` eviction as
+    /// `copy-selection-and-cancel`); `Some(name)` sets/overwrites a MANUAL
+    /// buffer (exempt from eviction).
+    SetBuffer { name: Option<String>, data: String },
+    /// `select-layout|selectl [-t target] [layout-name]` (Task 6, sub-project
+    /// 4): rebuild the target window's split tree as one of the five preset
+    /// layouts. `name: None` (bare `select-layout`) re-applies the window's
+    /// current cycle position (tmux's "re-flow the current named layout"
+    /// idiom) -- dispatch-time, since it needs `Window::last_layout`.
+    /// `name: Some(n)` is validated against the five exact tmux layout names
+    /// HERE (mirroring `bind-key -T`'s inline table-name validation just
+    /// above) -- `Err("unknown layout: {n}")` for anything else.
+    SelectLayout { target: Option<String>, name: Option<String> },
+    /// `next-layout|nextl [-t target]` (Task 6): advance the target window's
+    /// `next-layout` cycle by one (wrapping), per `layout::PRESET_CYCLE`.
+    NextLayout { target: Option<String> },
+    /// `swap-pane|swapp [-U] [-D] [-s src] [-t dst]` (Task 6): `dir: Some(Up
+    /// | Down)` swaps the ACTING client's active pane with the
+    /// previous/next pane in creation order (wrapping), focus following the
+    /// active pane to its new position. `dir: None` uses the explicit
+    /// `-s src`/`-t dst` pane targets instead (each `None` half defaults via
+    /// the normal `resolve_pane_target` fallback -- the acting client's
+    /// focused pane). Any other `Direction` is unreachable: `resolve`'s flag
+    /// scanner only ever admits `-U`/`-D` for this command.
+    SwapPane { dir: Option<Direction>, src: Option<String>, dst: Option<String> },
+    /// `rotate-window|rotatew [-D] [-t target]` (Task 6): rotate every pane's
+    /// content through the target window's leaf positions by one step.
+    /// `down` is the `-D` flag; bare `rotate-window` (`down: false`, the
+    /// `C-o` default binding) and `-D` (the `M-o` binding) rotate in opposite
+    /// directions -- see `Layout::rotate`'s doc comment for the exact
+    /// permutation each maps to.
+    RotateWindow { down: bool, target: Option<String> },
+    /// `break-pane|breakp [-d] [-n name]` (Task 7, sub-project 4): the
+    /// target session/window's FOCUSED pane leaves its window and becomes a
+    /// new window (next free index >= the session's `base-index`), which
+    /// becomes current unless `-d` (`detached`) is given. `-n` names the new
+    /// window. No pane target flag: winmux's break-pane always acts on the
+    /// resolved current pane (matches the design spec's `## 6. Window ops`
+    /// section, which omits a `-s`/`-t` pane selector entirely -- smaller,
+    /// honest scope, same pattern as `swap-pane`'s own documented
+    /// deviations).
+    BreakPane { detached: bool, name: Option<String> },
+    /// `move-window|movew [-k] -t index` (Task 7): re-index the CURRENT
+    /// window (of the target session) to `target` (required -- there is
+    /// nothing to do without one, unlike real tmux's fuller cross-session
+    /// form). Occupied index -> `index in use: <n>` unless `-k` (`kill`)
+    /// kills the occupant first. `target` is resolved at dispatch time as a
+    /// bare/`:`-prefixed index within the SAME session (no cross-session
+    /// move -- see the design spec's `## 6. Window ops` section).
+    MoveWindow { kill: bool, target: String },
+    /// `find-window|findw <pattern>` (Task 7): case-insensitive substring
+    /// search (v1, no regex) over window NAMES and every pane's CURRENTLY
+    /// VISIBLE content (not scrollback) in the target session, in window-
+    /// index order; jumps to the first match (current window counts too).
+    /// No match -> `Ok` with a transient `no windows matching: <p>` message
+    /// (not an `Err` -- matches tmux, which never treats "nothing found" as
+    /// a command failure).
+    FindWindow { pattern: String },
+    /// `choose-tree|choosetree [-s] [-w]` (Task 8, sub-project 4): open the
+    /// choose-tree overlay on the acting client. `sessions: true` (`-s`)
+    /// lists every session (one collapsed row each); `false` (bare, or the
+    /// real tmux `-w` flag) lists the acting client's CURRENT session's
+    /// windows (a session header row + one indented row per window) — see
+    /// the design spec's `## 7. Overlays` section for the exact row format
+    /// and the documented "windows of the current session only" scope
+    /// simplification. `-s`/`-w` together is a usage error.
+    ChooseTree { sessions: bool },
+    /// `display-panes|displayp [-d ms]` (Task 8): show a per-pane digit
+    /// overlay on the acting client's current window; `ms: None` uses the
+    /// `display-panes-time` option's current value (resolved at dispatch
+    /// time, not here).
+    DisplayPanes { ms: Option<u32> },
+}
+
+/// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
+/// `send-keys -X` command set. See the design spec's `## 2. Copy mode`
+/// section and the `## copy-mode` contract section for the exact per-name
+/// mapping (`copy_action_name`/`copy_action_from_x_name` below).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyAction {
+    CursorLeft,
+    CursorRight,
+    CursorUp,
+    CursorDown,
+    StartOfLine,
+    EndOfLine,
+    HistoryTop,
+    HistoryBottom,
+    TopLine,
+    MiddleLine,
+    BottomLine,
+    ScrollUp,
+    ScrollDown,
+    HalfpageUp,
+    HalfpageDown,
+    PageUp,
+    PageDown,
+    NextWord,
+    PreviousWord,
+    NextWordEnd,
+    Cancel,
+    /// Task 3, sub-project 4 (selection): anchor := cursor, starting a new
+    /// linear selection (or restarting one if a selection was already
+    /// active).
+    BeginSelection,
+    /// Toggle rectangle mode on the CURRENT selection; a no-op (v1
+    /// simplification, documented) when there is no active selection --
+    /// tmux additionally sticks the toggled mode for the NEXT selection in
+    /// the same copy-mode session, which winmux does not reproduce.
+    RectangleToggle,
+    /// Swap the anchor and cursor (including each one's own scroll offset).
+    /// A no-op when there is no active selection.
+    OtherEnd,
+    /// Drop the current selection (if any); copy mode itself stays active.
+    ClearSelection,
+    /// Extract the current selection's text (if any) into a new automatic
+    /// paste buffer, then exit copy mode (the "copy" action).
+    SelectionAndCancel,
+    /// Task 4, sub-project 4 (search): open the `/`/`C-s` "Search Down: "
+    /// status-line prompt (forward = toward newer content / the live
+    /// bottom). Committing dispatches the actual search; see the
+    /// `## copy-mode` contract section's Task 4 amendment.
+    SearchForward,
+    /// Task 4: open the `?`/`C-r` "Search Up: " status-line prompt
+    /// (backward = toward older content / history top).
+    SearchBackward,
+    /// Task 4: repeat the last committed search in the SAME direction (`n`).
+    /// A no-op if no search has ever been committed in this copy-mode
+    /// session.
+    SearchAgain,
+    /// Task 4: repeat the last committed search in the OPPOSITE direction
+    /// (`N`). A no-op if no search has ever been committed in this copy-mode
+    /// session.
+    SearchReverse,
+}
+
+/// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
+/// table storage, `list-keys` output).
+fn copy_action_name(a: CopyAction) -> &'static str {
+    match a {
+        CopyAction::CursorLeft => "copy-cursor-left",
+        CopyAction::CursorRight => "copy-cursor-right",
+        CopyAction::CursorUp => "copy-cursor-up",
+        CopyAction::CursorDown => "copy-cursor-down",
+        CopyAction::StartOfLine => "copy-start-of-line",
+        CopyAction::EndOfLine => "copy-end-of-line",
+        CopyAction::HistoryTop => "copy-history-top",
+        CopyAction::HistoryBottom => "copy-history-bottom",
+        CopyAction::TopLine => "copy-top-line",
+        CopyAction::MiddleLine => "copy-middle-line",
+        CopyAction::BottomLine => "copy-bottom-line",
+        CopyAction::ScrollUp => "copy-scroll-up",
+        CopyAction::ScrollDown => "copy-scroll-down",
+        CopyAction::HalfpageUp => "copy-halfpage-up",
+        CopyAction::HalfpageDown => "copy-halfpage-down",
+        CopyAction::PageUp => "copy-page-up",
+        CopyAction::PageDown => "copy-page-down",
+        CopyAction::NextWord => "copy-next-word",
+        CopyAction::PreviousWord => "copy-previous-word",
+        CopyAction::NextWordEnd => "copy-next-word-end",
+        CopyAction::Cancel => "copy-cancel",
+        CopyAction::BeginSelection => "copy-begin-selection",
+        CopyAction::RectangleToggle => "copy-rectangle-toggle",
+        CopyAction::OtherEnd => "copy-other-end",
+        CopyAction::ClearSelection => "copy-clear-selection",
+        CopyAction::SelectionAndCancel => "copy-selection-and-cancel",
+        CopyAction::SearchForward => "copy-search-forward",
+        CopyAction::SearchBackward => "copy-search-backward",
+        CopyAction::SearchAgain => "copy-search-again",
+        CopyAction::SearchReverse => "copy-search-reverse",
+    }
+}
+
+/// Every [`CopyAction`], for building the canonical-name table and iterating
+/// in tests.
+const COPY_ACTIONS: &[CopyAction] = &[
+    CopyAction::CursorLeft,
+    CopyAction::CursorRight,
+    CopyAction::CursorUp,
+    CopyAction::CursorDown,
+    CopyAction::StartOfLine,
+    CopyAction::EndOfLine,
+    CopyAction::HistoryTop,
+    CopyAction::HistoryBottom,
+    CopyAction::TopLine,
+    CopyAction::MiddleLine,
+    CopyAction::BottomLine,
+    CopyAction::ScrollUp,
+    CopyAction::ScrollDown,
+    CopyAction::HalfpageUp,
+    CopyAction::HalfpageDown,
+    CopyAction::PageUp,
+    CopyAction::PageDown,
+    CopyAction::NextWord,
+    CopyAction::PreviousWord,
+    CopyAction::NextWordEnd,
+    CopyAction::Cancel,
+    CopyAction::BeginSelection,
+    CopyAction::RectangleToggle,
+    CopyAction::OtherEnd,
+    CopyAction::ClearSelection,
+    CopyAction::SelectionAndCancel,
+    CopyAction::SearchForward,
+    CopyAction::SearchBackward,
+    CopyAction::SearchAgain,
+    CopyAction::SearchReverse,
+];
+
+fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
+    COPY_ACTIONS.iter().copied().find(|a| copy_action_name(*a) == name)
+}
+
+/// `send-keys -X <name>` spelling -> [`CopyAction`] (tmux's copy-mode
+/// command names, hyphenated without the `copy-` prefix).
+fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
+    Some(match name {
+        "cancel" => CopyAction::Cancel,
+        "cursor-left" => CopyAction::CursorLeft,
+        "cursor-right" => CopyAction::CursorRight,
+        "cursor-up" => CopyAction::CursorUp,
+        "cursor-down" => CopyAction::CursorDown,
+        "start-of-line" => CopyAction::StartOfLine,
+        "end-of-line" => CopyAction::EndOfLine,
+        "history-top" => CopyAction::HistoryTop,
+        "history-bottom" => CopyAction::HistoryBottom,
+        "top-line" => CopyAction::TopLine,
+        "middle-line" => CopyAction::MiddleLine,
+        "bottom-line" => CopyAction::BottomLine,
+        "scroll-up" => CopyAction::ScrollUp,
+        "scroll-down" => CopyAction::ScrollDown,
+        "halfpage-up" => CopyAction::HalfpageUp,
+        "halfpage-down" => CopyAction::HalfpageDown,
+        "page-up" => CopyAction::PageUp,
+        "page-down" => CopyAction::PageDown,
+        "next-word" => CopyAction::NextWord,
+        "previous-word" => CopyAction::PreviousWord,
+        "next-word-end" => CopyAction::NextWordEnd,
+        "begin-selection" => CopyAction::BeginSelection,
+        "rectangle-toggle" => CopyAction::RectangleToggle,
+        "other-end" => CopyAction::OtherEnd,
+        "clear-selection" => CopyAction::ClearSelection,
+        // tmux's own -X spelling for this one command retains the "copy-"
+        // prefix (unlike every other -X name above) -- verified against
+        // tmux master's `cmd-copy-mode.c`/`window-copy.c` command table.
+        "copy-selection-and-cancel" => CopyAction::SelectionAndCancel,
+        "search-forward" => CopyAction::SearchForward,
+        "search-backward" => CopyAction::SearchBackward,
+        "search-again" => CopyAction::SearchAgain,
+        "search-reverse" => CopyAction::SearchReverse,
+        _ => return None,
+    })
 }
 
 /// Map a command name OR any tmux alias to its canonical full name. `None`
 /// for an unrecognized name.
 fn canonical(name: &str) -> Option<&'static str> {
+    if name == "copy-mode" {
+        return Some("copy-mode");
+    }
+    // Internal copy-* commands: bindable and resolvable but their canonical
+    // name IS the alias (no separate short form).
+    if let Some(a) = copy_action_from_canonical(name) {
+        return Some(copy_action_name(a));
+    }
     Some(match name {
         "split-window" | "splitw" => "split-window",
         "select-pane" | "selectp" => "select-pane",
@@ -244,6 +532,19 @@ fn canonical(name: &str) -> Option<&'static str> {
         "has-session" | "has" => "has-session",
         "kill-session" => "kill-session",
         "kill-server" => "kill-server",
+        "paste-buffer" | "pasteb" => "paste-buffer",
+        "list-buffers" | "lsb" => "list-buffers",
+        "delete-buffer" | "deleteb" => "delete-buffer",
+        "set-buffer" | "setb" => "set-buffer",
+        "select-layout" | "selectl" => "select-layout",
+        "next-layout" | "nextl" => "next-layout",
+        "swap-pane" | "swapp" => "swap-pane",
+        "rotate-window" | "rotatew" => "rotate-window",
+        "break-pane" | "breakp" => "break-pane",
+        "move-window" | "movew" => "move-window",
+        "find-window" | "findw" => "find-window",
+        "choose-tree" | "choosetree" => "choose-tree",
+        "display-panes" | "displayp" => "display-panes",
         _ => return None,
     })
 }
@@ -257,6 +558,12 @@ fn canonical(name: &str) -> Option<&'static str> {
 /// once the server rewires onto this table.
 pub fn usage(name: &str) -> Option<&'static str> {
     let canon = canonical(name)?;
+    if canon == "copy-mode" {
+        return Some("usage: copy-mode [-u] [-e]");
+    }
+    if copy_action_from_canonical(canon).is_some() {
+        return Some("usage: copy-<action> (no arguments)");
+    }
     Some(match canon {
         "split-window" => "usage: split-window [-h] [-v] [-t target]",
         "select-pane" => "usage: select-pane [-L] [-R] [-U] [-D] [-t target]",
@@ -291,6 +598,19 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "has-session" => "usage: has-session -t target",
         "kill-session" => "usage: kill-session [-t target]",
         "kill-server" => "usage: kill-server",
+        "paste-buffer" => "usage: paste-buffer [-p] [-r] [-b name] [-t target-pane]",
+        "list-buffers" => "usage: list-buffers",
+        "delete-buffer" => "usage: delete-buffer [-b name]",
+        "set-buffer" => "usage: set-buffer [-b name] data",
+        "select-layout" => "usage: select-layout [-t target] [layout-name]",
+        "next-layout" => "usage: next-layout [-t target]",
+        "swap-pane" => "usage: swap-pane [-U] [-D] [-s src] [-t dst]",
+        "rotate-window" => "usage: rotate-window [-D] [-t target]",
+        "break-pane" => "usage: break-pane [-d] [-n name]",
+        "move-window" => "usage: move-window [-k] -t index",
+        "find-window" => "usage: find-window pattern",
+        "choose-tree" => "usage: choose-tree [-s] [-w]",
+        "display-panes" => "usage: display-panes [-d ms]",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -387,6 +707,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
     };
     let usage_str = usage(canon).expect("canonical() and usage() command lists must agree");
     let bad = || usage_str.to_string();
+
+    if canon == "copy-mode" {
+        let Ok((b, _, p)) = scan_flags(&raw.args, &["-u", "-e"], &[]) else { return Err(bad()) };
+        if !p.is_empty() {
+            return Err(bad());
+        }
+        return Ok(ParsedCmd::CopyMode { page_up: has(&b, "-u"), mouse: has(&b, "-e") });
+    }
+    if let Some(action) = copy_action_from_canonical(canon) {
+        if !raw.args.is_empty() {
+            return Err(bad());
+        }
+        return Ok(ParsedCmd::CopyCmd(action));
+    }
 
     match canon {
         "split-window" => {
@@ -494,7 +828,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::DetachClient { target: value_of(&v, "-s") })
         }
         "send-keys" => {
-            let Ok((b, v, p)) = scan_flags(&raw.args, &["-l"], &["-t"]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-l", "-X"], &["-t"]) else { return Err(bad()) };
+            if has(&b, "-X") {
+                // tmux `send-keys -X <name>` spelling for a copy-mode
+                // command: the first positional arg is the -X command name,
+                // mapped to the internal `copy-*` command it aliases (see
+                // `copy_action_from_x_name`). Whether the acting client is
+                // actually IN copy mode is a dispatch-time (not parse-time)
+                // concern — see the `## copy-mode` contract section.
+                let Some(xname) = p.first() else { return Err(bad()) };
+                let Some(action) = copy_action_from_x_name(xname) else {
+                    return Err(format!("unknown -X command: {xname}"));
+                };
+                return Ok(ParsedCmd::CopyCmd(action));
+            }
             if p.is_empty() {
                 return Err(bad());
             }
@@ -609,7 +956,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                     "-T" => {
                         i += 1;
                         let Some(t) = raw.args.get(i) else { return Err(bad()) };
-                        if t != "root" && t != "prefix" {
+                        if !matches!(t.as_str(), "root" | "prefix" | "copy-mode" | "copy-mode-vi") {
                             return Err(format!("unknown key table: {t}"));
                         }
                         table = Some(t.clone());
@@ -647,7 +994,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                     "-T" => {
                         i += 1;
                         let Some(t) = raw.args.get(i) else { return Err(bad()) };
-                        if t != "root" && t != "prefix" {
+                        if !matches!(t.as_str(), "root" | "prefix" | "copy-mode" | "copy-mode-vi") {
                             return Err(format!("unknown key table: {t}"));
                         }
                         table = Some(t.clone());
@@ -731,6 +1078,107 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 return Err(bad());
             }
             Ok(ParsedCmd::KillServer)
+        }
+        "paste-buffer" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-p", "-r"], &["-b", "-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::PasteBuffer { name: value_of(&v, "-b"), target: value_of(&v, "-t"), no_replace: has(&b, "-r") })
+        }
+        "list-buffers" => {
+            if !raw.args.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ListBuffers)
+        }
+        "delete-buffer" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-b"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::DeleteBuffer { name: value_of(&v, "-b") })
+        }
+        "set-buffer" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-b"]) else { return Err(bad()) };
+            if p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::SetBuffer { name: value_of(&v, "-b"), data: p.join(" ") })
+        }
+        "select-layout" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-t"]) else { return Err(bad()) };
+            if p.len() > 1 {
+                return Err(bad());
+            }
+            let name = p.into_iter().next();
+            if let Some(n) = &name {
+                if !matches!(n.as_str(), "even-horizontal" | "even-vertical" | "main-horizontal" | "main-vertical" | "tiled") {
+                    return Err(format!("unknown layout: {n}"));
+                }
+            }
+            Ok(ParsedCmd::SelectLayout { target: value_of(&v, "-t"), name })
+        }
+        "next-layout" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::NextLayout { target: value_of(&v, "-t") })
+        }
+        "swap-pane" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-U", "-D"], &["-s", "-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::SwapPane { dir: direction_of(&b), src: value_of(&v, "-s"), dst: value_of(&v, "-t") })
+        }
+        "rotate-window" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-D"], &["-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::RotateWindow { down: has(&b, "-D"), target: value_of(&v, "-t") })
+        }
+        "break-pane" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-n"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::BreakPane { detached: has(&b, "-d"), name: value_of(&v, "-n") })
+        }
+        "move-window" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-k"], &["-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            let Some(target) = value_of(&v, "-t") else { return Err(bad()) };
+            Ok(ParsedCmd::MoveWindow { kill: has(&b, "-k"), target })
+        }
+        "find-window" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if p.len() != 1 {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::FindWindow { pattern: p[0].clone() })
+        }
+        "choose-tree" => {
+            let Ok((b, _, p)) = scan_flags(&raw.args, &["-s", "-w"], &[]) else { return Err(bad()) };
+            if !p.is_empty() || (has(&b, "-s") && has(&b, "-w")) {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseTree { sessions: has(&b, "-s") })
+        }
+        "display-panes" => {
+            let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-d"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            let ms = match value_of(&v, "-d") {
+                Some(s) => Some(s.parse::<u32>().map_err(|_| bad())?),
+                None => None,
+            };
+            Ok(ParsedCmd::DisplayPanes { ms })
         }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
@@ -1020,6 +1468,133 @@ mod tests {
         assert_eq!(resolve(&raw("resize-pane", &["-L", "abc"])).unwrap_err(), usage("resize-pane").unwrap());
     }
 
+    // ---- layout presets, swap-pane, rotate-window (Task 6, sub-project 4) --
+
+    #[test]
+    fn select_layout_flags_and_name_validation() {
+        assert_eq!(
+            resolve(&raw("select-layout", &["main-vertical"])).unwrap(),
+            ParsedCmd::SelectLayout { target: None, name: Some("main-vertical".to_string()) }
+        );
+        assert_eq!(
+            resolve(&raw("selectl", &["-t", "work", "tiled"])).unwrap(),
+            ParsedCmd::SelectLayout { target: Some("work".to_string()), name: Some("tiled".to_string()) }
+        );
+        assert_eq!(resolve(&raw("select-layout", &[])).unwrap(), ParsedCmd::SelectLayout { target: None, name: None });
+        assert_eq!(
+            resolve(&raw("select-layout", &["bogus"])).unwrap_err(),
+            "unknown layout: bogus"
+        );
+        assert_eq!(resolve(&raw("select-layout", &["a", "b"])).unwrap_err(), usage("select-layout").unwrap());
+    }
+
+    #[test]
+    fn next_layout_no_args() {
+        assert_eq!(resolve(&raw("next-layout", &[])).unwrap(), ParsedCmd::NextLayout { target: None });
+        assert_eq!(resolve(&raw("nextl", &["-t", "s"])).unwrap(), ParsedCmd::NextLayout { target: Some("s".to_string()) });
+        assert_eq!(resolve(&raw("next-layout", &["extra"])).unwrap_err(), usage("next-layout").unwrap());
+    }
+
+    #[test]
+    fn swap_pane_flags() {
+        assert_eq!(
+            resolve(&raw("swap-pane", &["-U"])).unwrap(),
+            ParsedCmd::SwapPane { dir: Some(Direction::Up), src: None, dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("swapp", &["-D"])).unwrap(),
+            ParsedCmd::SwapPane { dir: Some(Direction::Down), src: None, dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("swap-pane", &["-s", "0", "-t", "1"])).unwrap(),
+            ParsedCmd::SwapPane { dir: None, src: Some("0".to_string()), dst: Some("1".to_string()) }
+        );
+        assert_eq!(resolve(&raw("swap-pane", &["-L"])).unwrap_err(), usage("swap-pane").unwrap());
+    }
+
+    #[test]
+    fn rotate_window_flags() {
+        assert_eq!(resolve(&raw("rotate-window", &[])).unwrap(), ParsedCmd::RotateWindow { down: false, target: None });
+        assert_eq!(
+            resolve(&raw("rotatew", &["-D"])).unwrap(),
+            ParsedCmd::RotateWindow { down: true, target: None }
+        );
+        assert_eq!(
+            resolve(&raw("rotate-window", &["-t", "work"])).unwrap(),
+            ParsedCmd::RotateWindow { down: false, target: Some("work".to_string()) }
+        );
+    }
+
+    // ---- window ops (Task 7, sub-project 4) --------------------------------
+
+    #[test]
+    fn break_pane_flags() {
+        assert_eq!(resolve(&raw("break-pane", &[])).unwrap(), ParsedCmd::BreakPane { detached: false, name: None });
+        assert_eq!(
+            resolve(&raw("breakp", &["-d"])).unwrap(),
+            ParsedCmd::BreakPane { detached: true, name: None }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-n", "logs"])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: Some("logs".to_string()) }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-d", "-n", "logs"])).unwrap(),
+            ParsedCmd::BreakPane { detached: true, name: Some("logs".to_string()) }
+        );
+        assert_eq!(resolve(&raw("break-pane", &["extra"])).unwrap_err(), usage("break-pane").unwrap());
+    }
+
+    #[test]
+    fn move_window_flags() {
+        assert_eq!(
+            resolve(&raw("move-window", &["-t", "5"])).unwrap(),
+            ParsedCmd::MoveWindow { kill: false, target: "5".to_string() }
+        );
+        assert_eq!(
+            resolve(&raw("movew", &["-k", "-t", "3"])).unwrap(),
+            ParsedCmd::MoveWindow { kill: true, target: "3".to_string() }
+        );
+        // -t is required -- there's nothing for a bare move-window to do.
+        assert_eq!(resolve(&raw("move-window", &[])).unwrap_err(), usage("move-window").unwrap());
+    }
+
+    #[test]
+    fn find_window_pattern() {
+        assert_eq!(
+            resolve(&raw("find-window", &["logs"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "logs".to_string() }
+        );
+        assert_eq!(
+            resolve(&raw("findw", &["with space"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "with space".to_string() }
+        );
+        assert_eq!(resolve(&raw("find-window", &[])).unwrap_err(), usage("find-window").unwrap());
+        assert_eq!(resolve(&raw("find-window", &["a", "b"])).unwrap_err(), usage("find-window").unwrap());
+    }
+
+    // ---- overlays (Task 8, sub-project 4) ----------------------------------
+
+    #[test]
+    fn choose_tree_flags() {
+        assert_eq!(resolve(&raw("choose-tree", &[])).unwrap(), ParsedCmd::ChooseTree { sessions: false });
+        assert_eq!(resolve(&raw("choose-tree", &["-w"])).unwrap(), ParsedCmd::ChooseTree { sessions: false });
+        assert_eq!(resolve(&raw("choosetree", &["-s"])).unwrap(), ParsedCmd::ChooseTree { sessions: true });
+        assert_eq!(resolve(&raw("choose-tree", &["-s", "-w"])).unwrap_err(), usage("choose-tree").unwrap());
+        assert_eq!(resolve(&raw("choose-tree", &["extra"])).unwrap_err(), usage("choose-tree").unwrap());
+    }
+
+    #[test]
+    fn display_panes_flags() {
+        assert_eq!(resolve(&raw("display-panes", &[])).unwrap(), ParsedCmd::DisplayPanes { ms: None });
+        assert_eq!(
+            resolve(&raw("displayp", &["-d", "200"])).unwrap(),
+            ParsedCmd::DisplayPanes { ms: Some(200) }
+        );
+        assert_eq!(resolve(&raw("display-panes", &["-d", "nope"])).unwrap_err(), usage("display-panes").unwrap());
+        assert_eq!(resolve(&raw("display-panes", &["extra"])).unwrap_err(), usage("display-panes").unwrap());
+    }
+
     #[test]
     fn unknown_command_err_exact() {
         assert_eq!(resolve(&raw("bogus-cmd", &[])).unwrap_err(), "unknown command: bogus-cmd");
@@ -1090,6 +1665,177 @@ mod tests {
             resolve(&raw("renamew", &["newname"])).unwrap(),
             ParsedCmd::RenameWindow { target: None, name: "newname".to_string() }
         );
+    }
+
+    // ---- copy-mode (Task 2, sub-project 4) ----
+
+    #[test]
+    fn copy_mode_flags() {
+        assert_eq!(resolve(&raw("copy-mode", &[])).unwrap(), ParsedCmd::CopyMode { page_up: false, mouse: false });
+        assert_eq!(
+            resolve(&raw("copy-mode", &["-u"])).unwrap(),
+            ParsedCmd::CopyMode { page_up: true, mouse: false }
+        );
+        assert_eq!(
+            resolve(&raw("copy-mode", &["-u", "-e"])).unwrap(),
+            ParsedCmd::CopyMode { page_up: true, mouse: true }
+        );
+        assert_eq!(resolve(&raw("copy-mode", &["bogus"])).unwrap_err(), usage("copy-mode").unwrap());
+    }
+
+    #[test]
+    fn copy_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-cursor-left", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::CursorLeft));
+        assert_eq!(resolve(&raw("copy-cancel", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::Cancel));
+        assert_eq!(
+            resolve(&raw("copy-history-bottom", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::HistoryBottom)
+        );
+        // No arguments accepted.
+        assert_eq!(resolve(&raw("copy-cancel", &["x"])).unwrap_err(), usage("copy-cancel").unwrap());
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_to_copy_action() {
+        assert_eq!(resolve(&raw("send-keys", &["-X", "cancel"])).unwrap(), ParsedCmd::CopyCmd(CopyAction::Cancel));
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "cursor-left"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CursorLeft)
+        );
+        assert_eq!(
+            resolve(&raw("send", &["-X", "history-top"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::HistoryTop)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "bogus"])).unwrap_err(),
+            "unknown -X command: bogus"
+        );
+    }
+
+    #[test]
+    fn bind_key_accepts_copy_mode_tables() {
+        let ParsedCmd::BindKey { table, .. } =
+            resolve(&raw("bind", &["-T", "copy-mode-vi", "h", "copy-cursor-left"])).unwrap()
+        else {
+            panic!("expected BindKey")
+        };
+        assert_eq!(table, "copy-mode-vi");
+    }
+
+    // ---- selection + paste buffers (Task 3, sub-project 4) ----
+
+    #[test]
+    fn copy_selection_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-begin-selection", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::BeginSelection));
+        assert_eq!(resolve(&raw("copy-rectangle-toggle", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::RectangleToggle));
+        assert_eq!(resolve(&raw("copy-other-end", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::OtherEnd));
+        assert_eq!(resolve(&raw("copy-clear-selection", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::ClearSelection));
+        assert_eq!(
+            resolve(&raw("copy-selection-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SelectionAndCancel)
+        );
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_selection_names() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "begin-selection"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BeginSelection)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "rectangle-toggle"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::RectangleToggle)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "other-end"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::OtherEnd)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "clear-selection"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::ClearSelection)
+        );
+        // The one -X name that keeps the "copy-" prefix.
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-selection-and-cancel"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SelectionAndCancel)
+        );
+    }
+
+    // ---- search (Task 4, sub-project 4) ----
+
+    #[test]
+    fn copy_search_action_commands_resolve() {
+        assert_eq!(resolve(&raw("copy-search-forward", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchForward));
+        assert_eq!(resolve(&raw("copy-search-backward", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchBackward));
+        assert_eq!(resolve(&raw("copy-search-again", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchAgain));
+        assert_eq!(resolve(&raw("copy-search-reverse", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::SearchReverse));
+        // No arguments accepted (same rule as every other copy-* command).
+        assert_eq!(resolve(&raw("copy-search-forward", &["x"])).unwrap_err(), usage("copy-search-forward").unwrap());
+    }
+
+    #[test]
+    fn send_keys_dash_x_maps_search_names() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-forward"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchForward)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-backward"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchBackward)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-again"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchAgain)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "search-reverse"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::SearchReverse)
+        );
+    }
+
+    #[test]
+    fn paste_buffer_flags() {
+        assert_eq!(
+            resolve(&raw("paste-buffer", &[])).unwrap(),
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false }
+        );
+        assert_eq!(
+            resolve(&raw("pasteb", &["-p", "-b", "foo", "-t", "work"])).unwrap(),
+            ParsedCmd::PasteBuffer { name: Some("foo".to_string()), target: Some("work".to_string()), no_replace: false }
+        );
+        assert_eq!(
+            resolve(&raw("paste-buffer", &["-r"])).unwrap(),
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true }
+        );
+        assert_eq!(resolve(&raw("paste-buffer", &["bogus"])).unwrap_err(), usage("paste-buffer").unwrap());
+    }
+
+    #[test]
+    fn list_buffers_takes_no_args() {
+        assert_eq!(resolve(&raw("lsb", &[])).unwrap(), ParsedCmd::ListBuffers);
+        assert_eq!(resolve(&raw("list-buffers", &["x"])).unwrap_err(), usage("list-buffers").unwrap());
+    }
+
+    #[test]
+    fn delete_buffer_flags() {
+        assert_eq!(resolve(&raw("deleteb", &[])).unwrap(), ParsedCmd::DeleteBuffer { name: None });
+        assert_eq!(
+            resolve(&raw("delete-buffer", &["-b", "foo"])).unwrap(),
+            ParsedCmd::DeleteBuffer { name: Some("foo".to_string()) }
+        );
+    }
+
+    #[test]
+    fn set_buffer_flags_and_requires_data() {
+        assert_eq!(
+            resolve(&raw("setb", &["hello", "world"])).unwrap(),
+            ParsedCmd::SetBuffer { name: None, data: "hello world".to_string() }
+        );
+        assert_eq!(
+            resolve(&raw("set-buffer", &["-b", "foo", "hi"])).unwrap(),
+            ParsedCmd::SetBuffer { name: Some("foo".to_string()), data: "hi".to_string() }
+        );
+        assert_eq!(resolve(&raw("set-buffer", &["-b", "foo"])).unwrap_err(), usage("set-buffer").unwrap());
     }
 
     #[test]

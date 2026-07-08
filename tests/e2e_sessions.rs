@@ -39,7 +39,7 @@ fn e2e_detach_reattach_persists() {
 
     // Client A: `winmux -L <s> new -s work`.
     let (mut pty_a, proc_a, rx_a) = spawn_winmux_pty(&["-L", &socket, "new", "-s", "work"]);
-    let mut grid_a = Grid::new(COLS, ROWS);
+    let mut grid_a = Grid::new(COLS, ROWS, 0);
     let mut raw_a: Vec<u8> = Vec::new();
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -100,7 +100,7 @@ fn e2e_detach_reattach_persists() {
 
     // Client B: `winmux -L <s> attach -t work` -- the prior output persists.
     let (mut pty_b, proc_b, rx_b) = spawn_winmux_pty(&["-L", &socket, "attach", "-t", "work"]);
-    let mut grid_b = Grid::new(COLS, ROWS);
+    let mut grid_b = Grid::new(COLS, ROWS, 0);
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
         wait_until(deadline, || {
@@ -129,7 +129,7 @@ fn e2e_windows_roundtrip() {
     let _guard = ServerGuard { socket: socket.clone() };
 
     let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket]);
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(COLS, ROWS, 0);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     assert!(
@@ -207,7 +207,7 @@ fn e2e_kill_session_exits_client() {
     let _guard = ServerGuard { socket: socket.clone() };
 
     let (_pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "new", "-s", "foo"]);
-    let mut grid = Grid::new(COLS, ROWS);
+    let mut grid = Grid::new(COLS, ROWS, 0);
     let mut raw: Vec<u8> = Vec::new();
 
     let deadline = Instant::now() + Duration::from_secs(15);

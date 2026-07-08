@@ -67,6 +67,86 @@ grows downward.
 
 ## `layout` — split tree (pure)
 
+**Amendment (sub-project 4, Task 5 — mouse):** `resize_focused` is now a thin
+wrapper over a new, more general `resize_from(&mut self, pane: PaneId, dir:
+Direction, area: Rect, cells: u16) -> bool`, which takes an explicit
+reference leaf instead of always using `self.focused` — needed for mouse
+border-drag resize, which must be able to move a border adjacent to a pane
+that ISN'T currently focused, without changing focus. `resize_focused`'s own
+signature/behavior is unchanged. See the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md).
+
+**Amendment (sub-project 4, Task 6 — layout presets, swap-pane,
+rotate-window):** three additions, all still pure (no I/O):
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+/// `next-layout`'s cycle order; also the canonical index (0..=4) stored in
+/// `model::Window::last_layout`.
+pub const PRESET_CYCLE: [LayoutPreset; 5] = [ /* the 5 variants above, in order */ ];
+
+impl LayoutPreset {
+    pub fn name(self) -> &'static str;             // "even-horizontal", ...
+    pub fn from_name(s: &str) -> Option<LayoutPreset>; // exact match only
+    pub fn cycle_index(self) -> u8;                 // position in PRESET_CYCLE
+}
+
+impl Layout {
+    /// Rebuild the split tree from scratch as one of the five presets.
+    /// `panes` is the CALLER-supplied pane order used for placement
+    /// (position 0 is the "main" pane for MainHorizontal/MainVertical) --
+    /// callers pass CREATION order (ascending PaneId), not `self.panes()`'s
+    /// current tree order, so a preset re-applied after a swap/rotate stays
+    /// pinned to the same placement regardless of how the tree got
+    /// scrambled. `main_width`/`main_height` are the `main-pane-width`/
+    /// `main-pane-height` option values, clamped internally so the main pane
+    /// is >= MIN_PANE_W/H and the other panes are too. A single pane always
+    /// just fills `area`. Focus is preserved if still present in `panes`
+    /// (else falls back to `panes[0]`); zoom is cleared. No-op if `panes` is
+    /// empty.
+    pub fn apply_preset(&mut self, preset: LayoutPreset, panes: &[PaneId], area: Rect, main_width: u16, main_height: u16);
+
+    /// Swap the CONTENTS of the two leaves holding `a` and `b` (each pane
+    /// keeps its id; they trade tree/screen positions). `self.focused`
+    /// stores a PaneId, so a focused pane that is one of `a`/`b`
+    /// automatically "follows" to its new position -- no explicit focus
+    /// bookkeeping. Clears zoom. `false` (no-op) if `a == b` or either id
+    /// isn't a leaf of this layout.
+    pub fn swap_panes(&mut self, a: PaneId, b: PaneId) -> bool;
+
+    /// Rotate every pane's content through the tree's leaf positions by one
+    /// step. `forward` shifts each position's content to what the PREVIOUS
+    /// leaf position held (content moves one position later, wrapping last
+    /// -> first); `!forward` is the mirror. Focus follows the SCREEN CELL
+    /// (leaf position), not the pane -- whichever position was focused stays
+    /// focused, now showing whichever pane rotated into it. Clears zoom.
+    /// `false` (no-op) with 0 or 1 panes.
+    pub fn rotate(&mut self, forward: bool) -> bool;
+}
+```
+
+Rounding rule for every preset's even splits: remainder cells go to the
+EARLIER (leftmost/topmost) entries first (`even_lengths`, a private helper).
+`tiled`'s rows-first grid: `rows=cols=1; while r*c<n { r+=1; if r*c<n {
+c+=1 } }`; a short final row's panes are spread evenly over the row's OWN
+pane count (not the full `cols`), so the last pane in a short row ends up
+wider than a normal column ("last short row spans"). Deviation from the SP4
+design spec's `Layout::rotate(forward: bool)` signature: none — the
+parameter name and meaning match; only the mapping from
+`rotate-window`/`-D` to `forward` was a judgment call (see
+`cmd`/`server::dispatch` amendments in
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)'s
+`## layout-presets` section) since neither the task brief nor the design
+spec pin down the exact `-D`/bare direction-to-permutation mapping.
+
 ```rust
 pub type PaneId = u32;
 
@@ -124,6 +204,11 @@ impl Layout {
     /// minimums within `area`. Returns false if nothing changed.
     pub fn resize_focused(&mut self, dir: Direction, area: Rect, cells: u16) -> bool;
 
+    /// Task 5 (mouse) addition: generalizes `resize_focused` to an explicit
+    /// reference pane instead of `self.focused` (see the amendment note
+    /// above). Never changes focus.
+    pub fn resize_from(&mut self, pane: PaneId, dir: Direction, area: Rect, cells: u16) -> bool;
+
     /// Toggle zoom on the focused pane. Zoom auto-clears on split/remove.
     pub fn toggle_zoom(&mut self);
     pub fn is_zoomed(&self) -> bool;
@@ -148,6 +233,17 @@ impl Layout {
 ```
 
 ## `grid` — per-pane terminal emulator
+
+**SUPERSEDED (sub-project 4, Task 1):** `Grid::new` gained a third
+`history_limit: u32` parameter, and `Grid` gained `history_len`, `view_cell`,
+`view_row_text`, `title`, and `take_title_changed`. Real scrollback capture
+and a real (save/restore) alternate screen replaced the MVP's "no scrollback,
+alt screen just clears" behavior; OSC 0/2 now capture the pane title instead
+of being ignored. See the `## grid-v2` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
+for the full current contract. This section is kept for historical reference
+only; everything below it describing scrollback-free/OSC-ignored MVP behavior
+is superseded.
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -256,6 +352,43 @@ pub struct StatusRow {
     pub right_style: grid::Style,
 }
 
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-08, SP4 Task 8 — overlays):**
+/// `PaneView` gains `copy: Option<render::CopyView>` (SP4 Task 2, already in
+/// effect — see the sibling SP4 contract's `## copy-mode` section) and
+/// `Scene` gains `mode_style: grid::Style`, `display_panes_colour: grid::
+/// Style`, `display_panes_active_colour: grid::Style`, and `overlay:
+/// Option<render::Overlay>`:
+///
+/// ```rust
+/// pub struct ListOverlay {
+///     /// Optional header row (empty = none); painted in the default style.
+///     pub title: String,
+///     /// (already-formatted row text, is this row selected).
+///     pub rows: Vec<(String, bool)>,
+///     /// Index into `rows` of the first row shown below the title —
+///     /// scrolling when `rows` is longer than the available height.
+///     pub top: usize,
+/// }
+///
+/// pub enum Overlay {
+///     /// choose-tree: clears/replaces the WHOLE client area; selected row
+///     /// painted in `Scene::mode_style`, everything else default style.
+///     List(ListOverlay),
+///     /// display-panes: `(pane rect, digit 0-9, is the focused pane)` —
+///     /// colour comes from `Scene::display_panes_colour`/
+///     /// `display_panes_active_colour`, not carried per-entry.
+///     PaneDigits(Vec<(geom::Rect, u32, bool)>),
+/// }
+/// ```
+///
+/// Painted LAST, over everything else `compose_back` already composed
+/// (panes/borders/status/message) — see the compositing rules below. Both
+/// new colour fields resolve `display-panes-colour`/`-active-colour`
+/// (design spec `## 7. Overlays`; defaults blue/red) applied as a `bg` onto
+/// the default style. See `2026-07-07-parity-polish-interfaces.md`'s
+/// `## overlays` section for the server-side building rules (`ClientMode::
+/// ChooseTree`/`DisplayPanes`, the hardcoded key tables, the `cmd`/
+/// `bindings`/`options` amendments).
 pub struct Scene<'a> {
     /// Host terminal size (cols, rows).
     pub size: (u16, u16),
@@ -268,7 +401,8 @@ pub struct Scene<'a> {
     /// "terminal too small", transient messages), drawn with its own
     /// resolved style (`message-style`). With `status off` the message
     /// overlays the BOTTOM row (tmux draws messages on the last line even
-    /// without a status bar).
+    /// without a status bar). With an `Overlay::List` active, the message
+    /// instead takes the PANEL's own last row (see the compositing rules).
     pub message: Option<(String, grid::Style)>,
     /// Border cell style (`pane-border-style` resolved; default = default
     /// style).
@@ -276,6 +410,18 @@ pub struct Scene<'a> {
     /// Style for border cells adjacent to the focused pane
     /// (`pane-active-border-style` resolved; default fg green).
     pub border_active: grid::Style,
+    /// Copy mode's position-indicator/selection style (`mode-style`
+    /// resolved; default `bg=yellow,fg=black`) — ALSO the choose-tree
+    /// selected-row highlight style (SP4 Task 8).
+    pub mode_style: grid::Style,
+    /// display-panes digit-block colour for every pane except the focused
+    /// one (SP4 Task 8; default blue).
+    pub display_panes_colour: grid::Style,
+    /// display-panes digit-block colour for the focused pane (SP4 Task 8;
+    /// default red).
+    pub display_panes_active_colour: grid::Style,
+    /// choose-tree / display-panes overlay (SP4 Task 8); `None` = inactive.
+    pub overlay: Option<Overlay>,
 }
 
 pub struct Renderer { /* private: front + back cell buffers */ }
@@ -319,6 +465,21 @@ impl Renderer {
 - Message (`Scene::message: Some((text, style))`): replaces the status row's
   content, filling that row with `style`; when `status` is `None` it overlays
   the BOTTOM row instead.
+- **Overlay pass (SP4 Task 8), painted LAST:** `Overlay::List` clears the
+  ENTIRE client area to the default style, paints an optional title row (row
+  0, default style), then `rows` (each padded to full width: selected in
+  `Scene::mode_style`, others default style), scrolled so `top`'s row is the
+  first shown below the title. If `Scene::message` is also `Some` (e.g.
+  choose-tree's `x` kill-confirm prompt), it takes the panel's own LAST row
+  (reserved before laying out `rows`, painted after them so it always wins)
+  instead of the ordinary status-row placement above — the panel would
+  otherwise have already overwritten it. `Overlay::PaneDigits` paints, for
+  each `(rect, digit, active)`: a centered 5x5 block-digit bitmap (space
+  cells in `display_panes_colour`/`display_panes_active_colour`) when `rect`
+  is at least 6 wide x 5 tall, else a single centered glyph in the same
+  colour (a "small-number fallback", `rect.w == 0 || rect.h == 0` paints
+  nothing) — touching only cells inside each listed pane's rect, leaving
+  everything else (borders, status, other panes) untouched.
 - Diff emission: for each changed cell, emit minimal CUP (skip if the cursor is
   already adjacent from the previous emitted cell) + SGR (only on style change)
   + the char. UTF-8 encode chars. Reset SGR (CSI 0m) at stream end.
@@ -480,6 +641,24 @@ pseudoconsole and unblocks the reader thread.
 
 ## `host` — host terminal control
 
+**Amendment (sub-project 4, Task 5 — mouse):** the shared restore sequence
+(`apply_restore`, run by both `Drop for Host` and the panic hook) now writes
+`CSI ?1000l ?1002l ?1006l` (disable xterm mouse reporting: normal tracking +
+button-motion + SGR extended coordinates) UNCONDITIONALLY, ahead of the
+pre-existing `CSI ?1049l ?25h 0m` (leave alt screen, show cursor, reset SGR)
+— i.e. every exit path (normal exit, error, panic) now ALSO disables mouse
+reporting on the real terminal, regardless of whether the server ever told
+this client to enable it. Terminal-restore invariant (extended): a
+crashed/killed server, or a bug that forgot to send the `l` sequences before
+a client detached, can never leave the user's real terminal with mouse
+reporting stuck on — writing the disable sequences to a terminal that never
+had them enabled is a harmless no-op (per the SGR mouse protocol, an `l` for
+a mode that was never `h`'d does nothing). No signature change; `Host::enter`/
+`Host::write`/`Drop`'s documented byte sequence is otherwise unchanged. See
+the `## mouse` section of
+[`2026-07-07-parity-polish-interfaces.md`](2026-07-07-parity-polish-interfaces.md)
+for the enable-sequence (server) side of this feature.
+
 **Amendment (sub-project 2, Task 8):**
 
 - `Host::enter()`'s internal ordering changed (follow-up #3): every value
@@ -514,8 +693,10 @@ impl Host {
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>; // write + flush stdout
 }
 impl Drop for Host {
-    // Leave alt screen (CSI ?1049l), show cursor (CSI ?25h), reset SGR,
-    // restore saved console modes. Must be infallible (ignore errors).
+    // Disable xterm mouse reporting (CSI ?1000l ?1002l ?1006l — Task 5,
+    // sub-project 4, unconditional), leave alt screen (CSI ?1049l), show
+    // cursor (CSI ?25h), reset SGR, restore saved console modes. Must be
+    // infallible (ignore errors).
 }
 
 /// Install a panic hook that performs the same restoration as Drop before

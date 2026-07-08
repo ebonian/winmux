@@ -29,7 +29,7 @@ fn e2e_split_kill_exit() {
 
     let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket]);
 
-    let mut grid = Grid::new(common::COLS, common::ROWS);
+    let mut grid = Grid::new(common::COLS, common::ROWS, 0);
 
     // 1. Status bar appears. Bare `winmux` now attaches to an auto-named
     //    session ("0", the lowest unused non-negative integer) instead of

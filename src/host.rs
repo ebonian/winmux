@@ -53,8 +53,16 @@ unsafe fn apply_restore(
     input_cp: u32,
     output_cp: u32,
 ) {
-    // CSI ?1049l = leave alt screen, CSI ?25h = show cursor, CSI 0m = reset SGR.
-    let seq = b"\x1b[?1049l\x1b[?25h\x1b[0m";
+    // CSI ?1000l/?1002l/?1006l = disable xterm mouse reporting (normal +
+    // button-motion + SGR extended coordinates) UNCONDITIONALLY, even if
+    // this client never saw a `mouse on` enable sequence from the server —
+    // Task 5, sub-project 4's terminal-restore invariant: a crashed/killed
+    // server (or a bug that forgot to send the `l` sequences) must never
+    // leave the user's real terminal with mouse reporting stuck on. Writing
+    // the disable sequences to a terminal that never had them enabled is a
+    // harmless no-op. CSI ?1049l = leave alt screen, CSI ?25h = show cursor,
+    // CSI 0m = reset SGR.
+    let seq = b"\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1049l\x1b[?25h\x1b[0m";
     let mut written: u32 = 0;
     let _ = WriteFile(stdout, Some(seq), Some(&mut written), None);
     let _ = SetConsoleMode(stdout, stdout_mode);

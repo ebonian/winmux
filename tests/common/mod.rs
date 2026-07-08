@@ -76,6 +76,24 @@ pub fn has_vertical_border(grid: &Grid) -> bool {
     false
 }
 
+/// Like [`has_vertical_border`], but returns the column index of the border
+/// (rather than just whether one exists) -- used by mouse e2e tests (Task
+/// 10) that need to click at a coordinate KNOWN to be on one side of a
+/// vertical split, computed from the actual rendered layout rather than an
+/// assumed 50/50 split column.
+pub fn vertical_border_col(grid: &Grid) -> Option<u16> {
+    let pane_rows = grid.rows().saturating_sub(1); // exclude status bar
+    if pane_rows == 0 {
+        return None;
+    }
+    for c in 1..grid.cols().saturating_sub(1) {
+        if (0..pane_rows).all(|r| grid.cell(c, r).ch == '│') {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Poll `cond` every 100ms until it is true or the deadline passes.
 pub fn wait_until<F: FnMut() -> bool>(deadline: Instant, mut cond: F) -> bool {
     loop {

@@ -21,6 +21,14 @@ None ever blocked a merge.
    rather than eliminating the underlying class of race in the abstract —
    see `src/server.rs` module docs for the exact reasoning before assuming
    it's closed for good.
+   **Update (sub-project 4, Task 9 fix round):** the `Tick` handler now
+   batches every ready client's escape-time flush into one
+   `handle_event(Tick)` call (previously each `ServerEvent` touched exactly
+   one client's `Stdin`). This slightly widens this same accepted race's
+   blast radius: a session/window dying mid-batch from one client's flushed
+   event can now affect a second, already-collected-but-not-yet-processed
+   client's flush in the same tick. Not a new class of bug, same accepted
+   limitation, just a marginally larger surface — no behavior change made.
 3. **RESOLVED** (sub-project 2, Task 8, commit `09a274a`). `Host::enter()`
    had a partial-failure gap: code pages/stdout mode were mutated before the
    `RESTORE` snapshot was published. Fixed by publishing `RESTORE` before the
@@ -178,12 +186,17 @@ Documented deviations from real tmux, accepted for SP3's scope (global-only
 options, one dispatcher shared by all four entry points) and carried forward
 as sub-project 4 ("parity polish") candidates rather than merge blockers.
 
-25. **`escape-time` is parsed and stored but not honored.** The option
-    exists in the registry (`src/options.rs`) with tmux's default (500ms)
-    and round-trips through `set`/`show`, but nothing reads it back to
-    govern the actual Escape-vs-Alt-sequence disambiguation window in
-    `src/keys.rs`'s input decoder or `src/input.rs`'s `KeyMachine` — that
-    timing is currently a fixed constant, not configurable.
+25. **RESOLVED** (sub-project 4, Task 9). `escape-time` is parsed and
+    stored but not honored. The option exists in the registry
+    (`src/options.rs`) with tmux's default (500ms) and round-trips through
+    `set`/`show`, but nothing reads it back to govern the actual
+    Escape-vs-Alt-sequence disambiguation window in `src/keys.rs`'s input
+    decoder or `src/input.rs`'s `KeyMachine` — that timing is currently a
+    fixed constant, not configurable. Now wired end to end: `KeyDecoder::
+    pending_starts_with_escape` + `KeyMachine::set_escape_time`/
+    `escape_ready`/`flush_now`, driven by the server's `Tick` handler — see
+    `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## naming`
+    section.
 26. **No per-session/per-window option scopes.** `Options` (Task 4) is one
     global instance on `Server`, matching tmux's `-g` (global) scope only;
     real tmux allows session- and window-level overlays (`set -w`,
@@ -198,10 +211,20 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (`#{?...}`), no arithmetic/string format functions. `status-right`'s
     real tmux default (`#{=21:pane_title}`-bearing) is out of reach for this
     reason (documented deviation in `src/options.rs`'s `default_value`).
-28. **`automatic-rename` is inert.** The option is registered with tmux's
-    default (`on`) and round-trips through `set`/`show`, but no code path
-    actually renames a window based on its running command — window names
-    only ever change via explicit `rename-window`/the `,` prompt/config.
+28. **RESOLVED** (sub-project 4, Task 9). `automatic-rename` is inert. The
+    option is registered with tmux's default (`on`) and round-trips through
+    `set`/`show`, but no code path actually renames a window based on its
+    running command — window names only ever change via explicit
+    `rename-window`/the `,` prompt/config. Now wired: a window's active
+    pane's OSC title (`grid::Grid`'s Task 1 capture) drives
+    `Server::maybe_auto_rename`, gated by the global option AND a new
+    per-window `model::Window::auto_rename` flag (permanently cleared by
+    any manual rename) — see the `## naming` section referenced above.
+    Documented divergence (unchanged from the design spec): the name
+    derives from the console title (ConPTY surfaces `SetConsoleTitle` as
+    OSC 0), not the foreground process, and `allow-rename`/ESC k remains
+    deferred (item still tracked implicitly via the design spec's
+    "Documented deferrals" list, not separately itemized here).
 29. **`status-interval` is stored but unused for a general refresh timer.**
     The status-right clock still only re-renders on a minute-granularity
     change-detector (`server.rs`'s `local_clock`/Tick handling, inherited
@@ -243,3 +266,363 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (`docs/specs/2026-07-07-command-config-design.md`'s "Explicit
     deviations from tmux" section) that had not yet been cross-referenced
     here.
+
+## Discovered during sub-project 4 (parity polish)
+
+34. **`Key{code: KeyCode::Space}` is unreachable by a real spacebar
+    keypress** (discovered implementing Task 3, selection + paste buffers).
+    `keys::classify_single_byte` (the live input decoder) only ever produces
+    the `Space` code variant for `Ctrl-Space` (byte `0x00`, explicitly
+    special-cased); an ordinary bare spacebar press (byte `0x20`) decodes to
+    `Key{code: KeyCode::Char(' ')}` instead. `KeyCode::Space` otherwise
+    exists purely for `parse_key("Space")`/`send-keys Space`/`key_name`
+    notation (config files, `list-keys` output), not live keyboard input.
+    Consequence: ANY default or user binding registered via
+    `named("Space")`/`bind ... Space ...` targeting the ROOT, PREFIX, or a
+    copy-mode table is unreachable by an actual spacebar press — confirmed
+    live via Task 2's pre-existing emacs `copy-mode` default `Space →
+    copy-page-down` (`src/bindings.rs`). BOTH default-table cases are now
+    fixed at the bindings level: Task 3's own `copy-mode-vi` `Space →
+    copy-begin-selection` was written around the gap from the start (bound
+    under `Char(' ')`, not `named("Space")`), and the Task 3 REVIEW FIX
+    rebound the emacs `Space → copy-page-down` default under `Char(' ')`
+    too. What remains open here is only the general decoder-level gap
+    (a USER's `bind ... Space ...` config line still silently produces an
+    unreachable binding). A real fix belongs in `keys::classify_single_byte`
+    (making a
+    bare `0x20` decode as `KeyCode::Space` instead of `Char(' ')`, or
+    equivalently normalizing `Char(' ')` to `Space` wherever keys are
+    looked up) — deferred since it's a decoder-level change with unknown
+    blast radius across every existing table/test that relies on today's
+    `Char(' ')` semantics for plain-space forwarding to a pane (see
+    `input::is_plain_forwardable`, which currently forwards `Char(' ')` as
+    ordinary typed input — changing the decode would need to preserve that).
+
+35. **Mouse clicks/drags are never forwarded to the pane application's own
+    mouse-reporting mode** (Task 5, mouse). tmux, when a pane's own
+    application has ALSO requested mouse reporting (e.g. vim/tmux-inside-
+    tmux/htop with mouse support enabled), can forward click/drag events to
+    that application instead of consuming them for pane focus/copy-mode/
+    resize. winmux v1 always consumes a mouse event for its OWN routing
+    (`server::dispatch::dispatch_mouse`) and never re-encodes/forwards the
+    raw SGR bytes to the focused pane's pty — explicitly out of scope per
+    the task brief ("Click also forwards to the application if the pane's
+    program enabled mouse reporting itself — OUT OF SCOPE for this task
+    unless the design spec says otherwise" — it doesn't). A real fix would
+    need per-pane mouse-mode tracking (has THIS pane's own app requested
+    `?1000h`/etc. via its own output stream?) plus a policy for which takes
+    priority when both winmux and the inner app want the same click.
+36. **Drag-to-select only starts inside a pane already in THAT client's copy
+    mode** (Task 5, mouse). Real tmux implicitly enters copy mode on a
+    `Drag1` over a LIVE (non-copy-mode) pane; winmux's `mouse_down` only arms
+    a selection drag when the click lands inside the pane already bound to
+    the client's `ClientMode::Copy` — a plain click-drag on a live pane just
+    focuses on `Down` and does nothing further. Matches the design spec's
+    own bulleted overview, which scopes "Drag1 = selection" under "In copy
+    mode:" specifically; documented as a deliberate v1 scope decision, not
+    an oversight.
+37. **`word-separators` is a hardcoded constant, not a real tmux option**
+    (Task 5, mouse). Double-click word selection (`select_word_at` in
+    `src/server/dispatch.rs`) uses tmux's DEFAULT `word-separators` value
+    (`" -_@"`) as a private `const WORD_SEPARATORS`, matching the task
+    brief's explicit instruction ("hardcode tmux's default set unless the
+    option already exists"). A `set -g word-separators <chars>` line is
+    accepted/stored nowhere and has no effect — no `word-separators` entry
+    exists in `src/options.rs`'s `SPECS` table at all.
+38. **Mouse-during-prompt/confirm/choose-tree/display-panes is swallowed
+    entirely, not forwarded to the overlay** (Task 5, mouse; scope widened
+    in the final SP4 review's merge-gate fix round). `dispatch_mouse` drops
+    (silent no-op) any mouse event while the acting client's `ClientMode` is
+    `ConfirmCmd`, `Prompt`, `ChooseTree`, or `DisplayPanes`, rather than
+    e.g. letting a click land on the pane underneath or interacting with the
+    overlay's own content in any way. The task brief left tmux's own real
+    behavior here undecided ("decide per tmux and document"); winmux's
+    choice prioritizes never letting a stray click race a confirm's y/n
+    capture, or hit-test against pane geometry an overlay is currently
+    hiding, over any interactive mouse behavior during these (rare,
+    short-lived) modal states. `ChooseTree`/`DisplayPanes` originally
+    shipped (Task 8) without joining this guard at all — a real bug, not a
+    documented deviation, fixed in the same review round; see
+    `docs/follow-ups.md` #61 for the follow-on "real tmux-style mouse
+    routing into choose-tree" ticket this fix deferred.
+39. **Status-row click hit-testing doesn't replicate the renderer's final
+    spatial truncation** (Task 5, mouse). `mouse_status_click` rebuilds the
+    same left-prefix + per-window-tab span layout `render_one`/
+    `status::status_spans` draws to hit-test which window a click column
+    belongs to, but does NOT replicate `render::compose_back`'s LAST step —
+    right-truncating when the built left+right strings don't fit the actual
+    terminal width. On an extremely narrow terminal (narrower than the
+    status content), a click past the true truncation point could resolve
+    to a window tab that isn't actually visible there. Low practical impact
+    (`status-left-length`/`status-right-length` already cap the common case;
+    this only matters on terminals narrower than those caps plus every
+    window tab combined).
+40. **Corner-cell border hit-testing tie-break is arbitrary** (Task 5,
+    mouse). `server::dispatch::hit_test` checks vertical-border positions
+    before horizontal-border positions, so the single cell at a 4-way "+"
+    junction between four panes always resolves to a vertical-border drag,
+    never horizontal, with no way for the user to pick the other axis at
+    that exact cell (they can still grab a non-corner cell along the
+    horizontal border one column over). Documented, not treated as a bug —
+    real tmux has the same class of single-cell ambiguity at a "+" junction
+    and doesn't document a resolution rule either.
+41. **`swap-pane -s`/`-t` cannot move a pane between windows or sessions**
+    (Task 6, layout presets). `exec_swap_pane`'s explicit-target form now
+    ERRORS (`"swap-pane: can only swap panes within the same window"`)
+    rather than silently no-opping when `-s`/`-t` resolve to different
+    windows — but real tmux actually supports this (moving a pane to a
+    different window/session, swapping it there). Implementing it for real
+    would mean teaching `Layout` to remove a leaf from one tree and insert it
+    into another (today `Layout::swap_panes` only relabels leaf values within
+    a single tree) — worth doing for full tmux parity, but out of scope for
+    the Task 6 fix round, which only closed the "silent no-op" gap with an
+    honest error.
+42. **`swap-pane -U`/`-D` combined with `-s` is rejected, not implemented**
+    (Task 6, layout presets). Real tmux's full `swap-pane [-dDU] [-s
+    src-pane] [-t dst-pane]` semantics let `-s` additionally override which
+    pane a directional (`-U`/`-D`) swap is computed relative to. The Task 6
+    fix round implements the more common case (`-t` selects which pane is
+    swapped up/down, defaulting to the active pane when `-t` is absent) but
+    rejects `-U`/`-D` combined with `-s` with a usage error rather than
+    guessing at the full matrix. Worth revisiting if a real workflow needs
+    the `-s`-with-direction form.
+43. **`main-pane-width`/`main-pane-height` are baked into a ratio at
+    `select-layout`/`next-layout` apply-time, not stored as an absolute
+    size** (Task 6, layout presets). `Layout`'s tree only ever stores `f32`
+    split ratios (no absolute-size node variant), so `apply_preset` computes
+    `ratio_for(target_absolute_cells, area_len)` ONCE, at application time —
+    the first render reproduces the exact configured main-pane cell count,
+    but a LATER window resize scales the main pane proportionally rather
+    than preserving the literal configured width/height the way real tmux
+    does (tmux recomputes the absolute size on every resize). One-line fix
+    framing: preserve absolute main-pane size across resize like tmux — would
+    need a `Layout` node variant (or side-table) that remembers "this split's
+    first child wants N absolute cells" and re-derives the ratio from the
+    CURRENT area on every resize/render, not just at apply-time. Functionally
+    acceptable for now (documented deviation, not a bug); doc gap closed by
+    this same fix round (see `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
+    `layout-presets` section).
+
+44. **`break-pane` has no `-s`/`-t` pane-selector flag** (Task 7, window
+    ops). Real tmux's `break-pane` can target any pane via `-s`; winmux's
+    always acts on the resolved CURRENT pane (matches the design spec's
+    `## 6. Window ops` signature, which itself omits a pane selector —
+    smaller, honest scope, same pattern as `swap-pane`'s own documented
+    `-s`/`-t` deviations, follow-ups #41/#42). One-line fix framing: add an
+    optional pane target parsed the same way `kill-pane -t`/`swap-pane -t`
+    already are, threading it through `resolve_pane_target` instead of the
+    current hardcoded `None`.
+
+45. **`move-window` cannot move a window to a DIFFERENT session** (Task 7).
+    Real tmux's `move-window -t <session:index>` can relocate a window
+    across sessions; winmux's `move_window` (`model.rs`) is same-session
+    re-indexing only, and `exec_move_window` explicitly discards any
+    `session:` prefix on the `-t` value. Matches the design spec's `## 6.
+    Window ops` framing ("re-index current window"). One-line fix framing:
+    would need a cross-session variant of `Session::move_window` that lifts
+    the `Window` out of one `Session.windows` and into another's, re-minting
+    nothing (the `WindowId` stays valid — ids are global) but re-running the
+    destination session's `lowest_unused_index` floor if no explicit index
+    is given.
+
+46. **`find-window` always jumps to the first match — no choose-list for
+    multiple matches** (Task 7). The design spec's `## 6. Window ops`
+    section is explicit about this ("jump to first match"), so this is NOT
+    a shortfall against the spec of record, but it IS a real simplification
+    relative to actual tmux (which shows a `choose-tree`-style picker when
+    more than one window matches). Once Task 8's choose-tree overlay lands
+    (design spec `## 7. Overlays`), `find-window` could route multi-match
+    results through it instead of the deterministic first-match jump —
+    tracked here so that follow-up wiring has a home.
+
+## Deferred from sub-project 4 (parity polish, closeout — 2026-07-08)
+
+Ticketed by Task 10 (e2e + docs closeout) from `docs/specs/2026-07-07-parity-polish-design.md`'s
+"## Documented deferrals" list (its closing line: "ticket in follow-ups.md at
+closeout"). Every item below was a DELIBERATE v1 scope decision documented in
+the design spec at the time its owning task shipped, not a bug discovered
+after the fact — cross-referenced against follow-ups #34-46 above to avoid
+duplicates (mouse-forwarding-to-pane-apps is already #35; automatic-rename's
+`allow-rename`/ESC k gap was noted inline at #28 but explicitly left
+"not separately itemized" there, so it gets its own ticket here as promised).
+None block the sub-project 4 merge.
+
+47. **Scrollback does not reflow on terminal resize** (Task 1, grid v2). Real
+    tmux (≥1.9) reflows scrollback content to the new width on resize;
+    winmux's `VecDeque<Vec<Cell>>` scrollback lines are clipped/padded to the
+    new width lazily on READ instead (design spec `## 1. Grid`: "NO reflow
+    on resize ... documented winmux divergence, ticket"). A resize mid-copy-
+    mode-scroll can therefore show ragged/truncated historical lines that
+    don't match what a reflowing terminal would show.
+48. **`choose-buffer` (`=`) is not implemented** (Task 3, paste buffers). The
+    design spec explicitly deferred a picker UI for selecting among multiple
+    named/automatic paste buffers; `paste-buffer`/`delete-buffer` always
+    default to the newest buffer (or an explicit `-b name`) with no
+    interactive chooser.
+49. **`D` (choose-client) is not implemented** (Task 7, window ops; design
+    spec `## 6. Window ops`: "`D` choose-client: DEFERRED"). There is
+    no way to list and switch/detach OTHER attached clients from within a
+    session; only `switch-client`'s session-level `(`/`)` and the CLI's
+    `detach-client` exist.
+50. **`choose-tree` has no preview, tagging, filtering, or sort options**
+    (Task 8, overlays). The design spec's `## 7. Overlays` section is
+    explicit ("No preview, no tagging (documented)"); winmux's `w`/`s`
+    overlay is a flat, unfilterable, untaggable list with plain up/down
+    navigation and no session/window content preview pane, unlike real
+    tmux's `choose-tree`.
+51. **No right-click context menus** (mouse, Task 5). Real tmux (recent
+    versions) can show a right-click menu over a pane/status-line/border;
+    winmux's mouse routing has no menu concept at all — every mouse event
+    resolves to a direct action (focus/resize/select/scroll) or is dropped,
+    never a menu.
+52. **`allow-rename` (`ESC k` / the `#{automatic-rename}` toggle escape) is
+    not implemented** (Task 9, automatic-rename; see also follow-up #28,
+    which noted this gap inline but deferred the formal ticket to this
+    closeout). `automatic-rename` is a global/window flag only
+    (`set -g automatic-rename off` / `rename-window` disabling it
+    permanently for that window); there is no per-pane-application escape
+    sequence to toggle it transiently the way real tmux's `allow-rename`
+    plus `ESC k` support.
+53. **`paste-buffer -p`'s bracketed-paste flag is accepted but has no
+    effect** (Task 3, paste buffers). Real tmux's `-p` wraps the pasted
+    bytes in `ESC[200~`/`ESC[201~` bracketed-paste markers so a
+    bracketed-paste-aware application (e.g. a shell with `bracketed-paste`
+    support) can distinguish pasted text from typed keystrokes; winmux's
+    `-p` is parsed and accepted but the write is always a plain byte dump
+    (design spec `## 3. Paste buffers`: "`-p` accepted and ignored,
+    documented").
+54. **`find-window` matching is plain case-insensitive substring, not
+    regex** (Task 7, window ops; design spec `## 6. Window ops`: "v1 no
+    regex"). A pattern like `^foo` or `bar$` is matched LITERALLY (including
+    the `^`/`$` characters) rather than as an anchor, unlike real tmux's
+    `-r`-capable regex matching.
+55. **No `copy-pipe`/OSC 52 clipboard integration in copy mode** (Tasks 2-4,
+    copy mode). Copying in copy mode only ever writes to winmux's own
+    internal paste-buffer store; there is no way to pipe a copy-mode
+    selection to an external command (tmux's `copy-pipe`/`copy-pipe-and-cancel`)
+    or to emit an OSC 52 sequence so the selection also lands on the REAL
+    system clipboard (some tmux configs wire this up for clipboard
+    integration over SSH).
+56. **Emacs copy-mode table omits `C-k` (copy-to-end-of-line-and-cancel) and
+    `M-m` (back-to-indentation)** (Task 2, copy mode; design spec `## 2. Copy
+    mode`: "`C-k` copy to end of line and cancel (defer, not in v1 tables)").
+    Both are real tmux emacs-table bindings; winmux's emacs copy-mode table
+    covers the more commonly used subset only.
+57. **Mouse bindings have no bindable NAMES** (`MouseDown1Pane`,
+    `MouseDrag1Border`, etc.) **in `bind-key`** (Task 5, mouse; design spec
+    `## 4. Mouse`: "Mouse \"bindings\" are HARDCODED v1 ... the bindings
+    table stays keyboard-only"). Every mouse behavior (click-focus,
+    border-drag-resize, wheel-scroll, etc.) is wired directly in
+    `server::dispatch::dispatch_mouse`/`mouse_down`/`mouse_wheel` rather than
+    going through the `Bindings` table, so a user cannot `bind-key -T
+    root MouseDown1Pane <command>` to customize mouse behavior the way real
+    tmux allows.
+
+## Test-flakiness follow-up (Task 10 closeout verification, 2026-07-08)
+
+58. **Concurrent-output copy-mode/selection tests in `tests/server_proto.rs`
+    have flaked under full-parallelism `cargo test`.** During Task 10's own
+    pre-merge verification, `selection_survives_concurrent_output` was
+    reported to have flaked twice previously (passing standalone and at
+    `--test-threads=4`), and in this task's own repeated `cargo test` runs
+    `other_end_survives_concurrent_output` (same shape: asserts a
+    content-pinned copy-mode endpoint stays correct while a background
+    thread concurrently feeds the pane new output) flaked once out of three
+    full-suite runs — also confirmed to pass standalone and at
+    `--test-threads=4` immediately after. Both tests are inherently
+    timing-sensitive (they race a real background writer thread against the
+    main assertion under whatever scheduling a fully-parallel `cargo test`
+    run gives the process), consistent with the project's existing
+    documented `server_proto` flakiness class (CLAUDE.md's "Commands"
+    section, `docs/follow-ups.md` general framing). Candidate fixes: widen
+    the tests' timing margins, or run the affected tests (or all of
+    `server_proto`) at a capped thread count in CI rather than full
+    default parallelism.
+
+## Follow-ups from the final whole-branch review (sub-project 4, 2026-07-08)
+
+59. **`'` index-prompt empty-commit is a silent no-op; `MoveWindow`/
+    `RenameWindow`/`RenameSession` siblings all error on empty instead**
+    (Task 7/8, prompt commit handling). `PromptKind::Index`'s empty-buffer
+    commit is a deliberate, comment-documented silent no-op
+    (`src/server/dispatch.rs`, matching `PromptKind::Command`'s own
+    empty-commit-is-silent-cancel precedent), whereas `RenameWindow`/
+    `RenameSession` error via `model::validate_name` rejecting an empty
+    name, and `MoveWindow` errors via a failed `u32` parse on an empty
+    target. Verified by the final SP4 review as a real inconsistency
+    between sibling prompts, but a reasoned judgment call (empty `'` input
+    genuinely means "stay on the current window," unlike an empty rename/
+    move target, which has no sensible default) rather than a defect.
+    Ticketed so the deliberateness is durable and revisitable if the
+    inconsistency ever surprises a user.
+60. **`swap-pane -t` first/last wraparound has no dedicated test**
+    (Task 6, layout presets). The wrap arithmetic
+    (`src/server/dispatch.rs`, `(pos+n-1)%n` / `(pos+1)%n`) is standard and
+    the same pattern is already pretested via `rotate`, but no test
+    exercises `pos == 0` swapping `Up` (should wrap to the last pane) or
+    `pos == n-1` swapping `Down` (should wrap to pane 0) for `n >= 3` panes.
+    Low-risk coverage gap, not a known bug -- add a
+    `swap_pane_wraps_at_ends` (or similar) `server_proto` test.
+61. **Choose-tree ignores mouse entirely -- no click-to-select or
+    wheel-to-scroll routing** (Task 8, overlays; amends #38's scope). The
+    final SP4 review's merge-gate fix made `dispatch_mouse` swallow every
+    mouse event while `ChooseTree`/`DisplayPanes` is open (fixing the
+    hidden-pane-focus leak, see #38), but real tmux lets the mouse interact
+    WITH an open choose-tree: a click on a row selects it, wheel scrolls
+    the list. winmux v1 has no such routing at all -- a deliberate scope
+    cut for this fix round, not a regression (there was never any
+    choose-tree mouse routing to begin with; the bug fixed here was mouse
+    leaking THROUGH the overlay to the hidden panes underneath, not a
+    missing choose-tree mouse feature). Candidate follow-on: hit-test the
+    overlay's own row rects (mirroring `mouse_status_row`'s pattern) and
+    map a click to `ChooseTreeAction::Commit`-equivalent behavior, wheel to
+    `Up`/`Down`.
+62. **`Window::name`/`Session::name` field safety relies on an unstated
+    invariant** (Task 9, naming; security audit finding). Both fields are
+    plain `String`s with no type-level guarantee that every write went
+    through `model::validate_name` -- the invariant holds today only
+    because every call site that sets a name (`exec_rename_window`,
+    `exec_rename_session`, `derive_auto_name`'s caller) happens to be
+    gated by it, and choose-tree row rendering (`src/server/dispatch.rs`,
+    `TreeRow` text building) plus the status bar trust that transitively
+    when interpolating names into rendered VT output with no further
+    escaping. No exploit exists today (verified in the final SP4 review's
+    security pass), but the invariant is easy to silently break in a
+    future refactor that adds a new direct-assignment call site. Add a doc
+    comment on `Window::name`/`Session::name` pinning "only ever set via a
+    `validate_name`-gated setter" so the risk is documented at the field,
+    not just at today's call sites.
+63. **`render::CopyView::cursor` is a dead field** (Task 2/3, copy mode;
+    security audit finding). `server::render_one` populates
+    `CopyView { scroll, cursor: (cs.cx, cs.cy), sel }` for the pane bound
+    to a client's `ClientMode::Copy`, but `render.rs`'s
+    `Renderer::compose_back` never reads `cv.cursor` -- only `cv.scroll`
+    (view-cell lookups, position indicator) and `cv.sel` (selection
+    highlight) are consumed. The actual terminal cursor placement during
+    copy mode is computed independently in `server::render_one`'s own
+    `(cursor, cursor_visible)` match on `client.mode` (clamping
+    `cs.cx`/`cs.cy` into the pane rect directly), not through `CopyView` at
+    all. `CopyView` is part of the locked render interface contract
+    (`docs/specs/2026-07-06-mvp-interfaces.md` and the `## copy-mode`
+    section of `docs/specs/2026-07-07-parity-polish-interfaces.md`), so
+    removing the field requires a contract amendment in both files plus
+    updating the one construction site (`src/server.rs`) -- deferred here
+    rather than folded into this fix commit to keep that commit's
+    contract-surgery scope to the items it was already touching; genuinely
+    safe to delete whenever someone picks this up (no consumer anywhere
+    reads it).
+
+64. **Stale `MouseDrag` state when an overlay opens mid-drag** (found in the
+    final SP4 fix-wave re-review). The overlay mouse guard in
+    `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse events while
+    choose-tree/display-panes are open but does not clear
+    `client.mouse.drag`, unlike the sibling "outside pane area" guard which
+    explicitly resets it. A drag armed before an overlay opens (keyboard-
+    triggered overlay mid-drag, or a `display-panes -d` timer expiry) can
+    leave stale `Border`/`Selecting` state alive across the overlay's
+    lifetime, revivable by a later out-of-sequence `Drag`/`Up` frame with no
+    intervening `Down`. Not reachable from a conformant terminal's mouse
+    protocol (real terminals always send Down before Drag/Up), hence LOW and
+    non-blocking; fix is a one-liner (`client.mouse.drag = MouseDrag::None`
+    in the overlay guard arm) plus a test that arms a drag, opens an
+    overlay, and asserts the drag state is cleared.

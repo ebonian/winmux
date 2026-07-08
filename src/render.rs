@@ -2,12 +2,39 @@ use crate::geom::Rect;
 use crate::grid::{Cell, Color, Grid, Style};
 use crate::layout::PaneId;
 
+/// Copy-mode rendering data for one pane (Task 2, sub-project 4): the pane's
+/// content is read via `Grid::view_cell(scroll, ..)` instead of the live
+/// `cell` when this is `Some`, a `[scroll/history_len]` position indicator is
+/// painted right-aligned on the pane's top row in `Scene::mode_style`, and
+/// `cursor` (view coordinates) replaces the pane's live cursor for terminal
+/// cursor placement.
+pub struct CopyView {
+    pub scroll: u32,
+    pub cursor: (u16, u16),
+    /// Selection highlight (Task 3, sub-project 4), precomputed by the
+    /// SERVER in VIEW coordinates (`start_col, start_row, end_col, end_row,
+    /// rect`) and already clamped into the visible pane rect -- `None` when
+    /// there is no active selection, or the selection is wholly scrolled out
+    /// of the current view. Linear (`rect == false`): `start_row`'s
+    /// highlighted run is `start_col..`, `end_row`'s is `..=end_col`, every
+    /// row strictly between is fully highlighted (standard "line-wrap"
+    /// selection painting) -- a caller that clamped an off-screen endpoint
+    /// widens `start_col`/`end_col` to 0/`cols-1` so this rule still paints
+    /// correctly at the clamped edge. Rectangle (`rect == true`): every row
+    /// in `start_row..=end_row` highlights exactly `start_col..=end_col`.
+    pub sel: Option<(u16, u16, u16, u16, bool)>,
+}
+
 pub struct PaneView<'a> {
     pub id: PaneId,
     pub rect: Rect,
     pub grid: &'a Grid,
     pub focused: bool,
     pub dead: bool,
+    /// `Some` when this pane is the one bound to some client's
+    /// `ClientMode::Copy` (see module docs above); `None` for ordinary live
+    /// rendering.
+    pub copy: Option<CopyView>,
 }
 
 /// The status row's full drawing recipe (SP3 Task 8, superseding the old
@@ -31,6 +58,37 @@ pub struct StatusRow {
     pub right_style: Style,
 }
 
+/// One row of a [`Overlay::List`] panel (choose-tree, Task 8): the row's
+/// already-formatted display text and whether it is the current selection
+/// (painted in `Scene::mode_style`, reversed against the panel's plain
+/// rows). Built fresh by the SERVER on every render from live registry state
+/// (never a stale snapshot -- see the `## overlays` contract section).
+pub struct ListOverlay {
+    /// Optional header line, painted on the panel's first row in the
+    /// default style (empty = no header row; the first `rows` entry starts
+    /// at row 0 instead).
+    pub title: String,
+    pub rows: Vec<(String, bool)>,
+    /// Index into `rows` of the first row painted at the panel's top visible
+    /// line (below the title, if any) -- how the panel scrolls when `rows`
+    /// is longer than the available height.
+    pub top: usize,
+}
+
+/// Everything [`Scene::overlay`] can paint OVER the already-composed frame
+/// (Task 8, sub-project 4 — design spec `## 7. Overlays`): `List`
+/// (choose-tree) clears the whole client area and paints a full-screen
+/// panel; `PaneDigits` (display-panes) paints a 5x5 block-digit bitmap (or a
+/// single-glyph fallback for an undersized pane) centered in each listed
+/// pane's rect, without touching anything else on screen. The `(Rect, u32,
+/// bool)` tuple is `(pane rect, digit 0-9, is the acting client's focused
+/// pane)` — colour is resolved once via `Scene::display_panes_colour` /
+/// `display_panes_active_colour`, not carried per-entry.
+pub enum Overlay {
+    List(ListOverlay),
+    PaneDigits(Vec<(Rect, u32, bool)>),
+}
+
 pub struct Scene<'a> {
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
@@ -47,6 +105,20 @@ pub struct Scene<'a> {
     /// Border cells adjacent to the focused pane (`pane-active-border-style`,
     /// tmux default `fg=green`).
     pub border_active: Style,
+    /// Copy mode's position-indicator (and, from Task 3, selection
+    /// highlight) style (`mode-style` applied to the default style, tmux
+    /// default `bg=yellow,fg=black`).
+    pub mode_style: Style,
+    /// display-panes (Task 8) digit-block colour for every pane EXCEPT the
+    /// acting client's focused one (`display-panes-colour` applied to the
+    /// default style, tmux default blue).
+    pub display_panes_colour: Style,
+    /// display-panes (Task 8) digit-block colour for the acting client's
+    /// FOCUSED pane (`display-panes-active-colour`, tmux default red).
+    pub display_panes_active_colour: Style,
+    /// choose-tree / display-panes (Task 8): painted last, over everything
+    /// else composed above. `None` = no overlay active.
+    pub overlay: Option<Overlay>,
 }
 
 pub struct Renderer {
@@ -96,7 +168,8 @@ impl Renderer {
             *c = Cell::default();
         }
 
-        // 1) copy each pane's grid into its rect
+        // 1) copy each pane's grid into its rect -- copy-mode panes read a
+        // scrolled view (`view_cell`) instead of the live screen (`cell`).
         for pv in &scene.panes {
             let r = pv.rect;
             for dy in 0..r.h {
@@ -110,9 +183,70 @@ impl Renderer {
                         continue;
                     }
                     if dx < pv.grid.cols() && dy < pv.grid.rows() {
-                        let cell = pv.grid.cell(dx, dy);
+                        let cell = match &pv.copy {
+                            Some(cv) => pv.grid.view_cell(cv.scroll, dx, dy),
+                            None => pv.grid.cell(dx, dy),
+                        };
                         self.set(x, y, cell);
                     }
+                }
+            }
+        }
+
+        // 1a) copy-mode selection highlight (Task 3, sub-project 4):
+        // `mode_style`'s fg/bg painted ON TOP of whatever pass 1 already put
+        // there (character and every OTHER style attribute -- bold,
+        // underline, etc. -- preserved), for every cell inside the
+        // precomputed (already view-clamped) selection rect.
+        for pv in &scene.panes {
+            let Some(cv) = &pv.copy else { continue };
+            let Some((sc, sr, ec, er, rect)) = cv.sel else { continue };
+            let r = pv.rect;
+            for dy in sr..=er.min(r.h.saturating_sub(1)) {
+                let y = r.y + dy;
+                if !in_band(y) || dy >= pv.grid.rows() {
+                    continue;
+                }
+                let (row_lo, row_hi) = if rect || (dy == sr && dy == er) {
+                    (sc, ec)
+                } else if dy == sr {
+                    (sc, r.w.saturating_sub(1))
+                } else if dy == er {
+                    (0, ec)
+                } else {
+                    (0, r.w.saturating_sub(1))
+                };
+                for dx in row_lo..=row_hi.min(r.w.saturating_sub(1)) {
+                    let x = r.x + dx;
+                    if x >= cols || dx >= pv.grid.cols() {
+                        continue;
+                    }
+                    let idx = y as usize * cols as usize + x as usize;
+                    let existing = self.back[idx];
+                    let style = Style { fg: scene.mode_style.fg, bg: scene.mode_style.bg, ..existing.style };
+                    self.set(x, y, Cell { ch: existing.ch, style });
+                }
+            }
+        }
+
+        // 1b) copy-mode position indicator: `[scroll/history_len]`,
+        // right-aligned on the pane's TOP row, in `mode_style`.
+        for pv in &scene.panes {
+            let Some(cv) = &pv.copy else { continue };
+            let r = pv.rect;
+            if !in_band(r.y) {
+                continue;
+            }
+            let history_len = pv.grid.history_len();
+            let indicator = format!("[{}/{}]", cv.scroll, history_len);
+            let chars: Vec<char> = indicator.chars().collect();
+            let ind_len = (chars.len() as u16).min(r.w);
+            let start_x = r.x + r.w.saturating_sub(ind_len);
+            let skip = chars.len() - ind_len as usize; // truncate from the left if wider than the pane
+            for (i, ch) in chars[skip..].iter().enumerate() {
+                let x = start_x + i as u16;
+                if x < cols {
+                    self.set(x, r.y, Cell { ch: *ch, style: scene.mode_style });
                 }
             }
         }
@@ -244,6 +378,104 @@ impl Renderer {
                 self.set((start + i) as u16, y, Cell { ch, style: st.right_style });
             }
         }
+
+        // 5) overlay (Task 8, sub-project 4): painted LAST, over everything
+        // above. `List` (choose-tree) clears/replaces the whole client area
+        // (including the status row just painted); `PaneDigits`
+        // (display-panes) only touches cells inside the listed pane rects.
+        match &scene.overlay {
+            None => {}
+            Some(Overlay::List(list)) => {
+                for c in self.back.iter_mut() {
+                    *c = Cell { ch: ' ', style: Style::default() };
+                }
+                let mut y: u16 = 0;
+                if !list.title.is_empty() && y < rows {
+                    for (i, ch) in list.title.chars().enumerate() {
+                        if i as u16 >= cols {
+                            break;
+                        }
+                        self.set(i as u16, y, Cell { ch, style: Style::default() });
+                    }
+                    y += 1;
+                }
+                // A message (e.g. choose-tree's `x` kill-confirm prompt, see
+                // `ClientMode::ChooseTree`'s `pending_kill`) takes the panel's
+                // LAST row, same as it takes the status row outside the
+                // overlay -- reserved BEFORE laying out the row list so the
+                // two never collide, and painted AFTER the rows so it always
+                // wins visually.
+                let msg_reserved: u16 = if scene.message.is_some() && rows > y { 1 } else { 0 };
+                let visible = rows.saturating_sub(y).saturating_sub(msg_reserved) as usize;
+                let start = list.top.min(list.rows.len());
+                let end = (start + visible).min(list.rows.len());
+                for (i, (text, selected)) in list.rows[start..end].iter().enumerate() {
+                    let yy = y + i as u16;
+                    let style = if *selected { scene.mode_style } else { Style::default() };
+                    for x in 0..cols {
+                        self.set(x, yy, Cell { ch: ' ', style });
+                    }
+                    for (cx, ch) in text.chars().enumerate() {
+                        if cx as u16 >= cols {
+                            break;
+                        }
+                        self.set(cx as u16, yy, Cell { ch, style });
+                    }
+                }
+                if let Some((msg, style)) = &scene.message {
+                    let msg_y = rows - 1;
+                    for x in 0..cols {
+                        self.set(x, msg_y, Cell { ch: ' ', style: *style });
+                    }
+                    for (i, ch) in msg.chars().enumerate() {
+                        if i as u16 >= cols {
+                            break;
+                        }
+                        self.set(i as u16, msg_y, Cell { ch, style: *style });
+                    }
+                }
+            }
+            Some(Overlay::PaneDigits(entries)) => {
+                for (rect, digit, active) in entries {
+                    let style = if *active { scene.display_panes_active_colour } else { scene.display_panes_colour };
+                    self.paint_pane_digit(*rect, *digit, style, cols, rows);
+                }
+            }
+        }
+    }
+
+    /// Paint one display-panes (Task 8) digit into `rect`: a 5x5 block
+    /// bitmap (see [`digit_bitmap`]) centered in the rect when it's at least
+    /// 6 cells wide (5 + a 1-cell margin) and 5 tall; otherwise a
+    /// single-glyph "small-number fallback" (the design spec's own term) at
+    /// the rect's center; a zero-size rect paints nothing.
+    fn paint_pane_digit(&mut self, rect: Rect, digit: u32, style: Style, cols: u16, rows: u16) {
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        if rect.w >= 6 && rect.h >= 5 {
+            let ox = rect.x + (rect.w - 5) / 2;
+            let oy = rect.y + (rect.h - 5) / 2;
+            for (dy, row) in digit_bitmap(digit).iter().enumerate() {
+                for (dx, ch) in row.chars().enumerate() {
+                    if ch != '#' {
+                        continue;
+                    }
+                    let x = ox + dx as u16;
+                    let y = oy + dy as u16;
+                    if x < cols && y < rows {
+                        self.set(x, y, Cell { ch: ' ', style });
+                    }
+                }
+            }
+        } else {
+            let ch = char::from_digit(digit, 10).unwrap_or('?');
+            let x = rect.x + rect.w / 2;
+            let y = rect.y + rect.h / 2;
+            if x < cols && y < rows {
+                self.set(x, y, Cell { ch, style });
+            }
+        }
     }
 
     /// Reallocate both buffers to the new size and invalidate the front buffer
@@ -351,6 +583,30 @@ fn border_glyph(up: bool, down: bool, left: bool, right: bool) -> char {
     }
 }
 
+/// display-panes (Task 8, sub-project 4): a 5-row x 5-column block-digit
+/// bitmap for `0..=9` (`'#'` = painted cell, `'.'` = untouched). Not a real
+/// tmux artifact -- tmux's own display-panes digit rendering isn't a
+/// documented byte-for-byte spec, so this is winmux's own simple, legible
+/// 5x5 font (the design spec only pins the CELL SIZE, not the exact glyph
+/// shapes). `digit` outside `0..=9` (unreachable via the digit-key/pane-cap
+/// path, which only ever mints 0-9) falls back to all-blank rather than
+/// panicking.
+fn digit_bitmap(digit: u32) -> [&'static str; 5] {
+    match digit {
+        0 => ["#####", "#...#", "#...#", "#...#", "#####"],
+        1 => ["..#..", ".##..", "..#..", "..#..", "#####"],
+        2 => ["#####", "....#", "#####", "#....", "#####"],
+        3 => ["#####", "....#", "..###", "....#", "#####"],
+        4 => ["#...#", "#...#", "#####", "....#", "....#"],
+        5 => ["#####", "#....", "#####", "....#", "#####"],
+        6 => ["#####", "#....", "#####", "#...#", "#####"],
+        7 => ["#####", "....#", "...#.", "..#..", "..#.."],
+        8 => ["#####", "#...#", "#####", "#...#", "#####"],
+        9 => ["#####", "#...#", "#####", "....#", "#####"],
+        _ => ["", "", "", "", ""],
+    }
+}
+
 fn cup(x: u16, y: u16) -> String {
     format!("\x1b[{};{}H", y + 1, x + 1)
 }
@@ -419,7 +675,7 @@ mod tests {
     use crate::grid::{Color, Grid};
 
     fn grid_with(cols: u16, rows: u16, bytes: &[u8]) -> Grid {
-        let mut g = Grid::new(cols, rows);
+        let mut g = Grid::new(cols, rows, 0);
         g.feed(bytes);
         g
     }
@@ -455,14 +711,18 @@ mod tests {
         let scene = Scene {
             size: (7, 4),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: &right, focused: true, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 4);
         r.compose_back(&scene);
@@ -489,15 +749,19 @@ mod tests {
         let scene = Scene {
             size: (7, 5),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false },
-                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: true, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -515,12 +779,16 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("AB".to_string(), status_base())], "Z")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -541,12 +809,16 @@ mod tests {
         let g = grid_with(6, 1, b"");
         let scene = Scene {
             size: (6, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("ab".to_string(), status_base())], "123456")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(6, 2);
         r.compose_back(&scene);
@@ -560,12 +832,16 @@ mod tests {
         let g = grid_with(5, 1, b"");
         let scene = Scene {
             size: (5, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("ignored".to_string(), status_base())], "ignored")),
             message: Some(("hey".to_string(), default_msg_style())),
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(5, 2);
         r.compose_back(&scene);
@@ -583,12 +859,16 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: true, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         r.compose_back(&scene);
@@ -608,14 +888,18 @@ mod tests {
         let scene = Scene {
             size: (7, 2),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 1 }, grid: &left, focused: false, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 1 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &right, focused: true, dead: false, copy: None },
             ],
             zoomed: true,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 2);
         r.compose_back(&scene);
@@ -636,12 +920,16 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -651,12 +939,16 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((1, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -671,12 +963,16 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
         }
@@ -686,12 +982,16 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((2, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -706,12 +1006,16 @@ mod tests {
         let mut r = Renderer::new(4, 2);
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let _ = r.compose(&scene, Some((0, 0)), true); // prime
         // identical recompose, cursor hidden -> no diff bytes, just hide
@@ -726,12 +1030,16 @@ mod tests {
         {
             let scene = Scene {
                 size: (4, 2),
-                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+                panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
                 zoomed: false,
                 status: Some(default_status(Vec::new(), "")),
                 message: None,
                 border: Style::default(),
                 border_active: green_active(),
+                mode_style: Style::default(),
+                display_panes_colour: Style::default(),
+                display_panes_active_colour: Style::default(),
+                overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true); // prime
         }
@@ -740,12 +1048,16 @@ mod tests {
 
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let out = r.compose(&scene, Some((0, 0)), true);
         let got = String::from_utf8_lossy(&out);
@@ -765,7 +1077,7 @@ mod tests {
         let g = grid_with(10, 1, b"");
         let scene = Scene {
             size: (10, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(
                 vec![
@@ -777,6 +1089,10 @@ mod tests {
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(10, 2);
         let out = r.compose(&scene, None, false);
@@ -796,7 +1112,7 @@ mod tests {
         let g = grid_with(4, 1, b"ab");
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 1, w: 4, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 1, w: 4, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(StatusRow {
                 top: true,
@@ -808,6 +1124,10 @@ mod tests {
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -826,12 +1146,16 @@ mod tests {
         let g = grid_with(4, 2, b"ab\r\ncd");
         let scene = Scene {
             size: (4, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: None,
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(4, 2);
         let out = r.compose(&scene, None, false);
@@ -849,12 +1173,16 @@ mod tests {
         let custom = Style { fg: Color::Idx(7), bg: Color::Idx(4), ..Style::default() }; // white on blue
         let scene = Scene {
             size: (6, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(vec![("AB".to_string(), custom)], "")),
             message: None,
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(6, 2);
         let out = r.compose(&scene, None, false);
@@ -874,15 +1202,19 @@ mod tests {
         let scene = Scene {
             size: (7, 5),
             panes: vec![
-                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: true, dead: false },
-                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false },
-                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: false, dead: false },
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: true, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: false, dead: false, copy: None },
             ],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: None,
             border: Style { fg: Color::Idx(240), ..Style::default() },      // pane-border-style fg=colour240
             border_active: Style { fg: Color::Idx(1), ..Style::default() }, // pane-active-border-style fg=red
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(7, 5);
         r.compose_back(&scene);
@@ -902,16 +1234,142 @@ mod tests {
         let custom = Style { fg: Color::Idx(7), bg: Color::Idx(1), bold: true, ..Style::default() };
         let scene = Scene {
             size: (5, 2),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false }],
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 5, h: 1 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: Some(default_status(Vec::new(), "")),
             message: Some(("hi".to_string(), custom)),
             border: Style::default(),
             border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: None,
         };
         let mut r = Renderer::new(5, 2);
         let out = r.compose(&scene, None, false);
         let got = String::from_utf8_lossy(&out);
         assert!(got.contains("\x1b[0;1;37;41mhi"), "got: {got:?}");
+    }
+
+    // ---- overlays (Task 8, sub-project 4) ----------------------------------
+
+    /// `Overlay::List` clears the whole client area, paints each row's text
+    /// left-aligned padded to full width, and paints the SELECTED row in
+    /// `mode_style` while every other row stays the plain default style.
+    #[test]
+    fn overlay_list_paints_rows_and_selection() {
+        let g = grid_with(10, 3, b"should be hidden");
+        let mode_style = Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() }; // yellow/black
+        let scene = Scene {
+            size: (10, 3),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 3 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style,
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::List(ListOverlay {
+                title: String::new(),
+                rows: vec![("row0".to_string(), false), ("row1 sel".to_string(), true)],
+                top: 0,
+            })),
+        };
+        let mut r = Renderer::new(10, 3);
+        r.compose_back(&scene);
+
+        // Row 0 (unselected): text painted, default style.
+        let row0: String = (0..4).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, "row0");
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+        // Padding past the text is still cleared to the row's style (full
+        // client-area clear, not just the text run).
+        assert_eq!(r.back_cell(9, 0).ch, ' ');
+        assert_eq!(r.back_cell(9, 0).style, Style::default());
+
+        // Row 1 (selected): text painted in mode_style, including padding.
+        let row1: String = (0..8).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, "row1 sel");
+        assert_eq!(r.back_cell(0, 1).style, mode_style);
+        assert_eq!(r.back_cell(9, 1).ch, ' ');
+        assert_eq!(r.back_cell(9, 1).style, mode_style);
+
+        // The overlay fully replaced the pane's own content underneath.
+        assert_eq!(r.back_cell(0, 2).ch, ' ');
+    }
+
+    /// display-panes' 5x5 block digit for `1`, exact cells, in a rect sized
+    /// exactly to the bitmap's minimum (6 wide x 5 tall): per
+    /// `digit_bitmap(1)` (`"..#..", ".##..", "..#..", "..#..", "#####"`),
+    /// centering offsets `ox = (6-5)/2 = 0`, `oy = (5-5)/2 = 0`, so the
+    /// bitmap occupies columns 0..5, rows 0..5 exactly with column 5 blank.
+    /// `active: true` -> painted in `display_panes_active_colour` (bg red).
+    #[test]
+    fn overlay_digits_5x5() {
+        let g = grid_with(6, 5, b"");
+        let red = Style { bg: Color::Idx(1), ..Style::default() };
+        let blue = Style { bg: Color::Idx(4), ..Style::default() };
+        let scene = Scene {
+            size: (6, 5),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 5 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: blue,
+            display_panes_active_colour: red,
+            overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 6, h: 5 }, 1, true)])),
+        };
+        let mut r = Renderer::new(6, 5);
+        r.compose_back(&scene);
+
+        // "on" cells per digit_bitmap(1), each a space char in the active
+        // (red) style.
+        let on_cells: &[(u16, u16)] = &[(2, 0), (1, 1), (2, 1), (2, 2), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)];
+        for &(x, y) in on_cells {
+            assert_eq!(r.back_cell(x, y).ch, ' ', "cell ({x},{y}) should be an 'on' block");
+            assert_eq!(r.back_cell(x, y).style.bg, Color::Idx(1), "cell ({x},{y}) should be display_panes_active_colour (red)");
+        }
+        // An "off" cell within the bitmap's bounding box is left untouched
+        // (still the pane's own default-styled blank content, not painted).
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+        // Column 5 (outside the 5-wide glyph, inside the 6-wide rect) is
+        // also untouched.
+        assert_eq!(r.back_cell(5, 0).style, Style::default());
+    }
+
+    /// A pane too small for the 5x5 block (below the 6x5 threshold) falls
+    /// back to a single centered glyph in the resolved colour, not the block
+    /// bitmap.
+    #[test]
+    fn overlay_digits_small_fallback() {
+        let g = grid_with(3, 3, b"");
+        let blue = Style { bg: Color::Idx(4), ..Style::default() };
+        let scene = Scene {
+            size: (3, 3),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: &g, focused: false, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: blue,
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 3, h: 3 }, 7, false)])),
+        };
+        let mut r = Renderer::new(3, 3);
+        r.compose_back(&scene);
+        // centered single glyph: x = 0 + 3/2 = 1, y = 0 + 3/2 = 1
+        assert_eq!(r.back_cell(1, 1).ch, '7');
+        assert_eq!(r.back_cell(1, 1).style.bg, Color::Idx(4));
+        // nowhere else touched
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
     }
 }

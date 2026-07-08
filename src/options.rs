@@ -26,6 +26,7 @@
 //! `#{session_name}`, `%H:%M`, ...) used by `status-left`/`status-right`/
 //! `display-message`.
 
+use crate::grid::Color;
 use crate::keys::{self, Key};
 use crate::style::{self, PartialStyle};
 use std::collections::BTreeMap;
@@ -87,8 +88,10 @@ const SPECS: &[Spec] = &[
     Spec { name: "repeat-time", kind: Kind::Number, choices: &[] },
     Spec { name: "default-command", kind: Kind::Str, choices: &[] },
     Spec { name: "renumber-windows", kind: Kind::Flag, choices: &[] },
-    // Accepted-inert options (SP4): typed, validated, stored, shown; no
-    // getter beyond `show` since nothing consumes them yet.
+    // `mouse` (Task 5, sub-project 4): now LIVE — see the `mouse()` getter's
+    // doc comment. Accepted-inert options (SP4) follow below: typed,
+    // validated, stored, shown; no getter beyond `show` since nothing
+    // consumes them yet.
     Spec { name: "mouse", kind: Kind::Flag, choices: &[] },
     Spec { name: "history-limit", kind: Kind::Number, choices: &[] },
     Spec { name: "escape-time", kind: Kind::Number, choices: &[] },
@@ -98,6 +101,22 @@ const SPECS: &[Spec] = &[
     Spec { name: "default-terminal", kind: Kind::Str, choices: &[] },
     Spec { name: "exit-empty", kind: Kind::Flag, choices: &[] },
     Spec { name: "aggressive-resize", kind: Kind::Flag, choices: &[] },
+    // Copy mode (Task 2, sub-project 4).
+    Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
+    // Selection + paste buffers (Task 3, sub-project 4).
+    Spec { name: "buffer-limit", kind: Kind::Number, choices: &[] },
+    // Layout presets (Task 6, sub-project 4): `main-horizontal`/
+    // `main-vertical`'s main-pane size.
+    Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
+    Spec { name: "main-pane-height", kind: Kind::Number, choices: &[] },
+    // Overlays (Task 8, sub-project 4): choose-tree + display-panes.
+    // `display-panes-colour`/`-active-colour` are plain BARE colours (not
+    // full `fg=...`/`bg=...` style strings) -- stored as `Str` and parsed on
+    // read via `style::parse_color` (see the two getters below), per the
+    // design spec's `## 7. Overlays` section.
+    Spec { name: "display-panes-time", kind: Kind::Number, choices: &[] },
+    Spec { name: "display-panes-colour", kind: Kind::Str, choices: &[] },
+    Spec { name: "display-panes-active-colour", kind: Kind::Str, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -172,6 +191,16 @@ fn default_value(name: &str) -> Value {
         "default-terminal" => Value::Str("screen".to_string()),
         "exit-empty" => Value::Flag(true),
         "aggressive-resize" => Value::Flag(false),
+        "mode-style" => {
+            let s = "bg=yellow,fg=black";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "buffer-limit" => Value::Number(50),
+        "main-pane-width" => Value::Number(80),
+        "main-pane-height" => Value::Number(24),
+        "display-panes-time" => Value::Number(1000),
+        "display-panes-colour" => Value::Str("blue".to_string()),
+        "display-panes-active-colour" => Value::Str("red".to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -391,6 +420,97 @@ impl Options {
         self.flag("renumber-windows")
     }
 
+    pub fn history_limit(&self) -> u32 {
+        self.number("history-limit")
+    }
+
+    /// `mouse` (Task 5, sub-project 4): global on/off for xterm mouse
+    /// reporting. tmux default `off`. Reclassifies `mouse` from the
+    /// accepted-inert group (SP4 options review) to a live, consumed option
+    /// — `server::dispatch::exec_set_option` reacts to a change by
+    /// broadcasting the SGR mouse-mode enable/disable escape sequences to
+    /// every attached client, and `server::Server::finish_attach` sends the
+    /// enable sequence to a newly-attaching client when this is already on.
+    pub fn mouse(&self) -> bool {
+        self.flag("mouse")
+    }
+
+    /// Copy mode's key table selector: `true` = `mode-keys vi`
+    /// (`WhichTable::CopyModeVi`), `false` = the emacs default
+    /// (`WhichTable::CopyMode`).
+    pub fn mode_keys_vi(&self) -> bool {
+        matches!(self.values.get("mode-keys"), Some(Value::Choice("vi")))
+    }
+
+    /// Copy mode's position-indicator/selection style (Task 2: only the
+    /// position indicator uses this yet; selection highlighting is Task 3).
+    pub fn mode_style(&self) -> &PartialStyle {
+        self.style_ref("mode-style")
+    }
+
+    /// Max AUTOMATIC paste buffers (Task 3, sub-project 4) before
+    /// `copy-selection-and-cancel`/bare `set-buffer` evicts the oldest;
+    /// manual (`set-buffer -b`) buffers are exempt. tmux default 50.
+    pub fn buffer_limit(&self) -> u32 {
+        self.number("buffer-limit")
+    }
+
+    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4): the
+    /// `main-horizontal`/`main-vertical` layout presets' main-pane size,
+    /// clamped at APPLICATION time by `layout::apply_preset` so the other
+    /// panes never fall below `MIN_PANE_W`/`MIN_PANE_H`. tmux defaults: width
+    /// 80, height 24.
+    pub fn main_pane_width(&self) -> u16 {
+        self.number("main-pane-width") as u16
+    }
+
+    pub fn main_pane_height(&self) -> u16 {
+        self.number("main-pane-height") as u16
+    }
+
+    /// `display-panes-time` (Task 8, sub-project 4): how long the
+    /// `display-panes` (`q`) overlay stays up before auto-dismissing, absent
+    /// an explicit `-d ms` override on the command itself. tmux default
+    /// 1000ms.
+    pub fn display_panes_time(&self) -> Duration {
+        Duration::from_millis(self.number("display-panes-time") as u64)
+    }
+
+    /// `display-panes-colour` (Task 8): the digit-overlay background colour
+    /// for every pane EXCEPT the acting client's currently focused one. A
+    /// stored value that no longer parses as a bare colour (only reachable
+    /// by a future `set-option` bypassing today's `set`-time validation --
+    /// there isn't one yet, `Kind::Str` accepts any control-char-free string)
+    /// falls back to the compiled default rather than panicking.
+    pub fn display_panes_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("display-panes-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    /// `display-panes-active-colour` (Task 8): same as
+    /// [`Options::display_panes_colour`], for the focused pane's digit only.
+    pub fn display_panes_active_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("display-panes-active-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(1))
+    }
+
+    /// `escape-time` (Task 9, sub-project 4): how long a pending lone/
+    /// partial ESC sequence (`input::KeyMachine::escape_ready`) may sit
+    /// unresolved before the server force-flushes it as a bare `Escape` key.
+    /// tmux default 500ms; reclassifies `escape-time` from the
+    /// accepted-inert group to a live, consumed option (see the design
+    /// spec's `## 8. escape-time` section).
+    pub fn escape_time(&self) -> Duration {
+        Duration::from_millis(self.number("escape-time") as u64)
+    }
+
+    /// `automatic-rename` (Task 9, sub-project 4): global on/off for
+    /// tracking a window's name to its active pane's OSC title. tmux default
+    /// on. ANDed with the per-window `model::Window::auto_rename` flag by
+    /// `server::Server::maybe_auto_rename` — see that method's doc comment
+    /// and the design spec's `## 9. automatic-rename` section.
+    pub fn automatic_rename(&self) -> bool {
+        self.flag("automatic-rename")
+    }
+
     fn number(&self, name: &str) -> u32 {
         match self.values.get(name) {
             Some(Value::Number(n)) => *n,
@@ -501,6 +621,17 @@ pub struct FormatCtx<'a> {
     pub pane_index: u32,
     pub hostname: &'a str,
     pub now: SystemTimeParts,
+    /// `#T`/`#{pane_title}` (Task 9, sub-project 4): the focused pane's OSC
+    /// 0/2 title (`server::PaneRuntime::title`), empty until the pane's
+    /// program ever sets one. Already control-char-clean and length-capped
+    /// by `grid::Grid`'s OSC handler — no further sanitizing needed here.
+    /// Documented divergence from real tmux (fix round, review minor 1):
+    /// tmux's `#T`/`#{pane_title}` falls back to the pane's running command
+    /// name when no title has ever been set; here it falls back to an empty
+    /// string, same root cause as the `automatic-rename` divergence
+    /// (`docs/follow-ups.md` #28) — no foreground-process tracking exists in
+    /// this codebase, only the ConPTY-surfaced console title.
+    pub pane_title: &'a str,
 }
 
 const MONTHS: [&str; 12] = [
@@ -512,7 +643,8 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /// `display-message`:
 ///
 /// - `#S` session name, `#I` window index, `#W` window name, `#F` window
-///   flags, `#P` pane index, `#H` hostname, `##` literal `#`.
+///   flags, `#P` pane index, `#H` hostname, `#T` pane title (Task 9,
+///   sub-project 4), `##` literal `#`.
 /// - `#{session_name}`, `#{window_index}`, `#{window_name}` (long forms of
 ///   the three most common `#`-codes); any other `#{...}` -> empty
 ///   (documented SP3 simplification — the full tmux format-expression
@@ -555,6 +687,10 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                     chars.next();
                     out.push_str(ctx.hostname);
                 }
+                Some('T') => {
+                    chars.next();
+                    out.push_str(ctx.pane_title);
+                }
                 Some('{') => {
                     chars.next();
                     let mut name = String::new();
@@ -571,6 +707,7 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                             "session_name" => out.push_str(ctx.session),
                             "window_index" => out.push_str(&ctx.window_index.to_string()),
                             "window_name" => out.push_str(ctx.window_name),
+                            "pane_title" => out.push_str(ctx.pane_title),
                             _ => {} // unknown long form -> empty
                         }
                     }
@@ -669,6 +806,7 @@ mod tests {
             pane_index: 0,
             hostname: "HOST",
             now,
+            pane_title: "",
         }
     }
 
@@ -770,6 +908,16 @@ mod tests {
     }
 
     #[test]
+    fn mouse_defaults_off_and_toggles() {
+        let mut o = Options::new();
+        assert!(!o.mouse(), "tmux default: mouse off");
+        o.set("mouse", Some("on"), false, false).unwrap();
+        assert!(o.mouse());
+        o.set("mouse", None, false, false).unwrap(); // no value on a Flag toggles
+        assert!(!o.mouse());
+    }
+
+    #[test]
     fn unset_restores_default() {
         let mut o = Options::new();
         o.set("base-index", Some("5"), false, false).unwrap();
@@ -855,6 +1003,53 @@ mod tests {
     }
 
     #[test]
+    fn copy_mode_getters() {
+        let mut o = Options::new();
+        assert!(!o.mode_keys_vi());
+        let ms = o.mode_style();
+        assert_eq!(ms.apply_to(crate::grid::Style::default()).fg, crate::grid::Color::Idx(0));
+        assert_eq!(ms.apply_to(crate::grid::Style::default()).bg, crate::grid::Color::Idx(3));
+        o.set("mode-keys", Some("vi"), false, false).unwrap();
+        assert!(o.mode_keys_vi());
+    }
+
+    #[test]
+    fn main_pane_size_getters() {
+        let mut o = Options::new();
+        assert_eq!(o.main_pane_width(), 80);
+        assert_eq!(o.main_pane_height(), 24);
+        o.set("main-pane-width", Some("30"), false, false).unwrap();
+        o.set("main-pane-height", Some("10"), false, false).unwrap();
+        assert_eq!(o.main_pane_width(), 30);
+        assert_eq!(o.main_pane_height(), 10);
+    }
+
+    /// Task 8, sub-project 4: `display-panes-time` (Duration getter) and the
+    /// two bare-colour getters, defaults AND after a `set-option` round trip.
+    #[test]
+    fn display_panes_getters() {
+        let mut o = Options::new();
+        assert_eq!(o.display_panes_time(), Duration::from_millis(1000));
+        assert_eq!(o.display_panes_colour(), Color::Idx(4)); // blue
+        assert_eq!(o.display_panes_active_colour(), Color::Idx(1)); // red
+
+        o.set("display-panes-time", Some("200"), false, false).unwrap();
+        o.set("display-panes-colour", Some("green"), false, false).unwrap();
+        o.set("display-panes-active-colour", Some("colour208"), false, false).unwrap();
+        assert_eq!(o.display_panes_time(), Duration::from_millis(200));
+        assert_eq!(o.display_panes_colour(), Color::Idx(2));
+        assert_eq!(o.display_panes_active_colour(), Color::Idx(208));
+    }
+
+    #[test]
+    fn buffer_limit_getter() {
+        let mut o = Options::new();
+        assert_eq!(o.buffer_limit(), 50);
+        o.set("buffer-limit", Some("10"), false, false).unwrap();
+        assert_eq!(o.buffer_limit(), 10);
+    }
+
+    #[test]
     fn accepted_inert_options_store() {
         let mut o = Options::new();
         o.set("mouse", Some("on"), false, false).unwrap();
@@ -916,8 +1111,21 @@ mod tests {
     #[test]
     fn expand_unknown_long_empty() {
         let c = ctx("s", sample_time());
-        assert_eq!(expand_format("<#{pane_title}>", &c), "<>");
+        assert_eq!(expand_format("<#{nonsense}>", &c), "<>");
         assert_eq!(expand_format("<#Z>", &c), "<>");
+    }
+
+    #[test]
+    fn expand_pane_title() {
+        // #T / #{pane_title} (Task 9, sub-project 4).
+        let mut c = ctx("s", sample_time());
+        c.pane_title = "vim";
+        assert_eq!(expand_format("#T", &c), "vim");
+        assert_eq!(expand_format("<#{pane_title}>", &c), "<vim>");
+        // Empty (never-titled pane) is the common case -- expands to nothing,
+        // same as an unset `#{...}` form, not a literal placeholder.
+        let empty = ctx("s", sample_time());
+        assert_eq!(expand_format("#T", &empty), "");
     }
 
     #[test]

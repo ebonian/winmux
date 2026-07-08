@@ -1,4 +1,5 @@
 pub mod bindings;
+pub mod buffers;
 pub mod cli;
 pub mod client;
 pub mod cmd;
