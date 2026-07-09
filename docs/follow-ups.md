@@ -653,16 +653,66 @@ None block the sub-project 4 merge.
     aren't reachable through a conformant SGR stream and are exercised
     directly against `Server`/`ClientState` instead.
 
-65. **Directional focus MRU tie-break is a single-slot approximation** (from
-    the focus-nav hotfix `6e6ff4d`, its review). When multiple panes are
-    valid candidates for `select-pane -L/-R/-U/-D`, real tmux picks the most
-    recently used; winmux uses the window's single last-pane slot if it is
-    among the candidates, else the first candidate in pane-index order.
-    Correct for the 2-candidate case and deterministic otherwise; a full
-    per-window MRU ordering would make 3+-candidate columns match tmux
-    exactly. Also noted by the review: no test drives the pre-fix bug via
-    Left/Up specifically (fix is symmetric per axis pair), and none
-    exercises focus_dir while zoomed — coverage niceties.
+65. **RESOLVED** (SP6 parity wave 2, Task 3: edge-wrap directional
+    navigation + real `active_point` MRU). *Original text:* Directional
+    focus MRU tie-break is a single-slot approximation (from the focus-nav
+    hotfix `6e6ff4d`, its review). When multiple panes are valid candidates
+    for `select-pane -L/-R/-U/-D`, real tmux picks the most recently used;
+    winmux uses the window's single last-pane slot if it is among the
+    candidates, else the first candidate in pane-index order. Correct for
+    the 2-candidate case and deterministic otherwise; a full per-window MRU
+    ordering would make 3+-candidate columns match tmux exactly. Also noted
+    by the review: no test drives the pre-fix bug via Left/Up specifically
+    (fix is symmetric per axis pair), and none exercises focus_dir while
+    zoomed — coverage niceties.
+
+    **Fixed:** two changes, both in `src/layout.rs::Layout::focus_dir`
+    (contract-amended in `docs/specs/2026-07-06-mvp-interfaces.md`). (a)
+    **Edge-flip wrap** (`docs/tmux-reference/panes-and-layout.md` §1.1,
+    `window_pane_find_left/right/up/down`): the four adjacency arms now
+    compute a search edge that flips to one past the FAR side of `area`
+    when the focused pane is already flush against the near side, so
+    directional navigation wraps (Left from the leftmost pane reaches the
+    rightmost, symmetric in all four directions) instead of silently
+    no-op'ing at a window edge. (b) **Real per-pane `active_point` MRU**:
+    the single-slot `last_focused` approximation is replaced by a real
+    tmux-style recency counter — `focus_dir` gained an `activity: &dyn
+    Fn(PaneId) -> u64` parameter, and the tie-break is now the candidate
+    with the greatest `activity(pane)` (ties fall back to first-in-leaf-
+    order, matching tmux's strict-`>` `window_pane_choose_best` loop
+    exactly), correctly ranking 3+-candidate columns. The counter itself
+    (`Server::pane_activity: HashMap<PaneId, u64>` +
+    `Server::next_active_point`, `src/server.rs`) is server-global (like
+    tmux's, meaningful across windows/sessions) and stamped by
+    `Server::stamp_active` at every focus-change call site in
+    `src/server/dispatch.rs`: `exec_select_pane`'s `focus_dir` and
+    `focus_pane` branches, `exec_split_window`/`exec_new_window`/
+    `exec_new_session` (a newly created pane is focused, hence most
+    recent), `exec_last_pane`, and `mouse_focus_pane` (mouse click focus,
+    also reused by the `display-panes` digit-jump). `Layout::last_focused`
+    itself is RETAINED, but narrowed to its one remaining job,
+    `focus_last`/the `prefix ;` toggle — an unrelated tmux feature, not
+    part of `focus_dir`'s algorithm anymore. `Layout::focus_next` has no
+    production call site today (dead outside unit tests, `o` is bound to
+    `select-pane -t :.+` instead), so it was left unstamped; a future
+    binding of it would need the same `Server::stamp_active` call the other
+    five sites get. New tests: `src/layout.rs`'s
+    `focus_dir_wraps_left_to_rightmost`, `focus_dir_wraps_down_to_top`,
+    `focus_dir_wrap_picks_most_recently_active_of_two_far_candidates`,
+    `focus_dir_three_candidates_ranked_by_activity` (this entry's exact
+    3-candidate gap), and
+    `focus_dir_ties_fall_back_to_first_candidate_in_leaf_order` (replaces
+    the old last_focused-fallback test, whose premise no longer exists
+    once every pane always has a real activity value); the pre-existing
+    `focus_dir_two_pane_horizontal`'s at-edge `false` assertions were
+    inverted to the new wrap outcome (computed comments explain why).
+    `tests/server_proto.rs`'s `focus_wraps_at_window_edge` covers the same
+    wrap end-to-end through a real client/server pair. Zoom interaction
+    unchanged/preserved: `focus_dir` still reads `all_rects` (the unzoomed
+    full-tree geometry) regardless of `self.zoomed`, so directional nav
+    while zoomed moves which pane is zoomed-in, exactly as before this fix
+    — not itself a regression target of this task, still an
+    untested-but-unchanged edge per the original note.
 
 66. **Mouse border-drag toward the top/left edge never resizes** (found while
     building Task 1's regression tests, SP6 parity wave 2; separate root

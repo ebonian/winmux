@@ -614,6 +614,17 @@ struct Server {
     /// ones. One instance, shared by every session/client (tmux itself
     /// scopes buffers server-wide too, not per-session).
     buffers: Buffers,
+    /// tmux's per-pane `active_point` counter (`window.c:593`; SP6 parity
+    /// wave 2, Task 3), global across the whole server -- matching tmux,
+    /// whose counter is meaningful across windows/sessions, not scoped to
+    /// one. Stamped by [`Server::stamp_active`] at every focus-change call
+    /// site so `Layout::focus_dir`'s MRU tie-break can rank candidates by
+    /// real recency instead of the old single-slot `last_focused`
+    /// approximation (closes follow-up #65). A pane with no entry here has
+    /// never been focused; `next_active_point` starts at 1 so that default
+    /// (read as 0) never collides with a real stamp.
+    pane_activity: HashMap<PaneId, u64>,
+    next_active_point: u64,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
@@ -984,7 +995,22 @@ impl Server {
             pending_config_message: None,
             hostname: computer_name(),
             buffers: Buffers::new(),
+            pane_activity: HashMap::new(),
+            next_active_point: 1,
         }
+    }
+
+    /// Stamp `id` as the most recently active pane (tmux's `active_point`,
+    /// `window.c:593`) -- called at every focus-change call site (SP6
+    /// parity wave 2, Task 3). `saturating_add`: a u64 counter wrapping
+    /// after ~1.8e19 focus changes is not a real concern, but keeping the
+    /// bump total (never panicking) matches this codebase's convention for
+    /// counters that are conceptually "never overflows" (follow-up #5's
+    /// spirit).
+    fn stamp_active(&mut self, id: PaneId) {
+        let point = self.next_active_point;
+        self.next_active_point = self.next_active_point.saturating_add(1);
+        self.pane_activity.insert(id, point);
     }
 
     /// How many rows the status bar takes out of a client's contribution to

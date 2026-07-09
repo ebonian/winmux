@@ -2208,6 +2208,44 @@ fn focus_down_into_split_row() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP6 parity wave 2, Task 3: `Layout::focus_dir`'s edge-flip wrap rule
+/// (`docs/tmux-reference/panes-and-layout.md` §1.1) -- directional
+/// navigation off the near edge of the window wraps to the far edge,
+/// mirroring `window_pane_find_left/right`. Pre-fix this was a silent
+/// no-op (`focus_dir_two_pane_horizontal`'s inverted `false` assertions,
+/// `src/layout.rs`).
+#[test]
+fn focus_wraps_at_window_edge() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // (1 | 2): focus starts on pane2 (right, cursor x > 40).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    // prefix-Left: pane2 -> pane1 (leftmost, single candidate, unaffected
+    // by the wrap fix).
+    c.send(&ClientMsg::Stdin(left.clone()));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40);
+
+    // prefix-Left AGAIN from the now-leftmost pane: pane1 is flush against
+    // the window's left edge, so the search edge flips to one past the
+    // right edge -- pane2 (flush right) is the sole candidate. Pre-fix this
+    // was a no-op (cursor would stay in pane1); post-fix it wraps back to
+    // pane2.
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `set -g window-status-current-style fg=red,bold` restyles ONLY the
 /// current window's tab; the non-current tab keeps the base style.
 #[test]

@@ -900,6 +900,9 @@ impl Server {
             Ok(pr) => {
                 self.panes.insert(new_id, pr);
                 self.apply_layout_for_session(&session_name);
+                // Newly created panes take focus (tmux default) -- the most
+                // recently active pane by construction.
+                self.stamp_active(new_id);
             }
             Err(_) => {
                 if let Some(s) = self.registry.session_mut(&session_name) {
@@ -915,18 +918,33 @@ impl Server {
         if let Some(d) = dir {
             let session_name = self.resolve_session_name(None, cs)?;
             let area_y = self.pane_area_y();
-            if let Some(session) = self.registry.session_mut(&session_name) {
-                let size = session.size;
-                let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
-                session.current_window_mut().layout.focus_dir(d, area);
+            let mut newly_focused = None;
+            {
+                let activity = &self.pane_activity;
+                let activity_fn = |id: PaneId| activity.get(&id).copied().unwrap_or(0);
+                if let Some(session) = self.registry.session_mut(&session_name) {
+                    let size = session.size;
+                    let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
+                    let layout = &mut session.current_window_mut().layout;
+                    if layout.focus_dir(d, area, &activity_fn) {
+                        newly_focused = Some(layout.focused());
+                    }
+                }
+            }
+            if let Some(id) = newly_focused {
+                self.stamp_active(id);
             }
             return Ok(String::new());
         }
         let (session_name, wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
+        let mut changed = false;
         if let Some(session) = self.registry.session_mut(&session_name) {
             if let Some(w) = session.windows.iter_mut().find(|w| w.id == wid) {
-                w.layout.focus_pane(pane_id);
+                changed = w.layout.focus_pane(pane_id);
             }
+        }
+        if changed {
+            self.stamp_active(pane_id);
         }
         Ok(String::new())
     }
@@ -967,8 +985,18 @@ impl Server {
 
     fn exec_last_pane(&mut self, cs: Option<&str>) -> Result<String, String> {
         let session_name = self.resolve_session_name(None, cs)?;
+        let mut newly_focused = None;
         if let Some(session) = self.registry.session_mut(&session_name) {
-            session.current_window_mut().layout.focus_last();
+            let layout = &mut session.current_window_mut().layout;
+            let before = layout.focused();
+            layout.focus_last();
+            let after = layout.focused();
+            if after != before {
+                newly_focused = Some(after);
+            }
+        }
+        if let Some(id) = newly_focused {
+            self.stamp_active(id);
         }
         Ok(String::new())
     }
@@ -993,6 +1021,8 @@ impl Server {
                     }
                 }
                 self.apply_layout_for_session(&session_name);
+                // A new window's sole pane starts focused (tmux default).
+                self.stamp_active(pane_id);
                 Ok(String::new())
             }
             Err(e) => Err(format!("open terminal failed: {e}")),
@@ -1707,8 +1737,12 @@ impl Server {
     }
 
     fn mouse_focus_pane(&mut self, session_name: &str, pane_id: PaneId) {
+        let mut changed = false;
         if let Some(session) = self.registry.session_mut(session_name) {
-            session.current_window_mut().layout.focus_pane(pane_id);
+            changed = session.current_window_mut().layout.focus_pane(pane_id);
+        }
+        if changed {
+            self.stamp_active(pane_id);
         }
     }
 
@@ -2343,6 +2377,8 @@ impl Server {
                 match self.registry.create_session(name.as_deref(), pane_id, size, base_index) {
                     Ok(_) => {
                         self.had_session = true;
+                        // A new session's sole pane starts focused.
+                        self.stamp_active(pane_id);
                         Ok(String::new())
                     }
                     Err(e) => {

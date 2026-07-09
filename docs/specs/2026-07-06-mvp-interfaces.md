@@ -181,15 +181,40 @@ impl Layout {
     pub fn focused(&self) -> PaneId;
 
     /// Geometric navigation: move focus to the pane adjacent in `dir`, per
-    /// tmux `select-pane -L/-R/-U/-D` semantics. A candidate is any pane
-    /// whose rect borders the focused rect in that direction (adjacent
-    /// across the single border cell) AND whose cross-axis range genuinely
-    /// OVERLAPS the focused pane's cross-axis range (a real interval-overlap
-    /// test). Among multiple candidates, tmux picks the most-recently-used
-    /// pane; winmux approximates this with its single "last pane" state
-    /// (`last_focused`, the `prefix ;` toggle target): prefer `last_focused`
-    /// if it is itself a candidate, else fall back to the first candidate in
-    /// leaf-tree order. Returns false (no change) if there is no candidate.
+    /// tmux `select-pane -L/-R/-U/-D` semantics
+    /// (`window_pane_find_{left,right,up,down}`, window.c; see
+    /// `docs/tmux-reference/panes-and-layout.md` §1.1). Two rules:
+    ///
+    /// 1. **Edge-flip wrap.** The search edge is normally the column/row
+    ///    immediately touching the focused pane's near side; but if the
+    ///    focused pane is already flush against that side of `area`, the
+    ///    edge flips to one past the FAR side, so candidates become the
+    ///    panes flush against the opposite edge -- navigation wraps (e.g.
+    ///    Left from the leftmost pane reaches the rightmost), symmetric in
+    ///    all four directions.
+    /// 2. **MRU tie-break.** A candidate is any pane flush against the
+    ///    (possibly wrapped) edge AND whose cross-axis range genuinely
+    ///    OVERLAPS the focused pane's cross-axis range (a real
+    ///    interval-overlap test). Among multiple candidates, the one with
+    ///    the greatest `activity(pane)` value wins (tmux's real
+    ///    `active_point` recency counter, `window_pane_choose_best`); ties
+    ///    (e.g. every candidate still at its caller-supplied default)
+    ///    resolve to whichever was seen FIRST in leaf/pane-index order,
+    ///    since only a strictly-greater candidate ever replaces the running
+    ///    best.
+    ///
+    /// `activity` is read-only and caller-supplied: `Layout` itself has no
+    /// counter (its per-window `last_focused` field is retained ONLY for
+    /// [`Self::focus_last`], the `prefix ;` toggle -- an unrelated feature).
+    /// Real tmux's `active_point` counter is global across the whole
+    /// server (meaningful across windows/sessions), so it is owned and
+    /// stamped by the server (`Server::pane_activity` /
+    /// `Server::stamp_active`, `src/server.rs`) at every focus-change call
+    /// site, and threaded in here as a closure. This replaces the old
+    /// single-slot `last_focused`-based MRU approximation (follow-up #65,
+    /// now resolved).
+    ///
+    /// Returns false (no change) if there is no candidate in that direction.
     //
     // Hotfix note (2026-07-08): the original implementation tested only
     // whether the focused pane's cross-axis MIDPOINT fell inside a
@@ -197,9 +222,14 @@ impl Layout {
     // length opposite a split column/row (e.g. a full-height pane next to a
     // top/bottom split), that midpoint could land exactly on the border
     // between two candidates and match neither, so directional navigation
-    // silently no-op'd. Replaced with the real interval-overlap + MRU
-    // tie-break described above; signature unchanged.
-    pub fn focus_dir(&mut self, dir: Direction, area: Rect) -> bool;
+    // silently no-op'd. Replaced with the real interval-overlap test kept
+    // above (unaffected by the 2026-07-10 wrap/MRU signature change below).
+    //
+    // Signature change (2026-07-10, SP6 parity wave 2 Task 3): added the
+    // `activity` parameter and the edge-flip wrap rule described above.
+    // Every caller (`src/server/dispatch.rs`'s `exec_select_pane`) and every
+    // unit test in `src/layout.rs` updated in the same commit.
+    pub fn focus_dir(&mut self, dir: Direction, area: Rect, activity: &dyn Fn(PaneId) -> u64) -> bool;
 
     /// Cycle focus to the next pane in leaf (tree, left-to-right) order,
     /// wrapping.
