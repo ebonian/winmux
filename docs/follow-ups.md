@@ -855,3 +855,16 @@ None block the sub-project 4 merge.
     `server::render_one`'s status pipeline; fixing it needs per-window
     active-pane data in `status::WindowEntry` (or the ctx). Not exercised
     by the fixture config (`#I`/`#W`/`#F` only). SMALL. LOW.
+
+72. **No application mouse passthrough** (adjudicated in SP6 Task 6 review, 2026-07-10).
+    winmux never relays raw mouse bytes to pane applications: a pane program that
+    enables mouse reporting (vim, htop, less --mouse) receives nothing; wheel input
+    is translated to 3x arrow keys only (src/server/dispatch.rs wheel path). Real
+    tmux forwards encoded mouse events to panes whose program requested mouse mode
+    (docs/tmux-reference/mouse.md, passthrough rules: MOUSE_* pane flags gate
+    consume-vs-forward, input_key_get_mouse re-encodes per the pane's requested
+    protocol). Consequence: SP6's drag-on-live-pane-enters-copy-mode is
+    unconditional where tmux would defer to a mouse-owning app. Real fix: track
+    DECSET 1000/1002/1003/1006 from pane output in grid, re-encode and forward in
+    dispatch, and gate copy-mode-entry/wheel translation on the pane's mouse mode.
+    MEDIUM effort. Interacts with #67(b) table-driven mouse bindings.
