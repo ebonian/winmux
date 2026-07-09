@@ -798,6 +798,18 @@ impl Server {
     fn kill_pane_by_id(&mut self, session_name: &str, pane_id: PaneId) -> Result<bool, String> {
         let owner_wid = self.registry.session_mut(session_name).and_then(|s| s.window_by_pane(pane_id).map(|w| w.id));
         let Some(wid) = owner_wid else { return Err("pane not found".to_string()) };
+        // Snapshot whether `pane_id` was this window's FOCUSED pane before
+        // removal: `Layout::remove` silently reassigns `focused` internally
+        // (to the nearest leaf of the sibling subtree) only in that case --
+        // review Finding 1(a): that reassignment was never stamped, so
+        // `focus_dir`'s MRU tie-break couldn't tell the handed-off pane was
+        // just made active.
+        let was_focused = self
+            .registry
+            .session_mut(session_name)
+            .and_then(|s| s.windows.iter().find(|w| w.id == wid))
+            .map(|w| w.layout.focused() == pane_id)
+            .unwrap_or(false);
         let removed = self
             .registry
             .session_mut(session_name)
@@ -807,6 +819,17 @@ impl Server {
         if removed {
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
+            self.pane_activity.remove(&pane_id); // Finding 2: prune, mirrors last_rects
+            if was_focused {
+                let new_focus = self
+                    .registry
+                    .session_mut(session_name)
+                    .and_then(|s| s.windows.iter().find(|w| w.id == wid))
+                    .map(|w| w.layout.focused());
+                if let Some(id) = new_focus {
+                    self.stamp_active(id);
+                }
+            }
             self.apply_layout_for_session(session_name);
             return Ok(false);
         }
@@ -824,6 +847,7 @@ impl Server {
         }
         self.panes.remove(&pane_id);
         self.last_rects.remove(&pane_id);
+        self.pane_activity.remove(&pane_id); // Finding 2: prune, mirrors last_rects
         self.apply_layout_for_session(session_name);
         Ok(false)
     }
@@ -860,6 +884,7 @@ impl Server {
             for pid in pane_ids {
                 self.panes.remove(&pid);
                 self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
             }
             self.apply_layout_for_session(session_name);
         }
@@ -1235,10 +1260,20 @@ impl Server {
 
     fn exec_rotate_window(&mut self, down: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
+        // Finding 1(c): `Layout::rotate` keeps the same LEAF POSITION
+        // focused, but a DIFFERENT PaneId now occupies it -- `self.focused`
+        // is reassigned to a new pane on every successful rotate, which
+        // must be stamped for the same reason as any other focus handoff.
+        let mut newly_focused = None;
         if let Some(session) = self.registry.session_mut(&session_name) {
             if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
-                window.layout.rotate(down);
+                if window.layout.rotate(down) {
+                    newly_focused = Some(window.layout.focused());
+                }
             }
+        }
+        if let Some(id) = newly_focused {
+            self.stamp_active(id);
         }
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
@@ -1275,6 +1310,16 @@ impl Server {
         if let Some(n) = &name {
             crate::model::validate_name(n, "window")?;
         }
+        // Finding 1(b), first half: snapshot whether `pane_id` was the
+        // source window's FOCUSED pane before removal -- `Layout::remove`
+        // only reassigns `focused` internally in that case, same as
+        // `kill_pane_by_id` above.
+        let was_focused = self
+            .registry
+            .session_mut(&session_name)
+            .and_then(|s| s.windows.iter().find(|w| w.id == wid))
+            .map(|w| w.layout.focused() == pane_id)
+            .unwrap_or(false);
         let removed = self
             .registry
             .session_mut(&session_name)
@@ -1286,6 +1331,16 @@ impl Server {
             // `Layout::remove` succeeds (it only ever refuses a
             // single-pane layout); unreachable in practice.
             return Err("can't break with only one pane".to_string());
+        }
+        if was_focused {
+            let new_focus = self
+                .registry
+                .session_mut(&session_name)
+                .and_then(|s| s.windows.iter().find(|w| w.id == wid))
+                .map(|w| w.layout.focused());
+            if let Some(id) = new_focus {
+                self.stamp_active(id);
+            }
         }
         let new_wid = self.registry.mint_window_id();
         if let Some(session) = self.registry.session_mut(&session_name) {
@@ -1305,6 +1360,13 @@ impl Server {
                 session.last = Some(new_wid);
             }
         }
+        // Finding 1(b), second half: the moved pane is always the sole,
+        // newly-focused pane of the brand-new window (`new_window`
+        // constructs it that way unconditionally, `-d` only changes which
+        // window the CLIENT displays, not which pane is focused inside the
+        // new window) -- stamp unconditionally, same as
+        // `exec_split_window`'s "new pane always takes focus" stamp.
+        self.stamp_active(pane_id);
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
     }
@@ -1347,6 +1409,7 @@ impl Server {
         for pid in occupant_panes {
             self.panes.remove(&pid);
             self.last_rects.remove(&pid);
+            self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
         }
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
@@ -3812,5 +3875,217 @@ mod sp6_config_compat_tests {
         let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set in the test environment");
         assert_eq!(super::expand_tilde("~"), home);
         assert_eq!(super::expand_tilde("no-tilde-here.conf"), "no-tilde-here.conf");
+    }
+}
+
+/// Fix-round-1 review findings (Task 3 report addendum, 2026-07-10):
+/// Finding 1 -- unstamped focus-handoff paths in `kill_pane_by_id`/
+/// `exec_break_pane`/`exec_rotate_window`; Finding 2 -- `pane_activity`
+/// never pruned on pane removal (unbounded leak). Both are inspected
+/// directly via `Server::pane_activity`/`Server::stamp_active`, which
+/// `dispatch.rs` (a child module of `server`) can already reach the same way
+/// production code does (see `exec_select_pane`'s `activity` closure above).
+#[cfg(test)]
+mod focus_activity_fix_tests {
+    use super::*;
+    use crate::grid::Grid;
+    use std::sync::mpsc::channel;
+
+    fn insert_blank_pane(server: &mut Server) -> PaneId {
+        let pane_id = server.mint_pane_id();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new() });
+        pane_id
+    }
+
+    /// One session/window with `n` panes, split HORIZONTALLY one after
+    /// another directly via `Layout::split` (bypassing `spawn_pane`/real
+    /// ConPTY, same pattern as `mouse_dispatch_tests::test_server_with_pane`
+    /// and `choose_tree_dispatch_tests::test_server_with_three_windows`).
+    /// Returns `(server, session_name, window_id, pane_ids_in_leaf_order)`.
+    /// `pane_activity` is left EMPTY -- none of this setup goes through the
+    /// production `exec_*` stamping call sites, so every pane reads as
+    /// never-focused (activity 0) until a test stamps one explicitly.
+    fn test_server_with_split_panes(n: usize) -> (Server, String, WindowId, Vec<PaneId>) {
+        assert!(n >= 1);
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        let first = insert_blank_pane(&mut server);
+        let session = server.registry.create_session(Some("0"), first, (80, 24), 0).expect("create_session");
+        let session_name = session.name.clone();
+        let wid = session.current;
+        let area = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let mut ids = vec![first];
+        for _ in 1..n {
+            let new_id = insert_blank_pane(&mut server);
+            let ok = server
+                .registry
+                .session_mut(&session_name)
+                .unwrap()
+                .windows
+                .iter_mut()
+                .find(|w| w.id == wid)
+                .unwrap()
+                .layout
+                .split(SplitDir::Horizontal, new_id, area)
+                .is_ok();
+            assert!(ok, "test setup: split must succeed");
+            ids.push(new_id);
+        }
+        (server, session_name, wid, ids)
+    }
+
+    fn focused_pane(server: &mut Server, session_name: &str, wid: WindowId) -> PaneId {
+        server.registry.session_mut(session_name).unwrap().windows.iter().find(|w| w.id == wid).unwrap().layout.focused()
+    }
+
+    fn set_focus(server: &mut Server, session_name: &str, wid: WindowId, pane: PaneId) {
+        server.registry.session_mut(session_name).unwrap().windows.iter_mut().find(|w| w.id == wid).unwrap().layout.focus_pane(pane);
+    }
+
+    fn max_activity(server: &Server) -> u64 {
+        server.pane_activity.values().copied().max().unwrap_or(0)
+    }
+
+    /// Finding 1(a): `kill_pane_by_id`'s `Layout::remove` reassigns focus
+    /// internally (to the sibling subtree's nearest leaf) only when the
+    /// KILLED pane was the window's focused one. That reassignment must get
+    /// a fresh `stamp_active`, or `focus_dir`'s MRU tie-break can't tell the
+    /// handed-off pane was just made active.
+    #[test]
+    fn kill_pane_by_id_stamps_focus_handoff() {
+        // H(A, H(B, C)): kill focused A -> Layout::remove hands focus to
+        // the sibling subtree's first leaf, B.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        server.stamp_active(c);
+        server.stamp_active(b);
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, a);
+
+        server.kill_pane_by_id(&session_name, a).expect("kill A");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
+        assert!(
+            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
+            "the pane focus is handed off to after kill-pane must get a FRESH activity stamp \
+             (got {:?}, previous max was {before_max})",
+            server.pane_activity.get(&new_focus)
+        );
+    }
+
+    /// Guard: killing a NON-focused pane must NOT spuriously stamp the
+    /// window's (unchanged) focus -- `Layout::remove` never touches
+    /// `focused` in that case, so neither should `kill_pane_by_id`.
+    #[test]
+    fn kill_pane_by_id_does_not_stamp_when_focus_unchanged() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        set_focus(&mut server, &session_name, wid, c);
+        server.stamp_active(c); // c is focused and already stamped
+
+        server.kill_pane_by_id(&session_name, a).expect("kill non-focused A");
+
+        assert_eq!(focused_pane(&mut server, &session_name, wid), c, "killing a non-focused pane must not move focus");
+        assert!(!server.pane_activity.contains_key(&b), "B was never focused and must not be spuriously stamped");
+    }
+
+    /// Finding 1(c): `Layout::rotate` keeps the same LEAF POSITION focused,
+    /// but a DIFFERENT PaneId now occupies it -- `focused` is reassigned to
+    /// a new pane on every successful rotate.
+    #[test]
+    fn exec_rotate_window_stamps_new_focus() {
+        let (mut server, session_name, wid, _ids) = test_server_with_split_panes(3);
+        let before_max = max_activity(&server);
+
+        server.exec_rotate_window(false, None, Some(&session_name)).expect("rotate-window");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert!(
+            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
+            "rotate-window's focus reassignment (Layout::rotate) must get a fresh stamp"
+        );
+    }
+
+    /// Finding 1(b): `exec_break_pane` has TWO focus-handoff sites --
+    /// (1) the source window's `Layout::remove` reassignment (same shape as
+    /// `kill_pane_by_id`), and (2) the moved pane becoming the new window's
+    /// sole, active pane.
+    #[test]
+    fn exec_break_pane_stamps_source_handoff_and_moved_pane() {
+        // H(A, B): break B (focused) out; source window keeps only A, whose
+        // Layout::remove-driven focus reassignment must be stamped, THEN
+        // the moved pane B must be stamped as the new window's active pane
+        // (in that order -- B's stamp must be the more recent of the two).
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        server.stamp_active(a);
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, b);
+
+        server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
+
+        let source_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(source_focus, a, "test setup sanity: only A remains in the source window");
+        let a_stamp = server.pane_activity.get(&a).copied().unwrap_or(0);
+        assert!(a_stamp > before_max, "source window's focus handoff (to A) after break-pane must get a fresh stamp");
+
+        let b_stamp = server.pane_activity.get(&b).copied().unwrap_or(0);
+        assert!(b_stamp > a_stamp, "the moved pane (B), becoming the new window's active pane, must be stamped AFTER A's handoff stamp");
+    }
+
+    /// Finding 2: `pane_activity` must be pruned wherever a pane is removed
+    /// from `self.panes`/`self.last_rects`, or it leaks unboundedly across
+    /// the server's lifetime.
+    #[test]
+    fn kill_pane_by_id_prunes_pane_activity() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        set_focus(&mut server, &session_name, wid, a);
+        server.stamp_active(a);
+        server.stamp_active(b);
+
+        server.kill_pane_by_id(&session_name, a).expect("kill A");
+
+        assert!(!server.pane_activity.contains_key(&a), "a killed pane's activity entry must be pruned");
+        assert!(server.pane_activity.contains_key(&b), "the surviving pane's entry must be untouched");
+    }
+
+    #[test]
+    fn kill_window_by_id_prunes_pane_activity_for_all_its_panes() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        // A second window so the first can be killed outright (kill_window
+        // refuses the session's only window).
+        let other_pane = insert_blank_pane(&mut server);
+        let other_wid = server.registry.mint_window_id();
+        server.registry.session_mut(&session_name).unwrap().new_window(other_wid, other_pane);
+        server.stamp_active(a);
+        server.stamp_active(b);
+
+        server.kill_window_by_id(&session_name, wid).expect("kill window");
+
+        assert!(!server.pane_activity.contains_key(&a), "killed window's pane A must be pruned from pane_activity");
+        assert!(!server.pane_activity.contains_key(&b), "killed window's pane B must be pruned from pane_activity");
+    }
+
+    #[test]
+    fn exec_move_window_prunes_occupant_pane_activity() {
+        // Two windows (idx0 = wid/A, idx1 = other_wid/B); move-window -k
+        // onto idx1 kills B, its occupant, whose activity entry must be
+        // pruned alongside its pane/rect cleanup.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(1);
+        let a = ids[0];
+        let other_pane = insert_blank_pane(&mut server);
+        let other_wid = server.registry.mint_window_id();
+        server.registry.session_mut(&session_name).unwrap().new_window(other_wid, other_pane);
+        server.stamp_active(a);
+        server.stamp_active(other_pane);
+        server.registry.session_mut(&session_name).unwrap().current = wid;
+
+        server.exec_move_window(true, "1".to_string(), Some(&session_name)).expect("move-window -k onto occupied index 1");
+
+        assert!(!server.pane_activity.contains_key(&other_pane), "the killed occupant's activity entry must be pruned");
+        assert!(server.pane_activity.contains_key(&a), "the mover's own pane activity must be untouched");
     }
 }

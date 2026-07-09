@@ -403,12 +403,28 @@ impl Layout {
             if !adjacent {
                 continue;
             }
+            // Literal transcription of `window.c:1992-1998` (doc §1.2): three
+            // OR'd clauses, INCLUSIVE of `top`/`bottom` (`f_y`/`f_b`, where
+            // `f_b` is deliberately one PAST the focused pane's last real
+            // row/column -- the border line itself). A candidate whose near
+            // edge lands exactly on `f_b` (or, symmetrically containing,
+            // whose far edge reaches past it) still counts even though it
+            // shares no real row/column with the focused pane -- only a
+            // diagonal touch at the shared border corner (2026-07-10 review
+            // fix: the prior `r_y < f_b` / `r_x < f_r` strict tests wrongly
+            // excluded exactly this boundary case).
             let overlaps = match dir {
                 Direction::Left | Direction::Right => {
-                    r.h > 0 && f.h > 0 && r_y < f_b && f_y < r_b
+                    r.h > 0 && f.h > 0 && {
+                        let end = r_b - 1; // candidate's last real row
+                        (r_y < f_y && end > f_b) || (r_y >= f_y && r_y <= f_b) || (end >= f_y && end <= f_b)
+                    }
                 }
                 Direction::Up | Direction::Down => {
-                    r.w > 0 && f.w > 0 && r_x < f_r && f_x < r_r
+                    r.w > 0 && f.w > 0 && {
+                        let end = r_r - 1; // candidate's last real column
+                        (r_x < f_x && end > f_r) || (r_x >= f_x && r_x <= f_r) || (end >= f_x && end <= f_r)
+                    }
                 }
             };
             if overlaps {
@@ -1453,6 +1469,56 @@ mod tests {
         assert_eq!(l.focused(), 3);
         assert!(l.focus_dir(Direction::Down, A, &|id| act.get(id)));
         assert_eq!(l.focused(), 1, "Down from the bottommost row wraps to the topmost");
+    }
+
+    #[test]
+    fn focus_dir_includes_corner_touching_candidate() {
+        // Finding 3 (review, 2026-07-10): the perpendicular-overlap test
+        // must be INCLUSIVE at the boundary (`window.c:1992-1998`, doc
+        // §1.2) -- a candidate whose near edge lands exactly on the focused
+        // pane's far boundary still counts, even though it shares no real
+        // row with it (only the border LINE, not any cell).
+        //
+        // H(V(1,4), V(2,3)) on A (80x24). H(1,2) at the default ratio gives
+        // pane1/pane4's column {x0,w40} and pane2/pane3's column
+        // {x41,w39} (`child_first(80,0.5)=round(79*0.5)=40`). Splitting
+        // pane1 vertically at the default ratio gives
+        // `child_first(24,0.5)=round(23*0.5)=12`: pane1 {y0,h12} (rows
+        // 0..12, so f_b = 0+12 = 12), pane4 {y13,h11}.
+        //
+        // The right column's V(2,3) split ratio is then nudged to 11/23
+        // (instead of the default-derived 12/23) via `set_ratio`, so
+        // `child_first(24,11/23)=11`: pane2 {y0,h11} (rows 0..11, still
+        // fully overlapping pane1's rows 0..11 -- an ordinary candidate
+        // either way) and pane3 {y=0+11+1=12,h12} (rows 12..24). Pane3's
+        // `r_y` (12) lands EXACTLY on pane1's `f_b` (12) -- a corner touch,
+        // not a real row overlap (pane1's real rows are 0..11; pane3's are
+        // 12..23). The old strict `r_y < f_b` test (12 < 12 = false)
+        // excluded pane3 as a Right-candidate from pane1; the new inclusive
+        // test (`r_y >= top && r_y <= bottom`, i.e. 12 >= 0 && 12 <= 12)
+        // includes it.
+        //
+        // Only pane3 is stamped, so if it's (correctly) a candidate it must
+        // win the tie-break against pane2 (default activity 0); if it's
+        // (incorrectly) excluded, Right would pick pane2 instead.
+        let mut act = Activity::new();
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // H(1,2); focus 2
+        l.focus_pane(1);
+        l.split(SplitDir::Vertical, 4, A).unwrap(); // H(V(1,4),2); focus 4
+        l.focus_pane(2);
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // H(V(1,4),V(2,3)); focus 3
+        let path3 = l.path_to(3).unwrap();
+        l.set_ratio(&path3[..path3.len() - 1], 11.0 / 23.0);
+        l.focus_pane(1);
+        act.stamp(3);
+        assert!(l.focus_dir(Direction::Right, A, &|id| act.get(id)));
+        assert_eq!(
+            l.focused(),
+            3,
+            "corner-touching pane3 (r_y == f_b) must be a Right-candidate from pane1, and \
+             being the only stamped one, must win the tie-break"
+        );
     }
 
     #[test]

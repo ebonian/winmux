@@ -195,7 +195,12 @@ impl Layout {
     /// 2. **MRU tie-break.** A candidate is any pane flush against the
     ///    (possibly wrapped) edge AND whose cross-axis range genuinely
     ///    OVERLAPS the focused pane's cross-axis range (a real
-    ///    interval-overlap test). Among multiple candidates, the one with
+    ///    interval-overlap test, INCLUSIVE at the boundary: a candidate
+    ///    whose near edge lands exactly on the focused pane's far boundary
+    ///    still counts, per tmux's `window.c:1992-1998` one-past-edge
+    ///    convention -- corner-touching-only candidates are not excluded;
+    ///    2026-07-10 review fix, closes the pre-existing strict-`<` gap
+    ///    from the 2026-07-08 hotfix). Among multiple candidates, the one with
     ///    the greatest `activity(pane)` value wins (tmux's real
     ///    `active_point` recency counter, `window_pane_choose_best`); ties
     ///    (e.g. every candidate still at its caller-supplied default)

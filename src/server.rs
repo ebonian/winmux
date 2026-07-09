@@ -1589,6 +1589,7 @@ impl Server {
             }
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
+            self.pane_activity.remove(&pane_id); // Finding 2 (review): prune, mirrors last_rects
             self.apply_layout_for_session(&session_name);
         } else {
             let is_only_window = self
@@ -1615,6 +1616,7 @@ impl Server {
                 for pid in pane_ids {
                     self.panes.remove(&pid);
                     self.last_rects.remove(&pid);
+                    self.pane_activity.remove(&pid); // Finding 2 (review): prune, mirrors last_rects
                 }
                 self.apply_layout_for_session(&session_name);
             }
@@ -1635,6 +1637,7 @@ impl Server {
             for pid in pane_ids {
                 self.panes.remove(&pid);
                 self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2 (review): prune, mirrors last_rects
             }
         }
         self.registry.kill_session(name);
