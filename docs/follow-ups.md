@@ -612,10 +612,11 @@ None block the sub-project 4 merge.
     safe to delete whenever someone picks this up (no consumer anywhere
     reads it).
 
-64. **Stale `MouseDrag` state when an overlay opens mid-drag** (found in the
-    final SP4 fix-wave re-review). The overlay mouse guard in
-    `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse events while
-    choose-tree/display-panes are open but does not clear
+64. **RESOLVED** (SP6 parity wave 2, Task 1: mouse drag-state lifecycle
+    fix). *Original text:* Stale `MouseDrag` state when an overlay opens
+    mid-drag (found in the final SP4 fix-wave re-review). The overlay mouse
+    guard in `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse
+    events while choose-tree/display-panes are open but does not clear
     `client.mouse.drag`, unlike the sibling "outside pane area" guard which
     explicitly resets it. A drag armed before an overlay opens (keyboard-
     triggered overlay mid-drag, or a `display-panes -d` timer expiry) can
@@ -627,6 +628,31 @@ None block the sub-project 4 merge.
     in the overlay guard arm) plus a test that arms a drag, opens an
     overlay, and asserts the drag state is cleared.
 
+    **Fixed:** a wider SP6 gap-analysis pass (`.superpowers/sdd/sp6-gap-analysis.md`
+    §D) found this exact defect class on two OTHER `dispatch_mouse`
+    early-return paths beyond the overlay guard this entry originally
+    ticketed — the status-row short-circuit (`ev.y == status row` diverts
+    Drag/Up to `dispatch_mouse_status`, which ignores them) and
+    `mouse_down`'s `MouseHit::None` arm (a press that misses every
+    pane/border cell) — and diagnosed the resulting user-visible symptom
+    ("border drag works once then dies"). All three now reset
+    `client.mouse.drag = MouseDrag::None` before their early return, mirroring
+    the "outside pane area" guard's existing pattern:
+    `src/server/dispatch.rs`'s `dispatch_mouse` (overlay guard and
+    status-row short-circuit) and `mouse_down`'s `MouseHit::None` arm.
+    Regression coverage: `tests/server_proto.rs`'s
+    `mouse_border_drag_twice_resizes_twice` (non-regression baseline for two
+    clean consecutive drags) and
+    `mouse_border_drag_release_on_status_row_then_drag_again` (genuine
+    RED/GREEN reproduction: an out-of-sequence `Drag` with no `Down`, sent
+    right after a status-row-swallowed release, must not spuriously move the
+    border), plus `src/server/dispatch.rs`'s `mouse_dispatch_tests` module
+    (`mouse_drag_cleared_when_overlay_swallows_release`,
+    `mouse_down_miss_clears_stale_drag`) for the overlay and
+    `MouseHit::None` legs, which — like this entry's original note says —
+    aren't reachable through a conformant SGR stream and are exercised
+    directly against `Server`/`ClientState` instead.
+
 65. **Directional focus MRU tie-break is a single-slot approximation** (from
     the focus-nav hotfix `6e6ff4d`, its review). When multiple panes are
     valid candidates for `select-pane -L/-R/-U/-D`, real tmux picks the most
@@ -637,3 +663,30 @@ None block the sub-project 4 merge.
     exactly. Also noted by the review: no test drives the pre-fix bug via
     Left/Up specifically (fix is symmetric per axis pair), and none
     exercises focus_dir while zoomed — coverage niceties.
+
+66. **Mouse border-drag toward the top/left edge never resizes** (found while
+    building Task 1's regression tests, SP6 parity wave 2; separate root
+    cause from #64's staleness class, out of that task's scope). A vertical
+    border drag's reference pane, from `mouse_down`'s `MouseHit::VBorder {
+    left }` (and `HBorder { top }` for horizontal borders), is bound ONCE at
+    `Down` time and reused unchanged for the whole gesture in
+    `mouse_drag_border` (`src/server/dispatch.rs`). But
+    `Layout::resize_from` (`src/layout.rs`) only accepts that reference for
+    `Direction::Right`/`Direction::Down` (which grow the split's FIRST
+    child, matching `left`/`top`'s first-child position) — `Direction::Left`/
+    `Direction::Up` (shrink the first child / grow the second) require the
+    SECOND-child pane as reference instead (see
+    `layout::tests::resize_from_reference_pane_ignores_focus`), which
+    `mouse_drag_border` never resolves. Net effect: dragging a border toward
+    the pane's own left/top edge (shrinking the LEFT/TOP pane, growing the
+    RIGHT/BOTTOM one) is a silent no-op, unconditionally and reproducibly —
+    confirmed empirically with a single, otherwise-correct drag (no staleness
+    involved at all). Plausibly the dominant real-world contributor to the
+    "border drag works once then dies" user reports #64/this class of fix
+    addressed, since a user alternating drag directions would see exactly
+    that symptom. Fix sketch: `mouse_drag_border` (or `mouse_down`'s
+    `VBorder`/`HBorder` arms) needs to resolve the CORRECT reference pane
+    per-direction each call (or store both siblings at `Down` time and pick
+    based on `delta`'s sign), then re-verify against
+    `layout::tests::resize_from_reference_pane_ignores_focus`'s contract.
+    Not fixed here — orthogonal to Task 1's drag-STATE-lifecycle scope.

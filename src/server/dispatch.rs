@@ -1614,11 +1614,30 @@ impl Server {
             client.mode,
             ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
         ) {
+            // #64: a drag armed before the overlay opened (keyboard-
+            // triggered mid-drag) must not survive across the overlay's
+            // lifetime -- clear it just like the sibling "outside pane
+            // area"/status-row guards do, so a later out-of-sequence
+            // Drag/Up can't revive stale Border/Selecting state.
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                client.mouse.drag = MouseDrag::None;
+            }
             return ExecOutcome::Ok(String::new());
         }
 
         if let Some(sy) = self.mouse_status_row(client) {
             if ev.y == sy {
+                // A border/selection drag that overshoots onto the status
+                // row at release is diverted to `dispatch_mouse_status`,
+                // which only handles Down(1)/Wheel -- Drag/Up would
+                // otherwise fall through with no reset, leaving
+                // `client.mouse.drag` stuck and making the NEXT drag a
+                // silent no-op (see `mouse_drag_border`'s `delta == 0`
+                // early return). Mirrors the "outside pane area" guard
+                // below.
+                if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                    client.mouse.drag = MouseDrag::None;
+                }
                 return self.dispatch_mouse_status(ev, client, session_name);
             }
         }
@@ -1735,7 +1754,14 @@ impl Server {
                 client.mouse.drag = MouseDrag::Selecting { moved: false };
                 ExecOutcome::Ok(String::new())
             }
-            MouseHit::None => ExecOutcome::Ok(String::new()),
+            MouseHit::None => {
+                // A press that misses every pane/border cell (off-by-one
+                // vs. a just-moved border, a zero-size rect, ...) must not
+                // leave a previously-armed drag stale -- every other arm
+                // above overwrites `client.mouse.drag` unconditionally.
+                client.mouse.drag = MouseDrag::None;
+                ExecOutcome::Ok(String::new())
+            }
         }
     }
 
@@ -3409,6 +3435,63 @@ mod mouse_dispatch_tests {
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         let ClientMode::Copy(cs) = &client_plain.mode else { panic!("expected Copy mode after plain copy-mode") };
         assert!(!cs.scroll_exit, "plain copy-mode entry (no -e) must not set scroll_exit");
+    }
+
+    /// Gap analysis §D point 2: `mouse_down`'s `MouseHit::None` arm didn't
+    /// reset `client.mouse.drag`, unlike every other arm (`VBorder`/
+    /// `HBorder`/`Pane`), which all overwrite it unconditionally. Real
+    /// hit-testing can't actually produce `MouseHit::None` for coordinates
+    /// inside a non-degenerate pane area on any practically-sized terminal
+    /// (`hit_test`'s pane/border rects always fully tile the area), so this
+    /// is exercised directly against `mouse_down` with an EMPTY `rects`
+    /// slice -- the same "zero-size rects" degenerate case the root-cause
+    /// doc comment on `hit_test` calls out, forced by hand rather than by
+    /// shrinking a real terminal to a degenerate size.
+    #[test]
+    fn mouse_down_miss_clears_stale_drag() {
+        let (mut server, session_name, pane_id) = test_server_with_pane(false);
+        let mut client = test_client(20, 10);
+        client.mouse.drag = super::super::MouseDrag::Border { pane: pane_id, vertical: true };
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.mouse_down(down, 1, &[], &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::None,
+            "a Down that misses every pane/border cell must clear stale drag state"
+        );
+    }
+
+    /// `docs/follow-ups.md` #64: the choose-tree/display-panes mouse guard
+    /// at the top of `dispatch_mouse` swallows Drag/Up events while an
+    /// overlay is open, but (before this fix) never cleared
+    /// `client.mouse.drag` -- so a drag armed before the overlay opened
+    /// (e.g. a keyboard-triggered `display-panes` mid-drag) survived the
+    /// overlay's lifetime, revivable by a later out-of-sequence `Drag`/`Up`
+    /// with no intervening `Down`. Not reachable through a conformant SGR
+    /// mouse stream (hence the unit-level construction here, mirroring
+    /// `alt_screen_wheel_does_not_enter_copy_mode`'s direct `Server`+
+    /// `ClientState` build instead of a pipe-driven e2e harness): a real
+    /// terminal always sends `Down` before `Drag`/`Up`, and `Down`'s own
+    /// arms already overwrite `client.mouse.drag` unconditionally, so this
+    /// exact sequence can only be forced by hand.
+    #[test]
+    fn mouse_drag_cleared_when_overlay_swallows_release() {
+        let (mut server, session_name, pane_id) = test_server_with_pane(false);
+        let mut client = test_client(20, 10);
+        client.mouse.drag = super::super::MouseDrag::Border { pane: pane_id, vertical: true };
+
+        let outcome = server.exec_display_panes_client(None, &mut client);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(matches!(client.mode, ClientMode::DisplayPanes(_)), "test setup: overlay must be open");
+
+        let up = MouseEvent { kind: MouseKind::Up(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.dispatch_mouse(up, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::None,
+            "overlay guard must clear stale drag state on a swallowed Up"
+        );
     }
 }
 

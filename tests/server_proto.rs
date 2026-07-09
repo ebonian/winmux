@@ -3196,6 +3196,26 @@ const CB_LEFT_DRAG: u8 = 0x20; // button 1 + motion bit
 const CB_WHEEL_UP: u8 = 0x40;
 const CB_WHEEL_DOWN: u8 = 0x41;
 
+/// Drain any `Output` messages that arrive on `c` within `dur`, feeding them
+/// into `grid`, WITHOUT panicking if none arrive -- unlike
+/// `Client::recv_output_until`, which requires a predicate to eventually
+/// become true. Used to prove a negative (nothing changed) after a bounded
+/// wait, once the caller has otherwise synchronized (e.g. a CLI round trip)
+/// that the action under test has already been fully processed server-side.
+fn drain_briefly(c: &Client, grid: &mut Grid, dur: Duration) {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match c.rx.recv_timeout(remaining) {
+            Ok(ServerMsg::Output(bytes)) => grid.feed(&bytes),
+            Ok(_) | Err(_) => return,
+        }
+    }
+}
+
 fn enable_mouse(name: &str, c: &mut Client) {
     let mut cli = cli_client(name);
     cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mouse".into(), "on".into()]));
@@ -3540,6 +3560,165 @@ fn mouse_border_drag_resizes() {
     server.join().expect("server exits after kill-server");
 }
 
+/// Baseline non-regression coverage for the "border drag works once then
+/// dies" bug (SP6 gap analysis §D): two consecutive, fully independent
+/// clean press-drag-release cycles (both releasing inside the pane area, no
+/// status-row/overlay interruption of either) must both actually resize --
+/// the baseline `mouse_border_drag_resizes` above only ever exercises one.
+///
+/// Empirically this already passes on BOTH sides of the Task 1 fix (not a
+/// RED test): `mouse_down`'s `VBorder`/`HBorder` arms unconditionally
+/// overwrite `client.mouse.drag` on every `Down` that lands cleanly on a
+/// real border, so a second, fully legitimate press always re-arms
+/// correctly regardless of what staleness preceded it -- staleness only
+/// bites when a `Drag`/`Up` arrives WITHOUT a fresh preceding `Down` (see
+/// `mouse_border_drag_release_on_status_row_then_drag_again` below, and the
+/// task report, for the actual RED/GREEN reproduction and the full
+/// investigation). This test is still valuable as a regression guard on
+/// the fix itself: an incorrect/overzealous drag-state reset could easily
+/// have broken this exact "second clean drag" case, and this test would
+/// catch that.
+///
+/// Both drags move the border further RIGHT (never left): `VBorder{ left }`
+/// binds the LEFT pane (the split's first child) as `mouse_drag_border`'s
+/// fixed resize-reference for the entire gesture, and `Layout::resize_from`
+/// only accepts a first-child reference for `Direction::Right` (see
+/// `layout::tests::resize_from_reference_pane_ignores_focus`) -- a LEFTWARD
+/// drag would need the second-child (right) pane as reference instead, which
+/// `mouse_drag_border` never resolves (confirmed empirically: even a SINGLE
+/// leftward drag never moves the border). That direction/reference-pane
+/// mismatch is a separate, always-reproducible pre-existing bug, out of
+/// Task 1's drag-STATE-lifecycle scope (see this task's report); rightward
+/// keeps this test isolated to the staleness bug this task addresses.
+#[test]
+fn mouse_border_drag_twice_resizes_twice() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let target_x1 = border_x + 4;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x1, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x1, 5, true)));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x1));
+    assert!(!has_vertical_border_at(&grid, border_x), "first drag must have actually moved the border");
+
+    // Second, independent drag: 4 more columns right. This is the case that
+    // fails today -- the first drag's stale `MouseDrag::Border` survives
+    // (nothing in the fixed-vs-buggy input sequence differs from a real
+    // user's second drag), and `mouse_drag_border` no-ops forever after.
+    let target_x2 = target_x1 + 4;
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x1, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x2, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x2, 5, true)));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x2));
+    assert!(!has_vertical_border_at(&grid, target_x1), "second drag must have actually moved the border again");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Regression test for the status-row leg of the same bug (SP6 gap analysis
+/// §D point 1): `dispatch_mouse`'s status-row short-circuit
+/// (`dispatch.rs:1620-1624`) diverts Drag/Up events landing on the status
+/// row to `dispatch_mouse_status`, which ignores them -- so a horizontal
+/// border drag whose RELEASE overshoots onto the status row (very reachable:
+/// the status bar sits immediately below the pane area) leaves
+/// `client.mouse.drag` stuck at `Border`.
+///
+/// Construction note (deviates from the task brief's literal "press again,
+/// motion, release inside the pane area" wording -- see this task's report
+/// for the full empirical investigation): a SECOND, fully independent
+/// press-drag-release cycle turns out NOT to reproduce a failure here, on
+/// EITHER side of the fix, because `mouse_down`'s `VBorder`/`HBorder` arms
+/// unconditionally overwrite `client.mouse.drag` on every `Down` that hits a
+/// real border -- so a legitimate fresh press always re-arms correctly
+/// regardless of what staleness came before. What the leftover
+/// `MouseDrag::Border` actually enables is a Drag frame arriving WITHOUT an
+/// intervening Down (a real-world possibility: buffered/coalesced motion
+/// reports trailing a release, or simply a terminal quirk) being
+/// misinterpreted as a live drag and moving the border using a reference
+/// pane nobody currently pressed -- exactly the "revivable by a later
+/// out-of-sequence Drag/Up frame with no intervening Down" failure mode
+/// `docs/follow-ups.md` #64 describes for the sibling overlay guard. This
+/// test reproduces that directly: after the status-row-swallowed release,
+/// a bare `Drag` frame (no `Down`) must NOT move the border.
+#[test]
+fn mouse_border_drag_release_on_status_row_then_drag_again() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, has_horizontal_border);
+    let border_y = find_horizontal_border(&grid);
+    let mid_y = border_y + 3;
+    let status_row = grid.rows() - 1;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, border_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, mid_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, status_row, true)));
+    c.recv_output_until(&mut grid, |g| has_horizontal_border_at(g, mid_y));
+    assert!(!has_horizontal_border_at(&grid, border_y), "first drag must have actually moved the border");
+
+    // Out-of-sequence: a `Drag` frame with NO preceding `Down`. Before the
+    // fix, `client.mouse.drag` is still the stale `Border{ pane: top,
+    // vertical: false }` left by the swallowed release above, so
+    // `mouse_drag_border` runs and moves the border to `target_y` using
+    // that leftover reference -- a spurious resize nobody pressed for.
+    // After the fix, `client.mouse.drag` was reset to `None` by the
+    // status-row guard, so a bare `Drag` is correctly inert.
+    let target_y = mid_y + 3;
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_y, false)));
+
+    // Synchronize on a fresh CLI round trip (a separate connection, but the
+    // server's single event loop processes messages in the order its
+    // reader threads forward them, and this request is issued and its
+    // response awaited well after the Drag frame above was sent) so the
+    // Drag frame is guaranteed fully processed before checking state, then
+    // drain whatever `Output` the Drag frame produced (if any) into `grid`.
+    let mut sync_cli = cli_client(&name);
+    sync_cli.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    expect_cli_done(&sync_cli, 0);
+    drain_briefly(&c, &mut grid, Duration::from_millis(500));
+
+    assert!(
+        has_horizontal_border_at(&grid, mid_y),
+        "an out-of-sequence Drag with no Down must NOT move the border (stale drag state revived)"
+    );
+    assert!(!has_horizontal_border_at(&grid, target_y), "the border must still be at mid_y, unmoved");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// The overlay leg of the same bug (`docs/follow-ups.md` #64): the
+// choose-tree/display-panes mouse guard in `dispatch_mouse` swallows
+// Drag/Up events while an overlay is open but (before this fix) did not
+// clear `client.mouse.drag`. Arms a border drag via a raw keyboard/config
+// path that reaches `dispatch_mouse` at the unit level (not exercisable
+// from a conformant SGR mouse stream through the e2e-style pipe harness,
+// since real terminals never send Drag/Up without a preceding Down and the
+// overlay guard sits ahead of the border/pane hit-test), asserting the
+// guard now resets `MouseDrag::None` before returning. See
+// `src/server/dispatch.rs`'s `mouse_dispatch_tests` module for the actual
+// coverage (`mouse_drag_cleared_when_overlay_swallows_release`) -- unlike
+// this file, that module constructs a `Server`/`ClientState` directly, so
+// it can set `client.mouse.drag` to a known `Border` value and open an
+// overlay without needing a real intervening Down event.
+
 // `alt_screen_wheel_sends_arrows`: the task brief's suggested e2e approach
 // (a PowerShell one-liner writes the raw `CSI ?1049h` bytes itself,
 // `Write-Host -NoNewline "$([char]27)[?1049h"`) was tried here first and
@@ -3570,6 +3749,21 @@ fn mouse_border_drag_resizes() {
 fn has_horizontal_border(g: &Grid) -> bool {
     let pane_rows = g.rows().saturating_sub(1);
     (0..pane_rows).any(|r| (0..g.cols()).all(|c| g.cell(c, r).ch == '─'))
+}
+
+/// True if row `row` (must be strictly above the bottom status row) is a
+/// full run of `─` across every column -- mirrors `has_vertical_border_at`'s
+/// pattern but for a horizontal split border.
+fn has_horizontal_border_at(g: &Grid, row: u16) -> bool {
+    let pane_rows = g.rows().saturating_sub(1);
+    row < pane_rows && (0..g.cols()).all(|c| g.cell(c, row).ch == '─')
+}
+
+/// The row of the first full-width horizontal split border, or panics if
+/// there isn't one -- mirrors `find_vertical_border`.
+fn find_horizontal_border(g: &Grid) -> u16 {
+    let pane_rows = g.rows().saturating_sub(1);
+    (0..pane_rows).find(|&row| has_horizontal_border_at(g, row)).expect("expected a horizontal split border")
 }
 
 /// The column of the first occurrence of `marker` in any row, or `None` if
