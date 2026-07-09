@@ -974,6 +974,10 @@ impl Server {
         Ok(String::new())
     }
 
+    // Deliberately does NOT `stamp_active` (nor do `exec_step_window`/
+    // `exec_last_window`): switching windows changes the session's current
+    // winlink, not any window's active pane -- tmux only bumps
+    // `active_point` in `window_set_active_pane`. See `stamp_active`'s doc.
     fn exec_select_window(&mut self, target: String, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, Some(&target))?;
         if let Some(session) = self.registry.session_mut(&session_name) {
@@ -3972,6 +3976,55 @@ mod focus_activity_fix_tests {
              (got {:?}, previous max was {before_max})",
             server.pane_activity.get(&new_focus)
         );
+    }
+
+    /// Fix round 2, coordinator-confirmed follow-on: `handle_exited` (a
+    /// pane's shell exiting NATURALLY, the most common death path) runs the
+    /// same `Layout::remove` focus reassignment as `kill_pane_by_id` -- and
+    /// tmux routes both through the same `window_lost_pane` ->
+    /// `window_set_active_pane` stamping -- so the handed-off pane must get
+    /// a fresh stamp here too. Same construction as
+    /// `kill_pane_by_id_stamps_focus_handoff`, but driving the pane-exit
+    /// event handler instead of kill-pane.
+    #[test]
+    fn handle_exited_stamps_focus_handoff() {
+        // H(A, H(B, C)): A's shell exits while A is focused ->
+        // Layout::remove hands focus to the sibling subtree's first
+        // leaf, B.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        server.stamp_active(c);
+        server.stamp_active(b);
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, a);
+
+        assert!(server.handle_exited(a), "handle_exited must report the server should keep running");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
+        assert!(
+            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
+            "the pane focus is handed off to after a natural pane exit must get a FRESH activity stamp \
+             (got {:?}, previous max was {before_max})",
+            server.pane_activity.get(&new_focus)
+        );
+        assert!(!server.pane_activity.contains_key(&a), "the exited pane's activity entry must be pruned (round-1 Finding 2 site)");
+    }
+
+    /// Guard, mirroring `kill_pane_by_id_does_not_stamp_when_focus_unchanged`:
+    /// a NON-focused pane exiting naturally must not spuriously stamp the
+    /// window's (unchanged) focus.
+    #[test]
+    fn handle_exited_does_not_stamp_when_focus_unchanged() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        set_focus(&mut server, &session_name, wid, c);
+        server.stamp_active(c);
+
+        assert!(server.handle_exited(a));
+
+        assert_eq!(focused_pane(&mut server, &session_name, wid), c, "a non-focused pane exiting must not move focus");
+        assert!(!server.pane_activity.contains_key(&b), "B was never focused and must not be spuriously stamped");
     }
 
     /// Guard: killing a NON-focused pane must NOT spuriously stamp the

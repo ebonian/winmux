@@ -1007,6 +1007,13 @@ impl Server {
     /// bump total (never panicking) matches this codebase's convention for
     /// counters that are conceptually "never overflows" (follow-up #5's
     /// spirit).
+    ///
+    /// Deliberate NON-call sites (fix round 2, controller-adjudicated):
+    /// `exec_select_window`/`exec_step_window`/`exec_last_window` do NOT
+    /// stamp -- this matches tmux, where switching windows changes the
+    /// session's current *winlink* only; `active_point` is bumped solely by
+    /// `window_set_active_pane` (a PANE focus change within a window). Do
+    /// not "fix" those paths by adding stamps there.
     fn stamp_active(&mut self, id: PaneId) {
         let point = self.next_active_point;
         self.next_active_point = self.next_active_point.saturating_add(1);
@@ -1582,6 +1589,22 @@ impl Server {
             .unwrap_or(false);
 
         if other_panes_alive {
+            // Fix round 2 (review follow-on): a natural pane exit runs the
+            // same `Layout::remove` focus reassignment as an explicit
+            // kill-pane (tmux routes both through `window_lost_pane` ->
+            // `window_set_active_pane`), so the handed-off pane must get a
+            // fresh activity stamp too -- same was-focused snapshot shape
+            // as `kill_pane_by_id`. This is the ONLY `handle_exited` branch
+            // that reassigns PANE focus: the window-death branch below
+            // retargets the session's current WINDOW (a winlink change,
+            // which tmux does not stamp -- see `stamp_active`'s doc), and
+            // the session-death branch destroys everything.
+            let was_focused = self
+                .registry
+                .session_mut(&session_name)
+                .and_then(|s| s.windows.iter().find(|w| w.id == window_id))
+                .map(|w| w.layout.focused() == pane_id)
+                .unwrap_or(false);
             if let Some(session) = self.registry.session_mut(&session_name) {
                 if let Some(window) = session.windows.iter_mut().find(|w| w.id == window_id) {
                     window.layout.remove(pane_id);
@@ -1590,6 +1613,16 @@ impl Server {
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
             self.pane_activity.remove(&pane_id); // Finding 2 (review): prune, mirrors last_rects
+            if was_focused {
+                let new_focus = self
+                    .registry
+                    .session_mut(&session_name)
+                    .and_then(|s| s.windows.iter().find(|w| w.id == window_id))
+                    .map(|w| w.layout.focused());
+                if let Some(id) = new_focus {
+                    self.stamp_active(id);
+                }
+            }
             self.apply_layout_for_session(&session_name);
         } else {
             let is_only_window = self
