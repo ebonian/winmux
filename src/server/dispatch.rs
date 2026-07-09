@@ -1823,7 +1823,7 @@ impl Server {
         match ev.kind {
             MouseKind::Down(btn) => self.mouse_down(ev, btn, &rects, client, session_name),
             MouseKind::Drag(_) => self.mouse_drag(ev, &rects, client, session_name),
-            MouseKind::Up(_) => self.mouse_up(client),
+            MouseKind::Up(_) => self.mouse_up(ev, &rects, client),
             MouseKind::WheelUp => self.mouse_wheel(ev, true, &rects, client, session_name),
             MouseKind::WheelDown => self.mouse_wheel(ev, false, &rects, client, session_name),
         }
@@ -1862,12 +1862,19 @@ impl Server {
 
     /// `Down1`/`Down2`/`Down3` inside the pane area: a border press arms a
     /// live resize drag; a pane press always focuses that pane (tmux
-    /// `select-pane`), and additionally arms a selection drag when it's a
-    /// LEFT click landing inside the pane bound to `client`'s OWN copy mode
-    /// (clicking on some other pane, or any click while not in copy mode at
-    /// all, only focuses -- see the design spec's "Down1 on pane -> focus"
-    /// bullet; forwarding the click to the pane's own mouse-reporting
-    /// application is out of scope for v1, documented deferral).
+    /// `select-pane`), and a LEFT click additionally arms `PendingSelect`
+    /// (SP6 Task 6: click purity, `mouse.md` §2.5/§5.3) -- neither the copy
+    /// cursor, the selection anchor, NOR copy-mode entry itself are touched
+    /// here; all of that is deferred to `mouse_drag`'s handling of the first
+    /// actual `Drag` event, so a plain click (`Down` then `Up`, no `Drag`)
+    /// is `select-pane` only, matching tmux exactly. Double/triple clicks
+    /// (`run == 2`/`3`) are the one exception: they still arm the word/line
+    /// selection immediately here, matching tmux's separate
+    /// `DoubleClick1Pane`/`TripleClick1Pane` bindings (not `MouseDown1Pane`)
+    /// which fire `select-word`/`select-line` right away. Non-left buttons
+    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet;
+    /// forwarding the click to the pane's own mouse-reporting application is
+    /// out of scope for v1, documented deferral).
     fn mouse_down(
         &mut self,
         ev: MouseEvent,
@@ -1888,17 +1895,38 @@ impl Server {
             MouseHit::Pane(pane_id) => {
                 self.mouse_focus_pane(session_name, pane_id);
                 let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
-                if btn != 1 || !in_copy_here {
+                if btn != 1 {
                     client.mouse.drag = MouseDrag::None;
                     return ExecOutcome::Ok(String::new());
                 }
                 let Some(rect) = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r) else {
                     return ExecOutcome::Ok(String::new());
                 };
-                let now = Instant::now();
-                let run = advance_click_run(&mut client.mouse, now, ev.x, ev.y, btn);
                 let cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
                 let cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+
+                if !in_copy_here {
+                    // (c) SP6 Task 6: root `MouseDrag1Pane -> copy-mode -M`.
+                    // The press itself is `select-pane` only (already done
+                    // above) -- copy-mode entry and the selection anchor are
+                    // deferred to the first actual `Drag` event, exactly like
+                    // the in-copy-mode plain-click case below.
+                    client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: true };
+                    return ExecOutcome::Ok(String::new());
+                }
+
+                let now = Instant::now();
+                let run = advance_click_run(&mut client.mouse, now, ev.x, ev.y, btn);
+                if run == 1 {
+                    // (a) SP6 Task 6: a plain click (`MouseDown1Pane` with no
+                    // subsequent `Drag`) is `select-pane` only in tmux's
+                    // copy-mode table too -- the copy cursor must NOT move
+                    // and no selection anchor becomes visible
+                    // (`mouse.md:537-539`). Defer both to the first `Drag`
+                    // event, anchored at THIS press position.
+                    client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
+                    return ExecOutcome::Ok(String::new());
+                }
                 let Some(p) = self.panes.get(&pane_id) else {
                     return ExecOutcome::Ok(String::new());
                 };
@@ -1908,15 +1936,6 @@ impl Server {
                     cs.cx = cx;
                     cs.cy = cy;
                     match run {
-                        1 => {
-                            cs.sel = Some(SelState {
-                                anchor_scroll: cs.scroll,
-                                anchor_x: cx,
-                                anchor_y: cy,
-                                anchor_total: history_total,
-                                rect: false,
-                            });
-                        }
                         2 => select_word_at(cs, &p.grid, history_total),
                         _ => select_line_at(cs, cols, history_total),
                     }
@@ -1944,6 +1963,61 @@ impl Server {
         match client.mouse.drag {
             MouseDrag::Border { pane, vertical } => {
                 self.mouse_drag_border(ev, pane, vertical, session_name);
+                ExecOutcome::Ok(String::new())
+            }
+            MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy } => {
+                if enter_copy {
+                    // (c) SP6 Task 6: enter copy mode on `pane` NOW, at the
+                    // first motion event (tmux's drag-START classification,
+                    // `mouse.md` §2.5) -- mirrors the root binding `if
+                    // pane_in_mode/mouse_any_flag { send -M } else {
+                    // copy-mode -M }`; winmux has no app-owns-mouse relay for
+                    // drag yet, so this always enters copy mode. `mouse:
+                    // false` matches real `-M` (it does NOT set
+                    // `scroll_exit` -- only `-e` does).
+                    if !self.panes.contains_key(&pane) {
+                        client.mouse.drag = MouseDrag::None;
+                        return ExecOutcome::Ok(String::new());
+                    }
+                    let outcome = self.exec_copy_mode(false, false, client, session_name);
+                    if matches!(outcome, ExecOutcome::Err(_)) {
+                        client.mouse.drag = MouseDrag::None;
+                        return outcome;
+                    }
+                    if !matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane) {
+                        // Focus moved off `pane` between the press and this
+                        // motion event (race) -- abandon rather than
+                        // mis-attribute the drag to whatever pane copy-mode
+                        // actually opened on.
+                        client.mode = ClientMode::Normal;
+                        client.mouse.drag = MouseDrag::None;
+                        return ExecOutcome::Ok(String::new());
+                    }
+                }
+                // Install the anchor at the PRESS position (tmux's
+                // `window_copy_start_drag`: `cmd_mouse_at(..., 1)` reads
+                // `lx/ly`, the press position, not the current motion
+                // position), then apply THIS event's motion to the cursor --
+                // real tmux calls `window_copy_drag_update` immediately
+                // after starting the drag, so the very first `Drag` frame
+                // both anchors AND extends the selection in one step.
+                if let ClientMode::Copy(cs) = &mut client.mode {
+                    if cs.pane == pane {
+                        let history_total = self.panes.get(&pane).map(|p| p.grid.history_total()).unwrap_or(0);
+                        cs.sel = Some(SelState {
+                            anchor_scroll: cs.scroll,
+                            anchor_x: press_x,
+                            anchor_y: press_y,
+                            anchor_total: history_total,
+                            rect: false,
+                        });
+                        if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
+                            cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
+                            cs.cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+                        }
+                    }
+                }
+                client.mouse.drag = MouseDrag::Selecting { moved: true };
                 ExecOutcome::Ok(String::new())
             }
             MouseDrag::Selecting { .. } => {
@@ -2021,22 +2095,41 @@ impl Server {
 
     /// `Up1`/`Up2`/`Up3`: ends whatever drag was in progress. A border-resize
     /// drag needs no further action (already applied live). A copy-mode
-    /// selection drag that saw at least one `Drag` event copies the
-    /// selection and exits copy mode -- tmux's `MouseDragEnd1Pane` default
-    /// (`copy-selection-and-cancel`). A PLAIN click (no `Drag` event at all
-    /// between this `Up` and the preceding `Down`, i.e. `moved == false`) is
-    /// left alone entirely: no copy, no cancel, no selection/buffer touch --
-    /// real tmux's copy-mode table has no default binding for a bare
-    /// `MouseUp1Pane`, only `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of
-    /// which require actual motion). The click's `select-pane`
-    /// (`mouse_down`'s unconditional focus) and, inside copy mode, its
-    /// zero-width point-selection anchor / cursor reposition still stand --
-    /// only the "release" side is a no-op.
-    fn mouse_up(&mut self, client: &mut ClientState) -> ExecOutcome {
+    /// selection drag that saw at least one `Drag` event (`moved == true`)
+    /// copies the selection and exits copy mode -- tmux's
+    /// `MouseDragEnd1Pane` default (`copy-selection-and-cancel`) -- but ONLY
+    /// if `ev` (the RELEASE event's own position) still hit-tests to the
+    /// pane the selection is bound to (SP6 Task 6, part (b): tmux resolves
+    /// `MouseDragEnd1Pane` against the pane under the pointer at release,
+    /// not the drag-origin pane; see the match arm below). A PLAIN click (no
+    /// `Drag` event at all between this `Up` and the preceding `Down`, i.e.
+    /// `MouseDrag::PendingSelect`/`Selecting{moved:false}` at this point,
+    /// both falling through to the wildcard arm) is left alone entirely: no
+    /// copy, no cancel, no selection/buffer touch -- real tmux's copy-mode
+    /// table has no default binding for a bare `MouseUp1Pane`, only
+    /// `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of which require actual
+    /// motion). The click's `select-pane` (`mouse_down`'s unconditional
+    /// focus) still stands -- only the "release" side is a no-op.
+    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
         match drag {
-            MouseDrag::Selecting { moved: true } if matches!(client.mode, ClientMode::Copy(_)) => {
-                self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+            MouseDrag::Selecting { moved: true } => {
+                let ClientMode::Copy(cs) = &client.mode else {
+                    return ExecOutcome::Ok(String::new());
+                };
+                // (b) SP6 Task 6: `MouseDragEnd1Pane` resolves against the
+                // pane under the pointer AT RELEASE, not the drag-origin
+                // pane (`mouse.md:308-311, 654-658`) -- releasing over a
+                // DIFFERENT pane (or a border/dead zone, which also fails
+                // this match) means that pane's key table has no
+                // `MouseDragEnd1Pane` binding for a non-copy-mode pane, so
+                // no copy happens; the origin pane keeps its selection and
+                // stays in copy mode.
+                if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == cs.pane) {
+                    self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+                } else {
+                    ExecOutcome::Ok(String::new())
+                }
             }
             _ => ExecOutcome::Ok(String::new()),
         }

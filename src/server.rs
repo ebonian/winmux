@@ -546,16 +546,38 @@ enum MouseDrag {
     /// is `true` for a column border (left|right panes) and `false` for a
     /// row border (top/bottom panes).
     Border { pane: PaneId, vertical: bool },
-    /// A `Down1` inside the pane bound to this client's copy mode armed
-    /// selection tracking; each subsequent `Drag1` extends the selection's
-    /// cursor endpoint and sets `moved`, and the eventual `Up1` copies it
+    /// A `Down1` (button 1) armed possible selection tracking, but nothing
+    /// about the copy cursor/anchor/mode has been touched YET — real tmux
+    /// (`mouse.md` §2.5/§5.3) classifies a drag START at the *press*
+    /// position only once the first actual `Drag` event arrives, and a
+    /// plain click (`Down` then `Up`, no `Drag` in between) never runs
+    /// `begin-selection`/`copy-mode -M` at all, just `select-pane` (already
+    /// done by `mouse_down`'s unconditional focus call). `press_x`/`press_y`
+    /// are pane-relative, captured at `Down` time, matching tmux's `lx/ly`
+    /// (the previous event's position it drag-START classifies against).
+    /// `enter_copy` is `true` when the press landed on a pane NOT bound to
+    /// this client's copy mode (root `MouseDrag1Pane -> copy-mode -M`: the
+    /// first `Drag` must open copy mode on `pane` before installing the
+    /// anchor) and `false` when the press landed inside the pane already
+    /// bound to this client's copy mode (copy-mode table's own
+    /// `MouseDrag1Pane -> begin-selection`: the anchor installs directly).
+    PendingSelect { pane: PaneId, press_x: u16, press_y: u16, enter_copy: bool },
+    /// A drag's anchor has been installed (either directly, for double/
+    /// triple-click word/line selection, or via `PendingSelect`'s first
+    /// `Drag`); each subsequent `Drag1` extends the selection's cursor
+    /// endpoint and sets `moved`, and the eventual `Up1` copies it
     /// (`copy-selection-and-cancel`, matching tmux's `MouseDragEnd1Pane`
-    /// default) ONLY if `moved` is true. Real tmux's copy-mode binding table
-    /// has no default for a bare `MouseUp1Pane` (release with no prior
-    /// drag) — `Down` always arms `Selecting { moved: false }`, since SGR
-    /// button-event tracking guarantees an `Up` after every `Down` even with
-    /// zero motion, and without this flag a plain click would always look
-    /// like a (zero-width) completed drag.
+    /// default) ONLY if `moved` is true AND the release lands on the same
+    /// pane the selection is bound to (tmux resolves `MouseDragEnd1Pane`
+    /// against the pane under the pointer AT RELEASE, not the drag-origin
+    /// pane — releasing elsewhere has no copy-mode binding there, so no
+    /// copy). Real tmux's copy-mode binding table has no default for a bare
+    /// `MouseUp1Pane` (release with no prior drag) — `Down` always arms
+    /// `Selecting { moved: false }` (via double/triple-click) or
+    /// `PendingSelect` (via a plain first click), since SGR button-event
+    /// tracking guarantees an `Up` after every `Down` even with zero
+    /// motion, and without this flag a plain click would always look like a
+    /// (zero-width) completed drag.
     Selecting { moved: bool },
 }
 

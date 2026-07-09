@@ -3320,6 +3320,27 @@ fn row_text(g: &Grid, row: u16) -> String {
     (0..g.cols()).map(|x| g.cell(x, row).ch).collect()
 }
 
+/// Piggy-back a `Cli` frame on `c` itself (rather than a separate
+/// `cli_client`) to synchronize with whatever `Stdin` frames were already
+/// sent on THIS SAME connection: a single connection's reader thread feeds
+/// the server's event queue strictly in send order, so by the time the
+/// returned `CliDone` arrives, every earlier frame on `c` is guaranteed to
+/// have been fully processed server-side — no arbitrary sleep needed. Any
+/// intervening `Output` frames (e.g. the periodic clock tick, or a mouse
+/// event's own — possibly no-op — render) are drained into `grid` rather
+/// than tripping up the wait. (SP6 Task 6: hoisted from
+/// `mouse_plain_click_in_copy_mode_keeps_mode_and_buffers`, which pioneered
+/// this pattern, for reuse by the click-purity/release-targeting tests.)
+fn next_cli_done(c: &Client, grid: &mut Grid) -> (u8, String, String) {
+    loop {
+        match c.recv() {
+            ServerMsg::Output(bytes) => grid.feed(&bytes),
+            ServerMsg::CliDone { code, out, err } => return (code, out, err),
+            other => panic!("unexpected message waiting for CliDone: {other:?}"),
+        }
+    }
+}
+
 impl Client {
     /// Accumulate raw `Output` payload bytes (across as many frames as
     /// needed) until the running buffer contains `needle` somewhere, or 10s
@@ -3507,22 +3528,7 @@ fn mouse_plain_click_in_copy_mode_keeps_mode_and_buffers() {
     c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, true)));
 
     // Piggy-back the assertions as `Cli` frames on the SAME connection as
-    // the click frames above: a single connection's reader thread feeds the
-    // server's event queue strictly in send order, so by the time these
-    // `CliDone` responses arrive, the Down/Up frames are guaranteed to have
-    // already been fully processed -- no arbitrary sleep needed. Any
-    // intervening `Output` frames (e.g. the periodic clock tick) are drained
-    // into `grid` rather than tripping up the wait.
-    fn next_cli_done(c: &Client, grid: &mut Grid) -> (u8, String, String) {
-        loop {
-            match c.recv() {
-                ServerMsg::Output(bytes) => grid.feed(&bytes),
-                ServerMsg::CliDone { code, out, err } => return (code, out, err),
-                other => panic!("unexpected message waiting for CliDone: {other:?}"),
-            }
-        }
-    }
-
+    // the click frames above -- see `next_cli_done`'s doc comment.
     c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
     let (code, out, _) = next_cli_done(&c, &mut grid);
     assert_eq!(code, 0);
@@ -3540,6 +3546,210 @@ fn mouse_plain_click_in_copy_mode_keeps_mode_and_buffers() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+// ---- SP6 Task 6: copy-mode mouse feel, part 1 (click purity, release
+// targeting, drag-enters-copy-mode) ----
+
+/// (a) `docs/tmux-reference/mouse.md:537-539`: a plain click (`Down` then
+/// `Up`, no `Drag` frame between them) inside copy mode is `select-pane`
+/// only -- the copy CURSOR must not move, and the click's target cell must
+/// not become a new (zero-width) selection anchor. The click's position is
+/// deliberately DIFFERENT from the cursor's post-entry position (moved there
+/// first via keyboard) so a regression that reinstates "click writes
+/// cs.cx/cs.cy unconditionally" is unambiguously caught.
+#[test]
+fn click_in_copy_mode_does_not_move_cursor() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Move the copy cursor to a known position via keyboard (emacs table:
+    // plain arrows move the cursor in copy mode) so it's provably distinct
+    // from the click target below.
+    let before_move = grid.cursor();
+    c.send(&ClientMsg::Stdin(b"\x1b[B\x1b[B\x1b[C\x1b[C\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() != before_move);
+    let moved_cursor = grid.cursor();
+    assert_ne!(moved_cursor, (0, 0), "test setup: moved cursor must differ from the click target (0,0) below");
+
+    // Plain click (press + release, NO drag frame) at a DIFFERENT cell.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, true)));
+
+    // Synchronize on the SAME connection: the server processes a whole
+    // batch of already-queued events (Down, Up, this Cli) before rendering,
+    // and `CliDone` is sent synchronously DURING that batch while the
+    // batch's own Output frame is only sent AFTER -- so `CliDone` can race
+    // ahead of the click's own render. That's fine for checking SERVER
+    // STATE read directly off the Cli response (buffer creation, below),
+    // but NOT for `grid.cursor()`, which only reflects frames actually
+    // received. Drain interim Output frames anyway (harmless).
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "a plain click in copy mode must not create a paste buffer: {out:?}");
+
+    // Force a genuine, predicate-observable render by making ONE further,
+    // real cursor-moving keystroke (Right). If the click had (incorrectly)
+    // moved the copy cursor to the clicked cell (0,0) and installed an
+    // anchor there, this final position would be (1,0); if the click was
+    // correctly a no-op, it's `moved_cursor` shifted right by one.
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() != moved_cursor);
+    let expected = (moved_cursor.0 + 1, moved_cursor.1);
+    assert_eq!(
+        grid.cursor(),
+        expected,
+        "a plain click in copy mode must not move the copy cursor (click's own no-op render may race a piggy-backed Cli's CliDone, so this checks a real subsequent keystroke's landing position instead)"
+    );
+    assert!(has_indicator(&grid, "[0/"), "a plain click in copy mode must not exit copy mode");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// (a) The selection anchor a `Drag` installs is the PRESS position, not
+/// wherever the first `Drag` event itself happens to report (a fast/coarse
+/// physical drag can jump several cells before the terminal emits its first
+/// motion frame). Press at col 0, but make the FIRST `Drag` frame already
+/// report col 4 -- if the anchor were (incorrectly) taken from that first
+/// `Drag` position instead of the remembered press position, the copied
+/// text would start at col 4 ("o123") instead of col 0 ("hello123").
+#[test]
+fn drag_after_click_anchors_at_press_point() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false))); // press at col 0
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 4, target_row, false))); // first Drag jumps to col 4
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false))); // further motion to col 7
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true))); // release at col 7
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("buffer0: 8 bytes: \"hello123\""),
+        "selection must span the PRESS position (col 0), not the first Drag frame's position (col 4): {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// (b) `docs/tmux-reference/mouse.md:308-311,654-658`: `MouseDragEnd1Pane`
+/// resolves against the pane under the pointer AT RELEASE, not the
+/// drag-origin pane. Select in the (focused) right pane, but release over
+/// the left pane -- no binding exists there for a non-copy-mode pane, so no
+/// copy happens; the origin pane must keep its selection and stay in copy
+/// mode.
+#[test]
+fn release_over_other_pane_does_not_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Two panes; split-window focuses the NEW (right) pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("hello123")));
+    let (target_row, click_x) = {
+        let text = screen_text(&grid);
+        let row = text.iter().position(|l| l.contains("hello123")).unwrap() as u16;
+        let col = text[row as usize].find("hello123").unwrap() as u16;
+        (row, col)
+    };
+    assert!(click_x > border_x, "test setup: click target must be in the RIGHT pane");
+
+    // Enter copy mode bound to the RIGHT pane (still focused).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Drag-select within the right pane, but RELEASE inside the left pane.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, click_x + 7, target_row, false)));
+    let release_x = border_x.saturating_sub(2);
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, release_x, target_row, true)));
+
+    // Synchronize on the SAME connection and drain any interim Output
+    // frames into `grid`.
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "releasing over a DIFFERENT pane must not copy the selection: {out:?}");
+
+    assert!(has_indicator(&grid, "[0/"), "copy mode must remain active when the release lands on a different pane");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// (c) `docs/tmux-reference/mouse.md:488,501`: the root table's
+/// `MouseDrag1Pane -> copy-mode -M` -- a press+motion (button 1) on a LIVE
+/// pane (not already in copy mode) enters copy mode immediately, anchored
+/// at the press point, with the selection following the drag; the
+/// subsequent release copies-and-cancels exactly like any copy-mode drag.
+#[test]
+fn drag_on_live_pane_enters_copy_mode_selecting() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    // NOT in copy mode. Press then drag (button 1) directly on the live
+    // pane: the first Drag frame must enter copy mode, anchored at the
+    // press point (col 0), with the selection already following the drag.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false)));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("buffer0: 8 bytes: \"hello123\""),
+        "drag on a live pane must enter copy mode selecting from the press point: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
 }
 
 /// Attach, enable mouse, create a second window, and rename both windows to
