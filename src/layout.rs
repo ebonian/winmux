@@ -1365,6 +1365,48 @@ mod tests {
     }
 
     #[test]
+    fn resize_from_first_child_reference_rejects_shrink_direction() {
+        // (1 | 2), pane 1 is the split's FIRST child (left pane). This pins
+        // down the `resize_from` contract that follow-up #66 traces the
+        // mouse-border-drag bug to: `mouse_down`'s `VBorder{ left }` hit-test
+        // always binds the LEFT pane (the first child) as the drag's
+        // reference leaf, for the WHOLE gesture, regardless of which way the
+        // user later drags. `resize_from` only accepts a first-child
+        // reference for `Direction::Right`/`Down` (`want_first`) --
+        // `Direction::Left` (shrink pane 1 / grow pane 2) requires the
+        // SECOND child (pane 2) as reference instead. Calling it with pane 1
+        // + Left, exactly what pre-fix `mouse_drag_border` does for every
+        // leftward drag, is a silent no-op: this is the defect class at the
+        // layout level, independent of any mouse plumbing.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        assert!(
+            !l.resize_from(1, Direction::Left, A, 1),
+            "first-child (left pane) reference + Left must no-op per resize_from's documented want_first contract"
+        );
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 40, h: 24 }),
+                (2, Rect { x: 41, y: 0, w: 39, h: 24 }),
+            ],
+            "layout must be untouched by the rejected call"
+        );
+        // The fix `mouse_drag_border` must apply: resolve the SECOND-child
+        // (pane 2) as reference for a leftward drag on this same border --
+        // then it succeeds, same net rect change as
+        // `resize_from_reference_pane_ignores_focus` above.
+        assert!(l.resize_from(2, Direction::Left, A, 1));
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 39, h: 24 }),
+                (2, Rect { x: 40, y: 0, w: 40, h: 24 }),
+            ]
+        );
+    }
+
+    #[test]
     fn resize_from_unknown_pane_is_noop() {
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();

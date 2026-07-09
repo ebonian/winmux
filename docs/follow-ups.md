@@ -690,3 +690,22 @@ None block the sub-project 4 merge.
     based on `delta`'s sign), then re-verify against
     `layout::tests::resize_from_reference_pane_ignores_focus`'s contract.
     Not fixed here — orthogonal to Task 1's drag-STATE-lifecycle scope.
+
+    **RESOLVED** (SP6 parity wave 2, Task 1b): fixed in `mouse_drag_border`
+    (`src/server/dispatch.rs`) — rather than resizing against the `pane`
+    bound once at `Down` (always the first-child/`left`/`top` side), it now
+    resolves the correct `Layout::resize_from` reference fresh on every
+    `Drag` call, per the resolved direction: unchanged (`pane`) for
+    `Direction::Right`/`Down`, but for `Direction::Left`/`Up` it looks up
+    `pane`'s current neighbor across that exact border cell (the pane
+    starting one cell past the border, since a border occupies its own
+    column/row between panes) and uses that as the reference instead.
+    `Layout::resize_from`'s public contract and signature are unchanged (no
+    contract-doc update needed) — a pure `dispatch.rs`-side fix. Tests:
+    `layout::tests::resize_from_first_child_reference_rejects_shrink_direction`
+    (`src/layout.rs`, pins the pre-existing `resize_from` contract the bug
+    traces to) plus two new `tests/server_proto.rs` regression tests,
+    `mouse_border_drag_resizes_leftward` and
+    `mouse_border_drag_resizes_upward`, which reproduced the bug RED (timed
+    out waiting for the border to move) before the fix and pass GREEN after.
+    Full `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.

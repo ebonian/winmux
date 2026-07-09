@@ -3560,6 +3560,77 @@ fn mouse_border_drag_resizes() {
     server.join().expect("server exits after kill-server");
 }
 
+/// Regression test for follow-up #66: dragging a vertical border LEFTWARD --
+/// toward the LEFT pane's OWN edge, shrinking pane 1 (the split's first
+/// child, which `mouse_down`'s `VBorder{ left }` hit-test always binds as
+/// `mouse_drag_border`'s reference for the WHOLE gesture) and growing pane 2
+/// -- must resize the split live, exactly like the rightward drag
+/// `mouse_border_drag_resizes` above already covers (real tmux: a border
+/// drag moves that border in EITHER direction). Pre-fix this is a silent
+/// no-op: `Layout::resize_from` only accepts a first-child reference for
+/// `Direction::Right`/`Down` (see `layout::tests::
+/// resize_from_reference_pane_ignores_focus` and its sibling
+/// `resize_from_first_child_reference_rejects_shrink_direction`), and
+/// `mouse_drag_border` never re-resolves the reference pane per-direction --
+/// confirmed empirically: the border never moves at all on a single
+/// leftward-only drag, fresh state, no staleness involved. See
+/// docs/follow-ups.md #66.
+#[test]
+fn mouse_border_drag_resizes_leftward() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let target_x = border_x - 10;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x, 5, true)));
+
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x));
+    assert!(!has_vertical_border_at(&grid, border_x), "border must have actually moved left");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Same defect, horizontal-border leg (`HBorder{ top }` / `Direction::Up`):
+/// dragging a horizontal border UPWARD -- toward the TOP pane's own edge,
+/// shrinking pane 1 and growing pane 2 -- must resize live, mirroring
+/// `mouse_border_drag_resizes_leftward` above. See docs/follow-ups.md #66.
+#[test]
+fn mouse_border_drag_resizes_upward() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, has_horizontal_border);
+    let border_y = find_horizontal_border(&grid);
+    let target_y = border_y - 5;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, border_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_y, true)));
+
+    c.recv_output_until(&mut grid, |g| has_horizontal_border_at(g, target_y));
+    assert!(!has_horizontal_border_at(&grid, border_y), "border must have actually moved up");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// Baseline non-regression coverage for the "border drag works once then
 /// dies" bug (SP6 gap analysis §D): two consecutive, fully independent
 /// clean press-drag-release cycles (both releasing inside the pane area, no

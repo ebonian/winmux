@@ -1798,6 +1798,17 @@ impl Server {
     /// clamping at layout minimums -- the border always ends up exactly at
     /// `ev.x`/`ev.y` if that position is reachable at all, rather than
     /// drifting from a stale accumulated offset.
+    ///
+    /// `pane` (bound once at `Down` by `VBorder{ left }`/`HBorder{ top }`) is
+    /// always the FIRST-child-side pane of whichever split owns this border.
+    /// `Layout::resize_from` only accepts a first-child reference for
+    /// `Direction::Right`/`Down` (see its `want_first` doc comment and
+    /// `layout::tests::resize_from_reference_pane_ignores_focus`) --
+    /// `Direction::Left`/`Up` need the SECOND-child-side pane instead. Using
+    /// `pane` unconditionally made every Left/Up drag (toward the
+    /// first-child pane's own edge) a silent no-op (follow-up #66); resolve
+    /// the correct reference pane fresh each call, per direction, by finding
+    /// `pane`'s current neighbor across this exact border.
     fn mouse_drag_border(&mut self, ev: MouseEvent, pane: PaneId, vertical: bool, session_name: &str) {
         let Some((area, rects)) = self.mouse_pane_rects(session_name) else { return };
         let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) else { return };
@@ -1812,8 +1823,28 @@ impl Server {
         }
         let dir = if delta > 0 { positive_dir } else { negative_dir };
         let cells = delta.unsigned_abs() as u16;
+        let reference = if matches!(dir, Direction::Left | Direction::Up) {
+            // The second-child neighbor starts one cell PAST the border
+            // itself (panes are separated by the single border cell, e.g.
+            // pane1 `x=0,w=40` / border at col 40 / pane2 `x=41` -- not
+            // `x=40`), so its origin is `current + 1`, not `current`.
+            rects
+                .iter()
+                .find(|(id, r)| {
+                    *id != pane
+                        && if vertical {
+                            r.x == current + 1 && r.y < rect.y + rect.h && r.y + r.h > rect.y
+                        } else {
+                            r.y == current + 1 && r.x < rect.x + rect.w && r.x + r.w > rect.x
+                        }
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or(pane)
+        } else {
+            pane
+        };
         if let Some(session) = self.registry.session_mut(session_name) {
-            session.current_window_mut().layout.resize_from(pane, dir, area, cells);
+            session.current_window_mut().layout.resize_from(reference, dir, area, cells);
         }
         self.apply_layout_for_session(session_name);
     }
