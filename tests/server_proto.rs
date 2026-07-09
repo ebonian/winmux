@@ -3752,6 +3752,178 @@ fn drag_on_live_pane_enters_copy_mode_selecting() {
     server.join().expect("server exits after last session dies");
 }
 
+// ---- drag autoscroll + word/line drag extension (Task 7, SP6 wave 2) ----
+
+/// `docs/tmux-reference/mouse.md` §5.4: while a drag selection is held with
+/// the pointer on the pane's FIRST row, the view scrolls one line and the
+/// selection extends every `MOUSE_DRAG_AUTOSCROLL_INTERVAL` (50ms) of real
+/// time -- serviced by the server's own `Tick`, not by any further mouse
+/// event from the client (matches the escape-time flush test's pattern:
+/// hold still and let the server's real timer do the work). Presses then
+/// drags to (0, 0) -- immediately the pane's top row -- and, having sent NO
+/// further mouse events, waits for the `[scroll/history]` indicator to climb
+/// to `[5/` purely from Tick-driven autoscroll (the Drag event itself only
+/// accounts for ONE line of that). Releasing then must have copied a
+/// selection spanning several distinct rows, not just the original
+/// zero-width point.
+#[test]
+fn drag_at_top_row_autoscrolls_into_history() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // More than one page (23 pane rows on an 80x24 terminal) of scrollback.
+    c.send(&ClientMsg::Stdin(b"1..150 | ForEach-Object { \"histmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("histmark150")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Press then drag to the pane's TOP row (0), col 0 -- the pointer parked
+    // on the edge row. This Drag installs a zero-width Char-kind selection
+    // anchored exactly here and, per `service_drag_edge`, fires ONE
+    // immediate extra scroll line (scroll -> 1) in addition to arming the
+    // autoscroll timer.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 0, false)));
+
+    // No further mouse events at all: hold the pointer there and let the
+    // server's real 50ms Tick drive the autoscroll timer the rest of the
+    // way to scroll == 5 (four MORE lines beyond the Drag's own immediate
+    // one).
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[5/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("buffer0:"), "expected a copied selection: {out:?}");
+    // Each autoscroll tick scrolls one MORE line and re-extends the
+    // selection by one more row; a multi-row selection's embedded newlines
+    // show up sanitized as `?` in the `list-buffers` sample
+    // (`buffers::sample`) -- having reached scroll >= 5 before release, the
+    // selection must span at least 5 distinct rows (>= 4 row breaks).
+    let row_breaks = out.matches('?').count();
+    assert!(
+        row_breaks >= 4,
+        "expected the drag-autoscroll selection to span several rows (>=5), only found {row_breaks} row breaks: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `docs/tmux-reference/mouse.md` :636-640 / `copy-mode-and-buffers.md`
+/// :440-447: after DoubleClick installs a `SelKind::Word` anchor
+/// (`select_word_at`), continuing to drag snaps the MOVING end to the whole
+/// word under the cursor, not the raw cell. Double-clicks "beta" (columns
+/// 6..=9 of "alpha beta gamma delta") then drags into the MIDDLE of "delta"
+/// (column 19, mid-word) -- if the drag extended cell-by-cell instead of
+/// snapping, the copied text would end mid-word ("...gamma del"); snapping
+/// must capture the WHOLE trailing word instead.
+#[test]
+fn drag_after_double_click_extends_by_words() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo \"alpha beta gamma delta\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "alpha beta gamma delta"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "alpha beta gamma delta").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Double-click "beta" (col 7, the 'e'): Down, Up, Down -- the second
+    // Down reaches run==2, installing the word anchor immediately
+    // (`mouse_down`'s `DoubleClick1Pane` -> `select-word` path).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, false)));
+
+    // Drag into the MIDDLE of "delta" (col 19, its 'l') and release there.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 19, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 19, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("\"beta gamma delta\""),
+        "drag after double-click must snap the moving end to the whole word under the cursor: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `docs/tmux-reference/mouse.md` :636-640 (SEL_LINE branch) /
+/// `copy-mode-and-buffers.md` :440-447: after TripleClick installs a
+/// `SelKind::Line` anchor (`select_line_at`), continuing to drag snaps the
+/// moving end to the WHOLE line under the cursor. Triple-clicks the
+/// "firstrow" line then drags onto (the middle of) the "secondrow" line a
+/// few rows below -- the copied selection must contain both lines in full,
+/// not just up to the drag's column.
+#[test]
+fn drag_after_triple_click_extends_by_lines() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo firstrow\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "firstrow"));
+    c.send(&ClientMsg::Stdin(b"echo secondrow\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "secondrow"));
+
+    let (row1, row2) = {
+        let text = screen_text(&grid);
+        let r1 = text.iter().position(|l| l.trim_end() == "firstrow").unwrap() as u16;
+        let r2 = text.iter().position(|l| l.trim_end() == "secondrow").unwrap() as u16;
+        (r1, r2)
+    };
+    assert!(row2 > row1, "test setup: secondrow must be below firstrow");
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Triple-click "firstrow" (Down, Up, Down, Up, Down -- run reaches 3).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+
+    // Drag down onto the middle of "secondrow"'s row and release there.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 3, row2, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 3, row2, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    // The copied sample's embedded newlines show up sanitized as `?`
+    // (`buffers::sample`): "firstrow?" proves the FULL first line was
+    // captured (not truncated mid-line) before the row break, and
+    // "?secondrow" proves the second line starts fresh on its own row.
+    assert!(out.contains("firstrow?"), "expected the whole first line captured: {out:?}");
+    assert!(out.contains("?secondrow"), "expected the whole second line captured: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// Attach, enable mouse, create a second window, and rename both windows to
 /// fixed short names (`w0`/`w1`) so the status line's exact tab text is
 /// deterministic for hit-testing — window 1 (`w1`) ends up current.

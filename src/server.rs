@@ -370,7 +370,8 @@ struct SearchPrompt {
 /// converted to the same key coordinate live at each use, so both
 /// endpoints are always compared in one coherent frame. `rect` toggles
 /// rectangle (column-bounding-box) selection vs. the default linear
-/// (reading-order) selection.
+/// (reading-order) selection. `kind` (Task 7, SP6 wave 2) is what unit the
+/// MOVING end snaps to while dragging -- see [`SelKind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SelState {
     anchor_scroll: u32,
@@ -379,6 +380,28 @@ struct SelState {
     /// `Grid::history_total()` at anchor time (see [`anchor_key_now`]).
     anchor_total: u64,
     rect: bool,
+    kind: SelKind,
+}
+
+/// What unit a copy-mode selection's MOVING end snaps to while dragging
+/// (Task 7, SP6 wave 2). `Char` is the default: keyboard `begin-selection`
+/// and a plain-click-then-drag extend cell by cell. `Word`/`Line` are
+/// installed by DoubleClick/TripleClick (`select_word_at`/`select_line_at`)
+/// and make every subsequent `Drag` event snap the moving end to whole
+/// word/line boundaries AND flip the fixed anchor end between the anchor
+/// word/line's start and end, matching tmux's `SEL_WORD`/`SEL_LINE`
+/// (`window_copy_synchronize_cursor_end`,
+/// `docs/tmux-reference/mouse.md` :636-642 and
+/// `docs/tmux-reference/copy-mode-and-buffers.md` :440-447): the selection
+/// is always a whole number of words/lines that always includes the anchor
+/// word/line. See `dispatch::move_drag_cursor`'s doc comment for the exact
+/// snap rule and `dispatch::word_bounds_at` for word-boundary detection
+/// (driven by the `word-separators` option, `Options::word_separators`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelKind {
+    Char,
+    Word,
+    Line,
 }
 
 /// A copy-mode view position's ordering/delta key AT ONE INSTANT: for a
@@ -523,6 +546,15 @@ const MOUSE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 /// event.
 const MOUSE_WHEEL_STEP: u32 = 5;
 
+/// Copy-mode drag autoscroll's repeat interval (Task 7, SP6 wave 2): while a
+/// drag selection is held with the pointer on the pane's first/last row, the
+/// view scrolls one line and the selection extends every time this much real
+/// time elapses -- tmux's `WINDOW_COPY_DRAG_REPEAT_TIME` (`window-copy.c:351`,
+/// documented in `docs/tmux-reference/mouse.md` §5.4/§8 as 50 000us / 20
+/// rows per second), serviced by the same 50ms `Tick` the escape-time flush
+/// already rides.
+const MOUSE_DRAG_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Per-client mouse session state (Task 5, sub-project 4): remembers the
 /// last left-button click (for double/triple-click detection, same cell +
 /// button within [`MOUSE_CLICK_WINDOW`]) and what an in-progress drag is
@@ -535,6 +567,31 @@ struct MouseClientState {
     /// window is treated the same as a 3rd, i.e. line selection again).
     last_click: Option<(Instant, u16, u16, u8, u8)>,
     drag: MouseDrag,
+    /// Armed while a drag selection's pointer sits on the pane's first/last
+    /// row (Task 7, SP6 wave 2): `None` otherwise. Serviced by
+    /// `Server::handle_event`'s `Tick` arm exactly like the escape-time
+    /// flush -- see [`AutoscrollState`].
+    autoscroll: Option<AutoscrollState>,
+}
+
+/// One armed copy-mode drag-autoscroll timer (Task 7, SP6 wave 2): `pane` is
+/// the pane the bound `ClientMode::Copy` selection lives on, `top` is `true`
+/// for the pane's FIRST row (scroll toward history) and `false` for its LAST
+/// row (scroll toward the live bottom), `cursor_x` is the pointer's last
+/// known pane-relative column (re-used every tick to re-evaluate a Word/Line
+/// selection's snap, since no new `Drag` event arrives while the pointer sits
+/// still), and `deadline` is when the next one-line scroll fires. Armed/
+/// refreshed by `dispatch::service_drag_edge` on every `Drag` event whose
+/// resulting cursor row is an edge row; cleared the moment a `Drag` lands
+/// off an edge row, the drag ends (`Up`), or the bound pane/copy-mode goes
+/// away -- matching tmux's "motion outside the pane is a no-op that stops
+/// the timer; leaving the edge row stops it too" (`mouse.md` §5.4).
+#[derive(Clone, Copy)]
+struct AutoscrollState {
+    pane: PaneId,
+    top: bool,
+    cursor_x: u16,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1142,6 +1199,13 @@ impl Server {
                 // client from `self.clients` mid-iteration) and processed
                 // just after it ends.
                 let mut escape_flush: Vec<ClientId> = Vec::new();
+                // Copy-mode drag autoscroll (Task 7, SP6 wave 2): collected
+                // here (same borrow-checked reason as `escape_flush` --
+                // servicing needs `self.panes`/`self.clients.get_mut`
+                // together, which the ongoing `self.clients.iter_mut()`
+                // above can't provide) and serviced just after this loop
+                // ends.
+                let mut autoscroll_due: Vec<ClientId> = Vec::new();
                 for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
                         if deadline.duration_since(set_at) >= MESSAGE_LIFETIME {
@@ -1159,6 +1223,23 @@ impl Server {
                     }
                     if client.key_machine.escape_ready(deadline) {
                         escape_flush.push(*cid);
+                    }
+                    if let Some(a) = client.mouse.autoscroll {
+                        if deadline >= a.deadline {
+                            autoscroll_due.push(*cid);
+                        }
+                    }
+                }
+                // Autoscroll tick: one line of scroll (+ selection re-snap)
+                // per due client, then re-arm for the next
+                // `MOUSE_DRAG_AUTOSCROLL_INTERVAL` -- matches tmux's
+                // `dragtimer` callback re-checking and re-arming itself each
+                // time (`mouse.md` §5.4). `self` is fully free again here
+                // (the `iter_mut` above has ended), so this can freely touch
+                // `self.panes`/`self.options` alongside `self.clients`.
+                for cid in autoscroll_due {
+                    if self.service_autoscroll_tick(cid, deadline) {
+                        dirty = true;
                     }
                 }
                 // escape-time flush: a lone/partial pending ESC older than

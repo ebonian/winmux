@@ -117,6 +117,11 @@ const SPECS: &[Spec] = &[
     Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
     // Selection + paste buffers (Task 3, sub-project 4).
     Spec { name: "buffer-limit", kind: Kind::Number, choices: &[] },
+    // Drag word/line selection extension (Task 7, SP6 wave 2): promoted from
+    // a hardcoded constant (`" -_@"`, an inaccurate guess never verified
+    // against real tmux) to a real, settable `Str` option -- see the
+    // `word_separators()` getter's doc comment for the verified default.
+    Spec { name: "word-separators", kind: Kind::Str, choices: &[] },
     // Layout presets (Task 6, sub-project 4): `main-horizontal`/
     // `main-vertical`'s main-pane size.
     Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
@@ -234,6 +239,14 @@ fn default_value(name: &str) -> Value {
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
         "buffer-limit" => Value::Number(50),
+        // Verified against `docs/tmux-reference/copy-mode-and-buffers.md`
+        // §6.4 / its options table (options-table.c:1262-1270): every
+        // printable non-alphanumeric ASCII character EXCEPT underscore.
+        // Plain space/tab are NOT in this string -- they're tmux's separate
+        // `WHITESPACE` class (`"\t "`, tmux.h:662), handled by
+        // `dispatch::char_class` as its own `CharClass::Whitespace` variant
+        // rather than folded into `Separator` here.
+        "word-separators" => Value::Str("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".to_string()),
         "main-pane-width" => Value::Number(80),
         "main-pane-height" => Value::Number(24),
         "display-panes-time" => Value::Number(1000),
@@ -598,6 +611,21 @@ impl Options {
     /// position indicator uses this yet; selection highlighting is Task 3).
     pub fn mode_style(&self) -> &PartialStyle {
         self.style_ref("mode-style")
+    }
+
+    /// `word-separators` (Task 7, SP6 wave 2): the character class boundary
+    /// double-click word selection (`select_word_at`) and continued-drag
+    /// word-extension (`dispatch::move_drag_cursor`) expand to. tmux default
+    /// (verified against `docs/tmux-reference/copy-mode-and-buffers.md`
+    /// §6.4's options table, NOT the task brief's unverified `" -_@"`
+    /// guess): every printable non-alphanumeric ASCII character except `_`
+    /// -- so alphanumerics+`_` form one class ("word chars"), a run of this
+    /// string's characters forms another (a run of separator punctuation is
+    /// itself a selectable "word"), and plain space/tab are a third,
+    /// separate whitespace class (tmux's `WHITESPACE`, never part of this
+    /// option's value) -- see `dispatch::CharClass`/`char_class`.
+    pub fn word_separators(&self) -> &str {
+        self.str_ref("word-separators")
     }
 
     /// Max AUTOMATIC paste buffers (Task 3, sub-project 4) before

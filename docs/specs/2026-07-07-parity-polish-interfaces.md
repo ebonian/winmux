@@ -939,7 +939,43 @@ typed getter:
 pub fn mouse(&self) -> bool;
 ```
 
+**Task 7 (SP6 wave 2) addendum — `word-separators` (`Str`), promoted from a
+hardcoded `dispatch.rs` constant to a real, settable option:**
+
+```rust
+pub fn word_separators(&self) -> &str;
+```
+
+New `SPECS`/`default_value` entry: `Str`, default
+`` "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~" `` (Rust escaping aside, the value is
+every printable non-alphanumeric ASCII character except `_`) — VERIFIED
+against `docs/tmux-reference/copy-mode-and-buffers.md` §6.4 / its options
+table, **not** the Task 5/6 code comment's `" -_@"` guess, which this task's
+brief flagged as unverified and turned out to be wrong (that string is not
+tmux's actual default anywhere in the reference doc). Plain space/tab are
+deliberately NOT part of this string: tmux keeps them as a separate
+`WHITESPACE` class (`"\t "`), distinct from both `word-separators` characters
+and alphanumeric+`_` "word" characters — a 3-class model
+(`dispatch::CharClass`/`char_class`) rather than the old 2-class
+(`is_word_sep` boolean) `WORD_SEPARATORS` constant it replaces. This is a
+BEHAVIOR fix, not just a value swap: the old constant folded space into the
+same class as separator punctuation, which (combined with the new,
+space-free default) would otherwise make a double-click at a word boundary
+swallow adjoining separator runs across whitespace; the 3-class model keeps
+whitespace, separator-punctuation runs, and word-character runs each their
+own selectable unit, matching tmux's `grid_reader_cursor_next_word{,_end}`
+model. `select_word_at` and the new `move_drag_cursor` (below) both read
+this option live via `word_bounds_at`/`char_class` — nothing caches a copy.
+
 ### `server`/`server::dispatch` amendment
+
+**STALE-SECTION NOTICE (SP6 wave 2, Task 7 review mandate):** this whole
+section originally documented Task 5's shape. Task 6 (click-purity/
+release-targeting fix round) reworked `MouseDrag` around a `PendingSelect`
+press-stash and changed the click/drag/release semantics; Task 7 (this
+section's current author) added drag-autoscroll and Word/Line drag
+extension. What follows describes the CURRENT (post-Task-7) shape only —
+see git history for the Task-5-era version if archaeology is ever needed.
 
 ```rust
 // src/server.rs
@@ -948,16 +984,35 @@ const MOUSE_ENABLE_SEQ: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_DISABLE_SEQ: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1006l";
 const MOUSE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 const MOUSE_WHEEL_STEP: u32 = 5; // tmux WheelUpPane/WheelDownPane default
+// Task 7: copy-mode drag autoscroll's repeat interval -- tmux's
+// WINDOW_COPY_DRAG_REPEAT_TIME (window-copy.c:351), 20 rows/sec while the
+// pointer sits on the pane's first/last row.
+const MOUSE_DRAG_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct ClientState {
     // ...existing fields unchanged...
-    mouse: MouseClientState, // NEW
+    mouse: MouseClientState, // NEW (Task 5)
 }
 
 #[derive(Default)]
 struct MouseClientState {
     last_click: Option<(std::time::Instant, u16, u16, u8, u8)>, // (when, x, y, button, run_length 1..=3)
     drag: MouseDrag,
+    // Task 7: armed while a drag selection's pointer sits on the pane's
+    // first/last row; `None` otherwise. Serviced by
+    // `Server::service_autoscroll_tick` from the `Tick` arm. Cleared
+    // unconditionally on every `Down` and every `Up`, and whenever a `Drag`
+    // event lands off an edge row or entirely outside the pane.
+    autoscroll: Option<AutoscrollState>,
+}
+
+// Task 7.
+#[derive(Clone, Copy)]
+struct AutoscrollState {
+    pane: layout::PaneId,
+    top: bool,       // true = pane's FIRST row (scroll toward history); false = LAST row (toward live bottom)
+    cursor_x: u16,    // pointer's last known pane-relative column -- re-used every Tick since no new Drag arrives while the pointer sits still
+    deadline: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -965,13 +1020,49 @@ enum MouseDrag {
     #[default]
     None,
     Border { pane: layout::PaneId, vertical: bool },
-    // `moved` (fix round, see the `Up` bullet below): starts `false` on
-    // `Down`, flips to `true` on the first `Drag`. Distinguishes a plain
-    // click (no `Drag` event at all before the matching `Up`) from an
-    // actual drag-select.
+    // Task 6: a `Down1` (button 1) ARMS possible selection tracking but does
+    // NOT yet touch the copy cursor/anchor/mode -- real tmux classifies a
+    // drag START at the *press* position only once the first actual `Drag`
+    // event arrives (`mouse.md` §2.5/§5.3), and a plain click (`Down` then
+    // `Up`, no `Drag` in between) never runs `begin-selection`/`copy-mode
+    // -M` at all, just `select-pane` (already done by `mouse_down`'s
+    // unconditional focus call). `press_x`/`press_y` are pane-relative,
+    // captured at `Down` time (tmux's `lx/ly`, the position drag-START
+    // classifies against). `enter_copy` is `true` when the press landed on
+    // a pane NOT already bound to this client's copy mode (root
+    // `MouseDrag1Pane -> copy-mode -M`: the first `Drag` must open copy mode
+    // on `pane` before installing the anchor) and `false` when the press
+    // landed inside the pane already bound to this client's copy mode
+    // (copy-mode table's own `MouseDrag1Pane -> begin-selection`: the anchor
+    // installs directly).
+    PendingSelect { pane: layout::PaneId, press_x: u16, press_y: u16, enter_copy: bool },
+    // A drag's anchor has been installed (either directly, for DoubleClick/
+    // TripleClick word/line selection; or via `PendingSelect`'s first
+    // `Drag`); each subsequent `Drag1` extends the selection's cursor
+    // endpoint (`move_drag_cursor`, below) and sets `moved`, and the
+    // eventual `Up1` copies it (`copy-selection-and-cancel`) ONLY if `moved`
+    // is true AND the release lands on the same pane the selection is bound
+    // to (Task 6 part (b): release-position targeting).
     Selecting { moved: bool },
 }
 ```
+
+`SelState` (defined in the `## copy-mode` section of
+[`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md))
+gained a `kind: SelKind` field in Task 7, alongside its pre-existing
+`anchor_scroll`/`anchor_x`/`anchor_y`/`anchor_total`/`rect` fields:
+
+```rust
+// Task 7: what a copy-mode selection's MOVING end snaps to while dragging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelKind { Char, Word, Line }
+```
+
+`Char` is the default (keyboard `begin-selection` and a plain-click-then-drag
+extend cell by cell); `Word`/`Line` are installed by DoubleClick/TripleClick
+(`select_word_at`/`select_line_at`) and make every subsequent `Drag` snap the
+moving end to whole word/line boundaries — see `move_drag_cursor`'s doc
+comment below for the exact rule.
 
 **Enable/disable sequence delivery** (design spec: "the server appends
 `\x1b[?1000h...` to the next composed output per client... and `l` variants
@@ -1031,49 +1122,141 @@ vertical- and horizontal-border position (a 4-way "+" junction) resolves to
 the vertical border — documented, arbitrary tie-break. Zero-size rects never
 match any branch (degrade to `None`), tolerating a too-small terminal.
 
-**Pane-area routing:**
-- `Down` on a border → arms `MouseDrag::Border { pane, vertical }` (no other
-  action).
+**Pane-area routing (current, post-Task-6/7 shape):**
+- `Down` on ANY hit (border, pane, or a miss) FIRST unconditionally clears
+  `client.mouse.autoscroll` (Task 7: a fresh press always invalidates
+  whatever a PRIOR drag left armed).
+- `Down` on a border → arms `MouseDrag::Border { pane, vertical }`.
 - `Down` on a pane → ALWAYS focuses it (`Layout::focus_pane`), any button.
-  Additionally, when it's button 1 landing inside the pane bound to this
-  CLIENT's OWN `ClientMode::Copy` (clicking a DIFFERENT pane, or clicking
-  while not in copy mode at all, only focuses — documented v1 scope,
-  matches the design spec's bulleted overview): `advance_click_run` (500ms
-  same-cell-same-button window, capped at run length 3) decides
-  single/double/triple-click semantics — 1 = `BeginSelection` at the clicked
-  view cell; 2 = `select_word_at` (expands to the maximal run of same-class
-  characters using tmux's hardcoded default `word-separators` = `" -_@"`,
-  NOT the plain-whitespace rule `copy-next-word`/`copy-previous-word` use);
-  3 = `select_line_at` (the whole clicked view row) — then arms
-  `MouseDrag::Selecting { moved: false }`.
-- `Drag` → `MouseDrag::Border` re-reads the reference pane's CURRENT rect
+  A non-`1` button then just arms `MouseDrag::None` and stops. Button 1:
+  - The pane is NOT bound to this CLIENT's OWN `ClientMode::Copy` → arms
+    `MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy: true }`
+    and returns — nothing about the copy cursor/mode is touched yet (Task 6
+    part (c): root `MouseDrag1Pane -> copy-mode -M` defers entry to the
+    first `Drag`).
+  - The pane IS bound to this client's copy mode → `advance_click_run`
+    (500ms same-cell-same-button window, capped at run length 3) decides
+    single/double/triple-click semantics:
+    - `run == 1` → arms `MouseDrag::PendingSelect { .., enter_copy: false }`
+      and returns (Task 6 part (a): a plain click never moves the copy
+      cursor or shows a selection anchor by itself — deferred to the first
+      `Drag`, anchored at THIS press position).
+    - `run == 2` → `select_word_at(cs, &grid, history_total, seps)` (`seps`
+      = the live `word-separators` option, `Options::word_separators`):
+      expands to the maximal run of same-[`CharClass`] characters around the
+      clicked cell (`word_bounds_at`), installs `kind: SelKind::Word`, then
+      arms `MouseDrag::Selecting { moved: false }`.
+    - `run >= 3` → `select_line_at`: the whole clicked view row, `kind:
+      SelKind::Line`, then arms `MouseDrag::Selecting { moved: false }`.
+- `Drag` on `MouseDrag::Border` → re-reads the reference pane's CURRENT rect
   every call (not an accumulated delta since the drag started — robust to
   layout-minimum clamping: the border always ends up exactly at the drag
   position if reachable at all) and calls `Layout::resize_from` with the
   sign/axis implied by the drag delta, then `apply_layout_for_session`.
-  `MouseDrag::Selecting { .. }` sets `moved = true` (see `Up` below) and
-  updates the bound `CopyState`'s `cx`/`cy` to the new cell (clamped into
-  the pane's rect).
-- `Up` → `MouseDrag::Border` needs no further action (already applied live).
-  `MouseDrag::Selecting { moved: true }` (while still in copy mode) calls
-  `exec_copy_action(CopyAction::SelectionAndCancel, ..)` — tmux's
-  `MouseDragEnd1Pane` default, which fires only after an actual drag.
-  **Click/drag/release semantics (fix round; matches real tmux's copy-mode
+- `Drag` on `MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy }`:
+  if `enter_copy`, enters copy mode on `pane` NOW (`exec_copy_mode(false,
+  false, ..)`, matching real `-M`: does NOT set `scroll_exit`) — abandons
+  (`drag = None`) if `pane`'s runtime is gone, `exec_copy_mode` errors, or
+  focus raced off `pane` between the press and this motion (`client.mode`
+  reset to `Normal` too in that last case). Then, regardless of
+  `enter_copy`, installs the anchor at the PRESS position with `kind:
+  SelKind::Char` (a plain click-drag never installs a word/line anchor —
+  only DoubleClick/TripleClick, in `mouse_down`, do that), calls
+  `move_drag_cursor` with THIS event's raw position, and `service_drag_edge`
+  (arms/refreshes/clears autoscroll — see below); arms `MouseDrag::Selecting
+  { moved: true }`.
+- `Drag` on `MouseDrag::Selecting { .. }` → sets `moved = true` (see `Up`
+  below), resolves the CURRENT pane from `client.mode`'s bound
+  `ClientMode::Copy`, and:
+  - if the event hit-tests inside that pane's CURRENT rect → calls
+    `move_drag_cursor` then `service_drag_edge` (same two calls as the
+    `PendingSelect` arm above).
+  - if it's entirely OUTSIDE that pane's rect → clears
+    `client.mouse.autoscroll` and otherwise leaves the selection exactly
+    where it was (Task 7, `mouse.md` §5.4: "motion outside the pane is a
+    no-op that stops the timer").
+- **`move_drag_cursor(panes, seps, client, pane, x_raw, y_raw)`** (Task 7,
+  free function, `dispatch.rs`): clamps `(x_raw, y_raw)` into `pane`'s
+  CURRENT `cols`/`rows`, then updates the bound `CopyState`'s `cx`/`cy` (and,
+  for `Word`/`Line`, `sel.anchor_x`):
+  - `sel.kind == Char` → `cs.cx = x_raw; cs.cy = y_raw` (unchanged from
+    pre-Task-7 behavior).
+  - `sel.kind == Word | Line` → computes `backward = (cursor_key, x_raw) <
+    (anchor_key, sel.anchor_x)` (row/col reading-order comparison, using the
+    SAME content-pinned `anchor_key_now`/`sel_key` `compute_sel_view` uses,
+    so scrolling mid-drag never desyncs the comparison), then: **dragging
+    BEFORE (up/left of) the anchor word/line** (`backward`) snaps the moving
+    end to the START of the word/line under the cursor and the anchor to the
+    anchor word/line's END; **dragging AFTER (down/right of, or still
+    inside) the anchor word/line** snaps the moving end to its END and the
+    anchor to the anchor word/line's START — so the selection is always a
+    whole number of words/lines that always includes the anchor word/line
+    (`docs/tmux-reference/mouse.md` :636-642,
+    `docs/tmux-reference/copy-mode-and-buffers.md` :440-447). Word bounds
+    come from `word_bounds_at` (shared with `select_word_at`, driven by
+    `char_class`/the live `word-separators` option — see the `options`
+    amendment above); line bounds are always column `0`/`cols - 1`. Both
+    ends' word/line spans are re-derived FRESH from that row's live text on
+    every call (one `Grid::view_row_text` each) rather than cached, so they
+    track content drift for free, and re-deriving from the anchor's CURRENT
+    `anchor_x` (whichever end it was last flipped to) always finds the SAME
+    word/line, since both ends of a word/line span are within the same run.
+- **`scroll_and_resnap(panes, seps, client, pane, top, cursor_x)`** (Task 7):
+  scrolls `cs.scroll` by one line (toward history if `top`, toward the live
+  bottom otherwise, both clamped) and re-runs `move_drag_cursor` at the edge
+  row (`0` if `top`, `rows - 1` otherwise) with `cursor_x`, so a `Word`/
+  `Line` selection's snap re-evaluates against the NEW scroll.
+- **`service_drag_edge(panes, seps, client, pane, cursor_x, now)`** (Task 7):
+  called after every interactive `Drag`'s `move_drag_cursor`. If the
+  resulting `cs.cy` is the pane's first or last row: calls
+  `scroll_and_resnap` ONCE immediately (tmux: the edge `Drag` event itself
+  already scrolls one line, in addition to the timer's later repeats) and
+  arms/refreshes `client.mouse.autoscroll = Some(AutoscrollState { pane,
+  top, cursor_x, deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL })`.
+  Otherwise clears `autoscroll` entirely.
+- **`Server::service_autoscroll_tick(cid, now)`** (Task 7, `pub(super)`,
+  called from `server::handle_event`'s `Tick` arm): due client ids are
+  collected during that arm's pre-existing `self.clients.iter_mut()` pass
+  (a plain `Copy` deadline check, same two-pass shape the escape-time flush
+  already uses, for the same borrow-checking reason — `self.panes` and
+  `self.clients.get_mut` together aren't available mid-`iter_mut`), then
+  serviced in a second pass once that borrow has ended. For each due client:
+  disarms (`autoscroll = None`, no redraw) if the client left
+  `ClientMode::Copy` on the armed pane, or that pane's runtime is gone;
+  otherwise calls `scroll_and_resnap` again (one more line + re-snap),
+  re-arms for another `MOUSE_DRAG_AUTOSCROLL_INTERVAL` from `now`, and
+  reports "redraw needed" — reproducing tmux's `dragtimer` callback
+  re-checking and re-arming itself every 50ms while the pointer sits on an
+  edge row (`mouse.md` §5.4). Nothing disarms autoscroll just because
+  history/the live bottom is already exhausted — matches tmux, which keeps
+  re-arming (each scroll clamps to a no-op) rather than noticing the limit
+  and stopping.
+- `Up` → `client.mouse.autoscroll` is unconditionally cleared FIRST (Task 7:
+  a release always ends any drag, autoscroll included), before matching on
+  the drag kind. `MouseDrag::Border` needs no further action (already
+  applied live). `MouseDrag::Selecting { moved: true }` (while still in copy
+  mode) calls `exec_copy_action(CopyAction::SelectionAndCancel, ..)` —
+  tmux's `MouseDragEnd1Pane` default — but ONLY if `ev` (the RELEASE event's
+  own position) still hit-tests to the pane the selection is bound to (Task
+  6 part (b): tmux resolves `MouseDragEnd1Pane` against the pane under the
+  pointer AT RELEASE, not the drag-origin pane — releasing over a DIFFERENT
+  pane, or a border/dead zone, has no `MouseDragEnd1Pane` binding there, so
+  no copy happens and the origin pane keeps its selection and stays in copy
+  mode). **Click/drag/release semantics (matches real tmux's copy-mode
   binding table exactly):** SGR button-event tracking sends an `Up` after
   every `Down`, even with zero motion in between — a bare click, no less
   than a drag, always produces a `Down` immediately followed by an `Up`. A
-  PLAIN click (`Selecting { moved: false }`, i.e. no `Drag` event was ever
-  seen between this `Down` and this `Up`) is therefore explicitly EXCLUDED
-  from `SelectionAndCancel`: it is a no-op on `Up` — no copy, no cancel, no
-  buffer write, copy mode stays entered — because real tmux's copy-mode
-  table has no default binding for a bare `MouseUp1Pane` at all, only
-  `MouseDrag1Pane` (extends selection) and `MouseDragEnd1Pane` (copies and
-  exits), both of which require actual motion; only `MouseDown1Pane`
-  (`select-pane`, focus-only) fires for a plain click. The click's focus-on-
-  `Down` and its zero-width point-selection anchor / cursor reposition still
-  happen regardless — only the `Up`-side copy/cancel is gated on `moved`.
-  Any other `Up` combination (border drag, or `Selecting` outside copy mode)
-  is a no-op.
+  PLAIN click (`PendingSelect`/`Selecting { moved: false }` at this point,
+  i.e. no `Drag` event was ever seen between this `Down` and this `Up`) is
+  therefore explicitly EXCLUDED from `SelectionAndCancel` — falls through to
+  the wildcard arm: no copy, no cancel, no buffer write, copy mode stays
+  entered (or, for a plain click that never even reached copy mode,
+  unaffected) — because real tmux's copy-mode table has no default binding
+  for a bare `MouseUp1Pane` at all, only `MouseDrag1Pane` (extends
+  selection) and `MouseDragEnd1Pane` (copies and exits), both of which
+  require actual motion; only `MouseDown1Pane` (`select-pane`, focus-only)
+  fires for a plain click. The click's focus-on-`Down` still stands — only
+  the "release" side is a no-op.
 - `WheelUp`/`WheelDown` over a pane whose `Grid::alt_screen()` is true →
   ALWAYS 3x synthesized arrow-key presses (`\x1b[A`/`\x1b[B`) written
   straight to the pane via `pty.write_input`, regardless of copy-mode state
@@ -1108,11 +1291,18 @@ the status row → `exec_step_window(false, ..)` / `exec_step_window(true,
 
 **Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
 forwarding a click/drag to the pane's own mouse-reporting application (the
-design spec's "v1: NOT forwarded" note); drag-to-select on a LIVE (non-
-copy-mode) pane (real tmux implicitly enters copy mode on such a drag; the
-brief's own bullet list scopes "Drag1 = selection" to "In copy mode:" only);
-`word-separators` as a real, settable option (hardcoded tmux default
-`" -_@"` instead).
+design spec's "v1: NOT forwarded" note; ticketed `docs/follow-ups.md` #72).
+Two PRIOR deferrals in this section are now RESOLVED and removed from this
+list: "drag-to-select on a live (non-copy-mode) pane" (Task 6's
+`PendingSelect { enter_copy: true }`) and "`word-separators` as a real
+option" (Task 7's `Options::word_separators`, replacing the old hardcoded
+`" -_@"` guess with the doc-verified tmux default). One new interaction is
+left untested rather than deferred outright: toggling `rectangle-toggle`
+(`R`/`v`) mid-drag on a `Word`/`Line`-kind selection — `sel.rect` and
+`sel.kind` are independent fields, so this is representable, but real tmux
+itself treats `SEL_WORD`/`SEL_LINE` and rectangle selection as mutually
+exclusive selection MODES rather than orthogonal flags; low risk (mouse-only
+entry point, no keybinding reaches this combination).
 
 Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
 sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
@@ -1123,7 +1313,21 @@ Critical regression test — plain click in copy mode must not copy/cancel,
 and must still focus its pane), `pane_default_active_border_follows_focus`
 (fix round: coverage gap closed — the DEFAULT `pane-active-border-style`
 green segment on a 3-pane T-junction border follows focus, not just the
-runtime-restyled case `pane_active_border_style_runtime` already covered).
+runtime-restyled case `pane_active_border_style_runtime` already covered),
+`drag_after_click_anchors_at_press_point` / `release_over_other_pane_does_
+not_copy` / `drag_on_live_pane_enters_copy_mode_selecting` (Task 6: press-
+position anchoring, release-position targeting, and root-table drag-into-
+copy-mode). **Task 7 (SP6 wave 2):** `drag_at_top_row_autoscrolls_into_
+history` (drags to the pane's top row, sends NO further mouse events, and
+waits — purely via the server's real `Tick` — for the `[scroll/history]`
+indicator to climb to `[5/`, then asserts the released selection spans
+several rows, not just the single line the Drag event's own immediate
+scroll would produce alone); `drag_after_double_click_extends_by_words`
+(double-clicks a word, drags into the MIDDLE of a later word on the same
+row, asserts the copied text includes that word's WHOLE trailing text, not
+truncated at the drop column); `drag_after_triple_click_extends_by_lines`
+(triple-clicks a line, drags onto a later row, asserts both the full first
+and full second line were captured).
 Unit tests (`src/server/dispatch.rs::mouse_dispatch_tests`):
 `exec_copy_mode_wires_mouse_flag_to_scroll_exit` (fix round: the Minor
 finding — `exec_copy_mode`'s `mouse` parameter is genuinely read now).

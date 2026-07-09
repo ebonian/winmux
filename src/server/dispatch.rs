@@ -19,6 +19,7 @@
 //! object, so the resolution logic (`resolve_session_name`/
 //! `resolve_window_target`/`resolve_pane_target`) is shared verbatim.
 
+use std::collections::HashMap;
 use std::time::{Instant, SystemTime};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -37,9 +38,9 @@ use crate::protocol::ServerMsg;
 
 use super::{
     advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key, send_msg,
-    spawn_pane, system_time_parts, ChooseTreeState, ChooseTreeView, ClientId, ClientMode, ClientState,
-    ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState,
-    Server, TreeTarget, MONTHS, MOUSE_WHEEL_STEP,
+    spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
+    ClientState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PromptKind, SearchPrompt,
+    SearchState, SelKind, SelState, Server, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::Grid;
 use std::time::Duration;
@@ -603,19 +604,65 @@ fn edit_line_buf(buf: &mut String, b: u8) -> LineEdit {
     }
 }
 
-// ---- mouse (Task 5, sub-project 4) ----
+// ---- mouse (Task 5, sub-project 4; word-separators + drag extension Task 7, SP6 wave 2) ----
 
-/// tmux's default `word-separators` option value (` -_@`), hardcoded per the
-/// task brief -- no `word-separators` option exists in the registry yet (a
-/// documented v1 simplification, alongside the existing `copy-next-word`/
-/// `copy-previous-word` motions' own whitespace-only word notion above,
-/// which double-click word selection intentionally does NOT reuse: tmux's
-/// real double-click uses `word-separators`, not the plain-whitespace rule
-/// those cursor motions use).
-const WORD_SEPARATORS: &str = " -_@";
+/// Which of tmux's three word-motion classes a character falls into
+/// (`docs/tmux-reference/copy-mode-and-buffers.md` §6.4's "vim-like 3-class
+/// model: whitespace / separators / other"): `Whitespace` (tmux's
+/// `WHITESPACE` = `"\t "`, always its own class regardless of the
+/// `word-separators` option), `Separator` (any character in the
+/// `word-separators` option's value -- a RUN of separator punctuation is
+/// itself a selectable "word", same as a run of word characters), and `Word`
+/// (everything else: alphanumerics + `_`, since `word-separators`'s tmux
+/// default excludes `_`). Double-click word selection
+/// (`select_word_at`/[`word_bounds_at`]) and the Task 7 drag-extension snap
+/// (`move_drag_cursor`) both expand to the maximal run of the SAME class as
+/// the reference character -- NOT the plain-whitespace-only rule
+/// `copy-next-word`/`copy-previous-word` (above) use, which is a documented,
+/// intentional divergence between winmux's two independent "word" notions
+/// (see those actions' own call sites).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Whitespace,
+    Separator,
+    Word,
+}
 
-fn is_word_sep(c: char) -> bool {
-    WORD_SEPARATORS.contains(c)
+fn char_class(c: char, seps: &str) -> CharClass {
+    if c == ' ' || c == '\t' {
+        CharClass::Whitespace
+    } else if seps.contains(c) {
+        CharClass::Separator
+    } else {
+        CharClass::Word
+    }
+}
+
+/// The maximal run of same-[`CharClass`] characters in `text` (a single view
+/// row's text) around column `x`, per `seps` (the live `word-separators`
+/// option value, `Options::word_separators`) -- shared by `select_word_at`
+/// (DoubleClick's initial anchor) and `move_drag_cursor` (Task 7's
+/// continued-drag word snap, which re-derives a word's bounds from
+/// WHICHEVER end of the word the current anchor/cursor column happens to sit
+/// on, since both ends are within the same run). Returns `(0, 0)` for a
+/// blank row rather than panicking on an out-of-range index.
+fn word_bounds_at(text: &str, x: u16, seps: &str) -> (u16, u16) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let ci = (x as usize).min(n - 1);
+    let class = char_class(chars[ci], seps);
+    let mut start = ci;
+    let mut end = ci;
+    while start > 0 && char_class(chars[start - 1], seps) == class {
+        start -= 1;
+    }
+    while end + 1 < n && char_class(chars[end + 1], seps) == class {
+        end += 1;
+    }
+    (start as u16, end as u16)
 }
 
 /// Hit-test result for a mouse event's `(x, y)` against a window's current
@@ -663,39 +710,186 @@ fn hit_test(rects: &[(PaneId, Rect)], x: u16, y: u16) -> MouseHit {
 }
 
 /// Double-click word selection (`DoubleClick1Pane` -> `select-word`): expand
-/// from the clicked cell to the maximal run of same-class characters (word
-/// chars, or [`WORD_SEPARATORS`] chars) on that view row, using
-/// [`WORD_SEPARATORS`] as the separator class -- NOT the plain-whitespace
-/// rule `copy-next-word`/`copy-previous-word` use (see [`WORD_SEPARATORS`]'s
-/// doc comment). A blank row (`n == 0`) clears any selection instead of
-/// panicking on an out-of-range index.
-fn select_word_at(cs: &mut CopyState, grid: &Grid, history_total: u64) {
+/// from the clicked cell to the maximal run of same-[`CharClass`] characters
+/// on that view row (see [`word_bounds_at`]), per the live `word-separators`
+/// option (`seps`). `kind: SelKind::Word` (Task 7, SP6 wave 2) marks this
+/// selection so a subsequent `Drag` (`move_drag_cursor`) snaps by whole
+/// words instead of extending cell-by-cell. A blank row clears any selection
+/// instead of panicking on an out-of-range index.
+fn select_word_at(cs: &mut CopyState, grid: &Grid, history_total: u64, seps: &str) {
     let text = grid.view_row_text(cs.scroll, cs.cy);
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    if n == 0 {
+    if text.chars().next().is_none() {
         cs.sel = None;
         return;
     }
-    let ci = (cs.cx as usize).min(n - 1);
-    let sep = is_word_sep(chars[ci]);
-    let mut start = ci;
-    let mut end = ci;
-    while start > 0 && is_word_sep(chars[start - 1]) == sep {
-        start -= 1;
-    }
-    while end + 1 < n && is_word_sep(chars[end + 1]) == sep {
-        end += 1;
-    }
-    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: start as u16, anchor_y: cs.cy, anchor_total: history_total, rect: false });
-    cs.cx = end as u16;
+    let (start, end) = word_bounds_at(&text, cs.cx, seps);
+    cs.sel = Some(SelState {
+        anchor_scroll: cs.scroll,
+        anchor_x: start,
+        anchor_y: cs.cy,
+        anchor_total: history_total,
+        rect: false,
+        kind: SelKind::Word,
+    });
+    cs.cx = end;
 }
 
 /// Triple-click line selection (`TripleClick1Pane` -> `select-line`): the
-/// whole clicked view row, column 0 through the last column.
+/// whole clicked view row, column 0 through the last column. `kind:
+/// SelKind::Line` (Task 7, SP6 wave 2) marks this selection so a subsequent
+/// `Drag` (`move_drag_cursor`) snaps by whole lines instead of extending
+/// cell-by-cell.
 fn select_line_at(cs: &mut CopyState, cols: u16, history_total: u64) {
-    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: 0, anchor_y: cs.cy, anchor_total: history_total, rect: false });
+    cs.sel = Some(SelState {
+        anchor_scroll: cs.scroll,
+        anchor_x: 0,
+        anchor_y: cs.cy,
+        anchor_total: history_total,
+        rect: false,
+        kind: SelKind::Line,
+    });
     cs.cx = cols.saturating_sub(1);
+}
+
+/// Update a copy-mode drag's cursor to pane-relative `(x_raw, y_raw)`
+/// (clamped here into the pane's CURRENT `cols`/`rows`, so callers may pass a
+/// raw event/edge coordinate unclamped). Task 7, SP6 wave 2: if the active
+/// selection's `kind` is [`SelKind::Word`] or [`SelKind::Line`] (installed by
+/// `select_word_at`/`select_line_at`), the MOVING end snaps to the whole
+/// word/line under the cursor instead of the raw cell, and the FIXED anchor
+/// end flips between the anchor word/line's start and end -- tmux's
+/// `SEL_WORD`/`SEL_LINE` `window_copy_synchronize_cursor_end`
+/// (`docs/tmux-reference/mouse.md` :636-642,
+/// `docs/tmux-reference/copy-mode-and-buffers.md` :440-447):
+///
+/// - Dragging BEFORE (up/left of) the anchor word/line -- i.e. the raw
+///   cursor position sorts earlier than `(anchor row, anchor column)` in
+///   reading order -- snaps the moving end to the START of the word/line
+///   under the cursor, and the anchor to the anchor word/line's END.
+/// - Dragging AFTER (down/right of, or still inside, the anchor word/line)
+///   snaps the moving end to its END, and the anchor to the anchor
+///   word/line's START.
+///
+/// so the selection is always a whole number of words/lines that always
+/// includes the anchor word/line, regardless of drag direction. [`SelKind::Char`]
+/// (a plain click-drag or `begin-selection`) is untouched: the moving end is
+/// exactly `(x_raw, y_raw)`. A no-op if the client isn't in `ClientMode::Copy`
+/// on `pane`, has no active selection, or `pane`'s runtime is gone.
+fn move_drag_cursor(
+    panes: &HashMap<PaneId, PaneRuntime>,
+    seps: &str,
+    client: &mut ClientState,
+    pane: PaneId,
+    x_raw: u16,
+    y_raw: u16,
+) {
+    let Some(p) = panes.get(&pane) else { return };
+    let cols = p.grid.cols();
+    let rows = p.grid.rows();
+    let history_len = p.grid.history_len();
+    let history_total = p.grid.history_total();
+    let x_raw = x_raw.min(cols.saturating_sub(1));
+    let y_raw = y_raw.min(rows.saturating_sub(1));
+
+    let ClientMode::Copy(cs) = &mut client.mode else { return };
+    if cs.pane != pane {
+        return;
+    }
+    let Some(sel) = cs.sel else { return };
+
+    match sel.kind {
+        SelKind::Char => {
+            cs.cx = x_raw;
+            cs.cy = y_raw;
+        }
+        SelKind::Word | SelKind::Line => {
+            let anchor_key = anchor_key_now(&sel, history_len, history_total);
+            let cursor_key = sel_key(cs.scroll, y_raw);
+            let backward = (cursor_key, x_raw) < (anchor_key, sel.anchor_x);
+            let (new_cx, new_anchor_x) = if sel.kind == SelKind::Line {
+                if backward {
+                    (0, cols.saturating_sub(1))
+                } else {
+                    (cols.saturating_sub(1), 0)
+                }
+            } else {
+                let (anchor_scroll_now, anchor_row_now) = key_to_view(anchor_key, rows);
+                let cursor_text = p.grid.view_row_text(cs.scroll, y_raw);
+                let anchor_text = p.grid.view_row_text(anchor_scroll_now, anchor_row_now);
+                let (cur_lo, cur_hi) = word_bounds_at(&cursor_text, x_raw, seps);
+                let (anc_lo, anc_hi) = word_bounds_at(&anchor_text, sel.anchor_x, seps);
+                if backward {
+                    (cur_lo, anc_hi)
+                } else {
+                    (cur_hi, anc_lo)
+                }
+            };
+            cs.cx = new_cx;
+            cs.cy = y_raw;
+            cs.sel = Some(SelState { anchor_x: new_anchor_x, ..sel });
+        }
+    }
+}
+
+/// One drag-autoscroll line: scrolls `cs.scroll` by one (toward history if
+/// `top`, toward the live bottom otherwise, both clamped) and re-runs
+/// [`move_drag_cursor`] at the edge row (`0` if `top`, `rows - 1` otherwise)
+/// with `cursor_x` so a Word/Line-kind selection's snap is re-evaluated
+/// against the NEW scroll (extending it one more word/line into the newly
+/// revealed content). Shared by the interactive edge-arm path
+/// (`service_drag_edge`) and the `Tick`-driven repeat
+/// (`Server::service_autoscroll_tick`). A no-op if the client isn't in copy
+/// mode on `pane` or `pane`'s runtime is gone.
+fn scroll_and_resnap(panes: &HashMap<PaneId, PaneRuntime>, seps: &str, client: &mut ClientState, pane: PaneId, top: bool, cursor_x: u16) {
+    let Some(p) = panes.get(&pane) else { return };
+    let history_len = p.grid.history_len();
+    let rows = p.grid.rows();
+    {
+        let ClientMode::Copy(cs) = &mut client.mode else { return };
+        if cs.pane != pane {
+            return;
+        }
+        if top {
+            cs.scroll = (cs.scroll + 1).min(history_len);
+        } else {
+            cs.scroll = cs.scroll.saturating_sub(1);
+        }
+    }
+    let cy_edge = if top { 0 } else { rows.saturating_sub(1) };
+    move_drag_cursor(panes, seps, client, pane, cursor_x, cy_edge);
+}
+
+/// After an interactive `Drag` event has updated the copy cursor
+/// (`move_drag_cursor`), arm/refresh/disarm this client's drag-autoscroll
+/// timer (Task 7, SP6 wave 2, `docs/tmux-reference/mouse.md` §5.4): if the
+/// resulting cursor row is the pane's first or last row, perform ONE
+/// immediate extra scroll line (matching tmux: the edge Drag event itself
+/// already scrolls once, in addition to the timer's later repeats) and arm
+/// `client.mouse.autoscroll` for [`MOUSE_DRAG_AUTOSCROLL_INTERVAL`] from
+/// `now`; otherwise clear it -- "motion outside the pane is a no-op that
+/// stops the timer... leaving the edge row stops it too". A no-op (autoscroll
+/// cleared) if the client isn't in copy mode on `pane` or `pane`'s runtime is
+/// gone.
+fn service_drag_edge(panes: &HashMap<PaneId, PaneRuntime>, seps: &str, client: &mut ClientState, pane: PaneId, cursor_x: u16, now: Instant) {
+    let Some(p) = panes.get(&pane) else {
+        client.mouse.autoscroll = None;
+        return;
+    };
+    let rows = p.grid.rows();
+    let cy = match &client.mode {
+        ClientMode::Copy(cs) if cs.pane == pane => cs.cy,
+        _ => {
+            client.mouse.autoscroll = None;
+            return;
+        }
+    };
+    if cy == 0 || cy == rows.saturating_sub(1) {
+        let top = cy == 0;
+        scroll_and_resnap(panes, seps, client, pane, top, cursor_x);
+        client.mouse.autoscroll = Some(AutoscrollState { pane, top, cursor_x, deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL });
+    } else {
+        client.mouse.autoscroll = None;
+    }
 }
 
 impl Server {
@@ -1664,6 +1858,7 @@ impl Server {
                     anchor_y: cs.cy,
                     anchor_total: p.grid.history_total(),
                     rect: false,
+                    kind: SelKind::Char,
                 });
             }
             CopyAction::RectangleToggle => {
@@ -1692,6 +1887,7 @@ impl Server {
                         anchor_y: cs.cy,
                         anchor_total: p.grid.history_total(),
                         rect: sel.rect,
+                        kind: sel.kind,
                     });
                     let row_under_current = key + cs.scroll as i64;
                     let (new_scroll, new_cy) = if (0..rows as i64).contains(&row_under_current) {
@@ -1883,6 +2079,11 @@ impl Server {
         client: &mut ClientState,
         session_name: &str,
     ) -> ExecOutcome {
+        // Task 7, SP6 wave 2: any fresh press invalidates whatever drag
+        // autoscroll timer a PRIOR drag may have left armed (a stray
+        // leftover would otherwise keep scrolling a selection nothing is
+        // dragging anymore).
+        client.mouse.autoscroll = None;
         match hit_test(rects, ev.x, ev.y) {
             MouseHit::VBorder { left } => {
                 client.mouse.drag = MouseDrag::Border { pane: left, vertical: true };
@@ -1932,11 +2133,12 @@ impl Server {
                 };
                 let history_total = p.grid.history_total();
                 let cols = p.grid.cols();
+                let seps = self.options.word_separators();
                 if let ClientMode::Copy(cs) = &mut client.mode {
                     cs.cx = cx;
                     cs.cy = cy;
                     match run {
-                        2 => select_word_at(cs, &p.grid, history_total),
+                        2 => select_word_at(cs, &p.grid, history_total, seps),
                         _ => select_line_at(cs, cols, history_total),
                     }
                 }
@@ -2000,22 +2202,28 @@ impl Server {
                 // position), then apply THIS event's motion to the cursor --
                 // real tmux calls `window_copy_drag_update` immediately
                 // after starting the drag, so the very first `Drag` frame
-                // both anchors AND extends the selection in one step.
+                // both anchors AND extends the selection in one step. Always
+                // `SelKind::Char` (Task 7): a plain click-drag never installs
+                // a word/line anchor -- only DoubleClick/TripleClick
+                // (`mouse_down`) do that.
+                let history_total = self.panes.get(&pane).map(|p| p.grid.history_total()).unwrap_or(0);
                 if let ClientMode::Copy(cs) = &mut client.mode {
                     if cs.pane == pane {
-                        let history_total = self.panes.get(&pane).map(|p| p.grid.history_total()).unwrap_or(0);
                         cs.sel = Some(SelState {
                             anchor_scroll: cs.scroll,
                             anchor_x: press_x,
                             anchor_y: press_y,
                             anchor_total: history_total,
                             rect: false,
+                            kind: SelKind::Char,
                         });
-                        if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
-                            cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
-                            cs.cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
-                        }
                     }
+                }
+                if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
+                    let x_raw = ev.x.saturating_sub(rect.x);
+                    let y_raw = ev.y.saturating_sub(rect.y);
+                    move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
+                    service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
                 }
                 client.mouse.drag = MouseDrag::Selecting { moved: true };
                 ExecOutcome::Ok(String::new())
@@ -2024,10 +2232,23 @@ impl Server {
                 // An actual `Drag` event happened: mark `moved` so `mouse_up`
                 // knows this is a real drag-select, not a plain click.
                 client.mouse.drag = MouseDrag::Selecting { moved: true };
-                if let ClientMode::Copy(cs) = &mut client.mode {
-                    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == cs.pane) {
-                        cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
-                        cs.cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+                let pane = match &client.mode {
+                    ClientMode::Copy(cs) => Some(cs.pane),
+                    _ => None,
+                };
+                if let Some(pane) = pane {
+                    match rects.iter().find(|(id, _)| *id == pane) {
+                        Some((_, rect)) => {
+                            let x_raw = ev.x.saturating_sub(rect.x);
+                            let y_raw = ev.y.saturating_sub(rect.y);
+                            move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
+                            service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                        }
+                        // Task 7, SP6 wave 2 / `mouse.md` §5.4: motion
+                        // OUTSIDE the pane rectangle is a no-op that also
+                        // stops any armed autoscroll timer (the selection
+                        // itself is left exactly where it was).
+                        None => client.mouse.autoscroll = None,
                     }
                 }
                 ExecOutcome::Ok(String::new())
@@ -2112,6 +2333,9 @@ impl Server {
     /// focus) still stands -- only the "release" side is a no-op.
     fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
+        // Task 7, SP6 wave 2: releasing always ends any armed drag
+        // autoscroll timer, whether or not this `Up` ends up copying.
+        client.mouse.autoscroll = None;
         match drag {
             MouseDrag::Selecting { moved: true } => {
                 let ClientMode::Copy(cs) = &client.mode else {
@@ -2133,6 +2357,33 @@ impl Server {
             }
             _ => ExecOutcome::Ok(String::new()),
         }
+    }
+
+    /// `Tick`-driven drag-autoscroll repeat (Task 7, SP6 wave 2): called by
+    /// `Server::handle_event`'s `Tick` arm for every client whose
+    /// `client.mouse.autoscroll` deadline has passed, AFTER that arm's own
+    /// `self.clients.iter_mut()` pass has ended (mirrors the pre-existing
+    /// escape-time flush's two-pass shape -- see its own comment for why).
+    /// Disarms (and returns `false`, no redraw needed) if the client is no
+    /// longer in `ClientMode::Copy` on the armed pane, or that pane's
+    /// runtime is gone; otherwise scrolls one line and re-snaps the
+    /// selection (`scroll_and_resnap`), re-arms for another
+    /// `MOUSE_DRAG_AUTOSCROLL_INTERVAL` from `now`, and returns `true`.
+    pub(super) fn service_autoscroll_tick(&mut self, cid: ClientId, now: Instant) -> bool {
+        let Some(client) = self.clients.get_mut(&cid) else { return false };
+        let Some(a) = client.mouse.autoscroll else { return false };
+        let in_copy = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == a.pane);
+        if !in_copy {
+            client.mouse.autoscroll = None;
+            return false;
+        }
+        if !self.panes.contains_key(&a.pane) {
+            client.mouse.autoscroll = None;
+            return false;
+        }
+        scroll_and_resnap(&self.panes, self.options.word_separators(), client, a.pane, a.top, a.cursor_x);
+        client.mouse.autoscroll = Some(AutoscrollState { deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL, ..a });
+        true
     }
 
     /// `WheelUp`/`WheelDown` inside the pane area.
