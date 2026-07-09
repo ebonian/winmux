@@ -214,10 +214,15 @@ impl Layout {
     /// Real tmux's `active_point` counter is global across the whole
     /// server (meaningful across windows/sessions), so it is owned and
     /// stamped by the server (`Server::pane_activity` /
-    /// `Server::stamp_active`, `src/server.rs`) at every focus-change call
-    /// site, and threaded in here as a closure. This replaces the old
-    /// single-slot `last_focused`-based MRU approximation (follow-up #65,
-    /// now resolved).
+    /// `Server::stamp_active`, `src/server.rs`) at every
+    /// `window_set_active_pane`-equivalent call site (explicit selection,
+    /// directional navigation, last-pane toggle, mouse focus, rotate,
+    /// non-detached creation -- but NEVER on `window_lost_pane`-shaped
+    /// death handoffs, where tmux reassigns the active pane WITHOUT
+    /// bumping the counter; see `Server::stamp_active`'s doc for the full
+    /// stamp/no-stamp map), and threaded in here as a closure. This
+    /// replaces the old single-slot `last_focused`-based MRU approximation
+    /// (follow-up #65, now resolved).
     ///
     /// Returns false (no change) if there is no candidate in that direction.
     //

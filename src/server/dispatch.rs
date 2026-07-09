@@ -798,18 +798,12 @@ impl Server {
     fn kill_pane_by_id(&mut self, session_name: &str, pane_id: PaneId) -> Result<bool, String> {
         let owner_wid = self.registry.session_mut(session_name).and_then(|s| s.window_by_pane(pane_id).map(|w| w.id));
         let Some(wid) = owner_wid else { return Err("pane not found".to_string()) };
-        // Snapshot whether `pane_id` was this window's FOCUSED pane before
-        // removal: `Layout::remove` silently reassigns `focused` internally
-        // (to the nearest leaf of the sibling subtree) only in that case --
-        // review Finding 1(a): that reassignment was never stamped, so
-        // `focus_dir`'s MRU tie-break couldn't tell the handed-off pane was
-        // just made active.
-        let was_focused = self
-            .registry
-            .session_mut(session_name)
-            .and_then(|s| s.windows.iter().find(|w| w.id == wid))
-            .map(|w| w.layout.focused() == pane_id)
-            .unwrap_or(false);
+        // NOTE (fix round 3): `Layout::remove` may reassign `focused` to a
+        // surviving sibling here -- deliberately NOT stamped. tmux's
+        // `window_lost_pane` (window.c) reassigns `w->active` directly
+        // (last_panes stack -> prev -> next) with no `active_point` bump:
+        // a death handoff preserves the survivor's historical recency.
+        // See `Server::stamp_active`'s doc for the full stamp/no-stamp map.
         let removed = self
             .registry
             .session_mut(session_name)
@@ -820,16 +814,6 @@ impl Server {
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
             self.pane_activity.remove(&pane_id); // Finding 2: prune, mirrors last_rects
-            if was_focused {
-                let new_focus = self
-                    .registry
-                    .session_mut(session_name)
-                    .and_then(|s| s.windows.iter().find(|w| w.id == wid))
-                    .map(|w| w.layout.focused());
-                if let Some(id) = new_focus {
-                    self.stamp_active(id);
-                }
-            }
             self.apply_layout_for_session(session_name);
             return Ok(false);
         }
@@ -1314,16 +1298,11 @@ impl Server {
         if let Some(n) = &name {
             crate::model::validate_name(n, "window")?;
         }
-        // Finding 1(b), first half: snapshot whether `pane_id` was the
-        // source window's FOCUSED pane before removal -- `Layout::remove`
-        // only reassigns `focused` internally in that case, same as
-        // `kill_pane_by_id` above.
-        let was_focused = self
-            .registry
-            .session_mut(&session_name)
-            .and_then(|s| s.windows.iter().find(|w| w.id == wid))
-            .map(|w| w.layout.focused() == pane_id)
-            .unwrap_or(false);
+        // NOTE (fix round 3): the source window's `Layout::remove` may hand
+        // focus to a surviving sibling -- deliberately NOT stamped, same
+        // `window_lost_pane` no-bump rule as `kill_pane_by_id` (the moved
+        // pane's stamp below is different: that one is a CREATION-path
+        // focus, tmux spawn.c shape).
         let removed = self
             .registry
             .session_mut(&session_name)
@@ -1335,16 +1314,6 @@ impl Server {
             // `Layout::remove` succeeds (it only ever refuses a
             // single-pane layout); unreachable in practice.
             return Err("can't break with only one pane".to_string());
-        }
-        if was_focused {
-            let new_focus = self
-                .registry
-                .session_mut(&session_name)
-                .and_then(|s| s.windows.iter().find(|w| w.id == wid))
-                .map(|w| w.layout.focused());
-            if let Some(id) = new_focus {
-                self.stamp_active(id);
-            }
         }
         let new_wid = self.registry.mint_window_id();
         if let Some(session) = self.registry.session_mut(&session_name) {
@@ -1364,12 +1333,16 @@ impl Server {
                 session.last = Some(new_wid);
             }
         }
-        // Finding 1(b), second half: the moved pane is always the sole,
-        // newly-focused pane of the brand-new window (`new_window`
-        // constructs it that way unconditionally, `-d` only changes which
-        // window the CLIENT displays, not which pane is focused inside the
-        // new window) -- stamp unconditionally, same as
-        // `exec_split_window`'s "new pane always takes focus" stamp.
+        // The moved pane is always the sole, newly-focused pane of the
+        // brand-new window (`new_window` constructs it that way
+        // unconditionally; `-d` only changes which window the CLIENT
+        // displays, not which pane is focused inside the new window) --
+        // stamp unconditionally. This is a CREATION-path focus (tmux
+        // `spawn.c:527-531`: a non-detached spawn calls
+        // `window_set_active_pane` on the new window's pane, which bumps
+        // `active_point`), same plumbing as `exec_split_window`/
+        // `exec_new_window`'s stamps -- unlike the source window's
+        // `window_lost_pane`-shaped handoff above, which must not stamp.
         self.stamp_active(pane_id);
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
@@ -3882,13 +3855,19 @@ mod sp6_config_compat_tests {
     }
 }
 
-/// Fix-round-1 review findings (Task 3 report addendum, 2026-07-10):
-/// Finding 1 -- unstamped focus-handoff paths in `kill_pane_by_id`/
-/// `exec_break_pane`/`exec_rotate_window`; Finding 2 -- `pane_activity`
-/// never pruned on pane removal (unbounded leak). Both are inspected
-/// directly via `Server::pane_activity`/`Server::stamp_active`, which
-/// `dispatch.rs` (a child module of `server`) can already reach the same way
-/// production code does (see `exec_select_pane`'s `activity` closure above).
+/// Task 3 fix rounds 1-3 (report addendum, 2026-07-10). Round 1: Finding 2
+/// -- `pane_activity` never pruned on pane removal (unbounded leak); still
+/// correct, prune tests kept. Rounds 1-2 also stamped death-handoff focus
+/// reassignments (`kill_pane_by_id`/`exec_break_pane` source window/
+/// `handle_exited`); round 3 REVERTED those after the controller verified
+/// tmux's `window_lost_pane` (window.c) never bumps `active_point` on a
+/// death handoff -- the survivor keeps its historical recency. Stamps
+/// remain only on `window_set_active_pane`-equivalent paths (rotate,
+/// `cmd-rotate-window.c:109`; creation, `spawn.c:527-531` -- incl.
+/// `exec_break_pane`'s moved pane). Everything is inspected directly via
+/// `Server::pane_activity`/`Server::stamp_active`, which `dispatch.rs` (a
+/// child module of `server`) can already reach the same way production
+/// code does (see `exec_select_pane`'s `activity` closure above).
 #[cfg(test)]
 mod focus_activity_fix_tests {
     use super::*;
@@ -3950,19 +3929,23 @@ mod focus_activity_fix_tests {
         server.pane_activity.values().copied().max().unwrap_or(0)
     }
 
-    /// Finding 1(a): `kill_pane_by_id`'s `Layout::remove` reassigns focus
-    /// internally (to the sibling subtree's nearest leaf) only when the
-    /// KILLED pane was the window's focused one. That reassignment must get
-    /// a fresh `stamp_active`, or `focus_dir`'s MRU tie-break can't tell the
-    /// handed-off pane was just made active.
+    /// Fix round 3 (controller-verified against the tmux C source,
+    /// INVERTING the round-1 Finding 1(a) ruling): `window.c
+    /// window_lost_pane` reassigns `w->active` DIRECTLY (last_panes stack
+    /// -> prev -> next) with NO `active_point` bump -- tmux does NOT stamp
+    /// on a kill-pane death handoff; the surviving pane keeps its
+    /// historical recency. `kill_pane_by_id` must leave the handed-off
+    /// pane's activity value untouched.
     #[test]
-    fn kill_pane_by_id_stamps_focus_handoff() {
+    fn kill_pane_by_id_does_not_stamp_focus_handoff() {
         // H(A, H(B, C)): kill focused A -> Layout::remove hands focus to
-        // the sibling subtree's first leaf, B.
+        // the sibling subtree's first leaf, B -- which must KEEP its prior
+        // activity value (2), not receive a fresh stamp.
         let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
         let (a, b, c) = (ids[0], ids[1], ids[2]);
-        server.stamp_active(c);
-        server.stamp_active(b);
+        server.stamp_active(c); // c = 1
+        server.stamp_active(b); // b = 2
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
         let before_max = max_activity(&server);
         set_focus(&mut server, &session_name, wid, a);
 
@@ -3970,31 +3953,31 @@ mod focus_activity_fix_tests {
 
         let new_focus = focused_pane(&mut server, &session_name, wid);
         assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
-        assert!(
-            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
-            "the pane focus is handed off to after kill-pane must get a FRESH activity stamp \
-             (got {:?}, previous max was {before_max})",
-            server.pane_activity.get(&new_focus)
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps active_point)"
         );
+        assert_eq!(max_activity(&server), before_max, "no pane anywhere may receive a fresh stamp from a death handoff");
+        assert!(!server.pane_activity.contains_key(&a), "the killed pane's activity entry must still be pruned (round-1 Finding 2)");
     }
 
-    /// Fix round 2, coordinator-confirmed follow-on: `handle_exited` (a
-    /// pane's shell exiting NATURALLY, the most common death path) runs the
-    /// same `Layout::remove` focus reassignment as `kill_pane_by_id` -- and
-    /// tmux routes both through the same `window_lost_pane` ->
-    /// `window_set_active_pane` stamping -- so the handed-off pane must get
-    /// a fresh stamp here too. Same construction as
-    /// `kill_pane_by_id_stamps_focus_handoff`, but driving the pane-exit
-    /// event handler instead of kill-pane.
+    /// Fix round 3, natural-exit variant of the above: `handle_exited`
+    /// routes through the same `window_lost_pane`-shaped handoff, so it
+    /// must not stamp either (inverts round 2's test, whose premise --
+    /// "tmux routes pane death through window_set_active_pane" -- the
+    /// controller's source check disproved). The round-1/2 prune
+    /// assertions stay as-is.
     #[test]
-    fn handle_exited_stamps_focus_handoff() {
+    fn handle_exited_does_not_stamp_focus_handoff() {
         // H(A, H(B, C)): A's shell exits while A is focused ->
         // Layout::remove hands focus to the sibling subtree's first
-        // leaf, B.
+        // leaf, B, which must keep its prior activity value.
         let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
         let (a, b, c) = (ids[0], ids[1], ids[2]);
-        server.stamp_active(c);
-        server.stamp_active(b);
+        server.stamp_active(c); // c = 1
+        server.stamp_active(b); // b = 2
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
         let before_max = max_activity(&server);
         set_focus(&mut server, &session_name, wid, a);
 
@@ -4002,13 +3985,13 @@ mod focus_activity_fix_tests {
 
         let new_focus = focused_pane(&mut server, &session_name, wid);
         assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
-        assert!(
-            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
-            "the pane focus is handed off to after a natural pane exit must get a FRESH activity stamp \
-             (got {:?}, previous max was {before_max})",
-            server.pane_activity.get(&new_focus)
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps active_point)"
         );
-        assert!(!server.pane_activity.contains_key(&a), "the exited pane's activity entry must be pruned (round-1 Finding 2 site)");
+        assert_eq!(max_activity(&server), before_max, "no pane anywhere may receive a fresh stamp from a death handoff");
+        assert!(!server.pane_activity.contains_key(&a), "the exited pane's activity entry must still be pruned (round-1 Finding 2 site)");
     }
 
     /// Guard, mirroring `kill_pane_by_id_does_not_stamp_when_focus_unchanged`:
@@ -4060,31 +4043,36 @@ mod focus_activity_fix_tests {
         );
     }
 
-    /// Finding 1(b): `exec_break_pane` has TWO focus-handoff sites --
-    /// (1) the source window's `Layout::remove` reassignment (same shape as
-    /// `kill_pane_by_id`), and (2) the moved pane becoming the new window's
-    /// sole, active pane.
+    /// Fix round 3, revised from round 1's Finding 1(b): `exec_break_pane`
+    /// has two focus changes of DIFFERENT tmux kinds. (1) The source
+    /// window's `Layout::remove` reassignment is a `window_lost_pane`
+    /// death handoff -- must NOT stamp (survivor keeps its history).
+    /// (2) The moved pane becoming the brand-new window's sole active pane
+    /// is a CREATION-path focus (tmux `spawn.c:527-531` shape,
+    /// `window_set_active_pane` on the new window's pane -- same plumbing
+    /// as `exec_new_window`'s stamp) -- MUST stamp.
     #[test]
-    fn exec_break_pane_stamps_source_handoff_and_moved_pane() {
-        // H(A, B): break B (focused) out; source window keeps only A, whose
-        // Layout::remove-driven focus reassignment must be stamped, THEN
-        // the moved pane B must be stamped as the new window's active pane
-        // (in that order -- B's stamp must be the more recent of the two).
+    fn exec_break_pane_stamps_moved_pane_but_not_source_handoff() {
+        // H(A, B): break B (focused) out. A (the source window's handed-off
+        // survivor) must keep its prior activity value exactly; B (the new
+        // window's creation-focused pane) must get a fresh stamp.
         let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
         let (a, b) = (ids[0], ids[1]);
-        server.stamp_active(a);
-        let before_max = max_activity(&server);
+        server.stamp_active(a); // a = 1
+        let a_before = server.pane_activity.get(&a).copied().expect("a stamped");
         set_focus(&mut server, &session_name, wid, b);
 
         server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
 
         let source_focus = focused_pane(&mut server, &session_name, wid);
         assert_eq!(source_focus, a, "test setup sanity: only A remains in the source window");
-        let a_stamp = server.pane_activity.get(&a).copied().unwrap_or(0);
-        assert!(a_stamp > before_max, "source window's focus handoff (to A) after break-pane must get a fresh stamp");
-
+        assert_eq!(
+            server.pane_activity.get(&a).copied(),
+            Some(a_before),
+            "the source window's handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps)"
+        );
         let b_stamp = server.pane_activity.get(&b).copied().unwrap_or(0);
-        assert!(b_stamp > a_stamp, "the moved pane (B), becoming the new window's active pane, must be stamped AFTER A's handoff stamp");
+        assert!(b_stamp > a_before, "the moved pane (B), creation-focused in its new window, must get a fresh stamp");
     }
 
     /// Finding 2: `pane_activity` must be pruned wherever a pane is removed

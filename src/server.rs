@@ -617,12 +617,16 @@ struct Server {
     /// tmux's per-pane `active_point` counter (`window.c:593`; SP6 parity
     /// wave 2, Task 3), global across the whole server -- matching tmux,
     /// whose counter is meaningful across windows/sessions, not scoped to
-    /// one. Stamped by [`Server::stamp_active`] at every focus-change call
-    /// site so `Layout::focus_dir`'s MRU tie-break can rank candidates by
-    /// real recency instead of the old single-slot `last_focused`
-    /// approximation (closes follow-up #65). A pane with no entry here has
-    /// never been focused; `next_active_point` starts at 1 so that default
-    /// (read as 0) never collides with a real stamp.
+    /// one. Stamped by [`Server::stamp_active`] at every
+    /// `window_set_active_pane`-equivalent call site (see that method's doc
+    /// for the full stamp/no-stamp map -- death handoffs deliberately do
+    /// NOT stamp) so `Layout::focus_dir`'s MRU tie-break can rank
+    /// candidates by real recency instead of the old single-slot
+    /// `last_focused` approximation (closes follow-up #65). A pane with no
+    /// entry here has never been focused; `next_active_point` starts at 1
+    /// so that default (read as 0) never collides with a real stamp.
+    /// Entries are pruned wherever panes are dropped (mirrors `last_rects`
+    /// cleanup exactly).
     pane_activity: HashMap<PaneId, u64>,
     next_active_point: u64,
 }
@@ -1001,19 +1005,38 @@ impl Server {
     }
 
     /// Stamp `id` as the most recently active pane (tmux's `active_point`,
-    /// `window.c:593`) -- called at every focus-change call site (SP6
-    /// parity wave 2, Task 3). `saturating_add`: a u64 counter wrapping
-    /// after ~1.8e19 focus changes is not a real concern, but keeping the
-    /// bump total (never panicking) matches this codebase's convention for
-    /// counters that are conceptually "never overflows" (follow-up #5's
-    /// spirit).
+    /// `window.c:593`; SP6 parity wave 2, Task 3). `saturating_add`: a u64
+    /// counter wrapping after ~1.8e19 focus changes is not a real concern,
+    /// but keeping the bump total (never panicking) matches this codebase's
+    /// convention for counters that are conceptually "never overflows"
+    /// (follow-up #5's spirit).
     ///
-    /// Deliberate NON-call sites (fix round 2, controller-adjudicated):
-    /// `exec_select_window`/`exec_step_window`/`exec_last_window` do NOT
-    /// stamp -- this matches tmux, where switching windows changes the
-    /// session's current *winlink* only; `active_point` is bumped solely by
-    /// `window_set_active_pane` (a PANE focus change within a window). Do
-    /// not "fix" those paths by adding stamps there.
+    /// Stamping happens ONLY where tmux calls `window_set_active_pane`
+    /// (which is the sole place `active_point` is ever bumped):
+    /// - explicit selection (`select-pane -t`, `exec_select_pane`'s target
+    ///   branch) and directional navigation (`focus_dir` commit);
+    /// - `exec_last_pane` (the `prefix ;` toggle);
+    /// - mouse click focus / `display-panes` digit jump
+    ///   (`mouse_focus_pane`);
+    /// - `rotate-window` (`cmd-rotate-window.c:109` calls
+    ///   `window_set_active_pane` -- `exec_rotate_window`);
+    /// - non-detached pane/window CREATION (`spawn.c:527-531`:
+    ///   `exec_split_window`, `exec_new_window`, `exec_new_session`, and
+    ///   `exec_break_pane`'s moved pane taking focus in its new window).
+    ///
+    /// NEVER on death handoffs: tmux's `window_lost_pane` (window.c)
+    /// reassigns `w->active` directly (last_panes stack -> prev -> next)
+    /// with NO `active_point` bump, so `kill_pane_by_id`,
+    /// `exec_break_pane`'s source-window reassignment, and
+    /// `handle_exited`'s natural-exit reassignment all deliberately leave
+    /// the surviving pane's historical recency untouched (fix round 3,
+    /// controller-verified against the tmux C source -- do not "fix" them
+    /// by adding stamps).
+    ///
+    /// Also deliberately NOT stamped: `exec_select_window`/
+    /// `exec_step_window`/`exec_last_window` -- switching windows changes
+    /// the session's current *winlink* only, never any window's active
+    /// pane, so tmux doesn't bump `active_point` there either.
     fn stamp_active(&mut self, id: PaneId) {
         let point = self.next_active_point;
         self.next_active_point = self.next_active_point.saturating_add(1);
@@ -1589,22 +1612,15 @@ impl Server {
             .unwrap_or(false);
 
         if other_panes_alive {
-            // Fix round 2 (review follow-on): a natural pane exit runs the
-            // same `Layout::remove` focus reassignment as an explicit
-            // kill-pane (tmux routes both through `window_lost_pane` ->
-            // `window_set_active_pane`), so the handed-off pane must get a
-            // fresh activity stamp too -- same was-focused snapshot shape
-            // as `kill_pane_by_id`. This is the ONLY `handle_exited` branch
-            // that reassigns PANE focus: the window-death branch below
-            // retargets the session's current WINDOW (a winlink change,
-            // which tmux does not stamp -- see `stamp_active`'s doc), and
-            // the session-death branch destroys everything.
-            let was_focused = self
-                .registry
-                .session_mut(&session_name)
-                .and_then(|s| s.windows.iter().find(|w| w.id == window_id))
-                .map(|w| w.layout.focused() == pane_id)
-                .unwrap_or(false);
+            // NOTE (fix round 3, reverting round 2's stamp): `Layout::
+            // remove` may hand focus to a surviving sibling here --
+            // deliberately NOT stamped. Round 2 stamped it on the premise
+            // that tmux routes pane death through `window_set_active_pane`;
+            // the controller's direct source check disproved that: tmux's
+            // `window_lost_pane` (window.c) reassigns `w->active` directly
+            // (last_panes stack -> prev -> next) with NO `active_point`
+            // bump, so the survivor keeps its historical recency. See
+            // `Server::stamp_active`'s doc for the full stamp/no-stamp map.
             if let Some(session) = self.registry.session_mut(&session_name) {
                 if let Some(window) = session.windows.iter_mut().find(|w| w.id == window_id) {
                     window.layout.remove(pane_id);
@@ -1613,16 +1629,6 @@ impl Server {
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
             self.pane_activity.remove(&pane_id); // Finding 2 (review): prune, mirrors last_rects
-            if was_focused {
-                let new_focus = self
-                    .registry
-                    .session_mut(&session_name)
-                    .and_then(|s| s.windows.iter().find(|w| w.id == window_id))
-                    .map(|w| w.layout.focused());
-                if let Some(id) = new_focus {
-                    self.stamp_active(id);
-                }
-            }
             self.apply_layout_for_session(&session_name);
         } else {
             let is_only_window = self
