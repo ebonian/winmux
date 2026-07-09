@@ -1020,9 +1020,9 @@ impl Server {
     ///   (`mouse_focus_pane`);
     /// - `rotate-window` (`cmd-rotate-window.c:109` calls
     ///   `window_set_active_pane` -- `exec_rotate_window`);
-    /// - non-detached pane/window CREATION (`spawn.c:527-531`:
-    ///   `exec_split_window`, `exec_new_window`, `exec_new_session`, and
-    ///   `exec_break_pane`'s moved pane taking focus in its new window).
+    /// - non-detached pane/window SPAWN (`spawn.c`: `exec_split_window`,
+    ///   `exec_new_window`, `exec_new_session` -- a freshly spawned pane
+    ///   takes focus with a bump).
     ///
     /// NEVER on death handoffs: tmux's `window_lost_pane` (window.c)
     /// reassigns `w->active` directly (last_panes stack -> prev -> next)
@@ -1032,6 +1032,14 @@ impl Server {
     /// the surviving pane's historical recency untouched (fix round 3,
     /// controller-verified against the tmux C source -- do not "fix" them
     /// by adding stamps).
+    ///
+    /// NEVER on break-pane's moved pane either (fix round 4): the classic
+    /// break-pane path (cmd-break-pane.c:153-158) sets `w->active = wp` by
+    /// DIRECT assignment, no bump -- tmux distinguishes a freshly SPAWNED
+    /// pane (stamped) from break-pane's RECYCLED pane (not stamped; the
+    /// `window_set_active_pane` at cmd-break-pane.c:80 belongs to the `-W`
+    /// floating feature only, which winmux doesn't implement). So
+    /// `exec_break_pane` stamps NOTHING, on either side.
     ///
     /// Also deliberately NOT stamped: `exec_select_window`/
     /// `exec_step_window`/`exec_last_window` -- switching windows changes

@@ -217,10 +217,12 @@ impl Layout {
     /// `Server::stamp_active`, `src/server.rs`) at every
     /// `window_set_active_pane`-equivalent call site (explicit selection,
     /// directional navigation, last-pane toggle, mouse focus, rotate,
-    /// non-detached creation -- but NEVER on `window_lost_pane`-shaped
-    /// death handoffs, where tmux reassigns the active pane WITHOUT
-    /// bumping the counter; see `Server::stamp_active`'s doc for the full
-    /// stamp/no-stamp map), and threaded in here as a closure. This
+    /// spawn-time creation -- but NEVER on `window_lost_pane`-shaped
+    /// death handoffs, nor on break-pane's recycled pane
+    /// (cmd-break-pane.c:158 assigns `w->active` directly): tmux
+    /// reassigns the active pane WITHOUT bumping the counter in both
+    /// cases; see `Server::stamp_active`'s doc for the full stamp/
+    /// no-stamp map), and threaded in here as a closure. This
     /// replaces the old single-slot `last_focused`-based MRU approximation
     /// (follow-up #65, now resolved).
     ///

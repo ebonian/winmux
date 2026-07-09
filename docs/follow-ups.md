@@ -690,17 +690,20 @@ None block the sub-project 4 merge.
     `exec_new_window`/`exec_new_session` (a newly created pane is
     focused, hence most recent), `exec_last_pane`, `mouse_focus_pane`
     (mouse click focus, also reused by the `display-panes` digit-jump),
-    `exec_rotate_window` (tmux `cmd-rotate-window.c:109` calls
-    `window_set_active_pane`), and `exec_break_pane`'s moved pane taking
-    focus in its new window (creation path, tmux `spawn.c:527-531`).
-    Death handoffs (`kill_pane_by_id`, `exec_break_pane`'s source-window
-    reassignment, `handle_exited`'s natural-exit reassignment)
-    deliberately do NOT stamp: tmux's `window_lost_pane` (window.c)
-    reassigns `w->active` directly (last_panes stack -> prev -> next)
-    with no `active_point` bump, so the surviving pane keeps its
-    historical recency (SP6 Task 3 fix round 3, verified directly
-    against the tmux C source). `pane_activity` entries are pruned
-    wherever panes are dropped (mirrors `last_rects` cleanup exactly).
+    and `exec_rotate_window` (tmux `cmd-rotate-window.c:109` calls
+    `window_set_active_pane`). Death handoffs (`kill_pane_by_id`,
+    `exec_break_pane`'s source-window reassignment, `handle_exited`'s
+    natural-exit reassignment) deliberately do NOT stamp: tmux's
+    `window_lost_pane` (window.c) reassigns `w->active` directly
+    (last_panes stack -> prev -> next) with no `active_point` bump, so
+    the surviving pane keeps its historical recency (SP6 Task 3 fix
+    round 3, verified directly against the tmux C source). Neither does
+    `exec_break_pane`'s moved pane (fix round 4): the classic break-pane
+    path (cmd-break-pane.c:153-158) sets `w->active = wp` by direct
+    assignment too -- tmux only stamps freshly SPAWNED panes (spawn.c),
+    not break-pane's recycled one -- so `exec_break_pane` stamps nothing
+    on either side. `pane_activity` entries are pruned wherever panes
+    are dropped (mirrors `last_rects` cleanup exactly).
     `Layout::last_focused`
     itself is RETAINED, but narrowed to its one remaining job,
     `focus_last`/the `prefix ;` toggle — an unrelated tmux feature, not

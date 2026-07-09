@@ -1333,17 +1333,16 @@ impl Server {
                 session.last = Some(new_wid);
             }
         }
-        // The moved pane is always the sole, newly-focused pane of the
-        // brand-new window (`new_window` constructs it that way
-        // unconditionally; `-d` only changes which window the CLIENT
-        // displays, not which pane is focused inside the new window) --
-        // stamp unconditionally. This is a CREATION-path focus (tmux
-        // `spawn.c:527-531`: a non-detached spawn calls
-        // `window_set_active_pane` on the new window's pane, which bumps
-        // `active_point`), same plumbing as `exec_split_window`/
-        // `exec_new_window`'s stamps -- unlike the source window's
-        // `window_lost_pane`-shaped handoff above, which must not stamp.
-        self.stamp_active(pane_id);
+        // NOTE (fix round 4): the moved pane becoming the new window's
+        // active pane is deliberately NOT stamped either. tmux's classic
+        // break-pane path (cmd-break-pane.c:153-158) assigns
+        // `w->active = wp` DIRECTLY, no `active_point` bump -- unlike a
+        // freshly SPAWNED window/split pane (spawn.c), which does get
+        // stamped. break-pane RECYCLES an existing pane, so it keeps its
+        // historical recency, same as the source window's
+        // `window_lost_pane`-shaped handoff above. (The
+        // `window_set_active_pane` at cmd-break-pane.c:80 belongs to the
+        // `-W` floating-window feature, which winmux doesn't implement.)
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
     }
@@ -3861,10 +3860,13 @@ mod sp6_config_compat_tests {
 /// reassignments (`kill_pane_by_id`/`exec_break_pane` source window/
 /// `handle_exited`); round 3 REVERTED those after the controller verified
 /// tmux's `window_lost_pane` (window.c) never bumps `active_point` on a
-/// death handoff -- the survivor keeps its historical recency. Stamps
+/// death handoff -- the survivor keeps its historical recency. Round 4
+/// then removed `exec_break_pane`'s moved-pane stamp as well
+/// (cmd-break-pane.c:153-158 assigns `w->active` directly; only freshly
+/// SPAWNED panes are stamped, spawn.c -- break-pane recycles one). Stamps
 /// remain only on `window_set_active_pane`-equivalent paths (rotate,
-/// `cmd-rotate-window.c:109`; creation, `spawn.c:527-531` -- incl.
-/// `exec_break_pane`'s moved pane). Everything is inspected directly via
+/// `cmd-rotate-window.c:109`; spawn-time creation, `spawn.c`; explicit
+/// selection/navigation/mouse). Everything is inspected directly via
 /// `Server::pane_activity`/`Server::stamp_active`, which `dispatch.rs` (a
 /// child module of `server`) can already reach the same way production
 /// code does (see `exec_select_pane`'s `activity` closure above).
@@ -4043,23 +4045,28 @@ mod focus_activity_fix_tests {
         );
     }
 
-    /// Fix round 3, revised from round 1's Finding 1(b): `exec_break_pane`
-    /// has two focus changes of DIFFERENT tmux kinds. (1) The source
-    /// window's `Layout::remove` reassignment is a `window_lost_pane`
-    /// death handoff -- must NOT stamp (survivor keeps its history).
-    /// (2) The moved pane becoming the brand-new window's sole active pane
-    /// is a CREATION-path focus (tmux `spawn.c:527-531` shape,
-    /// `window_set_active_pane` on the new window's pane -- same plumbing
-    /// as `exec_new_window`'s stamp) -- MUST stamp.
+    /// Fix round 4 (controller read cmd-break-pane.c directly, overturning
+    /// round 3's "creation-path" caveat for the moved pane): the classic
+    /// break-pane path (cmd-break-pane.c:153-158) creates the new window
+    /// and sets `w->active = wp` by DIRECT assignment -- no `active_point`
+    /// bump (the `window_set_active_pane` at :80 belongs to
+    /// `cmd_break_pane_float`, the new `-W` floating feature, irrelevant
+    /// here). tmux distinguishes: a freshly SPAWNED window/split pane gets
+    /// stamped (spawn.c); break-pane's RECYCLED pane does not. So NEITHER
+    /// side of `exec_break_pane` stamps -- the moved pane keeps its prior
+    /// recency too.
     #[test]
-    fn exec_break_pane_stamps_moved_pane_but_not_source_handoff() {
+    fn exec_break_pane_does_not_stamp_either_side() {
         // H(A, B): break B (focused) out. A (the source window's handed-off
-        // survivor) must keep its prior activity value exactly; B (the new
-        // window's creation-focused pane) must get a fresh stamp.
+        // survivor) AND B (the moved, recycled pane) must both keep their
+        // prior activity values exactly; no fresh stamp anywhere.
         let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
         let (a, b) = (ids[0], ids[1]);
         server.stamp_active(a); // a = 1
+        server.stamp_active(b); // b = 2
         let a_before = server.pane_activity.get(&a).copied().expect("a stamped");
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
+        let before_max = max_activity(&server);
         set_focus(&mut server, &session_name, wid, b);
 
         server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
@@ -4071,8 +4078,12 @@ mod focus_activity_fix_tests {
             Some(a_before),
             "the source window's handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps)"
         );
-        let b_stamp = server.pane_activity.get(&b).copied().unwrap_or(0);
-        assert!(b_stamp > a_before, "the moved pane (B), creation-focused in its new window, must get a fresh stamp");
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the moved pane must KEEP its historical activity value too (cmd-break-pane.c:158 assigns w->active directly, no bump)"
+        );
+        assert_eq!(max_activity(&server), before_max, "break-pane must not freshly stamp any pane");
     }
 
     /// Finding 2: `pane_activity` must be pruned wherever a pane is removed
