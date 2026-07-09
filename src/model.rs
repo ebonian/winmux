@@ -516,12 +516,21 @@ impl Session {
     /// - **`detach == true`** (`-d` given): tmux calls
     ///   `session_select(dst_session, wl_dst->idx)` -- select BY THE FIXED
     ///   INDEX that was `dst`'s, which post-swap is now occupied by `src`.
-    ///   That unconditionally makes `src` the new `current` (regardless of
-    ///   what `current` was beforehand), and — mirroring
-    ///   `session_set_current`'s "push the OLD curw onto the lastw stack"
-    ///   step — sets `last` to whatever `current` WOULD have flipped to
-    ///   under the no-`-d` rule above (i.e. the same-slot post-swap content
-    ///   of the window that was current before this call).
+    ///   That makes `src` the new `current` (regardless of what `current`
+    ///   was beforehand), and — mirroring `session_set_current`'s "push the
+    ///   OLD curw onto the lastw stack" step — sets `last` to whatever
+    ///   `current` WOULD have flipped to under the no-`-d` rule above (i.e.
+    ///   the same-slot post-swap content of the window that was current
+    ///   before this call). **EXCEPT** (review fix, round 1) when the
+    ///   pre-swap `current == dst`: the reselect target (dst's original
+    ///   slot, now showing `src`) IS the current slot in that case, and
+    ///   `session_set_current` early-returns (`if (wl == s->curw) return
+    ///   1;`, session.c:475-498) without touching curw or lastw at all --
+    ///   so the whole `-d` select is a no-op and the bookkeeping
+    ///   degenerates to exactly the no-`-d` rule (`current` flips dst ->
+    ///   src via the same slot-content logic; `last` flips only if it
+    ///   named `src`/`dst`, and is otherwise untouched -- never
+    ///   overwritten).
     ///
     /// `false` (no-op, nothing swapped) if `src == dst`, or either id isn't
     /// a live window in this session -- mirrors tmux's own "no-op success if
@@ -548,7 +557,12 @@ impl Session {
 
         let flip = |id: WindowId| if id == src { dst } else if id == dst { src } else { id };
         let flipped_current = flip(self.current);
-        if detach {
+        // `-d`'s reselect targets dst's original slot (post-swap content:
+        // src); when the pre-swap current == dst, that slot IS the current
+        // slot and tmux's `session_set_current` early-returns without
+        // touching curw/lastw (see the doc comment) -- so only a select
+        // that actually CHANGES the current slot takes the detach branch.
+        if detach && self.current != dst {
             self.last = Some(flipped_current);
             self.current = src;
         } else {
@@ -993,6 +1007,70 @@ mod tests {
         // last = flip(old current = 2) = 0 (dst; the window that was
         // displaced).
         assert_eq!(s.last, Some(0));
+    }
+
+    /// Review fix (Task 5, round 1): `-d` when the pre-swap CURRENT window
+    /// IS `dst` (reachable via explicit `-s`/`-t`, since `-t` resolves to
+    /// the focused window). tmux's `session_select` -> `session_set_current`
+    /// early-returns (`if (wl == s->curw) return 1;`, session.c:475-498)
+    /// WITHOUT touching lastw when the reselect target is already the
+    /// current winlink -- which is exactly this case: the `-d` reselect
+    /// targets dst's ORIGINAL index/slot, and that slot IS the current slot
+    /// when `current == dst`. So `last` must stay untouched (slot-wise);
+    /// the buggy version unconditionally overwrote it with `Some(src)`.
+    #[test]
+    fn swap_windows_detach_when_current_is_dst_preserves_last() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1, current=2, last=Some(0)
+        s.new_window(4, 11); // id4 idx2, current=4, last=Some(2)
+        // Coordinator's scenario shape: current=idx1, last=idx0 -- select
+        // idx0 then idx1.
+        assert!(s.select_window(0)); // current=0, last=Some(4)
+        assert!(s.select_window(1)); // current=2, last=Some(0)
+        assert_eq!((s.current, s.last), (2, Some(0)));
+
+        // swap -d with src = the third window (id4, idx2) and dst = the
+        // CURRENT window (id2, idx1).
+        assert!(s.swap_windows(4, 2, true));
+        // Indices swap: id4 takes idx1, id2 takes idx2.
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(0, 0), (4, 1), (2, 2)]
+        );
+        // The -d reselect targets dst's original index (1), whose post-swap
+        // content is src (id4) -- and since that slot IS the current slot,
+        // tmux early-returns: `current` degenerates to the pure-swap flip
+        // (the current slot idx1 now shows id4).
+        assert_eq!(s.current, 4);
+        // `last` (id0, a window unrelated to the swap) is UNTOUCHED -- the
+        // early return never pushes anything onto lastw. The buggy version
+        // set it to Some(4) (== current, doubly wrong).
+        assert_eq!(s.last, Some(0));
+    }
+
+    /// Same early-return case, but with `last` naming `src`: the lastw SLOT
+    /// is untouched by the early return, but its CONTENT changed with the
+    /// swap -- in WindowId terms `last` flips src -> dst (the same rule as
+    /// the non-detach branch, because `session_select` did nothing at all).
+    #[test]
+    fn swap_windows_detach_when_current_is_dst_flips_src_named_last() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1, current=2, last=Some(0)
+        s.new_window(4, 11); // id4 idx2, current=4, last=Some(2)
+        // current=idx1(id2), last=idx2(id4): re-selecting the already-
+        // current id4 is a no-op (doesn't disturb last), then idx1.
+        assert!(s.select_window(2)); // current=4, last=Some(2) (no-op)
+        assert!(s.select_window(1)); // current=2, last=Some(4)
+        assert_eq!((s.current, s.last), (2, Some(4)));
+
+        // swap -d, src=id4 (== last), dst=id2 (== current).
+        assert!(s.swap_windows(4, 2, true));
+        assert_eq!(s.current, 4);
+        // last's slot (idx2) now holds id2 -- last flips src(4) -> dst(2).
+        // The buggy version overwrote it to Some(4) (== current).
+        assert_eq!(s.last, Some(2));
     }
 
     /// Swapping a window with itself (or an id that isn't a live window in

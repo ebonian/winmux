@@ -402,16 +402,27 @@ impl Session {
       (same slot, new content); anything else is untouched.
     - `detach == true` (`-d` given): tmux calls `session_select(dst_session,
       wl_dst->idx)` — select BY THE FIXED INDEX that was `dst`'s, which
-      post-swap is now occupied by `src`. This unconditionally makes `src`
-      the new `current` (regardless of what `current` was beforehand), and
-      — mirroring `session_set_current`'s "push the OLD curw onto the
-      lastw stack" step — sets `last` to `flip(current)` as it stood BEFORE
-      this call (the same-slot post-swap content of whichever window was
-      current going in).
+      post-swap is now occupied by `src`. When that reselect actually
+      changes the current slot (i.e. pre-swap `current != dst`) this makes
+      `src` the new `current`, and — mirroring `session_set_current`'s
+      "push the OLD curw onto the lastw stack" step — sets `last` to
+      `flip(current)` as it stood BEFORE this call (the same-slot post-swap
+      content of whichever window was current going in). **EXCEPT** (review
+      fix, Task 5 round 1): when pre-swap `current == dst`, the reselect
+      target (dst's original slot, now showing `src`) IS the current slot,
+      and `session_set_current` early-returns (`if (wl == s->curw) return
+      1;`, session.c:475-498) without touching curw or lastw — the whole
+      `-d` select is a no-op, so the bookkeeping degenerates to exactly the
+      no-`-d` rule above (`current` flips dst → src via the same
+      slot-content logic; `last` flips only if it named `src`/`dst`, and is
+      otherwise left untouched — never overwritten).
     Tests: `model.rs`'s `swap_windows_exchanges_indices_keeps_ids` (pure
     index exchange; unrelated `current` untouched, related `last` flips),
     `swap_windows_without_detach_flips_current_to_other_window`,
     `swap_windows_with_detach_keeps_focus_on_source_window`,
+    `swap_windows_detach_when_current_is_dst_preserves_last` /
+    `swap_windows_detach_when_current_is_dst_flips_src_named_last` (the
+    early-return case, round-1 review fix),
     `swap_windows_same_id_or_unknown_id_is_noop`, and `window_relative_wraps`;
     end to end, `tests/server_proto.rs`'s
     `swap_window_relative_target_moves_current_window` /
