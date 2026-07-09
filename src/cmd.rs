@@ -520,6 +520,12 @@ fn canonical(name: &str) -> Option<&'static str> {
         "confirm-before" | "confirm" => "confirm-before",
         "command-prompt" => "command-prompt",
         "set-option" | "set" => "set-option",
+        // `setw`/`set-window-option` is a real separate tmux command entry
+        // (not a bare config-level alias) sharing `set-option`'s exec
+        // function with an implied `-w` -- see the "set-option" resolve arm
+        // below, which infers `window: true` from `raw.name` for these two
+        // spellings even without an explicit `-w` flag.
+        "setw" | "set-window-option" => "set-option",
         "show-options" | "show" => "show-options",
         "bind-key" | "bind" => "bind-key",
         "unbind-key" | "unbind" => "unbind-key",
@@ -901,8 +907,12 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::CommandPrompt { initial: value_of(&v, "-I") })
         }
         "set-option" => {
+            // `setw`/`set-window-option` imply `-w` even with no explicit
+            // flag -- `canonical()` collapses both spellings onto
+            // "set-option", so the original command word (`raw.name`, not
+            // `canon`) is the only place left to recover that implication.
             let mut global = false;
-            let mut window = false;
+            let mut window = matches!(raw.name.as_str(), "setw" | "set-window-option");
             let mut append = false;
             let mut unset = false;
             let mut i = 0;
@@ -1850,5 +1860,19 @@ mod tests {
             ParsedCmd::DisplayMessage { text: Some("hello world".to_string()) }
         );
         assert_eq!(resolve(&raw("display-message", &[])).unwrap(), ParsedCmd::DisplayMessage { text: None });
+    }
+
+    /// SP6 Task 2: `setw`/`set-window-option` are real tmux command entries
+    /// (not config-level aliases) sharing `set-option`'s exec function with
+    /// an implied `-w`, per `commands-config-options-formats.md`'s
+    /// `set-window-option`/`setw` note. `setw -g pane-base-index 1` must
+    /// parse to the exact same `ParsedCmd` as `set -w -g pane-base-index 1`
+    /// -- including `window: true` despite no explicit `-w` token.
+    #[test]
+    fn setw_is_set_option_alias() {
+        let want = resolve(&raw("set", &["-w", "-g", "pane-base-index", "1"])).unwrap();
+        assert_eq!(want, ParsedCmd::SetOption { global: true, window: true, append: false, unset: false, name: "pane-base-index".to_string(), value: Some("1".to_string()) });
+        assert_eq!(resolve(&raw("setw", &["-g", "pane-base-index", "1"])).unwrap(), want);
+        assert_eq!(resolve(&raw("set-window-option", &["-g", "pane-base-index", "1"])).unwrap(), want);
     }
 }

@@ -114,7 +114,15 @@ pub fn parse_style(input: &str) -> Result<PartialStyle, String> {
         return Ok(PartialStyle::default());
     }
     let mut style = PartialStyle::default();
-    for part in trimmed.split(',') {
+    // tmux's real delimiter set is space, comma, OR newline (`style.c:72`,
+    // `const char delimiters[] = " ,\n"`) -- `fg=white bg=black bold` is
+    // fully legal tmux; comma-only splitting was the bug. Runs of
+    // delimiters (doubled comma, doubled space, ...) are skipped rather
+    // than treated as an empty/bad component.
+    for part in trimmed.split([',', ' ', '\n']) {
+        if part.is_empty() {
+            continue;
+        }
         // tmux matches style keys, attribute words, and color names via
         // strcasecmp — lowercase the whole component before matching. (Hex
         // digits after `#` are unaffected: they are case-insensitive anyway.)
@@ -127,6 +135,21 @@ pub fn parse_style(input: &str) -> Result<PartialStyle, String> {
 
 fn apply_component(style: &mut PartialStyle, part: &str) -> Result<(), ()> {
     match part {
+        // `default` resets fg/bg/attrs all the way back to "unmentioned" --
+        // since `apply_to`'s `None` means "leave base untouched", that IS
+        // "reset to the base cell" (tmux: "reset fg/bg/us/attr/flags to the
+        // base cell"). Unlike `none`/`noattr` below, this also clears
+        // fg/bg, not just attributes.
+        "default" => {
+            style.fg = None;
+            style.bg = None;
+            style.bold = None;
+            style.dim = None;
+            style.italic = None;
+            style.underline = None;
+            style.reverse = None;
+            return Ok(());
+        }
         "none" | "noattr" => {
             style.bold = None;
             style.dim = None;
@@ -484,10 +507,61 @@ mod tests {
             parse_style("notanattr"),
             Err("bad style: notanattr".to_string())
         );
+        // A bad component still errors even when it's surrounded by
+        // otherwise-good ones (doubled/leading/trailing delimiters are now
+        // skipped, not an error -- see `doubled_delimiters_are_skipped`).
         assert_eq!(
-            parse_style("fg=red,,bold"),
-            Err("bad style: fg=red,,bold".to_string())
+            parse_style("fg=red,zzz,bold"),
+            Err("bad style: fg=red,zzz,bold".to_string())
         );
+    }
+
+    /// SP6 Task 2: `style.c`'s real delimiter set is space, comma, OR
+    /// newline (`" ,\n"`), not comma-only -- `fg=white bg=black bold` is
+    /// fully legal tmux config (the user's real `.tmux.conf` uses this
+    /// exact shape for `status-right-style`/`message-style`/etc).
+    #[test]
+    fn space_separated_terms() {
+        let s = parse_style("fg=white bg=black bold").unwrap();
+        let applied = s.apply_to(Style::default());
+        assert_eq!(applied.fg, Color::Idx(7));
+        assert_eq!(applied.bg, Color::Idx(0));
+        assert!(applied.bold);
+
+        // Mixed comma AND space delimiters in the same string.
+        let mixed = parse_style("fg=red,bold dim").unwrap();
+        let applied = mixed.apply_to(Style::default());
+        assert_eq!(applied.fg, Color::Idx(1));
+        assert!(applied.bold);
+        assert!(applied.dim);
+
+        // Newline is a delimiter too.
+        let nl = parse_style("fg=green\nbold").unwrap();
+        let applied = nl.apply_to(Style::default());
+        assert_eq!(applied.fg, Color::Idx(2));
+        assert!(applied.bold);
+    }
+
+    /// Runs of delimiters (doubled comma, doubled space, leading/trailing)
+    /// are skipped, not a parse error -- `style.c`: "Runs of delimiters are
+    /// skipped."
+    #[test]
+    fn doubled_delimiters_are_skipped() {
+        assert_eq!(parse_style("fg=red,,bold").unwrap(), parse_style("fg=red,bold").unwrap());
+        assert_eq!(parse_style(" fg=red  bold ").unwrap(), parse_style("fg=red,bold").unwrap());
+        assert_eq!(parse_style(",fg=red,").unwrap(), parse_style("fg=red").unwrap());
+    }
+
+    /// `default` resets fg/bg/attrs all the way to "unmentioned" (tmux:
+    /// "reset fg/bg/us/attr/flags to the base cell") -- unlike `none`, which
+    /// only resets attributes, not colors.
+    #[test]
+    fn default_term_resets_everything() {
+        let base = Style { fg: Color::Idx(2), bg: Color::Idx(0), bold: true, ..Style::default() };
+        assert_eq!(parse_style("default").unwrap().apply_to(base), base);
+        // `default` after other components wipes what came before it too.
+        let reset = parse_style("fg=red,bold,default").unwrap().apply_to(base);
+        assert_eq!(reset, base);
     }
 
     #[test]

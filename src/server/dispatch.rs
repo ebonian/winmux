@@ -235,6 +235,28 @@ fn is_bare(raw: &RawCmd, names: &[&str]) -> bool {
     raw.args.is_empty() && names.contains(&raw.name.as_str())
 }
 
+/// SP6 Task 2: expand a leading `~` (bare, or `~/...`/`~\...`) to
+/// `%USERPROFILE%`, mirroring tmux's parse-time tilde expansion
+/// (`commands-config-options-formats.md` §2.6) for the one path winmux
+/// resolves it for -- a runtime `source-file` argument (`execute_source_file_
+/// headless`'s only caller). `~user` (a DIFFERENT user's home directory) is
+/// deliberately NOT supported (no passwd database on Windows) and is left
+/// untouched, same as any other non-`~`-prefixed path. If `USERPROFILE`
+/// isn't set, the path is left untouched too (the subsequent file-open
+/// simply fails with its own "not found"-shaped error, same as tmux's own
+/// unresolvable-`~` token error).
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("USERPROFILE").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            return format!("{home}\\{rest}");
+        }
+    }
+    path.to_string()
+}
+
 /// `find-window` (Task 7, sub-project 4) content-search predicate:
 /// case-insensitive substring match against a pane's CURRENTLY VISIBLE
 /// screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever cover
@@ -2203,6 +2225,14 @@ impl Server {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
+            // SP6 Task 2: `cmd.rs`'s own `-T` validation has accepted these
+            // two table names since sub-project 4 (`copy-mode`/
+            // `copy-mode-vi` are real bindable tables, see `src/bindings.rs`
+            // `WhichTable`), but this dispatch-time match never grew the
+            // matching arms -- a parser/executor mismatch, not a missing
+            // feature (`.superpowers/sdd/sp6-gap-analysis.md` §A).
+            "copy-mode" => WhichTable::CopyMode,
+            "copy-mode-vi" => WhichTable::CopyModeVi,
             _ => return Err(format!("unknown key table: {table}")),
         };
         let k = crate::keys::parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
@@ -2214,6 +2244,8 @@ impl Server {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
+            "copy-mode" => WhichTable::CopyMode,
+            "copy-mode-vi" => WhichTable::CopyModeVi,
             _ => return Err(format!("unknown key table: {table}")),
         };
         if all {
@@ -2221,8 +2253,21 @@ impl Server {
             return Ok(String::new());
         }
         let key = key.expect("cmd::resolve guarantees a key unless -a is given");
-        let k = crate::keys::parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
-        self.bindings.unbind(which, &k);
+        // A key token that isn't valid winmux key notation (e.g. tmux's
+        // mouse pseudo-keys like `MouseDragEnd1Pane` -- real tmux keys, but
+        // winmux's mouse handling is hardcoded dispatch logic, not
+        // table-driven via named pseudo-keys, so no such binding could ever
+        // exist here to remove) is a silent no-op on UNBIND, not an error:
+        // removing something that structurally can never be bound is at
+        // least as harmless as removing something merely unbound (doc:
+        // "Removing a key that isn't bound is a silent no-op"; an
+        // unrecognized key is also one of the things real tmux's `-q`
+        // suppresses). `bind-key` (above) still errors on a bad key --
+        // CREATING a binding to a garbage key is a real mistake worth
+        // reporting; removing a no-op binding is not.
+        if let Some(k) = crate::keys::parse_key(&key) {
+            self.bindings.unbind(which, &k);
+        }
         Ok(String::new())
     }
 
@@ -2274,7 +2319,8 @@ impl Server {
     }
 
     fn execute_source_file_headless(&mut self, path: &str) -> Result<String, String> {
-        let candidate = ConfigCandidate { path: std::path::PathBuf::from(path), required: true };
+        let expanded = expand_tilde(path);
+        let candidate = ConfigCandidate { path: std::path::PathBuf::from(expanded), required: true };
         let errors = self.load_config_files(std::slice::from_ref(&candidate));
         if errors.is_empty() {
             Ok(String::new())
@@ -3658,5 +3704,77 @@ mod choose_tree_dispatch_tests {
             }
             _ => panic!("expected ChooseTree mode"),
         }
+    }
+}
+
+/// SP6 Task 2 (config compatibility): the two dispatch-level gaps the user's
+/// real `.tmux.conf` hit that neither `cmd.rs` parsing nor `options.rs`
+/// alone can cover -- copy-mode/copy-mode-vi key-table routing, and
+/// `source-file`'s `~` expansion.
+#[cfg(test)]
+mod sp6_config_compat_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// `bind`/`unbind -T copy-mode-vi`: the `WhichTable::CopyMode`/
+    /// `CopyModeVi` variants already existed (`src/bindings.rs:39-44`) and
+    /// `cmd.rs`'s OWN `-T` validation already accepted these table names --
+    /// only this dispatch-time match was missing the arms.
+    #[test]
+    fn bind_unbind_copy_mode_tables() {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+
+        let tail = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
+        server
+            .exec_bind_key("copy-mode-vi".to_string(), false, "y".to_string(), tail)
+            .expect("bind into copy-mode-vi");
+        let y = crate::keys::parse_key("y").unwrap();
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_some());
+
+        server
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()))
+            .expect("unbind from copy-mode-vi");
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_none());
+
+        // The user's actual fixture line: `unbind -T copy-mode-vi
+        // MouseDragEnd1Pane`. `MouseDragEnd1Pane` is a real tmux mouse
+        // pseudo-key, but winmux's mouse handling is hardcoded dispatch
+        // logic, not table-driven via named pseudo-keys, so `parse_key`
+        // rejects it -- unbinding it must still succeed as a silent no-op
+        // (nothing could ever have been bound there).
+        server
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()))
+            .expect("unbind of an unparseable pseudo-key is a silent no-op, not an error");
+
+        // A copy-mode-vi bind still errors on a genuinely bad key.
+        let tail2 = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
+        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "MouseDragEnd1Pane".to_string(), tail2).is_err());
+    }
+
+    /// `source-file ~/xyz.conf` expands the leading `~/` via `USERPROFILE`
+    /// before opening the file (`commands-config-options-formats.md` §2.6).
+    #[test]
+    fn source_file_expands_tilde() {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set in the test environment");
+        let filename = format!("winmux-test-tilde-{}.conf", std::process::id());
+        let full_path = std::path::Path::new(&home).join(&filename);
+        std::fs::write(&full_path, "set -g base-index 9\n").expect("write temp conf");
+
+        let result = server.execute_source_file_headless(&format!("~/{filename}"));
+        let _ = std::fs::remove_file(&full_path);
+        result.expect("source-file with a leading ~/ expands via USERPROFILE");
+        assert_eq!(server.options.base_index(), 9);
+    }
+
+    /// A bare `~` (no trailing path) also expands.
+    #[test]
+    fn expand_tilde_bare() {
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set in the test environment");
+        assert_eq!(super::expand_tilde("~"), home);
+        assert_eq!(super::expand_tilde("no-tilde-here.conf"), "no-tilde-here.conf");
     }
 }

@@ -117,6 +117,32 @@ const SPECS: &[Spec] = &[
     Spec { name: "display-panes-time", kind: Kind::Number, choices: &[] },
     Spec { name: "display-panes-colour", kind: Kind::Str, choices: &[] },
     Spec { name: "display-panes-active-colour", kind: Kind::Str, choices: &[] },
+    // SP6 Task 2 (config compatibility): every remaining option the user's
+    // real `.tmux.conf` sets that winmux's table was missing entirely.
+    // `visual-activity`/`visual-bell`/`visual-silence`/`bell-action`/
+    // `monitor-activity`/`clock-mode-colour`/`window-status-bell-style` are
+    // accepted-and-stored but INERT (no alerts/bell/clock-mode subsystem
+    // exists yet -- same bucket as `mouse`/`history-limit` before Task 5/7
+    // wired them up; see `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    // `status-justify`/`status-left-style`/`status-right-style`/
+    // `window-status-format`/`window-status-current-format`/
+    // `window-status-separator` are typed+stored here; the status-bar
+    // RENDERING wiring for them lands in Task 4.
+    Spec { name: "visual-activity", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "visual-bell", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "visual-silence", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "bell-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "monitor-activity", kind: Kind::Flag, choices: &[] },
+    // Bare colour token (like `display-panes-colour` above), not a full
+    // style string -- stored as `Str`, parsed on read via `style::parse_color`.
+    Spec { name: "clock-mode-colour", kind: Kind::Str, choices: &[] },
+    Spec { name: "window-status-bell-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "window-status-separator", kind: Kind::Str, choices: &[] },
+    Spec { name: "status-justify", kind: Kind::Choice, choices: &["left", "centre", "right", "absolute-centre"] },
+    Spec { name: "status-left-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "status-right-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "window-status-format", kind: Kind::Str, choices: &[] },
+    Spec { name: "window-status-current-format", kind: Kind::Str, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -201,6 +227,28 @@ fn default_value(name: &str) -> Value {
         "display-panes-time" => Value::Number(1000),
         "display-panes-colour" => Value::Str("blue".to_string()),
         "display-panes-active-colour" => Value::Str("red".to_string()),
+        "visual-activity" => Value::Choice("off"),
+        "visual-bell" => Value::Choice("off"),
+        "visual-silence" => Value::Choice("off"),
+        "bell-action" => Value::Choice("any"),
+        "monitor-activity" => Value::Flag(false),
+        "clock-mode-colour" => Value::Str("blue".to_string()),
+        "window-status-bell-style" => {
+            let s = "reverse";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "window-status-separator" => Value::Str(" ".to_string()),
+        "status-justify" => Value::Choice("left"),
+        "status-left-style" => {
+            let s = "default";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "status-right-style" => {
+            let s = "default";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "window-status-format" => Value::Str("#I:#W#{?window_flags,#{window_flags}, }".to_string()),
+        "window-status-current-format" => Value::Str("#I:#W#{?window_flags,#{window_flags}, }".to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -209,6 +257,12 @@ fn default_value(name: &str) -> Value {
 /// window overlays (see module docs).
 pub struct Options {
     values: BTreeMap<&'static str, Value>,
+    /// SP6 Task 2: free-form user (`@name`) options -- tmux accepts ANY
+    /// `@`-prefixed name at any scope, string-typed, no SPECS validation
+    /// (`commands-config-options-formats.md` §3.4). Keyed WITHOUT the `@`
+    /// (the prefix is stripped once at the `set`/`show` boundary). Starts
+    /// empty: there is no "default" for a user option, only "never set".
+    user_options: BTreeMap<String, String>,
 }
 
 impl Options {
@@ -219,7 +273,7 @@ impl Options {
         for spec in SPECS {
             values.insert(spec.name, default_value(spec.name));
         }
-        Options { values }
+        Options { values, user_options: BTreeMap::new() }
     }
 
     /// Set (or unset/append/toggle) one option.
@@ -233,6 +287,9 @@ impl Options {
     ///   missing value is `Err("bad value: <name> requires a value")`.
     /// - Unknown `name` -> `Err("unknown option: <name>")`.
     pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            return self.set_user_option(uname, value, append, unset);
+        }
         let spec = find_spec(name).ok_or_else(|| format!("unknown option: {name}"))?;
 
         if unset {
@@ -315,12 +372,75 @@ impl Options {
         Ok(())
     }
 
+    /// `set`'s `@name` branch (SP6 Task 2): any `@`-prefixed name is a
+    /// free-form user option -- string-typed, no SPECS validation, valid at
+    /// any scope (`commands-config-options-formats.md` §3.4). `uname` is
+    /// the name WITHOUT its `@` prefix (already stripped by the caller).
+    /// Otherwise mirrors the `Str`-kind rules on the built-in path: `-u`
+    /// removes it entirely (there is no default to fall back to -- an unset
+    /// user option is "never set", not a stored empty string); `-a` appends
+    /// onto the current value (or empty string if never set); control
+    /// characters are rejected in the same way and for the same reason as
+    /// every other `Str`-kind value (see the control-char rejection note on
+    /// this module's docs).
+    fn set_user_option(&mut self, uname: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if unset {
+            self.user_options.remove(uname);
+            return Ok(());
+        }
+        if append {
+            let mut current = self.user_options.get(uname).cloned().unwrap_or_default();
+            current.push_str(value.unwrap_or(""));
+            if has_control_chars(&current) {
+                return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+            }
+            self.user_options.insert(uname.to_string(), current);
+            return Ok(());
+        }
+        let value = value.ok_or_else(|| format!("bad value: @{uname} requires a value"))?;
+        if has_control_chars(value) {
+            return Err(format!("bad value: {}", sanitize_control_chars(value)));
+        }
+        self.user_options.insert(uname.to_string(), value.to_string());
+        Ok(())
+    }
+
     /// Format one option's current value back as tmux would print it
     /// (`show-options`/`show-options <name>`), or `None` for an unknown
-    /// name.
+    /// name. For an `@name` user option, `None` means "never set" -- the
+    /// SAME signal an unknown BUILT-IN name gives here (this is the
+    /// non-quiet-by-default tmux behavior: `show`'s caller, `server::
+    /// dispatch::exec_show_options`, already turns a `None` into `Err("unknown
+    /// option: {n}")` for ANY name with no further change needed). See
+    /// [`Options::show_user_option`] for the `-q`-aware variant that
+    /// distinguishes "never set" from "not a real option" with an
+    /// explicit quiet flag (commands-config-options-formats.md:255).
     pub fn show(&self, name: &str) -> Option<String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            return self.user_options.get(uname).cloned();
+        }
         let value = self.values.get(name)?;
         Some(format_value(value))
+    }
+
+    /// `-q`-aware read of a user (`@name`) option, mirroring tmux's `show
+    /// -gqv "@foo"` idiom -- the canonical "read a user option, empty if
+    /// unset" pattern (commands-config-options-formats.md:255: "`show -gqv
+    /// "@foo"` when unset: prints nothing, returns success -- the `o == NULL
+    /// && *name == '@'` branch errors `invalid option: %s` only without
+    /// `-q`."). `name` may be given with or without its leading `@`.
+    /// `quiet`: `true` (tmux `-q`) -> an unset option is silently `Ok(None)`;
+    /// `false` -> `Err("invalid option: @name")`, matching tmux's default
+    /// (no `-q`) behavior. Not yet wired into `server::dispatch` (SP6 Task
+    /// 2 scope is the `Options`-level semantics; CLI `-v`/`-q` flag parsing
+    /// for `show-options` is future work).
+    pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String> {
+        let uname = name.strip_prefix('@').unwrap_or(name);
+        match self.user_options.get(uname) {
+            Some(v) => Ok(Some(v.clone())),
+            None if quiet => Ok(None),
+            None => Err(format!("invalid option: @{uname}")),
+        }
     }
 
     /// All known options, one `name value` line per option, sorted by name
@@ -333,6 +453,11 @@ impl Options {
             .iter()
             .map(|(name, value)| format!("{name} {}", format_value(value)))
             .collect();
+        // Only ACTUALLY-SET user options appear (there is no "default" row
+        // for an `@name` the way built-in options always have one).
+        for (uname, value) in &self.user_options {
+            lines.push(format!("@{uname} {}", quote_if_needed(value)));
+        }
         lines.sort();
         lines.join("\n")
     }
@@ -509,6 +634,97 @@ impl Options {
     /// and the design spec's `## 9. automatic-rename` section.
     pub fn automatic_rename(&self) -> bool {
         self.flag("automatic-rename")
+    }
+
+    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2): how an
+    /// activity/bell/silence alert is shown (`off`/`on`/`both` -- `both`
+    /// means visual AND audible). Accepted-and-stored but INERT: no
+    /// alerts/bell subsystem exists yet (`docs/follow-ups.md`-tracked; see
+    /// `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    pub fn visual_activity(&self) -> &'static str {
+        self.choice("visual-activity")
+    }
+
+    pub fn visual_bell(&self) -> &'static str {
+        self.choice("visual-bell")
+    }
+
+    pub fn visual_silence(&self) -> &'static str {
+        self.choice("visual-silence")
+    }
+
+    /// `bell-action` (SP6 Task 2): which window(s) a bell alert routes to
+    /// (`any`/`none`/`current`/`other`). Accepted-and-stored but INERT, same
+    /// bucket as the `visual-*` getters above.
+    pub fn bell_action(&self) -> &'static str {
+        self.choice("bell-action")
+    }
+
+    /// `monitor-activity` (SP6 Task 2): per-window activity monitoring
+    /// on/off. Accepted-and-stored but INERT (no activity tracking exists
+    /// yet).
+    pub fn monitor_activity(&self) -> bool {
+        self.flag("monitor-activity")
+    }
+
+    /// `clock-mode-colour` (SP6 Task 2): the big-clock overlay's colour.
+    /// Accepted-and-stored but INERT (clock-mode itself does not exist).
+    /// Same fallback-on-unparseable-stored-value pattern as
+    /// [`Options::display_panes_colour`].
+    pub fn clock_mode_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("clock-mode-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    /// `window-status-bell-style` (SP6 Task 2): style for a window tab with
+    /// an unseen bell. Accepted-and-stored but INERT (no bell-state tracking
+    /// exists yet).
+    pub fn window_status_bell_style(&self) -> &PartialStyle {
+        self.style_ref("window-status-bell-style")
+    }
+
+    /// `window-status-separator` (SP6 Task 2): literal text between window
+    /// tabs in the status bar. Typed+stored here; `status.rs`'s tab-join
+    /// wiring is Task 4.
+    pub fn window_status_separator(&self) -> &str {
+        self.str_ref("window-status-separator")
+    }
+
+    /// `status-justify` (SP6 Task 2): window-list placement within the
+    /// status bar (`left`/`centre`/`right`/`absolute-centre`). Typed+stored
+    /// here; `status.rs`'s tab-placement wiring is Task 4.
+    pub fn status_justify(&self) -> &'static str {
+        self.choice("status-justify")
+    }
+
+    /// `status-left-style`/`status-right-style` (SP6 Task 2): per-side style
+    /// layered over `status-style`. Typed+stored here; `status.rs`'s
+    /// per-side layering wiring is Task 4.
+    pub fn status_left_style(&self) -> &PartialStyle {
+        self.style_ref("status-left-style")
+    }
+
+    pub fn status_right_style(&self) -> &PartialStyle {
+        self.style_ref("status-right-style")
+    }
+
+    /// `window-status-format`/`window-status-current-format` (SP6 Task 2):
+    /// per-window tab format-string templates. Typed+stored here (the
+    /// SP3 `expand_format` subset does not yet evaluate the `#{?...}`
+    /// conditional in tmux's real default -- rendering wiring, and any
+    /// needed `expand_format` extension, is Task 4).
+    pub fn window_status_format(&self) -> &str {
+        self.str_ref("window-status-format")
+    }
+
+    pub fn window_status_current_format(&self) -> &str {
+        self.str_ref("window-status-current-format")
+    }
+
+    fn choice(&self, name: &str) -> &'static str {
+        match self.values.get(name) {
+            Some(Value::Choice(c)) => c,
+            _ => unreachable!("{name} is always Choice"),
+        }
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -1047,6 +1263,88 @@ mod tests {
         assert_eq!(o.buffer_limit(), 50);
         o.set("buffer-limit", Some("10"), false, false).unwrap();
         assert_eq!(o.buffer_limit(), 10);
+    }
+
+    /// SP6 Task 2: `set -g @yank_action 'copy-pipe'` stores; `show`
+    /// retrieves it; `-u` clears it back to "never set" (no default to fall
+    /// back to). `show_user_option`'s `-q` semantics (doc citation:
+    /// commands-config-options-formats.md:255): a never-set user option is
+    /// silent (`Ok(None)`) when quiet, `Err("invalid option: ...")` when not.
+    #[test]
+    fn user_option_set_show_roundtrip() {
+        let mut o = Options::new();
+        // Unknown @-name before it's ever set: same "unknown" signal a
+        // built-in unknown name gives (`show` returns `None`).
+        assert_eq!(o.show("@yank_action"), None);
+
+        o.set("@yank_action", Some("copy-pipe"), false, false).unwrap();
+        assert_eq!(o.show("@yank_action"), Some("copy-pipe".to_string()));
+        assert_eq!(o.show_user_option("@yank_action", false), Ok(Some("copy-pipe".to_string())));
+        assert_eq!(o.show_user_option("yank_action", false), Ok(Some("copy-pipe".to_string())), "leading @ is optional");
+
+        // Append.
+        o.set("@yank_action", Some("-and-cancel"), true, false).unwrap();
+        assert_eq!(o.show("@yank_action"), Some("copy-pipe-and-cancel".to_string()));
+
+        // A DIFFERENT, never-set user option: quiet read is silent;
+        // non-quiet read errors like tmux.
+        assert_eq!(o.show_user_option("@unset_thing", true), Ok(None));
+        assert_eq!(o.show_user_option("@unset_thing", false), Err("invalid option: @unset_thing".to_string()));
+
+        // Control chars rejected, same rule as every other Str-kind value.
+        assert_eq!(
+            o.set("@evil", Some("a\x1bb"), false, false),
+            Err("bad value: a?b".to_string())
+        );
+
+        // `-u` clears it back to "never set" -- NOT an empty string.
+        o.set("@yank_action", None, false, true).unwrap();
+        assert_eq!(o.show("@yank_action"), None);
+        assert_eq!(o.show_user_option("@yank_action", true), Ok(None));
+    }
+
+    /// SP6 Task 2: every option added to close the user's real `.tmux.conf`
+    /// gap list -- defaults verified against
+    /// `docs/tmux-reference/commands-config-options-formats.md`'s options
+    /// appendix, plus a basic set/get round trip for each.
+    #[test]
+    fn sp6_config_compat_options_defaults_and_roundtrip() {
+        let mut o = Options::new();
+        assert_eq!(o.visual_activity(), "off");
+        assert_eq!(o.visual_bell(), "off");
+        assert_eq!(o.visual_silence(), "off");
+        assert_eq!(o.bell_action(), "any");
+        assert!(!o.monitor_activity());
+        assert_eq!(o.clock_mode_colour(), Color::Idx(4)); // blue
+        let bell_style = o.window_status_bell_style().apply_to(crate::grid::Style::default());
+        assert!(bell_style.reverse);
+        assert_eq!(o.window_status_separator(), " ");
+        assert_eq!(o.status_justify(), "left");
+        // `status-left-style`/`status-right-style` default to the literal
+        // tmux "default" style term -- a no-op that leaves the base cell
+        // untouched (style.rs's `default_term_resets_everything`).
+        let base = crate::grid::Style { fg: Color::Idx(3), ..crate::grid::Style::default() };
+        assert_eq!(o.status_left_style().apply_to(base), base);
+        assert_eq!(o.status_right_style().apply_to(base), base);
+        assert_eq!(o.window_status_format(), "#I:#W#{?window_flags,#{window_flags}, }");
+        assert_eq!(o.window_status_current_format(), "#I:#W#{?window_flags,#{window_flags}, }");
+
+        o.set("visual-activity", Some("both"), false, false).unwrap();
+        assert_eq!(o.visual_activity(), "both");
+        o.set("bell-action", Some("current"), false, false).unwrap();
+        assert_eq!(o.bell_action(), "current");
+        o.set("monitor-activity", Some("on"), false, false).unwrap();
+        assert!(o.monitor_activity());
+        o.set("clock-mode-colour", Some("green"), false, false).unwrap();
+        assert_eq!(o.clock_mode_colour(), Color::Idx(2));
+        o.set("window-status-separator", Some("|"), false, false).unwrap();
+        assert_eq!(o.window_status_separator(), "|");
+        o.set("status-justify", Some("centre"), false, false).unwrap();
+        assert_eq!(o.status_justify(), "centre");
+        o.set("status-right-style", Some("fg=white bg=black"), false, false).unwrap();
+        let applied = o.status_right_style().apply_to(crate::grid::Style::default());
+        assert_eq!(applied.fg, Color::Idx(7));
+        assert_eq!(applied.bg, Color::Idx(0));
     }
 
     #[test]

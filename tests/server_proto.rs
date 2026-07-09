@@ -1644,6 +1644,48 @@ fn source_file_runtime() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP6 Task 2 (config compatibility): the user's REAL `.tmux.conf`, copied
+/// verbatim into `tests/fixtures/user.tmux.conf`, must load with zero
+/// errors. Runtime `source-file` exercises the exact same
+/// `load_config_files`/dispatch path startup config loading uses
+/// (`execute_source_file_headless` wraps one `required: true` candidate
+/// through `load_config_files`, joining every collected error into the
+/// CLI's `err` field) -- a CLI exit code of 0 with an empty `err` is the
+/// strictest "zero config errors" signal available over the protocol today
+/// (there is no direct wire-level "error count" query; the transient
+/// status-bar `config: N error(s)` notice is a STARTUP-only, 750ms-lifetime
+/// side effect, and asserting its ABSENCE for a whole test would be racy --
+/// see `config_errors_collected_and_continue` above for the POSITIVE use of
+/// that same signal). Also spot-checks a few of the fixture's real effects:
+/// the custom prefix, the `|` rebind, and `mouse on`.
+#[test]
+fn user_config_loads_clean() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user.tmux.conf");
+    cli.send(&ClientMsg::Cli(vec!["source-file".into(), fixture.to_string_lossy().into_owned()]));
+    let (_out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "", "the user's .tmux.conf must load with zero errors");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "prefix".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "prefix C-a\n");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "mouse".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "mouse on\n");
+
+    cli.send(&ClientMsg::Cli(vec!["list-keys".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("bind-key -T prefix | split-window -h"), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 // ---- Task 7: startup config loading (`## config` contract section) ----
 
 /// A `.tmux.conf`-style fixture loaded at STARTUP (via `--config`, the

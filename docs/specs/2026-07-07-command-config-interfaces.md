@@ -1556,3 +1556,165 @@ simplifications.
 - `tests/e2e.rs` / `tests/e2e_sessions.rs`: untouched and green (they assert
   default-styled output through the real binary — the visual-stability
   proof).
+
+## `sp6-config-compat` — `.tmux.conf` compatibility batch (sub-project 6, Task 2)
+
+A real user's `.tmux.conf` (copied verbatim into
+`tests/fixtures/user.tmux.conf`) exposed 17 config-load errors against the
+tables/dispatch code locked above. This section amends `cmd`, `style`,
+`options`, and `server::dispatch` (all still within this file's scope) to
+close every one of them. No function SIGNATURE in the `cmd`/`style`/
+`server::dispatch` sections above changed — only `options.rs` gains new
+public surface (a user-option store plus new getters, below).
+
+### `cmd`: `setw`/`set-window-option` (§ Command table)
+
+`setw` and `set-window-option` are real tmux command entries (not
+config-level aliases) that share `set-option`'s exec function with an
+implied `-w`, per `commands-config-options-formats.md`'s note under §2.5
+("`set-window-option`/`setw` is a real separate command entry ... sharing
+the same exec function with an implied 'window' flag ... It is *not* a
+config-level alias"). `canonical()` now maps both spellings onto
+`"set-option"` alongside the existing `"set-option" | "set"` arm; because
+that collapse loses which spelling was typed, the `"set-option"` resolve arm
+additionally inspects `raw.name` (not `canon`) to seed `window: true` for
+`"setw"`/`"set-window-option"` even with no explicit `-w` token — `setw -g
+pane-base-index 1` now parses to the exact same `ParsedCmd::SetOption` as
+`set -w -g pane-base-index 1`. Test: `setw_is_set_option_alias`.
+
+### `style`: space/comma/newline delimiters, and `default` (§ Grammar)
+
+**Amendment, supersedes the "split on `,`" grammar rule above:** tmux's
+real delimiter set is space, comma, OR newline (`style.c:72`, `const char
+delimiters[] = " ,\n"`), not comma-only — `fg=white bg=black bold` is fully
+legal tmux (the fixture's `status-right-style`/`message-style`/etc use this
+exact shape). `parse_style` now splits on `[',', ' ', '\n']`; **runs of
+delimiters are skipped** (doubled/leading/trailing separators are no longer
+a parse error — this is a **behavior change** from the original grammar
+rule, which treated any empty component as a failure; `bad_style_err_string`
+was updated to no longer rely on a doubled comma as its trigger, and a new
+`doubled_delimiters_are_skipped` test pins the corrected behavior). Also
+added: the bare `default` term (from the grammar's "Anything else ->
+attribute lookup" -- see `commands-config-options-formats.md` §4.1's term
+table), which resets fg/bg/all five attribute fields back to "unmentioned"
+(NOT just attributes, unlike `none`/`noattr`) — represented as simply
+leaving every `PartialStyle` field at `None`, since that already means
+"leave base untouched" (tmux: "reset fg/bg/us/attr/flags to the base
+cell"). Required so `status-left-style`/`status-right-style`'s tmux-real
+default value, the literal string `"default"`, parses. Tests:
+`space_separated_terms`, `doubled_delimiters_are_skipped`,
+`default_term_resets_everything`.
+
+### `options`: user (`@name`) options + new SPECS entries + getters
+
+**New public surface** (Task-2 addition to the `options` contract block):
+
+```rust
+impl Options {
+    /// `-q`-aware read of a user (`@name`) option (commands-config-
+    /// options-formats.md:255): `quiet` true -> unset is silently
+    /// `Ok(None)`; false -> `Err("invalid option: @name")`. `name` may be
+    /// given with or without its leading `@`.
+    pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String>;
+
+    pub fn visual_activity(&self) -> &'static str;
+    pub fn visual_bell(&self) -> &'static str;
+    pub fn visual_silence(&self) -> &'static str;
+    pub fn bell_action(&self) -> &'static str;
+    pub fn monitor_activity(&self) -> bool;
+    pub fn clock_mode_colour(&self) -> crate::grid::Color;
+    pub fn window_status_bell_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_separator(&self) -> &str;
+    pub fn status_justify(&self) -> &'static str;
+    pub fn status_left_style(&self) -> &crate::style::PartialStyle;
+    pub fn status_right_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_format(&self) -> &str;
+    pub fn window_status_current_format(&self) -> &str;
+}
+```
+
+**User-option store (`@name`, `commands-config-options-formats.md` §3.4):**
+`Options` gains a private `user_options: BTreeMap<String, String>` field
+(keyed WITHOUT the leading `@`), starting empty — there is no "default" for
+a user option, only "never set". `set`/`show` both branch on a leading `@`
+BEFORE touching `SPECS`/`find_spec`: any `@`-prefixed name is accepted at
+any scope, string-typed (same control-char rejection and `-a`/`-u`
+semantics as a built-in `Str`-kind option, just with no default to unset
+back to — `-u` removes the entry entirely). `show("@name")` on a never-set
+name returns `None`, the SAME signal an unknown built-in name gives — so
+`server::dispatch::exec_show_options`'s existing `None -> Err("unknown
+option: ...")` mapping needs no dispatch-side change to reproduce tmux's
+DEFAULT (non-`-q`) "unset user option errors" behavior. `show_user_option`
+is the separate, explicit `-q`-aware entry point requested by the task
+brief's delegated judgment call — it is not yet wired into `server::
+dispatch` (CLI `-v`/`-q` flag parsing for `show-options` is future work);
+today it is directly unit-tested against `Options` only. `show_all` also
+lists any ACTUALLY-SET user options (never a "default" row, unlike every
+built-in option). Test: `user_option_set_show_roundtrip`.
+
+**New SPECS entries** (accepted+stored; getters above): `visual-activity` /
+`visual-bell` / `visual-silence` (Choice `off`/`on`/`both`, default `off`),
+`bell-action` (Choice `any`/`none`/`current`/`other`, default `any`),
+`monitor-activity` (Flag, default `off`), `clock-mode-colour` (Str, bare
+colour token like `display-panes-colour`, default `blue`, parsed on read via
+`style::parse_color` with the same graceful-fallback-to-`Idx(4)` pattern),
+`window-status-bell-style` (Style, default `reverse`), `window-status-separator`
+(Str, default `" "`), `status-justify` (Choice `left`/`centre`/`right`/
+`absolute-centre`, default `left`), `status-left-style` / `status-right-style`
+(Style, default the literal string `"default"` — see the `style` amendment
+above for why this now parses), `window-status-format` /
+`window-status-current-format` (Str, default
+`#I:#W#{?window_flags,#{window_flags}, }` — the `expand_format` subset does
+not yet evaluate the `#{?...}` conditional this default contains; these
+options are ACCEPTED+STORED verbatim, not evaluated, in Task 2). All
+defaults verified against `commands-config-options-formats.md`'s options
+appendix. `visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
+`window-status-bell-style` are INERT (no alerts/bell/clock-mode subsystem
+exists — same bucket as `mouse`/`history-limit` before their own Tasks
+wired them up); `status-justify`/`status-left-style`/`status-right-style`/
+`window-status-format`/`window-status-current-format`/`window-status-separator`
+are typed+stored here, with status-bar RENDERING wiring left to a later
+task. Test: `sp6_config_compat_options_defaults_and_roundtrip`.
+
+### `server::dispatch`: copy-mode/copy-mode-vi bind tables, `~` expansion
+
+**`exec_bind_key`/`exec_unbind_key`** (private `impl Server` methods, no
+signature change): both table-name matches gain `"copy-mode" =>
+WhichTable::CopyMode` and `"copy-mode-vi" => WhichTable::CopyModeVi` arms —
+`cmd.rs`'s OWN `-T` validation already accepted these two table names (a
+pre-existing parser/executor mismatch, not a missing feature; the
+`WhichTable` variants already existed in `src/bindings.rs`). Additionally,
+`exec_unbind_key` now treats an UNBIND whose key token fails
+`keys::parse_key` (e.g. tmux's mouse pseudo-key names like
+`MouseDragEnd1Pane` — real tmux keys, but winmux's mouse handling is
+hardcoded dispatch logic, not table-driven via named pseudo-keys, so no such
+binding could ever exist to remove) as a silent no-op rather than an error;
+`exec_bind_key` is UNCHANGED in this respect and still errors on a bad key
+(creating a binding to a garbage key is a real mistake; removing a
+structurally-impossible one is not). Test: `bind_unbind_copy_mode_tables`.
+
+**`execute_source_file_headless`** (private, no signature change): the
+`path` argument is now passed through a new private `expand_tilde` helper
+before `PathBuf::from` — a leading bare `~` or `~/...`/`~\...` expands to
+`%USERPROFILE%` (`commands-config-options-formats.md` §2.6), matching real
+tmux's parse-time tilde expansion for the one path winmux resolves it for.
+`~user` (a different user's home) is deliberately unsupported (no passwd
+database on Windows) and left untouched. Test: `source_file_expands_tilde`,
+`expand_tilde_bare`.
+
+### Fixture and end-to-end proof
+
+`tests/fixtures/user.tmux.conf`: a verbatim copy of a real user's
+`.tmux.conf`, used by `tests/server_proto.rs`'s `user_config_loads_clean` —
+loaded at runtime via `source-file` (exercising the exact same
+`load_config_files` path startup `-f` loading uses), asserting a `CliDone`
+exit code of 0 with an empty `err` field (the strictest "zero config
+errors" signal available over the protocol; there is no direct wire-level
+error-count query, and the transient startup-only status-bar `config: N
+error(s)` notice is racy to assert the ABSENCE of across a whole test), plus
+spot-checks of a few real effects (`prefix` now `C-a`, `mouse` `on`, `|`
+bound to `split-window -h`). Two fixture lines are intentionally inert for
+THIS task: `swap-window` (unimplemented until a later task — `bind-key`'s
+tail is stored unresolved, so parsing/binding never validates the command
+exists, matching tmux's own late-binding semantics) and `set -g @yank_action
+'copy-pipe'` (handled entirely by the user-option store above).
