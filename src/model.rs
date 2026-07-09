@@ -468,6 +468,95 @@ impl Session {
         self.windows.sort_by_key(|w| w.index);
         true
     }
+
+    /// tmux relative window-target resolution (`+N`/`-N`, SP6 Task 5): the
+    /// window `offset` slots after (positive) or before (negative) `from`
+    /// in INDEX order, WRAPPING (`winlink_next_by_number`/
+    /// `winlink_previous_by_number`, `windows-and-sessions.md` §"Target
+    /// resolution", cmd-find.c:396-407 -- `self.windows` is already kept
+    /// sorted by index by every mutator, so a plain wrapping walk over the
+    /// vector reproduces the winlink-tree walk exactly). `None` if `from`
+    /// isn't a live window in this session. A single-window session always
+    /// returns `from` itself (a 0-step wrap), matching a one-entry RB tree's
+    /// "next after the only entry is itself" wraparound.
+    pub fn window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId> {
+        let len = self.windows.len() as i64;
+        if len == 0 {
+            return None;
+        }
+        let pos = self.windows.iter().position(|w| w.id == from)? as i64;
+        let steps = offset.rem_euclid(len);
+        let new_pos = ((pos + steps).rem_euclid(len)) as usize;
+        Some(self.windows[new_pos].id)
+    }
+
+    /// tmux `swap-window` primitive (SP6 Task 5, `windows-and-sessions.md`
+    /// §swap-window): exchange `src` and `dst`'s `index` values in place --
+    /// each window OBJECT (id, name, layout, `last_layout`, `auto_rename`
+    /// state -- everything but `index`) keeps its own identity; only which
+    /// index it sits at trades places. This mirrors real tmux's actual
+    /// mechanism exactly ("the two winlinks stay at their indexes; their
+    /// `->window` pointers are exchanged") since winmux has no separate
+    /// winlink type -- here the `index` field on the (id-keyed) `Window`
+    /// struct doubles as that winlink identity. `self.windows` stays sorted
+    /// by index afterward.
+    ///
+    /// Also resolves `current`/`last` bookkeeping, since winmux tracks both
+    /// by `WindowId` (content) where tmux tracks them by winlink (slot/
+    /// index) -- the two only coincide when a window's index never changes,
+    /// which a swap explicitly violates for `src`/`dst`. Both branches are
+    /// captured with `src`'s and `dst'`s PRE-swap `current`/`last` values,
+    /// then:
+    /// - **`detach == false`** (no `-d`): tmux leaves `curw` (the winlink /
+    ///   slot pointer) UNTOUCHED, so whichever window is displayed at that
+    ///   slot is free to change underneath it. Translated to WindowId
+    ///   tracking: if `current` (or `last`) named `src` or `dst`, it FLIPS
+    ///   to the other id (same slot, new content); anything else is
+    ///   untouched.
+    /// - **`detach == true`** (`-d` given): tmux calls
+    ///   `session_select(dst_session, wl_dst->idx)` -- select BY THE FIXED
+    ///   INDEX that was `dst`'s, which post-swap is now occupied by `src`.
+    ///   That unconditionally makes `src` the new `current` (regardless of
+    ///   what `current` was beforehand), and — mirroring
+    ///   `session_set_current`'s "push the OLD curw onto the lastw stack"
+    ///   step — sets `last` to whatever `current` WOULD have flipped to
+    ///   under the no-`-d` rule above (i.e. the same-slot post-swap content
+    ///   of the window that was current before this call).
+    ///
+    /// `false` (no-op, nothing swapped) if `src == dst`, or either id isn't
+    /// a live window in this session -- mirrors tmux's own "no-op success if
+    /// both winlinks already point at the same window" rule (the `src ==
+    /// dst` case; an unknown id is a winmux-specific defensive addition,
+    /// since real tmux can't reach this primitive with an unresolved
+    /// target at all).
+    pub fn swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool {
+        if src == dst {
+            return false;
+        }
+        let (isrc, idst) = match (
+            self.windows.iter().position(|w| w.id == src),
+            self.windows.iter().position(|w| w.id == dst),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return false,
+        };
+        let idx_src = self.windows[isrc].index;
+        let idx_dst = self.windows[idst].index;
+        self.windows[isrc].index = idx_dst;
+        self.windows[idst].index = idx_src;
+        self.windows.sort_by_key(|w| w.index);
+
+        let flip = |id: WindowId| if id == src { dst } else if id == dst { src } else { id };
+        let flipped_current = flip(self.current);
+        if detach {
+            self.last = Some(flipped_current);
+            self.current = src;
+        } else {
+            self.current = flipped_current;
+            self.last = self.last.map(flip);
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +921,117 @@ mod tests {
         let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
         assert!(s.move_window(0, 0, false));
         assert_eq!(s.windows[0].index, 0);
+    }
+
+    // ---- swap-window (SP6 Task 5) ------------------------------------------
+
+    /// The pure index exchange: ids/content stay put, only `index` values
+    /// trade places; `windows` stays sorted by index. `current` unrelated to
+    /// either swapped window is untouched; `last`, if it named one of the
+    /// swapped windows, FLIPS to the other id (winlink/slot membership
+    /// travels with the index, not the content -- see `swap_windows`'s doc
+    /// comment).
+    #[test]
+    fn swap_windows_exchanges_indices_keeps_ids() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1, current=2, last=Some(0)
+        s.new_window(4, 11); // id4 idx2, current=4, last=Some(2)
+        assert!(s.swap_windows(0, 2, false));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(2, 0), (0, 1), (4, 2)]
+        );
+        // current (id4) named neither swapped window -> untouched.
+        assert_eq!(s.current, 4);
+        // last was Some(2) (== dst) -> flips to src (0): the slot that WAS
+        // "last" now shows the other window's content.
+        assert_eq!(s.last, Some(0));
+    }
+
+    /// Without `-d`: tmux leaves `curw` (the SLOT) untouched, so the client
+    /// stays on the same index and sees whatever now occupies it -- in
+    /// WindowId terms, `current`/`last` FLIP when they named `src`/`dst`.
+    #[test]
+    fn swap_windows_without_detach_flips_current_to_other_window() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1, current=2, last=Some(0)
+        // Current is window 2 (index 1); swap it (src) with window 0 (dst,
+        // index 0), no -d.
+        assert!(s.swap_windows(2, 0, false));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(2, 0), (0, 1)]
+        );
+        // Index 1 (where the client was looking) now shows window 0's
+        // content -- current becomes dst (0), "the window that came from
+        // N" per the doc.
+        assert_eq!(s.current, 0);
+        // last was Some(0) (== dst) -> flips to src (2).
+        assert_eq!(s.last, Some(2));
+    }
+
+    /// With `-d`: focus follows the WINDOW OBJECT -- `session_select(dst,
+    /// wl_dst->idx)` unconditionally selects whichever window now sits at
+    /// dst's ORIGINAL index, which is always `src` post-swap; the OLD
+    /// current (flipped to reflect its own post-swap slot content) becomes
+    /// `last`, mirroring `session_set_current`'s push-onto-lastw step.
+    #[test]
+    fn swap_windows_with_detach_keeps_focus_on_source_window() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1, current=2, last=Some(0)
+        assert!(s.swap_windows(2, 0, true)); // src = current window (2)
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(2, 0), (0, 1)]
+        );
+        // current stays on window 2 -- the user's ORIGINAL window, now
+        // relocated to index 1 (dst's original index).
+        assert_eq!(s.current, 2);
+        // last = flip(old current = 2) = 0 (dst; the window that was
+        // displaced).
+        assert_eq!(s.last, Some(0));
+    }
+
+    /// Swapping a window with itself (or an id that isn't a live window in
+    /// this session) is a no-op, mirroring tmux's own "no-op success if both
+    /// winlinks already point at the same window" rule.
+    #[test]
+    fn swap_windows_same_id_or_unknown_id_is_noop() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1
+        assert!(!s.swap_windows(0, 0, false));
+        assert!(!s.swap_windows(0, 999, false));
+        assert!(!s.swap_windows(999, 2, true));
+        assert_eq!(
+            s.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(0, 0), (2, 1)]
+        );
+    }
+
+    /// `window_relative`: `+N`/`-N` winlink-offset resolution, wrapping at
+    /// either end of the index-sorted window list.
+    #[test]
+    fn window_relative_wraps() {
+        let mut r = Registry::new();
+        let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
+        s.new_window(2, 10); // id2 idx1
+        s.new_window(4, 11); // id4 idx2
+        // From id0 (idx0): -1 wraps to the highest index (id4).
+        assert_eq!(s.window_relative(0, -1), Some(4));
+        // From id4 (idx2): +1 wraps to the lowest index (id0).
+        assert_eq!(s.window_relative(4, 1), Some(0));
+        // Plain forward/backward steps within range.
+        assert_eq!(s.window_relative(0, 1), Some(2));
+        assert_eq!(s.window_relative(4, -1), Some(2));
+        // Multi-step offsets.
+        assert_eq!(s.window_relative(0, 2), Some(4));
+        assert_eq!(s.window_relative(0, -2), Some(2));
+        // Unknown id -> None.
+        assert_eq!(s.window_relative(999, 1), None);
     }
 
     #[test]

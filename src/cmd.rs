@@ -284,6 +284,25 @@ pub enum ParsedCmd {
     /// bare/`:`-prefixed index within the SAME session (no cross-session
     /// move -- see the design spec's `## 6. Window ops` section).
     MoveWindow { kill: bool, target: String },
+    /// `swap-window|swapw [-d] [-s src] -t dst` (SP6 Task 5): exchange the
+    /// INDEX of the `src` window (default: the acting session's CURRENT
+    /// window -- winmux has no `-s`-defaulting marked-pane concept) with the
+    /// `dst` window's index, within the SAME session (no cross-session
+    /// support -- same simplification `move-window` already documents).
+    /// `dst` is REQUIRED (`resolve` rejects a missing `-t` with the usage
+    /// error before ever constructing this variant, so `dst` is always
+    /// `Some` in practice -- the `Option` shape mirrors `SwapPane`'s for
+    /// consistency). Both `src`/`dst` accept the SAME grammar
+    /// (`windows-and-sessions.md` §swap-window/§"Target resolution"):
+    /// absent -> current window; a bare `+N`/`-N` (N optional, default 1) ->
+    /// a relative winlink offset, WRAPPING; `:N` or a bare digit-string ->
+    /// exact index in the current session; anything else -> exact-then-
+    /// prefix window NAME match. `detach` (`-d`) governs whether the acting
+    /// session's focus follows the INDEX (default: `false`, i.e. `-d`
+    /// absent) or the WINDOW OBJECT (`true`, i.e. `-d` given) through the
+    /// swap -- see `Server::exec_swap_window`'s doc comment for the exact
+    /// current/last bookkeeping this implies.
+    SwapWindow { src: Option<String>, dst: Option<String>, detach: bool },
     /// `find-window|findw <pattern>` (Task 7): case-insensitive substring
     /// search (v1, no regex) over window NAMES and every pane's CURRENTLY
     /// VISIBLE content (not scrollback) in the target session, in window-
@@ -548,6 +567,7 @@ fn canonical(name: &str) -> Option<&'static str> {
         "rotate-window" | "rotatew" => "rotate-window",
         "break-pane" | "breakp" => "break-pane",
         "move-window" | "movew" => "move-window",
+        "swap-window" | "swapw" => "swap-window",
         "find-window" | "findw" => "find-window",
         "choose-tree" | "choosetree" => "choose-tree",
         "display-panes" | "displayp" => "display-panes",
@@ -614,6 +634,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "rotate-window" => "usage: rotate-window [-D] [-t target]",
         "break-pane" => "usage: break-pane [-d] [-n name]",
         "move-window" => "usage: move-window [-k] -t index",
+        "swap-window" => "usage: swap-window [-d] [-s src] -t dst",
         "find-window" => "usage: find-window pattern",
         "choose-tree" => "usage: choose-tree [-s] [-w]",
         "display-panes" => "usage: display-panes [-d ms]",
@@ -1165,6 +1186,14 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             let Some(target) = value_of(&v, "-t") else { return Err(bad()) };
             Ok(ParsedCmd::MoveWindow { kill: has(&b, "-k"), target })
         }
+        "swap-window" => {
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-s", "-t"]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            let Some(dst) = value_of(&v, "-t") else { return Err(bad()) };
+            Ok(ParsedCmd::SwapWindow { src: value_of(&v, "-s"), dst: Some(dst), detach: has(&b, "-d") })
+        }
         "find-window" => {
             let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
             if p.len() != 1 {
@@ -1567,6 +1596,28 @@ mod tests {
         );
         // -t is required -- there's nothing for a bare move-window to do.
         assert_eq!(resolve(&raw("move-window", &[])).unwrap_err(), usage("move-window").unwrap());
+    }
+
+    #[test]
+    fn swap_window_flags() {
+        // The user's real config binding: `bind -r "<" swap-window -d -t -1`.
+        assert_eq!(
+            resolve(&raw("swap-window", &["-d", "-t", "-1"])).unwrap(),
+            ParsedCmd::SwapWindow { src: None, dst: Some("-1".to_string()), detach: true }
+        );
+        // `bind -r ">" swap-window -d -t +1`.
+        assert_eq!(
+            resolve(&raw("swapw", &["-d", "-t", "+1"])).unwrap(),
+            ParsedCmd::SwapWindow { src: None, dst: Some("+1".to_string()), detach: true }
+        );
+        // Explicit -s/-t absolute-index targets, no -d.
+        assert_eq!(
+            resolve(&raw("swap-window", &["-s", ":2", "-t", ":4"])).unwrap(),
+            ParsedCmd::SwapWindow { src: Some(":2".to_string()), dst: Some(":4".to_string()), detach: false }
+        );
+        // -t is required -- there's nothing for a bare swap-window to do.
+        assert_eq!(resolve(&raw("swap-window", &[])).unwrap_err(), usage("swap-window").unwrap());
+        assert_eq!(resolve(&raw("swap-window", &["-s", "0"])).unwrap_err(), usage("swap-window").unwrap());
     }
 
     #[test]

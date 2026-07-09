@@ -198,6 +198,45 @@ fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
     panes.get(idx).copied().ok_or_else(|| format!("pane not found: {s}"))
 }
 
+/// `swap-window`'s `-s`/`-t` target grammar (SP6 Task 5,
+/// `windows-and-sessions.md` §swap-window/§"Target resolution"): `None` ->
+/// `session.current`; a bare `+N`/`-N` (N optional, default 1) -> a relative
+/// winlink offset via [`Session::window_relative`], WRAPPING; a leading `:`
+/// (`:N`, tmux's "index N in the current session" form) is stripped before
+/// falling back to [`resolve_window`]'s existing absolute-index/name
+/// grammar. No cross-session support (same-session-only, mirroring
+/// `move-window`'s documented simplification) -- a bare `session:window`
+/// target isn't split here at all; the whole string is resolved as a window
+/// spec within the CALLER's already-chosen session.
+fn resolve_swap_window_target(session: &Session, spec: Option<&str>) -> Result<WindowId, String> {
+    let Some(raw) = spec else { return Ok(session.current) };
+    let stripped = raw.strip_prefix(':').unwrap_or(raw);
+    if let Some(offset) = parse_relative_offset(stripped) {
+        return session
+            .window_relative(session.current, offset)
+            .ok_or_else(|| format!("window not found: {raw}"));
+    }
+    resolve_window(session, Some(stripped))
+}
+
+/// Parse a bare `+N`/`-N` winlink-offset token (`N` optional, defaulting to
+/// magnitude 1, per cmd-find.c:396-407's "`+`/`-` alone mean 1"). `None` for
+/// anything not shaped like a signed offset (falls through to
+/// [`resolve_window`]'s absolute-index/name grammar instead).
+fn parse_relative_offset(s: &str) -> Option<i64> {
+    let (sign, digits) = if let Some(d) = s.strip_prefix('+') {
+        (1i64, d)
+    } else if let Some(d) = s.strip_prefix('-') {
+        (-1i64, d)
+    } else {
+        return None;
+    };
+    if digits.is_empty() {
+        return Some(sign);
+    }
+    digits.parse::<i64>().ok().map(|n| sign * n)
+}
+
 /// Convert a `SystemTime` to a local-time `SYSTEMTIME` (carrying
 /// `wDayOfWeek`) for the CLI `ls` command's tmux-style creation-time
 /// formatting. Moved verbatim from the deleted `cli_exec.rs`.
@@ -1387,6 +1426,42 @@ impl Server {
             self.last_rects.remove(&pid);
             self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
         }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    /// `swap-window|swapw [-d] [-s src] -t dst` (SP6 Task 5,
+    /// `windows-and-sessions.md` §swap-window): exchange the target session's
+    /// `src` and `dst` windows' INDEXES (`src` defaults to the session's
+    /// current window; `dst` is required by `cmd::resolve`, so `dst` is
+    /// always `Some` here in practice). Both targets are resolved via
+    /// [`resolve_swap_window_target`]'s grammar (relative `+N`/`-N`,
+    /// wrapping; `:N`/bare-digit absolute index; name/prefix match).
+    ///
+    /// Same-window swap (`src == dst`, e.g. `-t` resolves back to the
+    /// current window with no other window present) is a no-op success,
+    /// mirroring real tmux. See [`crate::model::Session::swap_windows`]'s
+    /// doc comment for the exact `current`/`last`/`-d` bookkeeping this
+    /// delegates to -- this handler's only job is target resolution plus
+    /// re-flowing the layout for whichever window ends up current.
+    fn exec_swap_window(&mut self, src: Option<String>, dst: Option<String>, detach: bool, cs: Option<&str>) -> Result<String, String> {
+        let session_name = self.resolve_session_name(None, cs)?;
+        let Some(session) = self.registry.session_mut(&session_name) else {
+            return Err(format!("can't find session: {session_name}"));
+        };
+        let src_wid = resolve_swap_window_target(session, src.as_deref())?;
+        let Some(dst_spec) = dst else {
+            return Err(cmd::usage("swap-window").expect("swap-window has a usage string").to_string());
+        };
+        let dst_wid = resolve_swap_window_target(session, Some(&dst_spec))?;
+        session.swap_windows(src_wid, dst_wid, detach);
+        // NOTE: deliberately does NOT consult `renumber-windows` here --
+        // swap-window exchanges winlink indexes only, it never closes an
+        // index gap the way killing a window does. Per
+        // `windows-and-sessions.md` §"renumber-windows", the auto-trigger is
+        // `server_kill_window`'s `renumber=1` path plus the manual
+        // `move-window -r`; swap-window's own exec never calls
+        // `session_renumber_windows` at all.
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
     }
@@ -2662,6 +2737,7 @@ impl Server {
             RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
             BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
+            SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst, detach, None),
             FindWindow { pattern } => self.exec_find_window(pattern, None),
             ChooseTree { .. } => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
@@ -2845,6 +2921,7 @@ impl Server {
             RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
             BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
+            SwapWindow { src, dst, detach } => wrap(self.exec_swap_window(src, dst, detach, Some(session_name.as_str()))),
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),

@@ -248,6 +248,9 @@ impl Session {
     pub fn last_window(&mut self) -> bool;
     pub fn current_window(&self) -> &Window; pub fn current_window_mut(&mut self) -> &mut Window;
     pub fn window_by_pane(&mut self, pane: crate::layout::PaneId) -> Option<&mut Window>;
+    // Amendment (sub-project 6, Task 5, `swap-window`) -- see below.
+    pub fn window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>;
+    pub fn swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool;
 }
 ```
 
@@ -362,6 +365,57 @@ impl Session {
   `next_window`/`prev_window` are no-ops with a single window.
 - `last_window` swaps `current`/`last` (like `Layout::focus_last`); `false`
   if there is no `last` or it no longer exists.
+- **Amendment (sub-project 6, Task 5, `swap-window`):** two new `Session`
+  methods, both pure bookkeeping (no I/O), backing
+  `server::dispatch::exec_swap_window` (`## server-dispatch` section of the
+  sibling `command-config` contract). Full behavioral spec:
+  `docs/tmux-reference/windows-and-sessions.md` §swap-window.
+  - `window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>`:
+    the window `offset` slots after (positive) / before (negative) `from` in
+    INDEX order, WRAPPING at either end (`self.windows` is already
+    index-sorted by every mutator, so this is a plain modular walk over the
+    vector — the pure-data equivalent of tmux's `winlink_next_by_number`/
+    `winlink_previous_by_number` winlink-tree walk). `None` if `from` isn't
+    a live window in this session. A single-window session returns `from`
+    itself for any offset (0-step wrap). This is `swap-window`'s `-1`/`+1`
+    relative-target grammar (the user's real `bind -r "<" swap-window -d -t
+    -1` binding).
+  - `swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool`:
+    exchanges `src`'s and `dst`'s `index` values in place (`self.windows`
+    stays sorted afterward) — each window OBJECT (id, name, layout,
+    `last_layout`, `auto_rename` state) keeps its own identity; only which
+    index it sits at trades places, mirroring tmux's actual mechanism
+    exactly ("the two winlinks stay at their indexes; their `->window`
+    pointers are exchanged") since winmux has no separate winlink type (the
+    `index` field on the id-keyed `Window` doubles as that identity here).
+    `false` (no-op, nothing changed) if `src == dst`, or either id isn't a
+    live window in this session — mirrors tmux's own "no-op success if both
+    winlinks already point at the same window" rule.
+    Also resolves `current`/`last`, since winmux tracks both by `WindowId`
+    (content) where tmux tracks them by winlink (slot/index) — the two only
+    coincide when a window's index never changes, which the swap explicitly
+    violates for `src`/`dst`. Let `flip(id)` map `src`↔`dst` and pass any
+    other id through unchanged:
+    - `detach == false` (no `-d`): tmux leaves `curw` (the SLOT pointer)
+      untouched, so whatever the slot now displays is a different window —
+      `current`/`last`, if they named `src` or `dst`, FLIP to the other id
+      (same slot, new content); anything else is untouched.
+    - `detach == true` (`-d` given): tmux calls `session_select(dst_session,
+      wl_dst->idx)` — select BY THE FIXED INDEX that was `dst`'s, which
+      post-swap is now occupied by `src`. This unconditionally makes `src`
+      the new `current` (regardless of what `current` was beforehand), and
+      — mirroring `session_set_current`'s "push the OLD curw onto the
+      lastw stack" step — sets `last` to `flip(current)` as it stood BEFORE
+      this call (the same-slot post-swap content of whichever window was
+      current going in).
+    Tests: `model.rs`'s `swap_windows_exchanges_indices_keeps_ids` (pure
+    index exchange; unrelated `current` untouched, related `last` flips),
+    `swap_windows_without_detach_flips_current_to_other_window`,
+    `swap_windows_with_detach_keeps_focus_on_source_window`,
+    `swap_windows_same_id_or_unknown_id_is_noop`, and `window_relative_wraps`;
+    end to end, `tests/server_proto.rs`'s
+    `swap_window_relative_target_moves_current_window` /
+    `swap_window_without_d_keeps_focus_on_index`.
 
 **Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
 APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends

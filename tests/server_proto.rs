@@ -4407,6 +4407,84 @@ fn move_window_dash_k_kills() {
     server.join().expect("server exits after last session dies");
 }
 
+/// `swap-window -d -t -1` (SP6 Task 5, the user's real `bind -r "<"
+/// swap-window -d -t -1` binding minus the key-binding indirection):
+/// swaps the CURRENT window with the previous one by relative offset
+/// (wrapping), and `-d` means focus FOLLOWS THE WINDOW OBJECT -- the client
+/// keeps looking at its own pane content, which is now at the new (lower)
+/// index. Proven two ways: (1) the status line's `*`/`-` flags land on the
+/// swapped indexes, (2) the marked pane content stays visible (proof focus
+/// followed the WINDOW, not the slot).
+#[test]
+fn swap_window_relative_target_moves_current_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // `c` creates window 1 (index 1, current); window 0 becomes "last".
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo w1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w1mark").is_some());
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"swap-window -d -t -1\r".to_vec()));
+    // Window 1 (marked, was current) swaps indexes with window 0: window 1
+    // is now at index 0, window 0 is now at index 1. With -d, the client
+    // stays on window 1 (its own window), which is now current at index 0.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+    // Content proof: still looking at the SAME (marked) pane -- focus
+    // followed the window object across the index change.
+    assert!(marker_col(&grid, "w1mark").is_some());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `swap-window -t -1` (no `-d`): the client's focus stays on the same
+/// INDEX/slot, which now shows the OTHER window's content -- the opposite
+/// of the `-d` case above. Proven by pane content: after the swap, window
+/// 0's marker is visible again and window 1's marker is not, even though
+/// no `select-window`-style command was ever issued.
+#[test]
+fn swap_window_without_d_keeps_focus_on_index() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 0: mark its pane before switching away from it.
+    c.send(&ClientMsg::Stdin(b"echo w0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w0mark").is_some());
+
+    // `c` creates window 1 (index 1, current); window 0 becomes "last".
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo w1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w1mark").is_some());
+
+    // Swap current (window 1) with the previous window (window 0), WITHOUT
+    // -d.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"swap-window -t -1\r".to_vec()));
+    // Focus stayed on the same slot (index 1) -- which now shows window 0's
+    // content: "w0mark" is visible again, "w1mark" is not.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w0mark").is_some() && marker_col(g, "w1mark").is_none());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    // Window 0's shell (now at index 1, current) just exited, killing it;
+    // fallback goes to `last` (window 1, still alive, now at index 0) --
+    // the survivor renders as window 0.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")) && marker_col(g, "w1mark").is_some());
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `f` (find-window): matches by window NAME, matches by visible pane
 /// CONTENT, and shows a transient `no windows matching: <p>` message (and
 /// switches nothing) when neither matches.

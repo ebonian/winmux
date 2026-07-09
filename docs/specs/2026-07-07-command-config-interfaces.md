@@ -1739,8 +1739,95 @@ errors" signal available over the protocol; there is no direct wire-level
 error-count query, and the transient startup-only status-bar `config: N
 error(s)` notice is racy to assert the ABSENCE of across a whole test), plus
 spot-checks of a few real effects (`prefix` now `C-a`, `mouse` `on`, `|`
-bound to `split-window -h`). Two fixture lines are intentionally inert for
-THIS task: `swap-window` (unimplemented until a later task — `bind-key`'s
-tail is stored unresolved, so parsing/binding never validates the command
-exists, matching tmux's own late-binding semantics) and `set -g @yank_action
-'copy-pipe'` (handled entirely by the user-option store above).
+bound to `split-window -h`). One fixture line is intentionally inert:
+`set -g @yank_action 'copy-pipe'` (handled entirely by the user-option store
+above). The fixture's other two `swap-window` lines (`bind -r "<"
+swap-window -d -t -1` / `bind -r ">" swap-window -d -t +1`) parse and bind
+cleanly as of Task 2 already (`bind-key`'s tail is stored unresolved, so
+binding never validated the command exists) but were functionally inert
+until `swap-window` itself was implemented — see the `## swap-window`
+section below (sub-project 6, Task 5).
+
+## `swap-window` — swap-window command (sub-project 6, Task 5)
+
+Adds `ParsedCmd::SwapWindow { src: Option<String>, dst: Option<String>,
+detach: bool }` to the `cmd` enum locked above (Task 3), plus a
+`server::dispatch` handler — closing the gap flagged by the SP6 gap
+analysis (`swap-pane` existed; `swap-window` did not). Full spec:
+`docs/tmux-reference/windows-and-sessions.md` §swap-window.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    SwapWindow { src: Option<String>, dst: Option<String>, detach: bool },
+}
+```
+
+- `canonical()`: `"swap-window" | "swapw" => "swap-window"`.
+- `usage("swap-window")`: `"usage: swap-window [-d] [-s src] -t dst"`.
+- `resolve`: `scan_flags` with `bools: ["-d"]`, `values: ["-s", "-t"]`, no
+  positionals. `-t` is REQUIRED — a missing `-t` is the usage error (`dst`'s
+  `Option<String>` shape is therefore always `Some` once `resolve` succeeds;
+  it mirrors `SwapPane`'s `Option` shape for consistency, not because `dst`
+  can legitimately be absent downstream). `-s` is optional — absent means
+  "the acting session's current window" at dispatch time (winmux has no
+  marked-pane concept, so unlike real tmux's `CMD_FIND_DEFAULT_MARKED`
+  default, `-s`'s absence always means "current", never "the mark"). Test:
+  `swap_window_flags` (covers the user's real `-d -t -1` / `-d -t +1`
+  bindings, an explicit `-s :2 -t :4`, and the missing-`-t` usage error).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+New private helpers, and one new handler, following the `swap-pane`/
+`move-window` pattern (`exec_swap_pane`, `exec_move_window`) exactly —
+same-session-only scope, no cross-session support (the same simplification
+`move-window` already documents):
+
+```rust
+fn resolve_swap_window_target(session: &Session, spec: Option<&str>) -> Result<WindowId, String>;
+fn parse_relative_offset(s: &str) -> Option<i64>;
+fn exec_swap_window(&mut self, src: Option<String>, dst: Option<String>, detach: bool, cs: Option<&str>) -> Result<String, String>;
+```
+
+- `resolve_swap_window_target`'s grammar (both `src`/`dst`; per the doc's
+  §"Target resolution"): absent -> `session.current`; a leading `:` is
+  stripped (tmux's "index N in the CURRENT session" form) before falling
+  back to the existing `resolve_window` free function's absolute-index/
+  name-then-prefix grammar; a bare `+N`/`-N` (`N` optional, default
+  magnitude 1) is a RELATIVE winlink offset, resolved via the new
+  `model::Session::window_relative` primitive (below), WRAPPING at either
+  end of the index-sorted window list — this is what makes the user's real
+  `bind -r "<" swap-window -d -t -1` / `bind -r ">" swap-window -d -t +1`
+  bindings work end to end.
+- `exec_swap_window` resolves `src` (defaulting to current) and `dst`
+  (required — re-checked here too, defensively, since `dst: Option<String>`
+  is the locked shape even though `resolve` never actually constructs a
+  `None`), then delegates the entire swap mechanism — including the
+  `detach`/`-d` current-and-last bookkeeping — to the new
+  `model::Session::swap_windows` primitive (see the `server-client`
+  contract's `## model` section amendment), and finishes with the existing
+  `apply_layout_for_session` (re-flows whichever window ends up current;
+  mirrors every other window-switching handler). Same-window swap (`src ==
+  dst`, e.g. a single-window session's own `-1`/`+1` wrap target) is a no-op
+  success (`Session::swap_windows` returns `false`, silently ignored —
+  matches real tmux's own "no-op success if both winlinks already point at
+  the same window" rule). Deliberately does NOT consult
+  `renumber-windows` — swapping trades two winlinks' indexes without ever
+  closing a gap, so there is nothing for `Session::renumber` to fix (per the
+  doc's own `renumber-windows` section, the only auto-trigger is
+  `server_kill_window`'s `renumber=1` path). Wired into BOTH the headless
+  (`SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst,
+  detach, None)`) and client-context (`wrap(self.exec_swap_window(src, dst,
+  detach, Some(session_name.as_str())))`) dispatch tables, same pattern as
+  every other Task-6/7 window-op command.
+
+Tests: `tests/server_proto.rs`'s
+`swap_window_relative_target_moves_current_window` (the `-d` case: swaps
+the current window with the previous one by relative offset; the marked
+pane's content stays visible across the index change, proving focus
+followed the WINDOW OBJECT) and `swap_window_without_d_keeps_focus_on_index`
+(the no-`-d` case: after the same swap, the OTHER window's content becomes
+visible without any explicit `select-window`, proving focus stayed on the
+same INDEX/slot).
