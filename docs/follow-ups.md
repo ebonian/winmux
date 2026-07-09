@@ -709,3 +709,28 @@ None block the sub-project 4 merge.
     `mouse_border_drag_resizes_upward`, which reproduced the bug RED (timed
     out waiting for the border to move) before the fix and pass GREEN after.
     Full `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.
+
+67. **`unbind` on an unparseable key is unconditionally silent (not `-q`-gated), and
+    mouse pseudo-keys are not table-driven** (found in SP6 Task 2 review, 2026-07-10).
+    Two related fidelity gaps behind one shim: (a) `exec_unbind_key`
+    (`src/server/dispatch.rs`) silently no-ops for ANY token `keys::parse_key`
+    rejects — real tmux errors on `unknown key: %s` unless `-q` is given
+    (docs/tmux-reference/commands-config-options-formats.md:442), so a typo like
+    `unbind Ct-x` is swallowed today. Fix sketch: silence only tokens matching the
+    tmux mouse-pseudo-key name grammar (`MouseDown/Up/Drag/DragEnd{1,2,3}`,
+    `WheelUp/Down`, `Double/TripleClick{1,2,3}` × `Pane/Border/Status/StatusLeft/
+    StatusRight/StatusDefault`), error otherwise unless `-q`. (b) Deeper: winmux's
+    mouse actions are hardcoded in dispatch rather than resolved through the key
+    tables, so `unbind -T copy-mode-vi MouseDragEnd1Pane` (the user's real config —
+    tmux idiom for "don't copy/jump on mouse release in vi copy mode") parses clean
+    but cannot have its tmux effect. Real fix is table-driven mouse bindings
+    (synthesized mouse key names resolved through `Bindings` like tmux); sizeable,
+    interacts with SP6 Tasks 6-7's release-semantics work. LOW/MEDIUM.
+
+68. **`show-options -v`/`-q` CLI flags not wired into dispatch** (found in SP6
+    Task 2, 2026-07-10). `Options::show_user_option` implements tmux-correct
+    value-only/quiet semantics at the options layer (unit-tested), but `cmd.rs`
+    doesn't parse `-v`/`-q` for `show-options`/`show`, so `show -gqv "@foo"` — the
+    exact TPM rung-1 primitive (docs/superpowers/plans/2026-07-08-tpm-plugin-support.md)
+    — is not yet available end-to-end. Fix: parse the flags in cmd.rs, thread to
+    `exec_show_options`. SMALL. LOW (until SP5/TPM work starts).
