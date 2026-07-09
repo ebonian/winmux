@@ -1110,7 +1110,21 @@ simpler, and satisfies the same observable contract (the client's next
    `Rect { x: 0, y: pane_area_y(), w: session.size.0, h: session.size.1 }`,
    THIS session's CURRENT window's `Layout::rects`) — outside that area
    (including a blank gap row on a client taller than the session's shared
-   size) is a no-op that also clears any in-progress drag.
+   size) is a no-op that also ends any in-progress drag.
+
+**Guard-time drag teardown (`end_drag`, Task 7 fix round 1):** all three
+early-exit guards above (overlay-open on Drag/Up, status-row diversion on
+Drag/Up, outside-pane-area on any kind) end an in-progress drag via one
+shared helper, `end_drag(client)`, which clears BOTH `client.mouse.drag`
+AND `client.mouse.autoscroll`. The original Task 7 code cleared only
+`drag` at these sites, leaving an edge-armed autoscroll timer running
+forever when the pointer crossed onto the (adjacent) status row — the
+review-confirmed runaway-scroll bug, regression-tested by
+`autoscroll_stops_when_drag_leaves_onto_status_row`. This is the SECOND
+state-leak class at these exact guard sites (follow-up #64's stale-drag
+leak was the first), which is why the teardown is now a single named
+helper: any future per-drag field added to `MouseClientState` gets cleaned
+up at every guard by construction.
 
 **Hit-testing (`hit_test`, pure, tested indirectly via the `tests/
 server_proto.rs` mouse suite):** pane interior first; then a vertical

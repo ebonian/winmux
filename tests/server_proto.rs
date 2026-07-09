@@ -3818,6 +3818,91 @@ fn drag_at_top_row_autoscrolls_into_history() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Task 7 fix round 1 (review, Moderate): `docs/tmux-reference/mouse.md`
+/// §5.4 -- "motion outside the pane is a no-op that STOPS the timer". The
+/// three early-exit guards in `dispatch_mouse` (overlay-open, status-row
+/// diversion, outside-pane-area) reset `client.mouse.drag` but originally
+/// did NOT clear `client.mouse.autoscroll`; since `service_autoscroll_tick`
+/// only self-disarms when the client leaves copy mode or the pane vanishes,
+/// a drag armed at a pane edge whose pointer then moved onto the status row
+/// (adjacent to the pane's LAST row -- and reachable from the TOP row too
+/// with `status-position top`, exercised here so the armed scroll direction
+/// is the easy-to-assert into-history one) kept scrolling 1 line per 50ms
+/// forever. Arms autoscroll at the pane's top row, proves it is advancing,
+/// drags onto the status row, then samples the indicator's scroll offset
+/// twice ~300ms apart (6+ tick intervals) and asserts it stopped.
+#[test]
+fn autoscroll_stops_when_drag_leaves_onto_status_row() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Status bar on TOP: its row (0) is adjacent to the pane's FIRST row
+    // (1), so an upward edge-drag can overshoot onto it -- and the armed
+    // autoscroll direction is "into history", which the `[N/M]` indicator
+    // makes directly observable. (The bottom-edge variant is the same guard
+    // and the same bug; this construction just asserts more simply.)
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-position".into(), "top".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| row_text(g, 0).contains("[0]"));
+
+    // Plenty of history so the runaway scroll (RED) has room to keep
+    // visibly advancing at both sample points.
+    c.send(&ClientMsg::Stdin(b"1..300 | ForEach-Object { \"histmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("histmark300")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    // With status on top the indicator is on the pane's own first row,
+    // which is screen row 1 here -- `has_indicator`/`row0` read screen row
+    // 0, so wait on the pane row directly.
+    c.recv_output_until(&mut grid, |g| row_text(g, 1).contains("[0/"));
+
+    // Press + drag to the pane's TOP row (screen y = 1): arms autoscroll
+    // into history (one immediate line + the 50ms timer).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 1, false)));
+    // Prove the timer is genuinely running before the overshoot.
+    c.recv_output_until(&mut grid, |g| row_text(g, 1).contains("[5/"));
+
+    // Overshoot: drag onto the status row (screen y = 0). This hits
+    // `dispatch_mouse`'s status-row guard, which must stop the timer.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 0, false)));
+    // Synchronize on the same connection so the Drag has been fully
+    // processed server-side before sampling (`next_cli_done` pattern; no
+    // drag-END was sent so no buffer exists yet, and `list-buffers` is a
+    // clean exit-0 no-op either way).
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+
+    // Two samples ~300ms apart (6+ autoscroll intervals), parsing the
+    // `[N/M]` indicator's scroll offset from the pane's first row (screen
+    // row 1 under `status-position top`).
+    let sample = |g: &Grid| -> Option<u32> {
+        let row = row_text(g, 1);
+        let trimmed = row.trim_end();
+        let open = trimmed.rfind('[')?;
+        let rest = &trimmed[open + 1..];
+        let slash = rest.find('/')?;
+        rest[..slash].parse().ok()
+    };
+    drain_briefly(&c, &mut grid, Duration::from_millis(150));
+    let first = sample(&grid).expect("copy-mode indicator visible after overshoot");
+    drain_briefly(&c, &mut grid, Duration::from_millis(300));
+    let second = sample(&grid).expect("copy-mode indicator still visible");
+    assert_eq!(
+        first, second,
+        "autoscroll must STOP once the drag pointer leaves the pane onto the status row (mouse.md §5.4); scroll kept advancing {first} -> {second}"
+    );
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `docs/tmux-reference/mouse.md` :636-640 / `copy-mode-and-buffers.md`
 /// :440-447: after DoubleClick installs a `SelKind::Word` anchor
 /// (`select_word_at`), continuing to drag snaps the MOVING end to the whole

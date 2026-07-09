@@ -859,6 +859,24 @@ fn scroll_and_resnap(panes: &HashMap<PaneId, PaneRuntime>, seps: &str, client: &
     move_drag_cursor(panes, seps, client, pane, cursor_x, cy_edge);
 }
 
+/// End any in-progress mouse drag AND its edge-autoscroll timer together
+/// (Task 7 fix round 1). `dispatch_mouse`'s three early-exit guards
+/// (overlay-open, status-row diversion, outside-pane-area) each reset
+/// `client.mouse.drag` so a stale Border/Selecting drag can't survive
+/// across them (follow-up #64 / Task 1's state-leak class) -- but the Task 7
+/// review found the SAME leak class recurring with the new `autoscroll`
+/// field: a drag armed at a pane edge whose pointer then crossed onto the
+/// status row (adjacent to the pane's first/last row) kept its timer
+/// running forever, since `service_autoscroll_tick` only self-disarms when
+/// the client leaves copy mode or the pane dies. This helper is the one
+/// place "the drag session is over" is defined, so any FUTURE per-drag
+/// state added to `MouseClientState` gets cleaned up at every guard by
+/// construction instead of repeating the leak a third time.
+fn end_drag(client: &mut ClientState) {
+    client.mouse.drag = MouseDrag::None;
+    client.mouse.autoscroll = None;
+}
+
 /// After an interactive `Drag` event has updated the copy cursor
 /// (`move_drag_cursor`), arm/refresh/disarm this client's drag-autoscroll
 /// timer (Task 7, SP6 wave 2, `docs/tmux-reference/mouse.md` §5.4): if the
@@ -1980,9 +1998,11 @@ impl Server {
             // triggered mid-drag) must not survive across the overlay's
             // lifetime -- clear it just like the sibling "outside pane
             // area"/status-row guards do, so a later out-of-sequence
-            // Drag/Up can't revive stale Border/Selecting state.
+            // Drag/Up can't revive stale Border/Selecting state. Task 7 fix
+            // round 1: `end_drag` also stops the edge-autoscroll timer,
+            // which this guard's bare `drag = None` used to leave running.
             if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
-                client.mouse.drag = MouseDrag::None;
+                end_drag(client);
             }
             return ExecOutcome::Ok(String::new());
         }
@@ -1996,9 +2016,15 @@ impl Server {
                 // `client.mouse.drag` stuck and making the NEXT drag a
                 // silent no-op (see `mouse_drag_border`'s `delta == 0`
                 // early return). Mirrors the "outside pane area" guard
-                // below.
+                // below. Task 7 fix round 1: `end_drag` also stops the
+                // edge-autoscroll timer -- the pane's first/last row is
+                // ADJACENT to the status row, so an edge-armed drag
+                // overshooting here was the review's exact runaway-scroll
+                // scenario (`mouse.md` §5.4: "motion outside the pane...
+                // stops the timer"); regression test
+                // `autoscroll_stops_when_drag_leaves_onto_status_row`.
                 if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
-                    client.mouse.drag = MouseDrag::None;
+                    end_drag(client);
                 }
                 return self.dispatch_mouse_status(ev, client, session_name);
             }
@@ -2010,9 +2036,10 @@ impl Server {
         if ev.x >= area.w || ev.y < area.y || ev.y >= area.y + area.h {
             // Outside the pane area entirely (e.g. a blank gap row on a
             // client taller than the session's shared size): no-op, and end
-            // any in-progress drag so it can't keep resizing/selecting based
-            // on an off-screen position.
-            client.mouse.drag = MouseDrag::None;
+            // any in-progress drag (Task 7 fix round 1: including its
+            // edge-autoscroll timer, via `end_drag`) so it can't keep
+            // resizing/selecting/scrolling based on an off-screen position.
+            end_drag(client);
             return ExecOutcome::Ok(String::new());
         }
 
