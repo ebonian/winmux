@@ -1637,6 +1637,12 @@ impl Options {
     pub fn window_status_format(&self) -> &str;
     pub fn window_status_current_format(&self) -> &str;
 }
+
+/// SP6 Task 4 fix round 1: the stored default for `window-status-format`/
+/// `window-status-current-format`, public so `status::status_spans` can
+/// recognize the default path and apply the flagless one-space padding
+/// shim (see the deviation note below).
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
 ```
 
 **User-option store (`@name`, `commands-config-options-formats.md` §3.4):**
@@ -1673,13 +1679,18 @@ above for why this now parses), `window-status-format` /
 — originally stored verbatim as tmux's literal
 `#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); Task 4
 changed the DEFAULT to `#I:#W#F` because the `expand_format` subset still
-does not evaluate a general `#{?cond,a,b}` conditional, and `#I:#W#F`
-reproduces the identical rendered text for every window that has at least
-one flag — the only difference from tmux's literal default is the loss of
-its cosmetic single-trailing-space-for-column-alignment when a window has
-NO flags at all, which is also exactly what winmux's PRE-Task-4 hardcoded
-tab renderer already produced). All defaults verified against
-`commands-config-options-formats.md`'s options appendix.
+does not evaluate a general `#{?cond,a,b}` conditional. The default is
+exposed as a new public const `options::DEFAULT_WINDOW_STATUS_FORMAT` (fix
+round 1): `status::status_spans` compares each tab's effective format
+against it and, on the default path ONLY, pads an EMPTY flags string to a
+single space before expansion — reproducing the tmux conditional's `, }`
+else-branch, so the DEFAULT rendering is byte-identical to real tmux for
+both flagged and flagless windows and tab widths are stable across focus
+changes. What REMAINS of the deviation: a CUSTOM format containing
+`#{?...}` still expands its conditional to empty (docs/follow-ups.md #70;
+the general format engine is deferred to the TPM plan,
+`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`)). All defaults
+verified against `commands-config-options-formats.md`'s options appendix.
 `visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
 `window-status-bell-style` remain INERT (no alerts/bell/clock-mode subsystem
 exists — same bucket as `mouse`/`history-limit` before their own Tasks

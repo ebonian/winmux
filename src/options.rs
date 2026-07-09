@@ -67,6 +67,18 @@ struct Spec {
     choices: &'static [&'static str],
 }
 
+/// The stored default for `window-status-format`/`window-status-current-format`
+/// (SP6 Task 4 — a documented deviation from tmux's literal
+/// `#I:#W#{?window_flags,#{window_flags}, }`, whose `#{?cond,a,b}`
+/// conditional the `expand_format` subset does not evaluate; see the
+/// deviation note on `default_value`'s arm). Public and named so
+/// `status::status_spans` can recognize "the effective format IS the
+/// default" and apply the one-space flagless padding shim that reproduces
+/// the conditional's `, }` else-branch — keeping the default rendering
+/// byte-identical to real tmux for BOTH flagged and flagless windows
+/// (width-stable across focus changes). Custom formats are never padded.
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
+
 const SPECS: &[Spec] = &[
     Spec { name: "prefix", kind: Kind::Key, choices: &[] },
     Spec { name: "base-index", kind: Kind::Number, choices: &[] },
@@ -252,14 +264,18 @@ fn default_value(name: &str) -> Value {
         // conditional isn't in the `expand_format` subset (same "SP3
         // simplification" bucket as status-right's `#{=21:pane_title}` gap —
         // see that option's own deviation note above). `#I:#W#F` reproduces
-        // the identical rendered text for every FLAGGED window (the common
-        // case, and the only case winmux's pre-Task-4 hardcoded renderer
-        // ever produced) via the already-supported `#F` short code; the only
-        // loss is tmux's cosmetic single-trailing-space-for-alignment when a
-        // window has NO flags at all (winmux renders a bare `<idx>:<name>`
-        // there instead, matching the OLD hardcoded behavior exactly).
-        "window-status-format" => Value::Str("#I:#W#F".to_string()),
-        "window-status-current-format" => Value::Str("#I:#W#F".to_string()),
+        // the identical rendered text for every FLAGGED window via the
+        // already-supported `#F` short code; the conditional's `, }`
+        // else-branch (one padding space when a window has NO flags, which
+        // keeps tab width stable across focus changes) is reproduced by a
+        // default-format-only shim in `status::status_spans` (fix round 1)
+        // that pads an empty flags string to a single space — see
+        // DEFAULT_WINDOW_STATUS_FORMAT's doc comment above. Net: the
+        // DEFAULT rendering is byte-identical to real tmux in all cases;
+        // only CUSTOM formats using `#{?...}` remain unsupported
+        // (docs/follow-ups.md #70).
+        "window-status-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
+        "window-status-current-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }

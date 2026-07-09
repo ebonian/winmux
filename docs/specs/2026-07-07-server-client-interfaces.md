@@ -486,8 +486,18 @@ during design; empty is correct and is what's implemented/tested):
 - Then `Z` appended if `zoomed`.
 - So: current+zoomed → `*Z`; last+zoomed → `-Z`; zoomed only (neither current
   nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
-  all → bare `<index>:<name>` (e.g. `2:logs`) when the default
-  `window-status-format` (`#I:#W#F`) is in effect.
+  all → the flags string is empty.
+- **Default-format padding shim (SP6 Task 4 fix round 1):** when the
+  effective format for a tab IS `options::DEFAULT_WINDOW_STATUS_FORMAT`
+  (`#I:#W#F`, a public const), an EMPTY flags string is padded to a single
+  space before expansion — reproducing the `, }` else-branch of tmux's real
+  default `#I:#W#{?window_flags,#{window_flags}, }`, so a flagless window
+  renders `2:logs ` (trailing space) and every tab's width is stable across
+  focus changes, byte-identical to real tmux's default rendering. CUSTOM
+  formats are never padded — `#F` expands to the plain (possibly empty)
+  flags string, exactly what tmux's `#{window_flags}` would substitute.
+  Tests: `default_format_flagless_window_pads_one_space`,
+  `custom_format_flagless_window_not_padded`.
 
 **Render integration:** the server packs the returned spans into
 `render::StatusRow` (base fill, right text/style, top flag from

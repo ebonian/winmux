@@ -201,7 +201,21 @@ pub fn status_spans(
     let mut tab_spans: Vec<Vec<(String, Style)>> = Vec::with_capacity(windows.len());
     let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
     for w in windows {
-        let flags_str = flags(w);
+        let mut flags_str = flags(w);
+        let fmt = if w.current { window_current_format } else { window_format };
+        // Fix round 1 (width-stable default format): tmux's real default
+        // `#I:#W#{?window_flags,#{window_flags}, }` renders ONE padding
+        // space when a window has no flags, so a tab keeps its width when
+        // the window gains/loses `*`/`-` on focus change. winmux's stored
+        // default is `#I:#W#F` (no `#{?...}` support in the expand_format
+        // subset — options::DEFAULT_WINDOW_STATUS_FORMAT's doc comment);
+        // reproduce the conditional's else-branch here, on the
+        // DEFAULT-format path ONLY. A custom format (even one ending in
+        // `#F`) gets the plain empty flags string, exactly what real tmux's
+        // `#{window_flags}` would substitute.
+        if fmt == crate::options::DEFAULT_WINDOW_STATUS_FORMAT && flags_str.is_empty() {
+            flags_str.push(' ');
+        }
         let per_window_ctx = FormatCtx {
             session: ctx.session,
             window_index: w.index,
@@ -212,7 +226,6 @@ pub fn status_spans(
             now: ctx.now,
             pane_title: ctx.pane_title,
         };
-        let fmt = if w.current { window_current_format } else { window_format };
         let text = expand_format(fmt, &per_window_ctx);
         let tab_base = if w.current { current } else { non_current };
         let spans = styled_runs(&text, tab_base);
@@ -282,13 +295,14 @@ mod tests {
 
     /// tmux's real default (`#I:#W#{?window_flags,#{window_flags}, }`)
     /// isn't expressible by the `expand_format` subset without evaluating
-    /// its `#{?...}` conditional (undone work, tracked at the `options.rs`
-    /// default's own doc comment); winmux's stored default is the
-    /// expand_format-compatible `#I:#W#F`, which reproduces the SAME visible
-    /// text for every flagged case (only "no flags at all" loses tmux's
-    /// cosmetic trailing-space-for-alignment nicety — documented deviation).
-    /// Tests below use this exact string to exercise the REAL default path.
-    const DEFAULT_FMT: &str = "#I:#W#F";
+    /// its `#{?...}` conditional; winmux's stored default is the
+    /// expand_format-compatible `#I:#W#F`, plus a default-format-only
+    /// flagless one-space padding shim in `status_spans` (fix round 1) that
+    /// reproduces the conditional's else-branch — together byte-identical
+    /// to tmux's default rendering for flagged AND flagless windows. Tests
+    /// below alias the real constant so they exercise the REAL default path
+    /// (including the shim's `fmt == DEFAULT` comparison).
+    const DEFAULT_FMT: &str = crate::options::DEFAULT_WINDOW_STATUS_FORMAT;
 
     #[allow(clippy::too_many_arguments)]
     fn spans_default(
@@ -370,7 +384,11 @@ mod tests {
                 (" ".to_string(), base()),
                 ("1:powershell*".to_string(), Style { underline: true, ..base() }),
                 (" ".to_string(), base()),
-                ("2:logs".to_string(), base()),
+                // Flagless window on the DEFAULT-format path: one padding
+                // space (fix round 1 — matches tmux's real default
+                // `#{?window_flags,#{window_flags}, }` else-branch; the old
+                // pin `"2:logs"` predated the width-stability shim).
+                ("2:logs ".to_string(), base()),
             ]
         );
     }
@@ -649,13 +667,81 @@ mod tests {
             spans,
             vec![
                 (String::new(), base_style),
-                ("0:a".to_string(), base_style),
+                // Windows 0/1 are flagless on the DEFAULT-format path ->
+                // one padding space each (fix round 1; the old pins
+                // `"0:a"`/`"1:b"` predated the width-stability shim).
+                ("0:a ".to_string(), base_style),
                 ("|".to_string(), base_style),
-                ("1:b".to_string(), base_style),
+                ("1:b ".to_string(), base_style),
                 ("|".to_string(), base_style),
                 ("2:c*".to_string(), Style { underline: true, ..base_style }),
             ]
         );
+    }
+
+    // ---- Fix round 1: width-stable default format (flagless padding) ----
+
+    /// tmux's real default `#I:#W#{?window_flags,#{window_flags}, }` emits
+    /// ONE padding space when a window has NO flags, so a tab's width is
+    /// stable across the most common transition (a window gaining/losing
+    /// `*`/`-` on focus change). The `#I:#W#F` default must reproduce that:
+    /// on the DEFAULT-format path only, an empty flags string is padded to
+    /// a single space before expansion.
+    /// windows: 0 "aa" current  -> flags "*" -> "0:aa*" (5 chars)
+    ///          1 "bb" flagless -> flags " " -> "1:bb " (5 chars, SAME width)
+    #[test]
+    fn default_format_flagless_window_pads_one_space() {
+        let (ws, wcs) = default_partials();
+        let windows = vec![win(0, "aa", true, false, false), win(1, "bb", false, false, false)];
+        let spans = spans_default("", &windows, base(), &ws, &wcs);
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base()),
+                ("0:aa*".to_string(), Style { underline: true, ..base() }),
+                (" ".to_string(), base()),
+                ("1:bb ".to_string(), base()),
+            ]
+        );
+        // Width stability: flip which window is current -- every span's
+        // char width must be unchanged (`*` and the padding space are both
+        // exactly 1 column), so a focus change never reflows the status row.
+        let flipped = vec![win(0, "aa", false, false, false), win(1, "bb", true, false, false)];
+        let spans2 = spans_default("", &flipped, base(), &ws, &wcs);
+        let widths: Vec<usize> = spans.iter().map(|(t, _)| t.chars().count()).collect();
+        let widths2: Vec<usize> = spans2.iter().map(|(t, _)| t.chars().count()).collect();
+        assert_eq!(widths, widths2);
+        assert_eq!(spans2[1].0, "0:aa ");
+        assert_eq!(spans2[3].0, "1:bb*");
+    }
+
+    /// The one-space padding is a DEFAULT-format-path fidelity shim ONLY: a
+    /// CUSTOM format (even one that also ends in `#F`) gets the plain empty
+    /// flags string, exactly what `expand_format` substitutes -- no
+    /// invisible extra characters the user didn't write. (Real tmux with a
+    /// custom `#I:#W#F`-style format would also render `#F` empty here --
+    /// the padding lives in the DEFAULT format string's conditional, not in
+    /// `#{window_flags}` itself.)
+    #[test]
+    fn custom_format_flagless_window_not_padded() {
+        let (ws, wcs) = default_partials();
+        let windows = vec![win(0, "aa", false, false, false)];
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "<#I:#W#F>",
+            "<#I:#W#F>",
+            base(),
+            &ws,
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(spans[1].0, "<0:aa>"); // no padding space before `>`
     }
 
     // ---- inline `#[...]` style markers within a window format ----

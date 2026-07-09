@@ -821,3 +821,37 @@ None block the sub-project 4 merge.
     length-capping with inline `status-left` markers) — same "not
     implementing tmux's degenerate-width scrolling" bucket as follow-up #46
     (`find-window`) and #50 (`choose-tree` overflow). SMALL/MEDIUM. LOW.
+
+70. **Custom `window-status-format` values containing `#{?cond,a,b}` expand
+    the conditional to empty** (SP6 Task 4 + fix round 1, 2026-07-10). What
+    remains of the Task 4 default-format deviation after the fix-round-1
+    width-stability shim: winmux's stored DEFAULT is
+    `options::DEFAULT_WINDOW_STATUS_FORMAT` (`#I:#W#F`) plus a
+    default-path-only pad of an empty flags string to one space in
+    `status::status_spans` — together byte-identical to tmux's real default
+    `#I:#W#{?window_flags,#{window_flags}, }` for flagged AND flagless
+    windows, width-stable across focus changes. But a USER-set format that
+    itself uses `#{?...}` (or any other conditional/modifier outside the
+    `expand_format` subset) still renders that token as empty — the general
+    tmux format-expression engine is deliberately deferred to the TPM plan
+    (`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`). The three
+    doc sites describing the deviation: `src/options.rs`
+    (`DEFAULT_WINDOW_STATUS_FORMAT` + the `default_value` arm's note),
+    `docs/specs/2026-07-07-command-config-interfaces.md` (options SPECS
+    amendment), `docs/specs/2026-07-07-server-client-interfaces.md`
+    (`## status` flags-string/padding-shim rule). Not exercised by the
+    fixture config (its custom formats use only `#I`/`#W`/`#F`/`#[...]`).
+    MEDIUM (a format engine). LOW.
+
+71. **Per-window `FormatCtx` reuses the FOCUSED pane's `pane_index`/
+    `pane_title` for every window's tab expansion** (SP6 Task 4 review
+    Minor, 2026-07-10, `status::status_spans`). Each tab's
+    `window-status(-current)-format` expansion overrides
+    `window_index`/`window_name`/`window_flags` per window but carries the
+    caller's `pane_index`/`pane_title` (the acting client's focused pane in
+    the CURRENT window) unchanged — so `#P`/`#T` inside a per-window format
+    misrender for every non-focused window (they show the focused window's
+    values). Root cause: only one pane's title/index is threaded through
+    `server::render_one`'s status pipeline; fixing it needs per-window
+    active-pane data in `status::WindowEntry` (or the ctx). Not exercised
+    by the fixture config (`#I`/`#W`/`#F` only). SMALL. LOW.
