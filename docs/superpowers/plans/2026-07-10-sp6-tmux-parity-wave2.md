@@ -144,23 +144,29 @@ Spec: `docs/tmux-reference/mouse.md` — autoscroll: while a drag is held with t
 - [ ] **Step 4: Full verification + clippy** (including the existing copy-mode/selection suite for regressions).
 - [ ] **Step 5: Commit** `feat(mouse): drag autoscroll at pane edges; word/line drag extension after double/triple click`.
 
-### Task 8: choose-tree preview box
+### Task 8: choose-tree — real tree view, current-item default selection, preview box
 
 **Files:**
-- Modify: `src/render.rs` (`ListOverlay`/`Overlay` extension + preview blit + box chrome), `src/server.rs` (ChooseTreeState preview field), `src/server/dispatch.rs` (overlay build: preview source lookup + sizing; `v` key)
+- Modify: `src/render.rs` (`ListOverlay`/`Overlay` extension: indented tree rows + preview blit + box chrome), `src/server.rs` (ChooseTreeState: tree model, expanded-set, preview mode), `src/server/dispatch.rs` (tree build, expand/collapse keys, default selection, preview source lookup + sizing; `v` key)
 - Test: `src/render.rs` unit tests (exact cell assertions), `tests/server_proto.rs`
 
 **Interfaces:** `Overlay`/`ListOverlay` are NOT in any locked contract (gap analysis §C) — free to extend; note the addition in the parity-polish spec's overlay section anyway for documentation parity (same commit, additive).
 
-Spec: `docs/tmux-reference/choose-tree.md` — sizing: NORMAL mode gives the list 2/3 of the pane height (or 1/2 when that's more than the item count needs), no preview when the remainder would be under the minimum; BIG gives the list 1/4 (min 2 rows, max item count); `v` cycles OFF→BIG→NORMAL→OFF (default NORMAL). Preview content: session item → filmstrip of that session's windows (each window's active pane blitted side-by-side, separated by `│` dividers, each labeled); window item → filmstrip of its panes; content is a raw cell copy (truncate to fit, never scale), refreshed live each render tick. Box: single-line border across the top of the preview region with the selected item's title embedded.
+Spec: `docs/tmux-reference/choose-tree.md`. Three user-mandated behaviors, all per that doc:
 
-Note: winmux's ordering is already tmux-correct (stable creation order — gap analysis §C.1); no sort work in this task. Expand/collapse/tagging/`O`/`r` are explicitly deferred (Task 9 tickets them).
+**(a) Tree structure** (`prefix-s`): sessions are parent rows with their windows as indented child rows, tmux tree furniture (`+`/`-` expand markers, indentation); sessions start **expanded** per the doc's default-expansion rule (verify there — window children under each session); `Right`/`+` expands a collapsed session, `Left`/`-` collapses (per the doc's key table). `prefix-w` stays a window-list of the current session (its rows may show panes as children if the doc says so — follow the doc). Rows keep stable creation-order sorting (already correct).
 
-- [ ] **Step 1: RED — render unit tests with exact cell assertions:** `overlay_preview_blits_grid_cells` (construct a small grid with known cells, a preview rect, assert composed cells + border row + title text); `overlay_preview_truncates_oversized_grid`; `overlay_list_shrinks_to_two_thirds_when_preview_on` (sizing math per the doc, computed in comments). server_proto: `choose_tree_preview_shows_selected_windows_content` (create a window, print a marker string in its pane, open choose-tree, assert the marker appears in the rendered preview region); `choose_tree_v_toggles_preview` (OFF→BIG→NORMAL cycle observable via layout change).
+**(b) Default selection = current item**: on open, the selection starts on the CURRENT session (`prefix-s`) / current window (`prefix-w`) — per mode_tree's current-item start behavior in the doc — not row 0.
+
+**(c) Preview box**: sizing — NORMAL gives the list 2/3 of the pane height (or 1/2 when that's more than the item count needs), no preview when the remainder would be under the minimum; BIG gives the list 1/4 (min 2 rows, max item count); `v` cycles OFF→BIG→NORMAL→OFF (default NORMAL). Preview content: session item → filmstrip of that session's windows (each window's active pane blitted side-by-side, `│` dividers, each labeled); window item → filmstrip of its panes; raw cell copy (truncate, never scale), refreshed live each render tick. Box: single-line border across the top of the preview region with the selected item's title embedded.
+
+Tagging and `O`/`r` sort-cycling remain deferred (Task 9 tickets them).
+
+- [ ] **Step 1: RED — render unit tests with exact cell assertions:** `overlay_tree_rows_indent_children`; `overlay_preview_blits_grid_cells` (construct a small grid with known cells, a preview rect, assert composed cells + border row + title text); `overlay_preview_truncates_oversized_grid`; `overlay_list_shrinks_to_two_thirds_when_preview_on` (sizing math per the doc, computed in comments). server_proto: `choose_tree_sessions_show_window_children`; `choose_tree_default_selects_current_session` (create 3 sessions, attach to the middle one, open `s`, immediately Enter, assert we stayed on the current session — proving default selection); `choose_tree_collapse_hides_children_expand_restores`; `choose_tree_preview_shows_selected_windows_content` (marker string printed in a window's pane appears in the rendered preview region); `choose_tree_v_toggles_preview` (OFF→BIG→NORMAL observable via layout change).
 - [ ] **Step 2: Run, record RED.**
-- [ ] **Step 3: GREEN:** extend the overlay type with an optional preview block (cells snapshot + rect + title); server builds it each render pass from the selected row's target (session → filmstrip across its windows' active panes; window → filmstrip across its panes) using the pass-1 blit pattern from `render.rs:171-194`; sizing math per spec; `v` key cycles the mode (stored on ChooseTreeState).
+- [ ] **Step 3: GREEN:** tree model on ChooseTreeState (rows carry depth + TreeTarget; expanded set keyed by session id, selection stays identity-stable via the existing `selected: Option<TreeTarget>` pattern); default-selection lookup at open; expand/collapse key handling; extend the overlay type with an optional preview block (cells snapshot + rect + title); server builds it each render pass from the selected row's target using the pass-1 blit pattern from `render.rs:171-194`; sizing math per spec; `v` cycles the mode.
 - [ ] **Step 4: Full verification + clippy.**
-- [ ] **Step 5: Commit** `feat(choose-tree): live preview box with tmux sizing and v toggle`.
+- [ ] **Step 5: Commit** `feat(choose-tree): tree view with expand/collapse, current-item default selection, live preview box`.
 
 ### Task 9: e2e + docs closeout
 
@@ -176,11 +182,45 @@ Note: winmux's ordering is already tmux-correct (stable creation order — gap a
 - [ ] **Step 3: Full verification:** `cargo test` (all targets; `--test-threads=4` for server_proto if flaky), clippy, debug-binary smoke on a unique socket.
 - [ ] **Step 4: Commit** `test(e2e)+docs: SP6 closeout — user-conf roundtrip, drag-select e2e, follow-ups/CLAUDE.md`.
 
+### Task 10: clock mode (`prefix-t`)
+
+**Files:**
+- Modify: `src/cmd.rs` (`ParsedCmd::ClockMode` + table entry `clock-mode`, alias none, `-t` optional), `src/bindings.rs` (default `t` → `clock-mode` in the prefix table), `src/options.rs` (`clock-mode-style` Choice 12/24 default 24 — `clock-mode-colour` already exists from Task 2), `src/server.rs` + `src/server/dispatch.rs` (per-client clock overlay state + key handling), `src/render.rs` (clock overlay drawing)
+- Modify: `docs/specs/2026-07-07-command-config-interfaces.md` (new ParsedCmd variant + getter, same commit)
+- Test: cmd/render unit tests, `tests/server_proto.rs`
+
+**Interfaces:** new `ParsedCmd` variant (locked cmd contract — amend same commit). Overlay types unconstrained.
+
+Spec: `docs/tmux-reference/status-line-and-messages.md` §clock mode (window-clock.c): big-digit time centered in the pane, drawn in `clock-mode-colour`, format governed by `clock-mode-style` (12 → `%l:%M %p`, 24 → `%H:%M` — verify exact strings in the doc), refreshes on a timer (doc specifies the tick — winmux's 50ms/status tick is sufficient granularity; redraw when the displayed minute changes), any key exits (verify against the doc's exit rule; mouse per doc). Digit font: whatever the doc specifies (tmux's clock font table; winmux's display-panes 5x5 font may be reused only if the doc says they match — otherwise implement the doc's font).
+
+- [ ] **Step 1: RED:** cmd parse test (`clock-mode` → variant; `t` in default bindings test); render unit test `clock_overlay_draws_big_digits` (fixed time injected, exact cell assertions for at least one digit + colon, computed in comments); server_proto `clock_mode_opens_and_any_key_exits` (send prefix-t, assert clock glyphs rendered; send a key, assert pane content restored).
+- [ ] **Step 2: Run, record RED.**
+- [ ] **Step 3: GREEN:** overlay state (like DisplayPanes), render pass, minute-change refresh via Tick, exit-on-any-key.
+- [ ] **Step 4: Full verification + clippy.** Testability note: inject/freeze the displayed time through a seam (e.g. the overlay stores the formatted string at build time) so unit tests don't depend on wall-clock.
+- [ ] **Step 5: Amend contract; commit** `feat(clock): clock-mode overlay with prefix-t, clock-mode-colour/style`.
+
+### Task 11: active-pane border indication on shared dividers (half-border rule + pane-border-indicators)
+
+**Files:**
+- Modify: `src/render.rs` (border style attribution — the `touches_focused` adjacency logic at ~:243-272), `src/options.rs` (`pane-border-indicators` Choice off/colour/arrows/both, default colour)
+- Modify: `docs/specs/2026-07-07-command-config-interfaces.md` (new getter, same commit)
+- Test: `src/render.rs` unit tests (exact emitted-SGR assertions per existing style)
+
+**Interfaces:** render internals unconstrained; new option getter → contract amendment.
+
+Spec: `docs/tmux-reference/panes-and-layout.md` §7.1 (lines ~820-836) + §7.4. The user-visible bug: in a 1:1 two-pane split winmux paints the whole shared divider in the active style, indicating nothing. tmux splits a shared border **cosmetically**: for a LEFTRIGHT (side-by-side) split, divider cells with `wy <= sy/2` are styled as the LEFT pane's border and the rest as the RIGHT pane's; for TOPBOTTOM, the left half (`wx <= sx/2`) belongs to the TOP pane, the rest to the BOTTOM — so exactly half the divider is green, the half attributed to the active pane. `pane-border-indicators`: `off` = no activity indication (base style everywhere); `colour` (default) = the half-border colouring; `arrows`/`both` = four arrow glyphs on the active pane's border just inside each corner, pointing at the active pane (doc §7.4 has the exact glyph/position rules; use U+2190..U+2193 per the doc's Windows note). `both` = colour + arrows.
+
+- [ ] **Step 1: RED — render unit tests with exact cell/SGR assertions (computed in comments):** `two_pane_vertical_divider_half_styled` (side-by-side split, left pane active → top half of divider green, bottom half default; focus right → inverted), `two_pane_horizontal_divider_half_styled` (analogous for top/bottom), `border_indicators_off_suppresses_active_styling`, `border_indicators_arrows_draws_glyphs_at_active_corners` (assert the four glyph positions/directions per doc).
+- [ ] **Step 2: Run, record RED.**
+- [ ] **Step 3: GREEN:** rework border-cell style attribution per §7.1 (per-cell: determine owning pane for shared segments via the half rule, style by whether the OWNER is the focused pane), gate by the option; arrows pass after borders.
+- [ ] **Step 4: Full verification + clippy** — expect existing border tests asserting whole-divider-active to legitimately invert; update them with computed comments (sanctioned edit, mirrors tmux).
+- [ ] **Step 5: Amend contract; commit** `feat(render): tmux half-border active indication + pane-border-indicators`.
+
 ---
 
 ## Self-review notes
 
-- Spec coverage: gap §D→T1, §A→T2 (accept/store) + T4 (render) + T5 (swap-window), §B→T3, §E→T6+T7, §C→T8, deferrals→T9.
-- Order rationale: T1 first (worst daily pain, smallest); T2 unblocks the user's config immediately; T4 depends on T2's options existing; T6 before T7 (T7 builds on T6's drag-state plumbing); T8 independent; T9 last.
-- Contract discipline: T2 (command-config), T3 (mvp), T5 (command-config + possibly server-client) amend specs in-commit; T1/T6/T7 touch only private surface; T8 additive documentation.
-- Existing-test-edit sanction: ONLY Task 3's edge-case assertions (`focus_dir_two_pane_horizontal` and any sibling asserting no-wrap `false`) — the wrap fix legitimately inverts them; every other task adds tests.
+- Spec coverage: gap §D→T1(+1b), §A→T2 (accept/store) + T4 (render) + T5 (swap-window), §B→T3, §E→T6+T7, §C→T8 (expanded per user: tree view + current-item default + preview), user-adhoc→T10 (clock) + T11 (half-border indication), deferrals→T9.
+- Execution order: T1, T1b, T2, T3, T4, T5, T6, T7, T8, T10, T11, then T9 (closeout LAST — its docs/e2e cover everything before it).
+- Contract discipline: T2/T5/T10/T11 (command-config), T3 (mvp) amend specs in-commit; T1/T6/T7 touch only private surface; T8 additive documentation.
+- Existing-test-edit sanction: Task 3's edge-case assertions (wrap legitimately inverts them) and Task 11's whole-divider-active border tests (half rule legitimately inverts them); every other task adds tests.
