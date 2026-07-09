@@ -385,7 +385,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4)
 
 ```rust
 // status.rs
@@ -397,42 +397,87 @@ pub struct WindowEntry {
     pub zoomed: bool,
 }
 
-// SP3 Task 8 signature (styled spans; `StatusSpan`/its underline bool are
-// deleted — see the amended `render` section of 2026-07-06-mvp-interfaces.md
-// and the SP3 contract's `## render-styles` section):
+// SP6 Task 4 signature (status-justify, per-side styles, per-window
+// window-status-format/-current-format expansion, window-status-separator —
+// see the amendment below):
 pub fn status_spans(
-    left: &str,                                     // pre-expanded, pre-length-capped status-left text
+    left: &str,                                      // pre-expanded, pre-length-capped status-left text
+    left_style: &crate::style::PartialStyle,          // status-left-style
     windows: &[WindowEntry],
-    base: crate::grid::Style,                       // status-style applied to Style::default()
-    win_style: &crate::style::PartialStyle,         // window-status-style
-    win_current_style: &crate::style::PartialStyle, // window-status-current-style
+    ctx: &crate::options::FormatCtx,                  // session/pane/hostname/time; window_index/name/flags overridden per window
+    window_format: &str,                              // window-status-format (raw, NOT pre-expanded)
+    window_current_format: &str,                      // window-status-current-format (raw, NOT pre-expanded)
+    base: crate::grid::Style,                         // status-style applied to Style::default()
+    win_style: &crate::style::PartialStyle,           // window-status-style
+    win_current_style: &crate::style::PartialStyle,   // window-status-current-style
+    separator: &str,                                  // window-status-separator
+    justify: &str,                                    // status-justify: "left"/"centre"/"right"/"absolute-centre"
+    width: u16,                                        // terminal column count
+    right_len: usize,                                  // char count of the (already capped, already stripped) status-right text
 ) -> Vec<(String, crate::grid::Style)>;
+
+/// Strip `#[...]` inline style markers from `expand_format`-expanded text,
+/// keeping only the literal text — used for `status-right`, whose
+/// `render::StatusRow::right` field has only ONE style slot (no room for
+/// multiple inline-styled sub-runs the way `status_spans`'s returned `Vec`
+/// has for `left`/the window list).
+pub fn strip_style_markers(text: &str) -> String;
 ```
 
-**AMENDMENT (SP3 Task 8):** the original Task 5 signature was
+**AMENDMENT (SP3 Task 8, historical):** the original Task 5 signature was
 `status_spans(session_name: &str, windows: &[WindowEntry]) ->
 Vec<StatusSpan>`, hardcoding the `[<session>] ` prefix and an underline-only
-current-window marker. It now takes the ALREADY-EXPANDED `status-left` text
-(the server expands `[#S] ` — the default, which reproduces the old prefix
-exactly — via `options::expand_format` and caps it to `status-left-length`)
-plus the three style inputs, and returns fully resolved styles per span.
-`status.rs` remains pure bookkeeping with no dependency on `model.rs` (it
-now additionally depends on `grid::Style` + `style::PartialStyle`).
+current-window marker. SP3 Task 8 replaced it with the ALREADY-EXPANDED
+`status-left` text plus `base`/`win_style`/`win_current_style`, returning
+fully resolved styles per span.
 
-**Span composition** (index order as given in `windows`):
-1. One span with `left`'s text, styled `base`.
-2. Per window, one span `"<index>:<name><flags>"`, styled
-   `win_current_style.apply_to(base)` iff `current`, else
-   `win_style.apply_to(base)`. Note the current style layers over BASE —
-   NOT over `win_style` (tmux layers `window-status-current-style` over
-   `status-style` directly, so an fg set only in `window-status-style` never
-   leaks into the current tab). With default options (`win_style` empty,
-   `win_current_style` = `underscore`) this reproduces the old behavior
-   exactly: every span equals `base` except the current tab = `base` +
-   underline.
-3. Between window spans (not after the last one), a separate single-space
-   span `" "`, styled `base` — the separator never takes a window style,
-   even when the window before or after it is current.
+**AMENDMENT (SP6 Task 4 — status-justify, side styles, window formats,
+separator):** `status_spans` gained `left_style`, `ctx`, `window_format`,
+`window_current_format`, `separator`, `justify`, `width`, `right_len`.
+`status.rs` now depends on `crate::options` (`expand_format`/`FormatCtx`) —
+still pure (no I/O), `expand_format` is pure too.
+
+- **Per-window format expansion:** for each window, `window_current_format`
+  (if `current`) else `window_format` is expanded via `options::
+  expand_format` against a `FormatCtx` built from `ctx`'s
+  session/pane_index/hostname/now/pane_title fields, with `window_index`/
+  `window_name`/`window_flags` overridden to that window's own values
+  (`window_flags` uses the SAME flags-string rule as before — see below,
+  now fed through `#F` rather than hardcoded string concatenation).
+- **Inline `#[...]` style markers:** `expand_format` (SP6 Task 4 addition,
+  see the command-config contract amendment) passes `#[...]` blocks through
+  VERBATIM rather than interpreting them. `status.rs`'s private
+  `styled_runs` then splits each window's (and `left`'s) expanded text on
+  those markers into multiple `(text, Style)` sub-spans, additively layering
+  each marker's `style::parse_style`-parsed style onto that section's base
+  style (the tab's `win_style`/`win_current_style`-over-`base`, or `left`'s
+  `left_style`-over-`base`). Text with no markers — the common case —
+  yields exactly one span, byte-identical to the pre-Task-4 output. A
+  malformed marker (no closing `]`, or content `parse_style` rejects) is a
+  no-op/literal-text fallback, never a panic.
+- **`status-justify` positioning:** the window-list group's start column is
+  computed by a private `list_offset` helper per
+  `docs/tmux-reference/status-line-and-messages.md` §1.4's closed-form
+  offsets (winmux has no user-configurable centre/after content, so the
+  general 8-screen trim-order engine collapses to `left`/`centre`/`right`/
+  `absolute-centre` formulas keyed off `left`'s width, `right_len`, and the
+  list's own total width). The gap between `left` and the list start is
+  realized as a literal run of `base`-styled padding spaces inserted into
+  the returned `Vec` — `render::compose_back` is UNCHANGED, it still just
+  draws spans sequentially from column 0 (see `## render-styles`); this is
+  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task. An
+  offset that would require NEGATIVE padding (overflow: `left` + list +
+  `right` wider than the terminal) clamps to zero pad rather than
+  overlapping — a documented simplification vs. tmux's `<`/`>` scroll
+  markers (out of scope).
+- **`window-status-separator`** replaces the old hardcoded `" "` between
+  tabs (still omitted after the last one).
+- **`status-right`'s style** is resolved by the SERVER directly
+  (`options::status_right_style().apply_to(base)`, assigned to
+  `render::StatusRow::right_style`) since `right` has only one style slot;
+  any `#[...]` markers `expand_format` leaves in the expanded `status-right`
+  text are removed via `strip_style_markers` before length-capping and
+  assignment, rather than leaking literal `#[...]` bytes onto the screen.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
 between "else a literal space" and "else empty" phrasings that circulated
@@ -441,20 +486,27 @@ during design; empty is correct and is what's implemented/tested):
 - Then `Z` appended if `zoomed`.
 - So: current+zoomed → `*Z`; last+zoomed → `-Z`; zoomed only (neither current
   nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
-  all → bare `<index>:<name>` (e.g. `2:logs`).
+  all → bare `<index>:<name>` (e.g. `2:logs`) when the default
+  `window-status-format` (`#I:#W#F`) is in effect.
 
-**Render integration (as amended SP3 Task 8):** the server packs the
-returned spans into `render::StatusRow` (base fill, right text/style, top
-flag from `status-position`) — see the SP3 contract's `## render-styles`
-section; `render::compose_back` draws them left-to-right from column 0 with
-each span's own resolved style, then the right text right-aligned; the
-"total left length" used for right-truncation is the summed char count of
-all spans' text.
+**Render integration:** the server packs the returned spans into
+`render::StatusRow` (base fill, right text/style, top flag from
+`status-position`) — see the `## render-styles` section; `render::
+compose_back` draws them left-to-right from column 0 with each span's own
+resolved style, then the right text right-aligned; the "total left length"
+used for right-truncation is the summed char count of all spans' text
+(unchanged by this task — justify padding is just more span text).
 
-**Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
-exact expected `Vec<(String, Style)>` span vectors (mirrors `render.rs`'s
-exact-VT-bytes test style), including a `custom_styles_layering` test pinning
-the layered-over-base (not over-win_style) rule.
+**Implementation module:** `src/status.rs`, pure (no I/O, but now depends on
+`crate::options`), unit-tested with exact expected `Vec<(String, Style)>`
+span vectors (mirrors `render.rs`'s exact-VT-bytes test style), including
+`custom_styles_layering` (layered-over-base, not over-win_style),
+`status_justify_centre_positions_window_list`/`status_justify_right`/
+`status_justify_absolute_centre` (exact offset math), `window_status_format_
+expands_per_tab`/`window_status_current_format_used_for_current` (per-window
+expansion + format selection), `side_styles_layer_over_status_style`,
+`window_status_separator_respected`, and `inline_style_marker_in_window_
+format` (SP6 Task 4).
 
 ## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 

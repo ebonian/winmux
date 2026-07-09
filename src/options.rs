@@ -127,7 +127,7 @@ const SPECS: &[Spec] = &[
     // `status-justify`/`status-left-style`/`status-right-style`/
     // `window-status-format`/`window-status-current-format`/
     // `window-status-separator` are typed+stored here; the status-bar
-    // RENDERING wiring for them lands in Task 4.
+    // RENDERING wiring for them (SP6 Task 4) lands in `src/status.rs`.
     Spec { name: "visual-activity", kind: Kind::Choice, choices: &["off", "on", "both"] },
     Spec { name: "visual-bell", kind: Kind::Choice, choices: &["off", "on", "both"] },
     Spec { name: "visual-silence", kind: Kind::Choice, choices: &["off", "on", "both"] },
@@ -247,8 +247,19 @@ fn default_value(name: &str) -> Value {
             let s = "default";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
-        "window-status-format" => Value::Str("#I:#W#{?window_flags,#{window_flags}, }".to_string()),
-        "window-status-current-format" => Value::Str("#I:#W#{?window_flags,#{window_flags}, }".to_string()),
+        // SP6 Task 4 deviation from tmux's literal real default
+        // (`#I:#W#{?window_flags,#{window_flags}, }`): the `#{?cond,a,b}`
+        // conditional isn't in the `expand_format` subset (same "SP3
+        // simplification" bucket as status-right's `#{=21:pane_title}` gap —
+        // see that option's own deviation note above). `#I:#W#F` reproduces
+        // the identical rendered text for every FLAGGED window (the common
+        // case, and the only case winmux's pre-Task-4 hardcoded renderer
+        // ever produced) via the already-supported `#F` short code; the only
+        // loss is tmux's cosmetic single-trailing-space-for-alignment when a
+        // window has NO flags at all (winmux renders a bare `<idx>:<name>`
+        // there instead, matching the OLD hardcoded behavior exactly).
+        "window-status-format" => Value::Str("#I:#W#F".to_string()),
+        "window-status-current-format" => Value::Str("#I:#W#F".to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -707,11 +718,12 @@ impl Options {
         self.style_ref("status-right-style")
     }
 
-    /// `window-status-format`/`window-status-current-format` (SP6 Task 2):
-    /// per-window tab format-string templates. Typed+stored here (the
-    /// SP3 `expand_format` subset does not yet evaluate the `#{?...}`
-    /// conditional in tmux's real default -- rendering wiring, and any
-    /// needed `expand_format` extension, is Task 4).
+    /// `window-status-format`/`window-status-current-format` (SP6 Task 2,
+    /// rendering wired in Task 4): per-window tab format-string templates,
+    /// expanded per window by `status::status_spans` via `expand_format`.
+    /// Default `#I:#W#F` -- see the deviation note on this option's
+    /// `default_value` arm for why it isn't tmux's literal
+    /// `#{?window_flags,...}` string.
     pub fn window_status_format(&self) -> &str {
         self.str_ref("window-status-format")
     }
@@ -906,6 +918,25 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                 Some('T') => {
                     chars.next();
                     out.push_str(ctx.pane_title);
+                }
+                Some('[') => {
+                    // Inline style marker (`#[fg=white]`, ...): expand_format
+                    // does text substitution only -- `#[...]` blocks are
+                    // interpreted by the RENDERER's span builder
+                    // (`status::styled_runs`, SP6 Task 4), not here, so they
+                    // must survive expansion byte-for-byte. Copied verbatim,
+                    // including the brackets; an unterminated marker (no
+                    // closing `]`) is copied to end-of-string rather than
+                    // silently dropped -- no well-formed template hits this.
+                    chars.next(); // consume '['
+                    out.push('#');
+                    out.push('[');
+                    for c2 in chars.by_ref() {
+                        out.push(c2);
+                        if c2 == ']' {
+                            break;
+                        }
+                    }
                 }
                 Some('{') => {
                     chars.next();
@@ -1326,8 +1357,12 @@ mod tests {
         let base = crate::grid::Style { fg: Color::Idx(3), ..crate::grid::Style::default() };
         assert_eq!(o.status_left_style().apply_to(base), base);
         assert_eq!(o.status_right_style().apply_to(base), base);
-        assert_eq!(o.window_status_format(), "#I:#W#{?window_flags,#{window_flags}, }");
-        assert_eq!(o.window_status_current_format(), "#I:#W#{?window_flags,#{window_flags}, }");
+        // SP6 Task 4: default changed from tmux's literal
+        // `#{?window_flags,#{window_flags}, }` (not expressible by the
+        // `expand_format` subset) to the equivalent-for-flagged-windows
+        // `#I:#W#F` -- see the `default_value` deviation note.
+        assert_eq!(o.window_status_format(), "#I:#W#F");
+        assert_eq!(o.window_status_current_format(), "#I:#W#F");
 
         o.set("visual-activity", Some("both"), false, false).unwrap();
         assert_eq!(o.visual_activity(), "both");
@@ -1424,6 +1459,18 @@ mod tests {
         // same as an unset `#{...}` form, not a literal placeholder.
         let empty = ctx("s", sample_time());
         assert_eq!(expand_format("#T", &empty), "");
+    }
+
+    /// SP6 Task 4: `#[...]` inline style markers are text-substitution's
+    /// business only in that they must NOT be interpreted/eaten here --
+    /// they pass through byte-for-byte so `status::styled_runs` can parse
+    /// them afterward into styled spans. An unterminated marker (no closing
+    /// `]`) is copied verbatim to end-of-string rather than dropped.
+    #[test]
+    fn expand_inline_style_marker_passthrough() {
+        let c = ctx("s", sample_time());
+        assert_eq!(expand_format("#I #[fg=white]#W", &c), "1 #[fg=white]bash");
+        assert_eq!(expand_format("#[fg=white", &c), "#[fg=white");
     }
 
     #[test]

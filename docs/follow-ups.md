@@ -799,3 +799,25 @@ None block the sub-project 4 merge.
     exact TPM rung-1 primitive (docs/superpowers/plans/2026-07-08-tpm-plugin-support.md)
     — is not yet available end-to-end. Fix: parse the flags in cmd.rs, thread to
     `exec_show_options`. SMALL. LOW (until SP5/TPM work starts).
+
+69. **`status-justify` has no overflow/scroll behavior, and `status-left`'s
+    length cap counts `#[...]` marker bytes as visible width** (SP6 Task 4,
+    2026-07-10, `status::list_offset`/`status_spans`). When `left` + the
+    window list + `right` together exceed the terminal width under
+    `centre`/`right`/`absolute-centre` justify, real tmux scrolls the window
+    list around the focused window and draws `<`/`>` overflow markers
+    (`docs/tmux-reference/status-line-and-messages.md` §1.4); winmux instead
+    saturates the computed padding to zero (list abuts `left` with no gap,
+    no markers, no scrolling) — the row can visually overlap/overrun in a
+    narrow terminal instead of scrolling. Separately, `status-left`'s
+    `status-left-length` cap (`server.rs`'s `truncate_chars`) is applied to
+    the RAW `expand_format` output, which may still contain verbatim
+    `#[...]` inline style markers (SP6 Task 4's `#[...]` passthrough) — a
+    marker's characters count toward the length budget even though they
+    draw zero visible columns, and a cap could theoretically bisect a
+    marker. `status-right` doesn't have this problem (`strip_style_markers`
+    runs before its length cap). Not exercised by any current config
+    (`status-left` is empty in the fixture, and no config combines
+    length-capping with inline `status-left` markers) — same "not
+    implementing tmux's degenerate-width scrolling" bucket as follow-up #46
+    (`find-window`) and #50 (`choose-tree` overflow). SMALL/MEDIUM. LOW.

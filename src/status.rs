@@ -1,29 +1,53 @@
 //! Status-line span builder (pure).
 //!
-//! Turns a pre-expanded `status-left` string + window list + the status
-//! styling options into the ordered `(text, Style)` span sequence
-//! `render::compose_back` draws on the status row: the left string, followed
-//! by each window's `<idx>:<name><flags>` tab, space-separated. Every span
-//! carries a FULLY RESOLVED [`grid::Style`](crate::grid::Style) (SP3 Task 8,
-//! superseding the old `StatusSpan { text, underline }` bool):
+//! Turns the pre-expanded `status-left` text, the live window list, and the
+//! status-bar option table into the ordered `(text, Style)` span sequence
+//! `render::compose_back` draws left-to-right starting at column 0 (the
+//! status-right text is drawn separately, right-aligned, by the server —
+//! see `render::StatusRow::right`/`right_style`). Every span carries a
+//! FULLY RESOLVED [`grid::Style`](crate::grid::Style).
 //!
-//! - the left string and the single-space separators are drawn with `base`
-//!   (the `status-style` option applied to the default style);
-//! - a NON-current window tab is `window-status-style` layered over `base`;
-//! - the CURRENT window tab is `window-status-current-style` layered over
-//!   `base` — NOT over `window-status-style` (tmux layers the current style
-//!   over `status-style` directly, so an fg set only in
-//!   `window-status-style` does not leak into the current tab).
+//! **SP6 Task 4 (status-justify / per-side styles / window formats /
+//! separator):** `status_spans` grew from a hardcoded `#I:#W<flags>`-shaped
+//! tab renderer into a full per-tab `window-status-format`/
+//! `-current-format` expander (via [`crate::options::expand_format`]) with:
 //!
-//! With default options (`window-status-style` empty,
-//! `window-status-current-style` = `underscore`) this reproduces the SP2
-//! behavior exactly: every span equals `base` except the current tab, which
-//! is `base` + underline. See `docs/specs/2026-07-07-server-client-interfaces.md`
-//! "status" (flag-composition rule) and the SP3 contract's `## render-styles`
-//! section.
+//! - **justify** (`status-justify`): the window-list group's start column is
+//!   computed per `docs/tmux-reference/status-line-and-messages.md` §1.4's
+//!   positioning math (`left`/`centre`/`right`/`absolute-centre`) and
+//!   realized as a literal run of `base`-styled padding spaces between the
+//!   left section and the list — `render::compose_back` still just draws
+//!   spans sequentially from column 0, so no renderer change was needed.
+//! - **side styles**: `left` is styled `status-left-style` layered over
+//!   `base` (previously always bare `base`); `status-right-style` is
+//!   layered over `base` by the SERVER directly (`render::StatusRow::right`
+//!   has only one style slot — see [`strip_style_markers`] for why
+//!   status-right can't carry multiple inline-styled runs).
+//! - **window formats**: each tab's text is `window-status-current-format`
+//!   (current window) or `window-status-format` (every other window)
+//!   expanded via `expand_format` against a per-window
+//!   [`crate::options::FormatCtx`] (session/pane/hostname/time carried over
+//!   from the caller's context; `window_index`/`window_name`/`window_flags`
+//!   overridden per window). `expand_format` passes `#[...]` inline style
+//!   markers through VERBATIM (SP6 Task 4 addition — see that function's
+//!   doc comment); [`styled_runs`] (private) then splits the expanded text
+//!   on those markers into styled sub-spans, additively layering each
+//!   marker's parsed style onto the tab's base
+//!   (`window-status(-current)-style` over `status-style`, unchanged
+//!   layering rule from SP3). Text with no markers at all — the common case
+//!   — yields exactly one span, byte-identical to the pre-Task-4 output.
+//! - **separator**: `window-status-separator` (default a single space)
+//!   replaces the old hardcoded `" "` between tabs (still omitted after the
+//!   last tab).
+//!
+//! The CURRENT window's style is still `window-status-current-style`
+//! layered over `base` directly — NOT over `window-status-style` (tmux
+//! layers `window-status-current-style` over `status-style` directly, so an
+//! fg set only in `window-status-style` never leaks into the current tab).
 
 use crate::grid::Style;
-use crate::style::PartialStyle;
+use crate::options::{expand_format, FormatCtx};
+use crate::style::{self, PartialStyle};
 
 pub struct WindowEntry {
     pub index: u32,
@@ -48,28 +72,171 @@ fn flags(w: &WindowEntry) -> String {
     f
 }
 
-/// Build the status-bar spans: `left` (the already-expanded, already-length-
-/// capped `status-left` text) styled `base`, then per window (index order as
-/// given) a `"<idx>:<name><flags>"` span styled per the layering rules in
-/// the module docs, with a separate base-styled single-space span between
-/// windows (not after the last one).
+/// Split text already expanded by [`expand_format`] (which passes `#[...]`
+/// inline style markers through verbatim) into styled runs: literal text
+/// between markers, each carrying `default_style` layered with every
+/// `#[...]` style seen so far (tmux's `style_parse` is additive — a later
+/// `#[bg=black]` after an earlier `#[fg=white]` keeps both; a marker whose
+/// content fails to parse, or one with no closing `]`, is a no-op/treated as
+/// literal text — defensive, not expected from real configs). Text with no
+/// markers at all yields exactly one span equal to `default_style` — this
+/// is what keeps every pre-Task-4 test's expected values unchanged.
+fn styled_runs(text: &str, default_style: Style) -> Vec<(String, Style)> {
+    let mut spans = Vec::new();
+    let mut current = PartialStyle::default();
+    let mut buf = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            let mut inner = String::new();
+            let mut closed = false;
+            for c2 in chars.by_ref() {
+                if c2 == ']' {
+                    closed = true;
+                    break;
+                }
+                inner.push(c2);
+            }
+            if closed {
+                if !buf.is_empty() {
+                    spans.push((std::mem::take(&mut buf), current.apply_to(default_style)));
+                }
+                if let Ok(parsed) = style::parse_style(&inner) {
+                    current = current.merge(&parsed);
+                }
+            } else {
+                // Unterminated marker: no real config produces this: treat
+                // the `#[` + whatever followed as literal text rather than
+                // silently dropping it.
+                buf.push('#');
+                buf.push('[');
+                buf.push_str(&inner);
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    spans.push((buf, current.apply_to(default_style)));
+    spans
+}
+
+/// Strip `#[...]` inline style markers from already-`expand_format`-expanded
+/// text, keeping only the literal text. Used for `status-right`: unlike
+/// `left` (folded into `status_spans`'s returned `Vec`, which can carry any
+/// number of differently-styled runs) `render::StatusRow::right` is a single
+/// `String` with one `right_style` — there is no slot for multiple styled
+/// runs on that side, so any inline markers in `status-right` are dropped
+/// rather than leaking their literal `#[...]` text onto the screen.
+pub fn strip_style_markers(text: &str) -> String {
+    styled_runs(text, Style::default()).into_iter().map(|(t, _)| t).collect()
+}
+
+/// The window-list group's starting column per `status-justify`'s
+/// positioning rules (`docs/tmux-reference/status-line-and-messages.md`
+/// §1.4; winmux has no `status-format`-configurable centre/after content, so
+/// the general 8-screen trim-order engine collapses to these closed-form
+/// offsets for the fixed left/list/right layout):
+///
+/// - `left` (default): list starts immediately after `left` — offset =
+///   `left_width`.
+/// - `centre`: list is centered in the gap BETWEEN left and right —
+///   `middle = left_width + ((width - right_width) - left_width) / 2`,
+///   list starts at `middle - list_width / 2`.
+/// - `right`: list sits immediately before the right section — offset =
+///   `width - right_width - list_width`.
+/// - `absolute-centre`: list is centered in the FULL width, independent of
+///   left/right — offset = `(width - list_width) / 2`.
+///
+/// All arithmetic saturates at 0 rather than panicking when a section is
+/// wider than its allotted space (an overflowing list simply overlaps/abuts
+/// its neighbour rather than scrolling with tmux's `<`/`>` markers — a
+/// documented simplification, see the report).
+fn list_offset(justify: &str, width: usize, left_width: usize, right_width: usize, list_width: usize) -> usize {
+    match justify {
+        "centre" => {
+            let gap_end = width.saturating_sub(right_width);
+            let middle = left_width + gap_end.saturating_sub(left_width) / 2;
+            middle.saturating_sub(list_width / 2)
+        }
+        "right" => width.saturating_sub(right_width).saturating_sub(list_width),
+        "absolute-centre" => width.saturating_sub(list_width) / 2,
+        _ => left_width, // "left" and any unrecognized value
+    }
+}
+
+/// Build the status-bar spans, ready for `render::compose_back` to draw
+/// left-to-right from column 0 (see the module docs for the full SP6 Task 4
+/// design). `ctx` supplies every format-expansion field EXCEPT
+/// `window_index`/`window_name`/`window_flags`, which are overridden per
+/// window in the loop below (`ctx`'s own values for those three fields, if
+/// any, are ignored). `width` is the terminal's column count; `right_len` is
+/// the char count of the (already length-capped, already
+/// `strip_style_markers`-cleaned) `status-right` text the caller will draw
+/// right-aligned — needed for the `centre`/`right`/`absolute-centre` offset
+/// math but otherwise unused here.
+#[allow(clippy::too_many_arguments)]
 pub fn status_spans(
     left: &str,
+    left_style: &PartialStyle,
     windows: &[WindowEntry],
+    ctx: &FormatCtx,
+    window_format: &str,
+    window_current_format: &str,
     base: Style,
     win_style: &PartialStyle,
     win_current_style: &PartialStyle,
+    separator: &str,
+    justify: &str,
+    width: u16,
+    right_len: usize,
 ) -> Vec<(String, Style)> {
+    let left_base = left_style.apply_to(base);
+    let mut left_spans = styled_runs(left, left_base);
+    let left_width: usize = left_spans.iter().map(|(t, _)| t.chars().count()).sum();
+
     let non_current = win_style.apply_to(base);
     let current = win_current_style.apply_to(base);
-    let mut spans = Vec::with_capacity(1 + windows.len() * 2);
-    spans.push((left.to_string(), base));
+
+    let mut tab_spans: Vec<Vec<(String, Style)>> = Vec::with_capacity(windows.len());
+    let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
+    for w in windows {
+        let flags_str = flags(w);
+        let per_window_ctx = FormatCtx {
+            session: ctx.session,
+            window_index: w.index,
+            window_name: &w.name,
+            window_flags: &flags_str,
+            pane_index: ctx.pane_index,
+            hostname: ctx.hostname,
+            now: ctx.now,
+            pane_title: ctx.pane_title,
+        };
+        let fmt = if w.current { window_current_format } else { window_format };
+        let text = expand_format(fmt, &per_window_ctx);
+        let tab_base = if w.current { current } else { non_current };
+        let spans = styled_runs(&text, tab_base);
+        let width: usize = spans.iter().map(|(t, _)| t.chars().count()).sum();
+        tab_spans.push(spans);
+        tab_widths.push(width);
+    }
+    let sep_width = separator.chars().count();
+    let list_width: usize =
+        tab_widths.iter().sum::<usize>() + sep_width.saturating_mul(windows.len().saturating_sub(1));
+
+    let offset = list_offset(justify, width as usize, left_width, right_len, list_width);
+    let pad = offset.saturating_sub(left_width);
+
+    let mut spans = Vec::with_capacity(left_spans.len() + tab_spans.len() * 2);
+    spans.append(&mut left_spans);
+    if pad > 0 {
+        spans.push((" ".repeat(pad), base));
+    }
     let last_idx = windows.len().saturating_sub(1);
-    for (i, w) in windows.iter().enumerate() {
-        let text = format!("{}:{}{}", w.index, w.name, flags(w));
-        spans.push((text, if w.current { current } else { non_current }));
+    for (i, ts) in tab_spans.into_iter().enumerate() {
+        spans.extend(ts);
         if i != last_idx {
-            spans.push((" ".to_string(), base));
+            spans.push((separator.to_string(), base));
         }
     }
     spans
@@ -79,6 +246,7 @@ pub fn status_spans(
 mod tests {
     use super::*;
     use crate::grid::Color;
+    use crate::options::SystemTimeParts;
     use crate::style::parse_style;
 
     fn win(index: u32, name: &str, current: bool, last: bool, zoomed: bool) -> WindowEntry {
@@ -96,11 +264,62 @@ mod tests {
         (PartialStyle::default(), parse_style("underscore").unwrap())
     }
 
+    /// A neutral `FormatCtx` for tests that don't exercise time/pane/host
+    /// fields (`window_index`/`window_name`/`window_flags` are overridden
+    /// per window by `status_spans` regardless of what's set here).
+    fn ctx0() -> FormatCtx<'static> {
+        FormatCtx {
+            session: "s",
+            window_index: 0,
+            window_name: "",
+            window_flags: "",
+            pane_index: 0,
+            hostname: "",
+            now: SystemTimeParts { year: 2026, month: 1, day: 1, weekday: 0, hour: 0, min: 0, sec: 0 },
+            pane_title: "",
+        }
+    }
+
+    /// tmux's real default (`#I:#W#{?window_flags,#{window_flags}, }`)
+    /// isn't expressible by the `expand_format` subset without evaluating
+    /// its `#{?...}` conditional (undone work, tracked at the `options.rs`
+    /// default's own doc comment); winmux's stored default is the
+    /// expand_format-compatible `#I:#W#F`, which reproduces the SAME visible
+    /// text for every flagged case (only "no flags at all" loses tmux's
+    /// cosmetic trailing-space-for-alignment nicety — documented deviation).
+    /// Tests below use this exact string to exercise the REAL default path.
+    const DEFAULT_FMT: &str = "#I:#W#F";
+
+    #[allow(clippy::too_many_arguments)]
+    fn spans_default(
+        left: &str,
+        windows: &[WindowEntry],
+        base: Style,
+        win_style: &PartialStyle,
+        win_current_style: &PartialStyle,
+    ) -> Vec<(String, Style)> {
+        status_spans(
+            left,
+            &PartialStyle::default(),
+            windows,
+            &ctx0(),
+            DEFAULT_FMT,
+            DEFAULT_FMT,
+            base,
+            win_style,
+            win_current_style,
+            " ",
+            "left",
+            200, // plenty of room: never pads, never truncates
+            0,
+        )
+    }
+
     #[test]
     fn single_window_current() {
         let windows = vec![win(0, "powershell", true, false, false)];
         let (ws, wcs) = default_partials();
-        let spans = status_spans("[0] ", &windows, base(), &ws, &wcs);
+        let spans = spans_default("[0] ", &windows, base(), &ws, &wcs);
         // Defaults reproduce the old underline-only behavior: every span is
         // `base` except the current tab, which is `base` + underline.
         assert_eq!(
@@ -120,7 +339,7 @@ mod tests {
             win(2, "shell", true, false, false), // current -> "*"
         ];
         let (ws, wcs) = default_partials();
-        let spans = status_spans("[s] ", &windows, base(), &ws, &wcs);
+        let spans = spans_default("[s] ", &windows, base(), &ws, &wcs);
         assert_eq!(
             spans,
             vec![
@@ -142,7 +361,7 @@ mod tests {
             win(2, "logs", false, false, false),
         ];
         let (ws, wcs) = default_partials();
-        let spans = status_spans("[mysess] ", &windows, base(), &ws, &wcs);
+        let spans = spans_default("[mysess] ", &windows, base(), &ws, &wcs);
         assert_eq!(
             spans,
             vec![
@@ -166,7 +385,7 @@ mod tests {
         let windows = vec![win(0, "a", false, true, false), win(1, "b", true, false, false)];
         let ws = parse_style("fg=blue").unwrap();
         let wcs = parse_style("fg=red,bold").unwrap();
-        let spans = status_spans("[x] ", &windows, base(), &ws, &wcs);
+        let spans = spans_default("[x] ", &windows, base(), &ws, &wcs);
         assert_eq!(
             spans,
             vec![
@@ -178,6 +397,300 @@ mod tests {
                 // current: red+bold over BASE (no blue anywhere; no
                 // underline since wcs doesn't mention it)
                 ("1:b*".to_string(), Style { fg: Color::Idx(1), bold: true, ..base() }),
+            ]
+        );
+    }
+
+    // ---- SP6 Task 4: status-justify, side styles, window formats, separator ----
+
+    /// justify=centre: list centered in the gap BETWEEN left and right.
+    /// left="AB" (width 2), right_len=4, width=20, one window whose format
+    /// is bare `#I` and index 42 -> tab text "42" (width 2, no separator
+    /// needed with a single window).
+    /// middle = 2 + ((20-4)-2)/2 = 2 + 14/2 = 2+7 = 9
+    /// offset = middle - list_width/2 = 9 - 2/2 = 9-1 = 8
+    /// pad = offset - left_width = 8-2 = 6
+    #[test]
+    fn status_justify_centre_positions_window_list() {
+        let windows = vec![win(42, "w", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "AB",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "centre",
+            20,
+            4,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                ("AB".to_string(), base_style),
+                ("      ".to_string(), base_style), // 6 spaces of padding
+                ("42".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// justify=right: list sits immediately before the right section.
+    /// left="L" (width 1), right_len=5, width=20, one window `#I` index 7 ->
+    /// "7" (width 1).
+    /// offset = width - right_len - list_width = 20-5-1 = 14
+    /// pad = offset - left_width = 14-1 = 13
+    #[test]
+    fn status_justify_right() {
+        let windows = vec![win(7, "w", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "L",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "right",
+            20,
+            5,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                ("L".to_string(), base_style),
+                (" ".repeat(13), base_style),
+                ("7".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// justify=absolute-centre: list centered in the FULL width, ignoring
+    /// left/right entirely (right_len is passed but unused by this branch).
+    /// left="LEFT" (width 4), width=30, one window `#I` index 12 -> "12"
+    /// (width 2).
+    /// offset = (width - list_width)/2 = (30-2)/2 = 28/2 = 14
+    /// pad = offset - left_width = 14-4 = 10
+    #[test]
+    fn status_justify_absolute_centre() {
+        let windows = vec![win(12, "w", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "LEFT",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "absolute-centre",
+            30,
+            10,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                ("LEFT".to_string(), base_style),
+                (" ".repeat(10), base_style),
+                ("12".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// A custom `window-status-format` (used for BOTH current and
+    /// non-current here, to isolate pure substitution from the
+    /// current-vs-non-current format SELECTION tested separately below)
+    /// expands `#I`/`#W`/`#F` per tab, literal spaces preserved.
+    /// window 0: index=0 name="bash", non-current+last -> flags "-" ->
+    ///   " 0 bash - "
+    /// window 1: index=1 name="zsh", current -> flags "*" -> " 1 zsh * "
+    #[test]
+    fn window_status_format_expands_per_tab() {
+        let windows = vec![win(0, "bash", false, true, false), win(1, "zsh", true, false, false)];
+        let (ws, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "X",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            " #I #W #F ",
+            " #I #W #F ",
+            base_style,
+            &ws,
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                ("X".to_string(), base_style),
+                (" 0 bash - ".to_string(), base_style),
+                (" ".to_string(), base_style),
+                (" 1 zsh * ".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// `window-status-current-format` is used ONLY for the current window;
+    /// every other window uses `window-status-format` — distinct wrapper
+    /// strings make the selection observable.
+    #[test]
+    fn window_status_current_format_used_for_current() {
+        let windows = vec![win(0, "a", false, false, false), win(1, "b", true, false, false)];
+        let (ws, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I:#W",
+            "[#I:#W]",
+            base_style,
+            &ws,
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                ("0:a".to_string(), base_style),
+                (" ".to_string(), base_style),
+                ("[1:b]".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// `status-left-style` layers over `status-style` for the left span,
+    /// exactly like `window-status(-current)-style` layers over base for
+    /// tabs — the two sides never leak into each other (the left's cyan fg
+    /// doesn't affect the tab's style, and vice versa).
+    #[test]
+    fn side_styles_layer_over_status_style() {
+        let windows = vec![win(0, "w", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let left_style = parse_style("fg=cyan").unwrap();
+        let spans = status_spans(
+            "hi",
+            &left_style,
+            &windows,
+            &ctx0(),
+            DEFAULT_FMT,
+            DEFAULT_FMT,
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                // fg=cyan over base (bg stays green, from base())
+                ("hi".to_string(), Style { fg: Color::Idx(6), ..base_style }),
+                // tab style untouched by left_style
+                ("0:w*".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    /// `window-status-separator` set to `"|"` replaces the default single
+    /// space between tabs (still omitted after the last one).
+    #[test]
+    fn window_status_separator_respected() {
+        let windows = vec![
+            win(0, "a", false, false, false),
+            win(1, "b", false, false, false),
+            win(2, "c", true, false, false),
+        ];
+        let (ws, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            DEFAULT_FMT,
+            DEFAULT_FMT,
+            base_style,
+            &ws,
+            &wcs,
+            "|",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                ("0:a".to_string(), base_style),
+                ("|".to_string(), base_style),
+                ("1:b".to_string(), base_style),
+                ("|".to_string(), base_style),
+                ("2:c*".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    // ---- inline `#[...]` style markers within a window format ----
+
+    #[test]
+    fn inline_style_marker_in_window_format() {
+        let windows = vec![win(3, "vim", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I #[fg=white]#W",
+            "#I #[fg=white]#W",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                // "3 " stays the current-tab style (underline), "vim" gets
+                // fg=white layered ON TOP of the current-tab style.
+                ("3 ".to_string(), Style { underline: true, ..base_style }),
+                (
+                    "vim".to_string(),
+                    Style { fg: Color::Idx(7), underline: true, ..base_style }
+                ),
             ]
         );
     }

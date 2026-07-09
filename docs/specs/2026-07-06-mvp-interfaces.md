@@ -405,7 +405,14 @@ pub struct StatusRow {
     /// Left-aligned runs, each with its resolved style.
     pub spans: Vec<(String, grid::Style)>,
     pub right: String,
-    /// Style for `right` (`base` in SP3; `#[]` inline styles are SP4).
+    /// Style for `right` (`base` in SP3; as of **SP6 Task 4** the server
+    /// populates this with `status-right-style` layered over `base` — see
+    /// that task's amendment in `2026-07-07-server-client-interfaces.md`'s
+    /// `## status` section. Field TYPE is unchanged; only the VALUE the
+    /// server assigns it changed, so no signature amendment was needed
+    /// here. `right` never carries inline `#[...]`-styled sub-runs — there
+    /// is only one style slot — any such markers are stripped to plain text
+    /// before assignment (`status::strip_style_markers`).
     pub right_style: grid::Style,
 }
 

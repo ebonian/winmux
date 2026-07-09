@@ -51,7 +51,7 @@ use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
 use crate::render::{CopyView, ListOverlay, Overlay, PaneView, Renderer, Scene, StatusRow};
-use crate::status::{status_spans, WindowEntry};
+use crate::status::{status_spans, strip_style_markers, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -2169,9 +2169,15 @@ fn render_one(
         // Option-length caps apply while building the strings (tmux
         // truncates left/right to status-left/right-length); the renderer's
         // spatial right-first truncation still applies on top when the
-        // capped strings don't fit the terminal width.
+        // capped strings don't fit the terminal width. status-right is run
+        // through `strip_style_markers` BEFORE the length cap: `render::
+        // StatusRow::right` has only one style slot (no room for inline
+        // `#[...]`-styled sub-runs the way the left/window-list spans have),
+        // so any markers are dropped to plain text rather than leaking their
+        // literal `#[...]` bytes onto the screen (SP6 Task 4).
         let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
-        let right = truncate_chars(&expand_format(options.status_right(), &fctx), options.status_right_length());
+        let right_expanded = strip_style_markers(&expand_format(options.status_right(), &fctx));
+        let right = truncate_chars(&right_expanded, options.status_right_length());
         let entries: Vec<WindowEntry> = session
             .windows
             .iter()
@@ -2185,19 +2191,27 @@ fn render_one(
             .collect();
         let spans = status_spans(
             &left,
+            options.status_left_style(),
             &entries,
+            &fctx,
+            options.window_status_format(),
+            options.window_status_current_format(),
             base,
             options.window_status_style(),
             options.window_status_current_style(),
+            options.window_status_separator(),
+            options.status_justify(),
+            session.size.0,
+            right.chars().count(),
         );
         Some(StatusRow {
             top: options.status_position_top(),
             base,
             spans,
             right,
-            // status-right styling via `#[]` inline styles is SP4; until
-            // then the right side is drawn with the row's base style.
-            right_style: base,
+            // status-right-style layered over base (SP6 Task 4; previously
+            // always bare `base` until this task wired the option in).
+            right_style: options.status_right_style().apply_to(base),
         })
     } else {
         None

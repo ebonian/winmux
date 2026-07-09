@@ -792,9 +792,15 @@ two meta characters (everything else copies through verbatim):
 | `#{window_name}` | `ctx.window_name` |
 | `#{<anything else>}` | empty (documented SP3 simplification — no
   conditionals/modifiers, full tmux format-expression engine is SP4) |
+| `#[...]` | passed through VERBATIM, brackets included, up to and including
+  the first `]` (SP6 Task 4 addition — `#[fg=white]`-style inline style
+  markers are NOT interpreted by `expand_format`; they're left in the output
+  for `status::styled_runs` to split into styled spans afterward. An
+  unterminated marker — no closing `]` — is copied to end-of-string rather
+  than dropped) |
 | `#<any other char>`, trailing lone `#` | empty (unrecognized short code
   consumes the one following character; a `#` with nothing after it is
-  dropped) |
+  dropped; this does NOT apply to `#[`, handled above) |
 | `%%` | literal `%` |
 | `%H` `%M` `%S` `%d` `%m` | zero-padded 2-digit hour/min/sec/day/month
   from `ctx.now` |
@@ -1663,18 +1669,27 @@ colour token like `display-panes-colour`, default `blue`, parsed on read via
 `absolute-centre`, default `left`), `status-left-style` / `status-right-style`
 (Style, default the literal string `"default"` — see the `style` amendment
 above for why this now parses), `window-status-format` /
-`window-status-current-format` (Str, default
-`#I:#W#{?window_flags,#{window_flags}, }` — the `expand_format` subset does
-not yet evaluate the `#{?...}` conditional this default contains; these
-options are ACCEPTED+STORED verbatim, not evaluated, in Task 2). All
-defaults verified against `commands-config-options-formats.md`'s options
-appendix. `visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
-`window-status-bell-style` are INERT (no alerts/bell/clock-mode subsystem
+`window-status-current-format` (Str, default `#I:#W#F` as of **SP6 Task 4**
+— originally stored verbatim as tmux's literal
+`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); Task 4
+changed the DEFAULT to `#I:#W#F` because the `expand_format` subset still
+does not evaluate a general `#{?cond,a,b}` conditional, and `#I:#W#F`
+reproduces the identical rendered text for every window that has at least
+one flag — the only difference from tmux's literal default is the loss of
+its cosmetic single-trailing-space-for-column-alignment when a window has
+NO flags at all, which is also exactly what winmux's PRE-Task-4 hardcoded
+tab renderer already produced). All defaults verified against
+`commands-config-options-formats.md`'s options appendix.
+`visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
+`window-status-bell-style` remain INERT (no alerts/bell/clock-mode subsystem
 exists — same bucket as `mouse`/`history-limit` before their own Tasks
-wired them up); `status-justify`/`status-left-style`/`status-right-style`/
+wired them up). `status-justify`/`status-left-style`/`status-right-style`/
 `window-status-format`/`window-status-current-format`/`window-status-separator`
-are typed+stored here, with status-bar RENDERING wiring left to a later
-task. Test: `sp6_config_compat_options_defaults_and_roundtrip`.
+are now LIVE, rendering-wired in SP6 Task 4 — see `status::status_spans`'s
+amendment in `2026-07-07-server-client-interfaces.md`. Tests:
+`sp6_config_compat_options_defaults_and_roundtrip` (defaults + round trip),
+`expand_inline_style_marker_passthrough` (the `#[...]` passthrough this
+wiring depends on).
 
 ### `server::dispatch`: copy-mode/copy-mode-vi bind tables, `~` expansion
 
