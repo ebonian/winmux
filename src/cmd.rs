@@ -318,14 +318,23 @@ pub enum ParsedCmd {
     /// swap -- see `Server::exec_swap_window`'s doc comment for the exact
     /// current/last bookkeeping this implies.
     SwapWindow { src: Option<String>, dst: Option<String>, detach: bool },
-    /// `find-window|findw <pattern>` (Task 7): case-insensitive substring
-    /// search (v1, no regex) over window NAMES and every pane's CURRENTLY
-    /// VISIBLE content (not scrollback) in the target session, in window-
-    /// index order; jumps to the first match (current window counts too).
-    /// No match -> `Ok` with a transient `no windows matching: <p>` message
-    /// (not an `Err` -- matches tmux, which never treats "nothing found" as
-    /// a command failure).
-    FindWindow { pattern: String },
+    /// `find-window|findw [-CNTirZ] <pattern>` (Task 7; SP7 Task 12 closes
+    /// follow-ups #46/#54): opens the (possibly filtered-to-nothing)
+    /// choose-tree overlay on the target session's windows -- selecting an
+    /// entry performs the actual jump (real tmux is sugar for `window-tree
+    /// (choose-tree) mode`, NOT a direct jump, even for exactly one match --
+    /// `docs/tmux-reference/windows-and-sessions.md` `### find-window`).
+    /// `by_content`/`by_name`/`by_title` are `-C`/`-N`/`-T`; when all three
+    /// are `false` (no flag given), `server::dispatch` treats that as "match
+    /// all three" (the doc's default). `regex` is `-r` (match-string is a
+    /// regex instead of an fnmatch-style glob substring-wrapped in `*...*`);
+    /// `ignore_case` is `-i`. `-Z` (keep the tree zoomed) is accepted for
+    /// config/CLI compatibility but not stored -- a documented no-op, see
+    /// the parity-polish contract's `find-window-and-main-pane-sizing`
+    /// section. No match -> `Ok` with a transient `no windows matching: <p>`
+    /// message (not an `Err`, and no tree opens -- documented scope
+    /// narrowing versus real tmux's empty-tree-opens behavior).
+    FindWindow { pattern: String, by_content: bool, by_name: bool, by_title: bool, regex: bool, ignore_case: bool },
     /// `choose-tree|choosetree [-s] [-w]` (Task 8, sub-project 4): open the
     /// choose-tree overlay on the acting client. `sessions: true` (`-s`)
     /// lists every session (one collapsed row each); `false` (bare, or the
@@ -667,7 +676,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "break-pane" => "usage: break-pane [-d] [-n name] [-s src] [-t dst]",
         "move-window" => "usage: move-window [-k] -t index",
         "swap-window" => "usage: swap-window [-d] [-s src] -t dst",
-        "find-window" => "usage: find-window pattern",
+        "find-window" => "usage: find-window [-CNTirZ] pattern",
         "choose-tree" => "usage: choose-tree [-s] [-w]",
         "display-panes" => "usage: display-panes [-d ms]",
         "clock-mode" => "usage: clock-mode",
@@ -1270,11 +1279,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SwapWindow { src: value_of(&v, "-s"), dst: Some(dst), detach: has(&b, "-d") })
         }
         "find-window" => {
-            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            let Ok((b, _, p)) = scan_flags(&raw.args, &["-C", "-N", "-T", "-i", "-r", "-Z"], &[]) else { return Err(bad()) };
             if p.len() != 1 {
                 return Err(bad());
             }
-            Ok(ParsedCmd::FindWindow { pattern: p[0].clone() })
+            Ok(ParsedCmd::FindWindow {
+                pattern: p[0].clone(),
+                by_content: has(&b, "-C"),
+                by_name: has(&b, "-N"),
+                by_title: has(&b, "-T"),
+                regex: has(&b, "-r"),
+                ignore_case: has(&b, "-i"),
+                // `-Z` accepted (see `ParsedCmd::FindWindow`'s doc comment)
+                // but deliberately not stored -- documented no-op.
+            })
         }
         "choose-tree" => {
             let Ok((b, _, p)) = scan_flags(&raw.args, &["-s", "-w"], &[]) else { return Err(bad()) };
@@ -1745,14 +1763,32 @@ mod tests {
     fn find_window_pattern() {
         assert_eq!(
             resolve(&raw("find-window", &["logs"])).unwrap(),
-            ParsedCmd::FindWindow { pattern: "logs".to_string() }
+            ParsedCmd::FindWindow { pattern: "logs".to_string(), by_content: false, by_name: false, by_title: false, regex: false, ignore_case: false }
         );
         assert_eq!(
             resolve(&raw("findw", &["with space"])).unwrap(),
-            ParsedCmd::FindWindow { pattern: "with space".to_string() }
+            ParsedCmd::FindWindow { pattern: "with space".to_string(), by_content: false, by_name: false, by_title: false, regex: false, ignore_case: false }
         );
         assert_eq!(resolve(&raw("find-window", &[])).unwrap_err(), usage("find-window").unwrap());
         assert_eq!(resolve(&raw("find-window", &["a", "b"])).unwrap_err(), usage("find-window").unwrap());
+    }
+
+    /// SP7 Task 12: `-C`/`-N`/`-T`/`-i`/`-r`/`-Z` all parse; `-Z` is accepted
+    /// but not part of the parsed shape (documented no-op).
+    #[test]
+    fn find_window_flags_parse() {
+        assert_eq!(
+            resolve(&raw("find-window", &["-r", "-i", "^foo"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "^foo".to_string(), by_content: false, by_name: false, by_title: false, regex: true, ignore_case: true }
+        );
+        assert_eq!(
+            resolve(&raw("find-window", &["-N", "-T", "webby"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "webby".to_string(), by_content: false, by_name: true, by_title: true, regex: false, ignore_case: false }
+        );
+        assert_eq!(
+            resolve(&raw("find-window", &["-C", "-Z", "logs"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "logs".to_string(), by_content: true, by_name: false, by_title: false, regex: false, ignore_case: false }
+        );
     }
 
     // ---- overlays (Task 8, sub-project 4) ----------------------------------

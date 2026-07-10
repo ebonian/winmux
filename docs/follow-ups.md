@@ -681,22 +681,27 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     narrowings" note for why that specific three-flag corner isn't a
     verified-against-tmux-source ruling). Test:
     `tests/server_proto.rs::swap_pane_dash_s_with_direction_resolves_relative_to_s`.
-43. **`main-pane-width`/`main-pane-height` are baked into a ratio at
-    `select-layout`/`next-layout` apply-time, not stored as an absolute
-    size** (Task 6, layout presets). `Layout`'s tree only ever stores `f32`
-    split ratios (no absolute-size node variant), so `apply_preset` computes
-    `ratio_for(target_absolute_cells, area_len)` ONCE, at application time —
-    the first render reproduces the exact configured main-pane cell count,
-    but a LATER window resize scales the main pane proportionally rather
-    than preserving the literal configured width/height the way real tmux
-    does (tmux recomputes the absolute size on every resize). One-line fix
-    framing: preserve absolute main-pane size across resize like tmux — would
-    need a `Layout` node variant (or side-table) that remembers "this split's
-    first child wants N absolute cells" and re-derives the ratio from the
-    CURRENT area on every resize/render, not just at apply-time. Functionally
-    acceptable for now (documented deviation, not a bug); doc gap closed by
-    this same fix round (see `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
-    `layout-presets` section).
+43. **RESOLVED** (SP7 Task 12, 2026-07-10). `Layout::Node::Split` gained a
+    private `main_size: Option<u16>` annotation: `build_preset_tree`'s
+    `MainHorizontal`/`MainVertical` arms set it to the UNCLAMPED, already
+    percent-resolved `main-pane-width`/`-height` value, and `split_rects`
+    re-derives the actual first-child length via `clamp_main(target,
+    CURRENT_area_len, min)` on every `rects()` call (not just at apply-time)
+    -- so a later whole-window resize keeps the configured absolute size
+    instead of scaling it proportionally. A successful manual `resize_from`
+    on that same split clears the annotation (a deliberate user override of
+    the border sticks through further resizes instead of snapping back).
+    `main-pane-width`/`-height` were also promoted from plain `Number` to a
+    new `Kind::Size`/`Value::Size(SizeSpec)` that additionally accepts `N%`
+    (resolved against the target window's area at apply-time). No public
+    `Layout` signature changed (`Node` is private); `options::Options::
+    main_pane_width`/`_height`/`_for` gained a `total: u16` parameter --
+    contract amended in `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
+    `layout-presets` section and its new `find-window-and-main-pane-sizing`
+    section. Tests: `layout::tests::main_pane_width_survives_window_resize`
+    (+ height/reclamp/manual-override siblings), `options::tests::
+    main_pane_size_percent`, `tests/server_proto.rs`'s
+    `main_pane_width_survives_window_resize` (a real client Resize frame).
 
 44. **RESOLVED** (SP7 Task 11, 2026-07-10, closes this follow-up).
     *Original text:* `break-pane` has no `-s`/`-t` pane-selector flag (Task
@@ -733,15 +738,23 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     `move_window_across_sessions_*`;
     `tests/server_proto.rs::move_window_to_other_session_appears_there_and_leaves_source`.
 
-46. **`find-window` always jumps to the first match — no choose-list for
-    multiple matches** (Task 7). The design spec's `## 6. Window ops`
-    section is explicit about this ("jump to first match"), so this is NOT
-    a shortfall against the spec of record, but it IS a real simplification
-    relative to actual tmux (which shows a `choose-tree`-style picker when
-    more than one window matches). Once Task 8's choose-tree overlay lands
-    (design spec `## 7. Overlays`), `find-window` could route multi-match
-    results through it instead of the deterministic first-match jump —
-    tracked here so that follow-up wiring has a home.
+46. **RESOLVED** (SP7 Task 12, 2026-07-10). `find-window` now ALWAYS routes
+    into the choose-tree overlay, filtered to the matches (`server::dispatch
+    ::Server::exec_find_window_client` -> `open_choose_tree(..., filter:
+    Some(matches), ...)`) — even for exactly one match, matching real tmux's
+    `window-tree (choose-tree) mode` sugar exactly
+    (`docs/tmux-reference/windows-and-sessions.md` `### find-window`) and
+    replacing the old deterministic first-match direct jump this ticket
+    tracked. `ChooseTreeState` gained a `filter: Option<HashSet<WindowId>>`
+    field; `build_tree_rows` gained a matching parameter. Zero matches still
+    shows the pre-existing transient `no windows matching: <p>` message with
+    NO tree opening (a small, documented, intentional scope narrowing versus
+    real tmux's empty-tree-opens behavior). Contract amended in
+    `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `overlays` and
+    `window-ops` sections plus its new `find-window-and-main-pane-sizing`
+    section. Tests: `tests/server_proto.rs`'s `find_window_multi_match_
+    opens_choose_list`, `find_window_single_match_opens_choose_list_too`,
+    and the rewritten `find_window_f_prompt`.
 
 ## Deferred from sub-project 4 (parity polish, closeout — 2026-07-08)
 
@@ -888,11 +901,22 @@ None block the sub-project 4 merge.
     `-p` is parsed and accepted but the write is always a plain byte dump
     (design spec `## 3. Paste buffers`: "`-p` accepted and ignored,
     documented").
-54. **`find-window` matching is plain case-insensitive substring, not
-    regex** (Task 7, window ops; design spec `## 6. Window ops`: "v1 no
-    regex"). A pattern like `^foo` or `bar$` is matched LITERALLY (including
-    the `^`/`$` characters) rather than as an anchor, unlike real tmux's
-    `-r`-capable regex matching.
+54. **RESOLVED** (SP7 Task 12, 2026-07-10). `find-window` now supports
+    `-C`/`-N`/`-T` match targets (defaulting to all three when none given),
+    `-i` case-insensitivity, and real `-r` regex matching (via the new
+    `regex` crate dependency — first external crate beyond `vte`/`windows`,
+    justified in the task commit message: hand-rolling correct POSIX ERE
+    matching for a rarely-used flag was judged not worth the risk versus a
+    well-established pure-Rust dependency). The non-`-r` default path is a
+    small hand-rolled fnmatch-lite glob matcher (`*`/`?`, substring-wrapped
+    for name/title matching per tmux's own rule — no character classes, a
+    documented scope narrowing). `-Z` is parsed for CLI/config compatibility
+    but is a documented no-op (winmux's choose-tree has no zoom-passthrough
+    state). See `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
+    `find-window-and-main-pane-sizing` section for the full `FindMatcher`
+    contract. Test: `tests/server_proto.rs`'s
+    `find_window_regex_flag_matches_anchor` (`-r '^foo'` matches "foobar"
+    but not "barfoo", proving real anchoring, not substring-wrapped glob).
 55. **No `copy-pipe`/OSC 52 clipboard integration in copy mode** (Tasks 2-4,
     copy mode). Copying in copy mode only ever writes to winmux's own
     internal paste-buffer store; there is no way to pipe a copy-mode
@@ -1519,3 +1543,17 @@ None block the sub-project 4 merge.
     attached: bool` alongside `is_current` through `note_bell`/`note_
     activity`/`check_silence`). LOW priority (no test or real config
     exercises a fully-detached session receiving pane output).
+
+## Follow-ups from SP7 Task 12 (find-window regex/multi-match + absolute main-pane sizing, 2026-07-10)
+
+79. **`find-window -Z` (keep the tree zoomed) is accepted but inert.** The
+    flag parses (`cmd::resolve`'s `"find-window"` arm) so real tmux
+    invocations/configs don't error, but winmux's choose-tree overlay has no
+    zoom-passthrough state to preserve — opening a filtered tree never
+    actually zooms anything either way, so there is nothing for `-Z` to
+    "keep". Same "accepted-and-stored-but-no-behavior-yet" bucket as several
+    SP6 Task 2 options were before their own wiring tasks landed. SMALL to
+    implement (would need `ChooseTreeState` to remember "re-zoom the
+    committed pane on Enter" and `exec_tree_commit` to act on it). LOW
+    priority — no test or real workflow depends on it, and `find-window`'s
+    own target pane is rarely already zoomed at search time.

@@ -283,6 +283,15 @@ struct ChooseTreeState {
     pending_kill: Option<(TreeTarget, String)>,
     expanded: HashSet<String>,
     preview: PreviewMode,
+    /// SP7 Task 12 (closes follow-ups #46/#54): `Some(matches)` for a tree
+    /// opened by `find-window` -- the exact `WindowId`s the pattern matched,
+    /// snapshotted ONCE at open time (deliberately not live-refiltered
+    /// while the tree stays open -- a documented simplification, see
+    /// `dispatch::Server::exec_find_window_client`'s doc comment). `None`
+    /// for a plain `choose-tree`/`w`/`s` open (no filtering). Only the
+    /// `Windows` view ever has a filter -- `find-window` never opens
+    /// `Sessions`.
+    filter: Option<HashSet<WindowId>>,
 }
 
 /// Re-resolve choose-tree's selection identity to a display INDEX into a
@@ -2866,7 +2875,7 @@ impl Server {
         let session_name = client.session.as_deref()?;
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let rows = self.build_tree_rows(session_name, state.view, &state.expanded);
+                let rows = self.build_tree_rows(session_name, state.view, &state.expanded, state.filter.as_ref());
                 // Task 8 review fix, Critical #1: resolve by IDENTITY, not
                 // a raw clamped index -- see `resolve_tree_sel`'s doc
                 // comment. `build_render_overlay` runs with `&self` only

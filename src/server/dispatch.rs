@@ -22,6 +22,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
+use regex::Regex;
+
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
@@ -308,18 +310,114 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// `find-window` (Task 7, sub-project 4) content-search predicate:
-/// case-insensitive substring match against a pane's CURRENTLY VISIBLE
-/// screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever cover
-/// the live viewport. `needle` must already be lowercased by the caller
-/// (avoids re-lowering it once per pane/row).
-fn grid_contains(grid: &Grid, needle: &str) -> bool {
+/// `find-window` (SP7 Task 12, closes follow-up #54): a small hand-rolled
+/// fnmatch-lite glob matcher -- `*` matches any run of characters
+/// (including empty), `?` matches exactly one character, no character
+/// classes (`[...]`, a documented scope narrowing -- see the
+/// `find-window-and-main-pane-sizing` contract section). Classic
+/// greedy-backtrack wildcard algorithm: linear amortized, no recursion (so
+/// no stack-depth concern from a long pattern/text). Compares by Unicode
+/// scalar (`char`), not byte, so multi-byte window names/titles match
+/// correctly.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut match_pos = 0usize;
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = Some(pi);
+            match_pos = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            match_pos += 1;
+            ti = match_pos;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// `find-window` (SP7 Task 12): a compiled matcher -- either a real regex
+/// (`-r`, with `-i` folded in as an inline `(?i)` flag) or a plain
+/// glob/substring pattern (case already folded to lowercase at
+/// construction time when `-i`, matching every other `-i`-style case-fold
+/// in this codebase, so the per-text comparison below never re-checks
+/// `ignore_case` itself). See the `find-window-and-main-pane-sizing`
+/// contract section for the full `matches_name`/`matches_content` rationale
+/// (name/title matching glob-wraps in `*...*` and does a FULL match; content
+/// matching is a plain, unwrapped substring/regex search, mirroring tmux's
+/// distinct `m:`/`C:` format functions).
+struct FindMatcher {
+    regex: Option<Regex>,
+    glob_pattern: String,
+    ignore_case: bool,
+}
+
+impl FindMatcher {
+    fn new(pattern: &str, use_regex: bool, ignore_case: bool) -> Result<FindMatcher, String> {
+        if use_regex {
+            let pat = if ignore_case { format!("(?i){pattern}") } else { pattern.to_string() };
+            let re = Regex::new(&pat).map_err(|e| format!("invalid regex: {e}"))?;
+            Ok(FindMatcher { regex: Some(re), glob_pattern: String::new(), ignore_case })
+        } else {
+            let p = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+            Ok(FindMatcher { regex: None, glob_pattern: p, ignore_case })
+        }
+    }
+
+    fn norm(&self, s: &str) -> String {
+        if self.ignore_case {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// `-N`/`-T` (window name / pane title): full-string glob match, wrapped
+    /// in `*...*` when not `-r` (tmux's implicit substring-glob wrapping);
+    /// regex mode is an unanchored `is_match` (already substring-search
+    /// semantics unless the user's own pattern anchors with `^`/`$`).
+    fn matches_name(&self, text: &str) -> bool {
+        match &self.regex {
+            Some(re) => re.is_match(text),
+            None => glob_match(&format!("*{}*", self.glob_pattern), &self.norm(text)),
+        }
+    }
+
+    /// `-C` (pane content): PLAIN substring search (no glob wrapping --
+    /// tmux's `#{C:}` format function is a literal substring/regex search,
+    /// not fnmatch) or regex `is_match`, checked against one already-
+    /// extracted visible row at a time (see [`grid_matches`]).
+    fn matches_content(&self, text: &str) -> bool {
+        match &self.regex {
+            Some(re) => re.is_match(text),
+            None => self.norm(text).contains(self.glob_pattern.as_str()),
+        }
+    }
+}
+
+/// `find-window`'s `-C` content-search predicate: walks a pane's CURRENTLY
+/// VISIBLE screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever
+/// cover the live viewport -- one row at a time against `matcher.
+/// matches_content` (mirrors the retired `grid_contains`'s per-row walk, now
+/// matcher-generic instead of hardcoded lowercase-substring).
+fn grid_matches(grid: &Grid, matcher: &FindMatcher) -> bool {
     for row in 0..grid.rows() {
         let mut line = String::with_capacity(grid.cols() as usize);
         for col in 0..grid.cols() {
             line.push(grid.cell(col, row).ch);
         }
-        if line.to_lowercase().contains(needle) {
+        if matcher.matches_content(&line) {
             return true;
         }
     }
@@ -1428,7 +1526,12 @@ impl Server {
     /// `main-pane-width`/`main-pane-height` are window-scoped (#26): resolve
     /// through the TARGET window (not the acting client's current one --
     /// `select-layout -t <target>` can name a different window/session).
-    fn main_pane_size_for_window(&self, session_name: &str, wid: WindowId) -> (u16, u16) {
+    /// `area` is the target window's PRESET-APPLY-TIME area (same `Rect`
+    /// `exec_select_layout`/`exec_next_layout` already computed before
+    /// calling this) -- SP7 Task 12: threaded through so a stored `N%`
+    /// value (`options::SizeSpec::Percent`) resolves against the axis it
+    /// actually applies to (`area.w` for width, `area.h` for height).
+    fn main_pane_size_for_window(&self, session_name: &str, wid: WindowId, area: Rect) -> (u16, u16) {
         let window = self
             .registry
             .sessions()
@@ -1436,8 +1539,11 @@ impl Server {
             .find(|s| s.name == session_name)
             .and_then(|s| s.windows.iter().find(|w| w.id == wid));
         match window {
-            Some(w) => (self.options.main_pane_width_for(&w.window_options), self.options.main_pane_height_for(&w.window_options)),
-            None => (self.options.main_pane_width(), self.options.main_pane_height()),
+            Some(w) => (
+                self.options.main_pane_width_for(&w.window_options, area.w),
+                self.options.main_pane_height_for(&w.window_options, area.h),
+            ),
+            None => (self.options.main_pane_width(area.w), self.options.main_pane_height(area.h)),
         }
     }
 
@@ -1445,7 +1551,7 @@ impl Server {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid);
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid, area);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1473,7 +1579,7 @@ impl Server {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid);
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid, area);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1921,47 +2027,59 @@ impl Server {
         Ok(String::new())
     }
 
-    /// `find-window|findw <pattern>`: case-insensitive substring search
-    /// (v1, no regex) over the target session's window NAMES first, then
-    /// every pane's CURRENTLY VISIBLE content, in window-index order (the
-    /// current window is a normal candidate, not excluded); jumps to the
-    /// FIRST match. No match -> `Ok` carrying a transient `no windows
-    /// matching: <p>` message (not an `Err` -- "nothing found" is not a
-    /// command failure in tmux).
-    fn exec_find_window(&mut self, pattern: String, cs: Option<&str>) -> Result<String, String> {
-        let session_name = self.resolve_session_name(None, cs)?;
-        let needle = pattern.to_lowercase();
-        let snapshot: Vec<(WindowId, String, Vec<PaneId>)> = self
-            .registry
-            .session_mut(&session_name)
-            .map(|s| s.windows.iter().map(|w| (w.id, w.name.clone(), w.layout.panes())).collect())
-            .ok_or_else(|| format!("can't find session: {session_name}"))?;
-        let mut found: Option<WindowId> = None;
-        for (wid, wname, panes) in &snapshot {
-            if wname.to_lowercase().contains(&needle) {
-                found = Some(*wid);
-                break;
+    /// `find-window|findw [-CNTirZ] <pattern>` (SP7 Task 12, closes
+    /// follow-ups #46/#54): matches every window of the target session
+    /// against the enabled criteria (name/title/content, OR'd -- all three
+    /// when none of `-C`/`-N`/`-T` are given, per
+    /// `docs/tmux-reference/windows-and-sessions.md` `### find-window`),
+    /// then **always** opens a choose-tree filtered to the matches --
+    /// selecting an entry there performs the actual jump. This REPLACES the
+    /// old direct-jump-to-first-match behavior (a documented parity
+    /// deviation, follow-up #46) even for exactly one match, matching real
+    /// tmux exactly. No match -> `Ok` carrying the existing transient `no
+    /// windows matching: <p>` message with NO tree opening (a deliberate,
+    /// documented scope narrowing versus real tmux's empty-tree-opens
+    /// behavior -- see the `find-window-and-main-pane-sizing` contract
+    /// section).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_find_window_client(
+        &mut self,
+        pattern: String,
+        by_content: bool,
+        by_name: bool,
+        by_title: bool,
+        use_regex: bool,
+        ignore_case: bool,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        let matcher = match FindMatcher::new(&pattern, use_regex, ignore_case) {
+            Ok(m) => m,
+            Err(e) => return ExecOutcome::Err(e),
+        };
+        // Doc: "default when none given is all three (C = N = T = 1)".
+        let (by_content, by_name, by_title) = if !by_content && !by_name && !by_title { (true, true, true) } else { (by_content, by_name, by_title) };
+
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Err(format!("can't find session: {session_name}"));
+        };
+        let mut matches: HashSet<WindowId> = HashSet::new();
+        for w in &session.windows {
+            let mut hit = by_name && matcher.matches_name(&w.name);
+            if !hit && by_title {
+                hit = w.layout.panes().iter().any(|pid| self.panes.get(pid).and_then(|pr| pr.grid.title()).map(|t| matcher.matches_name(t)).unwrap_or(false));
             }
-            let content_match = panes.iter().any(|pid| self.panes.get(pid).map(|pr| grid_contains(&pr.grid, &needle)).unwrap_or(false));
-            if content_match {
-                found = Some(*wid);
-                break;
+            if !hit && by_content {
+                hit = w.layout.panes().iter().any(|pid| self.panes.get(pid).map(|pr| grid_matches(&pr.grid, &matcher)).unwrap_or(false));
+            }
+            if hit {
+                matches.insert(w.id);
             }
         }
-        match found {
-            Some(wid) => {
-                if let Some(session) = self.registry.session_mut(&session_name) {
-                    if wid != session.current {
-                        session.last = Some(session.current);
-                        session.current = wid;
-                        session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
-                    }
-                }
-                self.apply_layout_for_session(&session_name);
-                Ok(String::new())
-            }
-            None => Ok(format!("no windows matching: {pattern}")),
+        if matches.is_empty() {
+            return ExecOutcome::Ok(format!("no windows matching: {pattern}"));
         }
+        self.open_choose_tree(ChooseTreeView::Windows, Some(matches), client, session_name)
     }
 
     fn exec_send_prefix(&mut self, cs: Option<&str>) -> Result<String, String> {
@@ -3834,7 +3952,11 @@ impl Server {
             BreakPane { detached, name, src, dst } => self.exec_break_pane(detached, name, src, dst, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
             SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst, detach, None),
-            FindWindow { pattern } => self.exec_find_window(pattern, None),
+            // SP7 Task 12 (closes #46/#54): opening a (possibly filtered)
+            // choose-tree is fundamentally a CLIENT-side mode -- same rule
+            // as `ChooseTree` below -- there is no more headless direct-jump
+            // path (that was the parity deviation being fixed).
+            FindWindow { .. } => Err("no current client".to_string()),
             ChooseTree { .. } => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
             ClockMode => Err("no current client".to_string()),
@@ -4023,7 +4145,9 @@ impl Server {
             BreakPane { detached, name, src, dst } => wrap(self.exec_break_pane(detached, name, src, dst, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
             SwapWindow { src, dst, detach } => wrap(self.exec_swap_window(src, dst, detach, Some(session_name.as_str()))),
-            FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
+            FindWindow { pattern, by_content, by_name, by_title, regex, ignore_case } => {
+                self.exec_find_window_client(pattern, by_content, by_name, by_title, regex, ignore_case, client, session_name.as_str())
+            }
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
             ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
@@ -4237,17 +4361,11 @@ impl Server {
                 }
                 (true, None)
             }
-            PromptKind::FindWindow => {
-                match self.exec_find_window(buf, Some(session_name.as_str())) {
-                    Ok(msg) => {
-                        if !msg.is_empty() {
-                            client.message = Some((msg, Instant::now()));
-                        }
-                    }
-                    Err(e) => client.message = Some((e, Instant::now())),
-                }
-                (true, None)
-            }
+            // The `f` prompt never supplies `-C`/`-N`/`-T`/`-r`/`-i` --
+            // `exec_find_window_client` treats all-false `by_*` as "match
+            // all three" (the doc's own default), matching this prompt's
+            // pre-Task-12 "search everything" behavior exactly.
+            PromptKind::FindWindow => (true, Some(self.exec_find_window_client(buf, false, false, false, false, false, client, session_name.as_str()))),
             // Task-7 review, Important finding #1: `buf` is raw, unfiltered
             // prompt text (see `edit_line_buf`) -- without this check, a
             // non-numeric commit fell through `resolve_window_target`'s
@@ -4361,7 +4479,13 @@ impl Server {
     /// the "current session's windows only" scope simplification this task
     /// deliberately leaves unchanged (real tmux's `-w` shows the whole
     /// multi-session tree; see `ChooseTreeView`'s doc comment).
-    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>) -> Vec<TreeRow> {
+    ///
+    /// `filter` (SP7 Task 12, closes follow-ups #46/#54): `Some(ids)`
+    /// restricts the `Windows` view's window rows to `ids` (the session
+    /// HEADER row is always emitted regardless, for context); `None` shows
+    /// every window, unchanged. `Sessions` ignores `filter` entirely --
+    /// `find-window` never opens that view.
+    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>, filter: Option<&HashSet<WindowId>>) -> Vec<TreeRow> {
         let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
         let session_text = |s: &Session| format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" });
         let window_row = |session: &Session, w: &Window| {
@@ -4406,7 +4530,7 @@ impl Server {
                     depth: 0,
                     marker: Some('-'),
                 }];
-                rows.extend(session.windows.iter().map(|w| window_row(session, w)));
+                rows.extend(session.windows.iter().filter(|w| filter.is_none_or(|f| f.contains(&w.id))).map(|w| window_row(session, w)));
                 rows
             }
         }
@@ -4661,11 +4785,11 @@ impl Server {
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let (view, expanded) = match &client.mode {
-            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone()),
+        let (view, expanded, filter) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone(), state.filter.clone()),
             _ => return None,
         };
-        let rows = self.build_tree_rows(session_name, view, &expanded);
+        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
 
         // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
         // IDENTITY against this freshly rebuilt `rows`, rather than trusting
@@ -4819,38 +4943,50 @@ impl Server {
     /// mode the client was previously in (matches copy mode's own entry
     /// behavior — no special-casing for "already in copy mode"/"prompt open"
     /// etc., since a prompt/confirm keeps capture armed and therefore can
-    /// never actually dispatch this command in the first place).
+    /// never actually dispatch this command in the first place). SP7 Task
+    /// 12: now a thin wrapper over the shared [`Self::open_choose_tree`]
+    /// (`filter: None` -- a plain `choose-tree` open is never filtered).
     fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
+        self.open_choose_tree(view, None, client, session_name)
+    }
+
+    /// Shared choose-tree-opening logic (SP7 Task 12, extracted from the
+    /// pre-Task-12 `exec_choose_tree_client` so `find-window` can reuse it
+    /// with a filter -- closes follow-ups #46/#54): seeds `selected` with an
+    /// IDENTITY (not just an index) so the very first Up/Down/Commit/Kill
+    /// has one to re-resolve (Task 8 review fix, Critical #1).
+    ///
+    /// Default selection: with `filter: Some(_)` (a `find-window` open), the
+    /// FIRST matching window row wins -- the session's CURRENT window may
+    /// not even be in the match set, so that default (used below for a
+    /// plain, unfiltered open) would be meaningless here. With `filter:
+    /// None`, the SP6 wave 2 "current-item default" rule applies:
+    /// `Sessions` defaults to the acting client's own current session's row
+    /// (always present); `Windows` defaults to that session's CURRENT
+    /// window's row (also always present). `rows.first()` is only a
+    /// fallback for the structurally-unreachable case that lookup fails.
+    fn open_choose_tree(&mut self, view: ChooseTreeView, filter: Option<HashSet<WindowId>>, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let expanded = HashSet::new();
-        // Task 8 review fix, Critical #1: seed `selected` with an IDENTITY
-        // (not just an index) so the very first Up/Down/Commit/Kill has one
-        // to re-resolve, same as every subsequent keypress.
-        //
-        // SP6 wave 2, Task 8 (mode-tree's "current-item" default start,
-        // `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions`
-        // defaults to the ACTING CLIENT's own current session's row (always
-        // present -- sessions view lists every session unconditionally, and
-        // a session's own row always exists even collapsed); `Windows`
-        // defaults to that session's CURRENT window's row (also always
-        // present -- the windows view always shows every window of the
-        // current session). Row 0 (the old behavior) is only a fallback for
-        // the structurally-unreachable case that lookup fails.
-        let rows = self.build_tree_rows(session_name, view, &expanded);
-        let default_target = match view {
-            ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
-            ChooseTreeView::Windows => self
-                .registry
-                .sessions()
-                .iter()
-                .find(|s| s.name == session_name)
-                .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
+        let default_target = if filter.is_some() {
+            rows.iter().find(|r| matches!(r.target, TreeTarget::Window(..))).map(|r| r.target.clone())
+        } else {
+            match view {
+                ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
+                ChooseTreeView::Windows => self
+                    .registry
+                    .sessions()
+                    .iter()
+                    .find(|s| s.name == session_name)
+                    .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+            }
         };
         let selected = default_target
             .filter(|t| rows.iter().any(|r| &r.target == t))
             .or_else(|| rows.first().map(|r| r.target.clone()));
         let sel = selected.as_ref().and_then(|t| rows.iter().position(|r| &r.target == t)).unwrap_or(0);
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal });
+        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal, filter });
         ExecOutcome::Ok(String::new())
     }
 

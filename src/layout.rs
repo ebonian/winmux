@@ -24,6 +24,25 @@ enum Node {
     Split {
         dir: SplitDir,
         ratio: f32,
+        /// SP7 Task 12 (closes follow-up #43): when `Some(target)`, this
+        /// split's FIRST child wants an ABSOLUTE `target`-cell length along
+        /// `dir`'s axis, re-derived fresh (via [`clamp_main`]) against
+        /// whatever area is passed to [`split_rects`] -- unlike `ratio`,
+        /// which bakes in the area it was computed against, this survives a
+        /// later whole-window resize with a DIFFERENT area (real tmux
+        /// recomputes `main-pane-width`/`-height` the same way at layout
+        /// apply-time; this extends that to every subsequent render too,
+        /// which is winmux's deliberate parity IMPROVEMENT over one-shot
+        /// tmux presets -- see this field's setter, `build_preset_tree`'s
+        /// `MainHorizontal`/`MainVertical` arms, for the citation). `None`
+        /// for every other split (plain `split()`, the "others" stack inside
+        /// a main preset, every non-main preset) -- those keep the original
+        /// ratio-scales-with-area behavior. Manually resizing THIS split
+        /// (`resize_from`, e.g. Ctrl-arrow or a mouse border-drag) clears it
+        /// back to `None` on success -- see `Layout::clear_main_size`'s doc
+        /// comment -- so a deliberate manual override sticks instead of
+        /// snapping back to the configured absolute size on the next resize.
+        main_size: Option<u16>,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -47,13 +66,22 @@ fn child_first(l: u16, ratio: f32) -> u16 {
 }
 
 /// The two child rects of a split, EXCLUDING the single border row/column.
-/// Total: never panics; on areas too small to hold both children plus the
-/// border, the children degrade to zero-size rects (downstream minimum
-/// checks handle those).
-fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
+/// `main_size` (SP7 Task 12, follow-up #43): `Some(target)` overrides the
+/// ratio-based `child_first` computation with `clamp_main(target, L, min)`
+/// against THIS CALL's `area` -- the mechanism that makes a
+/// `main-horizontal`/`main-vertical` preset's configured absolute size
+/// survive a later resize (`ratio` is left in the node for display/
+/// backward-compat purposes but is not consulted when `main_size` is
+/// `Some`). Total: never panics; on areas too small to hold both children
+/// plus the border, the children degrade to zero-size rects (downstream
+/// minimum checks handle those).
+fn split_rects(dir: SplitDir, ratio: f32, main_size: Option<u16>, area: Rect) -> (Rect, Rect) {
     match dir {
         SplitDir::Horizontal => {
-            let c1 = child_first(area.w, ratio);
+            let c1 = match main_size {
+                Some(target) => clamp_main(target, area.w, MIN_PANE_W),
+                None => child_first(area.w, ratio),
+            };
             let c2 = area.w.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: c1, h: area.h },
@@ -61,7 +89,10 @@ fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
             )
         }
         SplitDir::Vertical => {
-            let c1 = child_first(area.h, ratio);
+            let c1 = match main_size {
+                Some(target) => clamp_main(target, area.h, MIN_PANE_H),
+                None => child_first(area.h, ratio),
+            };
             let c2 = area.h.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: area.w, h: c1 },
@@ -74,8 +105,8 @@ fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
 fn rects_of(node: &Node, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     match node {
         Node::Leaf(pid) => out.push((*pid, area)),
-        Node::Split { dir, ratio, first, second } => {
-            let (r1, r2) = split_rects(*dir, *ratio, area);
+        Node::Split { dir, ratio, main_size, first, second } => {
+            let (r1, r2) = split_rects(*dir, *ratio, *main_size, area);
             rects_of(first, r1, out);
             rects_of(second, r2, out);
         }
@@ -146,7 +177,7 @@ impl Layout {
             return Err(SplitRefused);
         }
 
-        let (r1, r2) = split_rects(dir, 0.5, fr);
+        let (r1, r2) = split_rects(dir, 0.5, None, fr);
         if r1.w < MIN_PANE_W
             || r1.h < MIN_PANE_H
             || r2.w < MIN_PANE_W
@@ -160,6 +191,7 @@ impl Layout {
         let mut replacement = Some(Node::Split {
             dir,
             ratio: 0.5,
+            main_size: None,
             first: Box::new(Node::Leaf(focused)),
             second: Box::new(Node::Leaf(new_pane)),
         });
@@ -224,7 +256,7 @@ fn leaf_is(node: &Node, id: PaneId) -> bool {
 fn remove_from(node: Node, id: PaneId) -> (Node, Option<PaneId>) {
     match node {
         Node::Leaf(pid) => (Node::Leaf(pid), None),
-        Node::Split { dir, ratio, first, second } => {
+        Node::Split { dir, ratio, main_size, first, second } => {
             if leaf_is(&first, id) {
                 let fallback = first_leaf(&second);
                 return (*second, Some(fallback));
@@ -236,13 +268,13 @@ fn remove_from(node: Node, id: PaneId) -> (Node, Option<PaneId>) {
             let (nf, rf) = remove_from(*first, id);
             if let Some(fallback) = rf {
                 return (
-                    Node::Split { dir, ratio, first: Box::new(nf), second },
+                    Node::Split { dir, ratio, main_size, first: Box::new(nf), second },
                     Some(fallback),
                 );
             }
             let (ns, rs) = remove_from(*second, id);
             (
-                Node::Split { dir, ratio, first: Box::new(nf), second: Box::new(ns) },
+                Node::Split { dir, ratio, main_size, first: Box::new(nf), second: Box::new(ns) },
                 rs,
             )
         }
@@ -283,8 +315,8 @@ fn area_at(root: &Node, path: &[bool], area: Rect) -> Rect {
     let mut a = area;
     for &b in path {
         match n {
-            Node::Split { dir, ratio, first, second } => {
-                let (r1, r2) = split_rects(*dir, *ratio, a);
+            Node::Split { dir, ratio, main_size, first, second } => {
+                let (r1, r2) = split_rects(*dir, *ratio, *main_size, a);
                 if b {
                     n = &**second;
                     a = r2;
@@ -560,11 +592,20 @@ impl Layout {
             return false;
         }
 
-        let ratio_old = match node_at(&self.root, &prefix) {
-            Node::Split { ratio, .. } => *ratio,
+        let (ratio_old, main_size_old) = match node_at(&self.root, &prefix) {
+            Node::Split { ratio, main_size, .. } => (*ratio, *main_size),
             Node::Leaf(_) => return false,
         };
-        let child1 = child_first(l, ratio_old) as i32;
+        // SP7 Task 12 (follow-up #43): a split annotated `main_size: Some`
+        // (a `main-horizontal`/`main-vertical` preset's main split) reads
+        // its CURRENT first-child length the same way `split_rects` does --
+        // via `clamp_main`, not the (possibly stale) `ratio` field -- so a
+        // manual resize starts from the length the user actually SEES, not
+        // whatever `ratio` alone would reconstruct.
+        let child1 = match main_size_old {
+            Some(target) => clamp_main(target, l, min) as i32,
+            None => child_first(l, ratio_old) as i32,
+        };
         let sign: i32 = if want_first { 1 } else { -1 };
         let lo = min as i32;
         let hi = (l as i32 - 1) - min as i32;
@@ -580,6 +621,18 @@ impl Layout {
             let ratio = c as f32 / (l as f32 - 1.0);
             self.set_ratio(&prefix, ratio);
             if self.all_min_ok(area) {
+                // A successful MANUAL resize of a `main_size`-annotated
+                // split overrides the preset's absolute-size stickiness
+                // going forward -- the user just told winmux explicitly
+                // what size they want this border at, so the next
+                // whole-window resize should scale it like any other split
+                // (ratio-based) rather than snapping back to the configured
+                // `main-pane-width`/`-height`. Only cleared on SUCCESS (not
+                // the revert-on-failure path below) so a no-op resize
+                // attempt never silently strips the annotation.
+                if main_size_old.is_some() {
+                    self.clear_main_size(&prefix);
+                }
                 return true;
             }
             if c == child1 {
@@ -654,6 +707,16 @@ impl Layout {
     fn set_ratio(&mut self, path: &[bool], v: f32) {
         if let Node::Split { ratio, .. } = node_at_mut(&mut self.root, path) {
             *ratio = v;
+        }
+    }
+
+    /// Clear the split node reached by `path`'s `main_size` annotation (SP7
+    /// Task 12, follow-up #43) -- see [`Self::resize_from`]'s only call site
+    /// for why (a successful manual resize of that split overrides the
+    /// preset's absolute-size stickiness).
+    fn clear_main_size(&mut self, path: &[bool]) {
+        if let Node::Split { main_size, .. } = node_at_mut(&mut self.root, path) {
+            *main_size = None;
         }
     }
 
@@ -762,7 +825,7 @@ fn stack_horizontal(mut nodes: Vec<Node>, widths: &[u16]) -> Node {
     let ratio = ratio_for(widths[0], l);
     let first = nodes.remove(0);
     let second = stack_horizontal(nodes, &widths[1..]);
-    Node::Split { dir: SplitDir::Horizontal, ratio, first: Box::new(first), second: Box::new(second) }
+    Node::Split { dir: SplitDir::Horizontal, ratio, main_size: None, first: Box::new(first), second: Box::new(second) }
 }
 
 /// Vertical-axis mirror of [`stack_horizontal`].
@@ -775,7 +838,7 @@ fn stack_vertical(mut nodes: Vec<Node>, heights: &[u16]) -> Node {
     let ratio = ratio_for(heights[0], l);
     let first = nodes.remove(0);
     let second = stack_vertical(nodes, &heights[1..]);
-    Node::Split { dir: SplitDir::Vertical, ratio, first: Box::new(first), second: Box::new(second) }
+    Node::Split { dir: SplitDir::Vertical, ratio, main_size: None, first: Box::new(first), second: Box::new(second) }
 }
 
 /// Clamp a requested `main-pane-width`/`main-pane-height` value so the main
@@ -826,11 +889,25 @@ fn build_preset_tree(preset: LayoutPreset, panes: &[PaneId], area: Rect, main_wi
         LayoutPreset::MainHorizontal => {
             let main_id = panes[0];
             let others = &panes[1..];
+            // `ratio` is still computed (from the CLAMPED height at this
+            // apply-time `area`) for display/back-compat parity with the
+            // pre-Task-12 tree shape; it is a NO-OP at render time whenever
+            // `main_size` is `Some` (see `split_rects`), but `apply_preset`
+            // deliberately never leaves a split without a self-consistent
+            // ratio in case some future caller reads it directly.
             let main_h = clamp_main(main_height, area.h, MIN_PANE_H);
             let ratio = ratio_for(main_h, area.h);
             let widths = even_lengths(area.w, others.len());
             let bottom = stack_horizontal(others.iter().map(|&p| Node::Leaf(p)).collect(), &widths);
-            Node::Split { dir: SplitDir::Vertical, ratio, first: Box::new(Node::Leaf(main_id)), second: Box::new(bottom) }
+            // SP7 Task 12 (follow-up #43): store the UNCLAMPED
+            // `main_height` (already percent-resolved by the caller, see
+            // `options::Options::main_pane_height`/`_for`'s doc comment) as
+            // this split's absolute-size annotation, not the clamped
+            // `main_h` -- `split_rects` re-clamps fresh against whatever
+            // area a LATER render/resize passes in, so a resize that grows
+            // the window doesn't permanently cap the target at today's
+            // clamp.
+            Node::Split { dir: SplitDir::Vertical, ratio, main_size: Some(main_height), first: Box::new(Node::Leaf(main_id)), second: Box::new(bottom) }
         }
         LayoutPreset::MainVertical => {
             let main_id = panes[0];
@@ -839,7 +916,7 @@ fn build_preset_tree(preset: LayoutPreset, panes: &[PaneId], area: Rect, main_wi
             let ratio = ratio_for(main_w, area.w);
             let heights = even_lengths(area.h, others.len());
             let right = stack_vertical(others.iter().map(|&p| Node::Leaf(p)).collect(), &heights);
-            Node::Split { dir: SplitDir::Horizontal, ratio, first: Box::new(Node::Leaf(main_id)), second: Box::new(right) }
+            Node::Split { dir: SplitDir::Horizontal, ratio, main_size: Some(main_width), first: Box::new(Node::Leaf(main_id)), second: Box::new(right) }
         }
         LayoutPreset::Tiled => {
             let n = panes.len();
@@ -1060,6 +1137,7 @@ impl Layout {
         let mut replacement = Some(Node::Split {
             dir,
             ratio,
+            main_size: None,
             first: Box::new(Node::Leaf(at)),
             second: Box::new(Node::Leaf(new_pane)),
         });
@@ -2211,6 +2289,94 @@ mod tests {
         assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 7, h: 24 }));
         assert_eq!(rects[1], (2, Rect { x: 8, y: 0, w: 2, h: 24 }));
         assert!(rects.iter().all(|(_, r)| r.w >= MIN_PANE_W));
+    }
+
+    // ---- SP7 Task 12 (closes follow-up #43): absolute main-pane sizing
+    // survives a later whole-window resize -- `rects()` is called against a
+    // DIFFERENT area than `apply_preset` was, with no re-`apply_preset` call
+    // in between (exactly how `Server::apply_layout_for_session` handles a
+    // real client Resize frame). ----
+
+    #[test]
+    fn main_pane_width_survives_window_resize() {
+        // apply-time area 80x24, main-pane-width=20: main pane (id 1) gets
+        // width 20 (unclamped: max_main = 80-1-2 = 77, 20 fits).
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+
+        // Resize the WINDOW (not the layout -- no apply_preset call) to a
+        // narrower 60x24 area: a ratio-only implementation would scale the
+        // main pane down proportionally (20/79 * 59 ~= 15); the fix keeps it
+        // at the literal configured 20 cells (unclamped: max_main =
+        // 60-1-2=57, 20 still fits).
+        let narrower = Rect { x: 0, y: 0, w: 60, h: 24 };
+        let rects = l.rects(narrower);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 21, y: 0, w: 39, h: 24 }));
+
+        // Resize WIDER too (120x24): still exactly 20, not scaled up.
+        let wider = Rect { x: 0, y: 0, w: 120, h: 24 };
+        let rects = l.rects(wider);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 21, y: 0, w: 99, h: 24 }));
+    }
+
+    #[test]
+    fn main_pane_height_survives_window_resize() {
+        // Vertical-axis mirror of `main_pane_width_survives_window_resize`.
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainHorizontal, &ids(2), A, 80, 8);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+
+        let shorter = Rect { x: 0, y: 0, w: 80, h: 16 };
+        let rects = l.rects(shorter);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 9, w: 80, h: 7 }));
+
+        let taller = Rect { x: 0, y: 0, w: 80, h: 40 };
+        let rects = l.rects(taller);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 9, w: 80, h: 31 }));
+    }
+
+    #[test]
+    fn main_pane_width_still_reclamps_on_resize_into_tiny_area() {
+        // The absolute size is re-CLAMPED (not just re-applied blindly)
+        // against whatever area a later resize provides -- shrinking the
+        // window down to 10 cols must still leave the "other" column at
+        // MIN_PANE_W, exactly like the apply-time clamp tests above.
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        let tiny = Rect { x: 0, y: 0, w: 10, h: 24 };
+        let rects = l.rects(tiny);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 7, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 8, y: 0, w: 2, h: 24 }));
+    }
+
+    #[test]
+    fn manual_resize_of_main_split_overrides_absolute_stickiness() {
+        // A manual Ctrl-arrow-style resize of the main-vertical border
+        // (`resize_from`) is a deliberate user override: it should stick
+        // through a later window resize, NOT snap back to the configured
+        // `main-pane-width` on the next render (matches the doc comment on
+        // `Layout::clear_main_size`).
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+
+        // Grow the main pane (pane 1, the first child) by 10 cells via a
+        // Right-direction resize referenced from pane 1 itself.
+        assert!(l.resize_from(1, Direction::Right, A, 10));
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 30, h: 24 }));
+
+        // Now resize the WHOLE WINDOW to a different area: the manually-set
+        // 30-cell width must scale like an ordinary ratio-based split (NOT
+        // stay pinned at either 30 or the original 20).
+        let wider = Rect { x: 0, y: 0, w: 160, h: 24 };
+        let rects = l.rects(wider);
+        assert_ne!(rects[0].1.w, 30, "a ratio-scaled split must not stay pinned at the manually-set width");
+        assert_ne!(rects[0].1.w, 20, "must not snap back to the original configured main-pane-width either");
     }
 
     #[test]

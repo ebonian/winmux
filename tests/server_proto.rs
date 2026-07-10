@@ -4816,6 +4816,49 @@ fn main_pane_width_option_respected() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP7 Task 12 (closes follow-up #43): a `main-vertical` preset's
+/// `main-pane-width` survives a REAL client Resize frame -- the border stays
+/// at the exact configured column instead of scaling proportionally with
+/// the new width (the pre-Task-12 behavior: `layout::Node`'s ratio-only
+/// representation baked the width in as a fraction of the AT-APPLY-TIME
+/// area, so a later resize would have moved the border to a different
+/// column -- see `layout::tests::main_pane_width_survives_window_resize`
+/// for the exact unit-level math this end-to-end test exercises for real).
+#[test]
+fn main_pane_width_survives_window_resize() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "main-pane-width".into(), "20".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["select-layout".into(), "main-vertical".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+
+    // Grow the terminal: a ratio-only implementation would move the border
+    // proportionally (20/79 of 80 cols -> roughly 20/79 * 119 ~= 30 at 120
+    // cols); the fix keeps it at the literal configured 20.
+    c.send(&ClientMsg::Resize { cols: 120, rows: 24 });
+    grid.resize(120, 24);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+    assert!(!has_vertical_border_at(&grid, 30), "must not have scaled proportionally with the wider window");
+
+    // Shrink it back down too.
+    c.send(&ClientMsg::Resize { cols: 60, rows: 24 });
+    grid.resize(60, 24);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn swap_pane_braces() {
     let name = unique_pipe_name();
@@ -5300,6 +5343,13 @@ fn swap_window_without_d_keeps_focus_on_index() {
 /// `f` (find-window): matches by window NAME, matches by visible pane
 /// CONTENT, and shows a transient `no windows matching: <p>` message (and
 /// switches nothing) when neither matches.
+///
+/// SP7 Task 12 (closes #46): real tmux's `find-window` is sugar for opening
+/// `window-tree` (choose-tree) mode FILTERED to the matches -- selecting the
+/// entry performs the jump -- it is NOT a direct jump, even for exactly one
+/// match. This inverts the pre-Task-12 version of this test (which asserted
+/// a direct jump on commit); computed comment: the old assertion was itself
+/// the parity deviation follow-up #46 tracked, now fixed.
 #[test]
 fn find_window_f_prompt() {
     let name = unique_pipe_name();
@@ -5320,19 +5370,32 @@ fn find_window_f_prompt() {
     c.send(&ClientMsg::Stdin(b"echo findme123\r".to_vec()));
     c.recv_output_until(&mut grid, |g| marker_col(g, "findme123").is_some());
 
-    // Currently on window 1: find-window by NAME jumps back to window 0.
+    // Currently on window 1: find-window by NAME opens a tree filtered to
+    // JUST window 0 (webby) -- window 1's row must NOT appear.
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"webby\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: webby-")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("1: powershell")),
+        "the tree must be FILTERED to only the matching window"
+    );
+    // Default selection is the (only) match; Enter commits the jump.
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby* 1:powershell-")));
 
-    // Now on window 0: find-window by CONTENT jumps to window 1.
+    // Now on window 0: find-window by CONTENT opens a tree filtered to JUST
+    // window 1 (the content match) -- window 0's row must NOT appear.
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"findme123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: powershell-")));
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: webby")), "the tree must be FILTERED to only the matching window");
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby- 1:powershell*")));
 
-    // No match: transient message, nothing moves.
+    // No match: transient message, no tree opens, nothing moves (documented
+    // scope narrowing versus real tmux's empty-tree-opens behavior).
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"zzznomatch\r".to_vec()));
@@ -5347,6 +5410,111 @@ fn find_window_f_prompt() {
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+/// SP7 Task 12 (closes #46): TWO windows match the same pattern -- the
+/// filtered tree must show BOTH rows (not just the first, as the retired
+/// direct-jump behavior effectively did), and committing a NON-default row
+/// (`Down` then `Enter`) jumps to that specific one, proving the tree is
+/// really driving the choice rather than some other pre-selected default.
+#[test]
+fn find_window_multi_match_opens_choose_list() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Two more windows, both named with a "log" substring.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n applog\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:applog*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n syslog\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:syslog*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window log\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("1: applog")) && lines.iter().any(|l| l.contains("2: syslog"))
+    });
+    // The unrelated window 0 must be filtered OUT.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: powershell")));
+
+    // Default selection is the FIRST match (window 1, applog); move Down to
+    // the second (window 2, syslog) and commit that one specifically.
+    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:syslog*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 12 (closes #46): even EXACTLY ONE match still opens the tree
+/// rather than jumping directly -- driven here through the bare
+/// `find-window` CLI command (not the `f` binding) for an independent code
+/// path from `find_window_f_prompt`'s prefix-key coverage.
+#[test]
+fn find_window_single_match_opens_choose_list_too() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n onlyme\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:onlyme*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window onlyme\r".to_vec()));
+    // The tree opens (row visible) rather than an immediate silent jump --
+    // still on window 1 (already current) with the tree overlay showing.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: onlyme")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:onlyme*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 12 (closes #54): `-r '^foo'` is a real anchored regex, not a
+/// glob substring -- "foobar" (starts with "foo") matches, "barfoo"
+/// (contains but doesn't START WITH "foo") does not, proving `-r` isn't
+/// silently degrading to the same `*pattern*` substring wrapping the
+/// default (non-`-r`) path uses.
+#[test]
+fn find_window_regex_flag_matches_anchor() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n foobar\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:foobar*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n barfoo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:barfoo*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window -r ^foo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: foobar")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("2: barfoo")),
+        "anchored regex must not match a window whose name only CONTAINS foo"
+    );
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:foobar*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
 }
 
 /// `'` opens the `index` prompt (label verbatim per the design spec, no

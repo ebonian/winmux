@@ -1575,31 +1575,27 @@ window, `Session::new_window`) initialize it to `None`.
 
 ### `options` amendment
 
-Two new `Number` options, both with typed getters returning `u16`:
+Two new `Size` options (SP7 Task 12 promotes these from `Number` to a new
+`Kind::Size`/`Value::Size(SizeSpec)` -- see that task's amendment below),
+both with typed getters returning `u16`:
 
 ```rust
-// SPECS additions: Spec { name: "main-pane-width", kind: Kind::Number, .. },
-//                  Spec { name: "main-pane-height", kind: Kind::Number, .. }
+// SPECS additions: Spec { name: "main-pane-width", kind: Kind::Size, .. },
+//                  Spec { name: "main-pane-height", kind: Kind::Size, .. }
 // defaults: main-pane-width = 80, main-pane-height = 24 (tmux defaults)
 
 impl Options {
-    pub fn main_pane_width(&self) -> u16;
-    pub fn main_pane_height(&self) -> u16;
+    pub fn main_pane_width(&self, total: u16) -> u16;
+    pub fn main_pane_height(&self, total: u16) -> u16;
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16;
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16;
 }
 ```
 
-**Documented deviation: ratio-baked, not absolute, across later resizes.**
-`Layout`'s tree only ever stores `f32` split ratios (no absolute-size node
-variant), so `apply_preset` converts `main-pane-width`/`-height`'s absolute
-cell count into a ratio via `ratio_for(target, area_len)` ONCE, at
-`select-layout`/`next-layout` apply-time. The FIRST render after applying the
-preset reproduces the exact configured cell count, but a LATER window
-resize scales the main pane proportionally along with everything else,
-rather than re-deriving the same absolute width/height the way real tmux
-does (tmux recomputes the absolute size on every resize). Functionally
-acceptable given the architecture and the Task 6 brief's test scope (exact
-rects at a fixed area); tracked as `docs/follow-ups.md` #43 for eventual
-absolute-size preservation.
+**Formerly a documented deviation (ratio-baked, not absolute, across later
+resizes) -- FIXED by SP7 Task 12, see that task's amendment below for the
+current behavior and `docs/follow-ups.md` #43's closed entry for the
+before/after.**
 
 ### `cmd` amendment
 
@@ -1754,13 +1750,15 @@ pub enum ParsedCmd {
     /// time as a bare/`:`-prefixed index within the SAME session; any
     /// `session:` prefix is accepted but ignored (no cross-session move).
     MoveWindow { kill: bool, target: String },
-    /// `find-window|findw <pattern>`: case-insensitive substring search
-    /// (v1, no regex) over window NAMES and every pane's CURRENTLY VISIBLE
-    /// content (not scrollback) in the target session, in window-index
-    /// order (the current window counts too); jumps to the FIRST match.
-    /// No match -> `Ok` carrying a transient `no windows matching: <p>`
-    /// message (not an `Err`).
-    FindWindow { pattern: String },
+    /// `find-window|findw [-CNTirZ] <pattern>` -- **SP7 Task 12 (closes
+    /// follow-ups #46/#54) REPLACED this variant's shape and its dispatch
+    /// behavior**; see the `find-window-and-main-pane-sizing` (SP7 Task 12)
+    /// section at the end of this file for the current, authoritative
+    /// contract. The v1 shape (`FindWindow { pattern: String }`, plain
+    /// case-insensitive substring, direct jump to the first match) is
+    /// PRESERVED HERE ONLY as a historical record of Task 7's original
+    /// scope.
+    FindWindow { pattern: String, by_content: bool, by_name: bool, by_title: bool, regex: bool, ignore_case: bool },
 }
 ```
 
@@ -1817,13 +1815,14 @@ Three new `exec_*` helpers, wired into both `execute` (headless) and
   `last_rects` cleanup if `-k` kills it — the occupant's `Window`/`Layout`
   is gone from the registry afterward), then respects
   `Options::renumber_windows()` same as every other structural op.
-- `exec_find_window`: snapshots `(WindowId, name, pane_ids)` for every
-  window in the target session, then for each in index order checks the
-  name (case-insensitive substring) then every listed pane's grid via the
-  new free function `grid_contains(grid: &Grid, needle_lowercased: &str) ->
-  bool` (walks `0..grid.rows()` × `0..grid.cols()`, i.e. the CURRENTLY
-  VISIBLE screen only, not scrollback); first match wins, `None` returns
-  the `no windows matching:` message as `Ok`, not `Err`.
+- `exec_find_window` (Task 7 original; **REPLACED by SP7 Task 12's
+  `exec_find_window_client`/headless-error split** -- see the
+  `find-window-and-main-pane-sizing` section at the end of this file):
+  snapshotted `(WindowId, name, pane_ids)` for every window in the target
+  session, checked the name (case-insensitive substring) then every listed
+  pane's grid via `grid_contains`, and jumped DIRECTLY to the first match.
+  `grid_contains` itself is retired by Task 12 in favor of a matcher-
+  generic `grid_matches`, see below.
 
 `'`'s dispatch has no dedicated `exec_*` — its `PromptKind::Index` commit
 validates `buf` is empty or all-ASCII-digits BEFORE delegating (Task-7
@@ -2375,6 +2374,57 @@ selection starting point (a `Down`-from-row-0 assumption is now wrong when
 the default selection is already the current, often LAST, row) — see the
 task report for the specific before/after reasoning per test.
 
+### **AMENDMENT (SP7 Task 12 — `find-window` routes into a FILTERED choose-tree):**
+
+`ChooseTreeState` gains one field, and `build_tree_rows` one parameter:
+
+```rust
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    sel: usize,
+    selected: Option<TreeTarget>,
+    pending_kill: Option<(TreeTarget, String)>,
+    expanded: std::collections::HashSet<String>,
+    preview: PreviewMode,
+    /// NEW: `Some(matches)` for a tree opened by `find-window` (the exact
+    /// `WindowId`s the pattern matched, snapshotted ONCE at open time --
+    /// deliberately not live-refiltered while the tree stays open, a
+    /// documented simplification); `None` for a plain `choose-tree`/`w`/`s`
+    /// open (no filtering).
+    filter: Option<std::collections::HashSet<WindowId>>,
+}
+```
+
+`build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded:
+&HashSet<String>, filter: Option<&HashSet<WindowId>>) -> Vec<TreeRow>`: in
+the `Windows` view, a window row is only emitted when `filter` is `None` or
+contains that window's id (the session HEADER row is always emitted
+regardless, for context); the `Sessions` view ignores `filter` entirely
+(`find-window` never opens that view). All three existing call sites
+(`build_render_overlay`, `dispatch_choose_tree_key`, and the opening logic
+below) thread `state.filter.as_ref()` / the caller's filter through.
+
+Opening a tree is refactored into one shared helper both `choose-tree` and
+`find-window` call:
+
+```rust
+impl Server {
+    /// `filter: None` = plain `choose-tree` (`exec_choose_tree_client` is
+    /// now a thin `sessions`-to-`view` wrapper around this). `filter:
+    /// Some(_)` = `find-window`'s filtered open: default selection is the
+    /// FIRST matching window row (not necessarily the session's current
+    /// window, which may not even be in the match set) instead of the
+    /// session's current-window default a plain `choose-tree -w` open uses.
+    fn open_choose_tree(
+        &mut self,
+        view: ChooseTreeView,
+        filter: Option<std::collections::HashSet<WindowId>>,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome;
+}
+```
+
 ## `clock-mode` — clock-mode overlay (sub-project 6 wave 2, Task 10)
 
 Implements `docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
@@ -2757,3 +2807,154 @@ window), `manual_rename_disables_auto` (CLI `rename-window` -> a later OSC
 title change is ignored), `pane_title_format_expands` (`display-message
 '#T'` returns the FULL title, distinguishing it from the derived-and-
 truncated window name).
+
+## `find-window-and-main-pane-sizing` (SP7 Task 12, closes #43/#46/#54)
+
+Two independent fixes bundled in one task per the SP7 plan: `find-window`
+gains real fnmatch-glob/regex matching plus routes into a filtered
+choose-tree instead of jumping directly (closes #46/#54, per
+`docs/tmux-reference/windows-and-sessions.md` `### find-window`); the
+`main-horizontal`/`main-vertical` layout presets' absolute `main-pane-width`/
+`-height` now survives a later whole-window resize instead of being baked
+into a ratio once at apply-time (closes #43, per
+`docs/tmux-reference/panes-and-layout.md`'s options table). The
+`ChooseTreeState.filter`/`build_tree_rows`/`open_choose_tree` amendments and
+the `ParsedCmd::FindWindow` shape change are documented in place, above (the
+`overlays` and `window-ops` sections respectively); this section covers
+everything else.
+
+### New dependency: `regex` (first external crate beyond `vte`/`windows`)
+
+**Justification** (per the task brief's explicit allowance): tmux's `-r`
+flag is real POSIX-extended-regex matching (`cmd-find-window.c`'s `m/r:`/
+`C/r:` format functions). Hand-rolling even a small ERE engine correctly
+(character classes, anchors, alternation, quantifiers) is a substantial,
+bug-prone undertaking for a rarely-used flag, whereas `regex` is a
+well-established, pure-Rust (no `unsafe`-heavy C bindings), no-OS-API
+dependency that composes cleanly with the existing crate set. The NON-`-r`
+default path (fnmatch-style glob: `*`/`?`, substring-wrapped) is still
+hand-rolled (`glob_match`, below) -- no crate needed for that, matching the
+brief's "hand-roll the subset if simple" fallback for the part that
+actually IS simple.
+
+### `cmd` amendment -- `find-window` flags
+
+`resolve`'s `"find-window"` arm now accepts `-C`/`-N`/`-T`/`-i`/`-r`/`-Z` as
+bool flags (via the existing `scan_flags` helper) plus exactly one
+positional `pattern`; usage string: `usage: find-window [-CNTirZ] pattern`.
+`-Z` (keep the tree zoomed) is accepted for config/CLI compatibility with
+real tmux invocations but is otherwise a documented no-op -- winmux's
+choose-tree has no zoom-passthrough state to keep (same "accepted, no
+behavior yet" bucket as several SP6 Task 2 options); tracked as a residual
+note for a future ticket, not blocking this task's closed tickets. See the
+`window-ops` section (above) for the full `ParsedCmd::FindWindow` shape.
+
+### `server::dispatch` amendment -- matcher + exec split
+
+Two new private helpers (module-level free functions in `dispatch.rs`):
+
+```rust
+/// fnmatch-lite: `*` (any run, including empty) and `?` (exactly one
+/// char), no character classes (`[...]`) -- a documented scope narrowing
+/// (real tmux's fnmatch supports them; window names/pane titles/content
+/// practically never need them, and the task brief sanctioned a "small"
+/// hand-rolled matcher). Classic greedy-backtrack wildcard algorithm
+/// (linear amortized, no recursion). `text`/`pattern` compared char-by-char
+/// (Unicode scalar granularity, not byte), so multi-byte UTF-8 names/titles
+/// match correctly.
+fn glob_match(pattern: &str, text: &str) -> bool;
+
+/// A compiled `find-window` matcher: either `Regex` (`-r`, `-i` folded in
+/// via `(?i)`) or a plain glob/substring pattern (case already folded to
+/// lowercase at construction time if `-i`, matching every other `-i`-style
+/// case-fold in this codebase). `Result::Err` only from `Regex::new`
+/// failing on `-r` (surfaced as `Err("invalid regex: {msg}")`, an ordinary
+/// command error -- unlike `ChooseTree`, `find-window` CAN fail before ever
+/// reaching a client, so this stays a `Result`, not baked into the
+/// `ExecOutcome`-returning client helper).
+struct FindMatcher { regex: Option<regex::Regex>, glob_pattern: String, ignore_case: bool }
+
+impl FindMatcher {
+    fn new(pattern: &str, use_regex: bool, ignore_case: bool) -> Result<FindMatcher, String>;
+    /// Name/title matching (`-N`/`-T`): glob mode wraps `glob_pattern` in
+    /// `*...*` (substring-glob, per the doc's "star = wrapped unless -r"
+    /// rule) and calls `glob_match` against the FULL string; regex mode
+    /// calls `Regex::is_match` (already substring-search semantics unless
+    /// the user's own pattern anchors with `^`/`$`).
+    fn matches_name(&self, text: &str) -> bool;
+    /// Content matching (`-C`): PLAIN substring search (glob mode does NOT
+    /// wrap/glob here -- tmux's `#{C:}` format function is a literal
+    /// substring/regex search, not fnmatch, per
+    /// `docs/tmux-reference/commands-config-options-formats.md`'s format
+    /// function table) or `Regex::is_match`, checked per VISIBLE grid ROW
+    /// (mirrors the retired `grid_contains`'s per-row walk -- not history,
+    /// not a single joined blob).
+    fn matches_content(&self, text: &str) -> bool;
+}
+```
+
+`exec_find_window_client(&mut self, pattern: String, by_content: bool,
+by_name: bool, by_title: bool, use_regex: bool, ignore_case: bool, client:
+&mut ClientState, session_name: &str) -> ExecOutcome`: when none of
+`by_content`/`by_name`/`by_title` are set (bare `find-window pattern`),
+defaults to all three (`docs/tmux-reference/windows-and-sessions.md`: "C = N
+= T = 1" when none given). Builds one `FindMatcher`, then for every window
+in the target session (index order) ORs the enabled criteria -- name
+(`w.name`), title (any pane's `grid.title().unwrap_or("")`), content (any
+pane's visible rows) -- short-circuiting per window on the first hit;
+collects the full match SET (not just the first). Zero matches: `Ok`
+carrying the existing transient `no windows matching: <p>` message, exactly
+as before (documented, intentional scope narrowing versus real tmux, which
+would open an empty filtered tree -- showing nothing to select is worse UX
+than the existing message and no test/ticket requires the stricter
+behavior). One or more matches: **always** calls `open_choose_tree` with
+`Some(matches)` -- no more "jump directly when exactly one match" shortcut
+(the parity fix `#46` targets).
+
+`execute_headless`'s `FindWindow { .. }` arm changes from directly executing
+the search to `Err("no current client".to_string())` -- matching `ChooseTree
+{ .. }`'s existing rule exactly, since opening (a possibly-filtered) tree is
+fundamentally a CLIENT-side mode, unlike the old direct-jump behavior which
+needed no client at all. `PromptKind::FindWindow`'s commit handler
+(`feed_prompt_byte`) now calls `exec_find_window_client` instead of the
+retired `exec_find_window`, routing its `ExecOutcome` through the same
+`route_outcome` path `PromptKind::Command` already uses.
+
+### `layout` -- NO public surface change
+
+`Layout::apply_preset`'s signature is UNCHANGED
+(`apply_preset(&mut self, preset: LayoutPreset, panes: &[PaneId], area:
+Rect, main_width: u16, main_height: u16)`) -- callers still pass
+pre-resolved absolute `u16` cell counts (now resolved from a percent-aware
+`options::Options::main_pane_width`/`_for`, see the `layout-presets`
+section's amended `options` amendment above). The fix for #43 lives entirely
+in `layout::Node`, a PRIVATE enum with no contract surface: `Node::Split`
+gains a `main_size: Option<u16>` field remembering "this split's first
+child wants an absolute `N`-cell length, re-derived via `clamp_main` against
+whatever area a LATER `rects()` call passes in" -- set by `build_preset_tree`
+only for the `MainHorizontal`/`MainVertical` presets' top split, `None`
+everywhere else, and cleared by a successful manual `resize_from` on that
+same split (a deliberate user override of the border takes precedence over
+the configured absolute size on any FURTHER resize). No other `Layout`
+method's signature changes.
+
+### TDD evidence (this task)
+
+Unit (`layout::tests`): `main_pane_width_survives_window_resize`,
+`main_pane_height_survives_window_resize`,
+`main_pane_width_still_reclamps_on_resize_into_tiny_area`,
+`manual_resize_of_main_split_overrides_absolute_stickiness`. Unit
+(`options::tests`): `main_pane_size_percent` (`50%`/`25%` resolve against a
+caller `total`, round-trips via `show`, `-u` restores the plain-cells
+default); `main_pane_size_getters` updated in place for the new `total`
+parameter. `tests/server_proto.rs`: `find_window_multi_match_opens_choose_
+list`, `find_window_single_match_opens_choose_list_too` (the OLD
+direct-jump assumption inverted, per the task brief's sanction),
+`find_window_regex_flag_matches_anchor` (`-r '^foo'`),
+`main_pane_width_survives_window_resize` (end-to-end: apply `main-vertical`
+with `main-pane-width 20`, push a real client `Resize` frame, assert the
+main pane column is still exactly 20). `find_window_f_prompt` (Task 7's
+original test) is rewritten to open the tree and commit with `Enter` for
+both the name-match and content-match cases, keeping its no-match assertion
+unchanged (see `exec_find_window_client`'s doc comment above for why the
+zero-match message path is preserved).
