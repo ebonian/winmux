@@ -2217,9 +2217,20 @@ impl Server {
                 let w = client.cols;
                 let list_height = Server::choose_tree_list_height(sy, w, rows.len(), state.preview);
                 let preview = if list_height < sy {
-                    let interior_h = sy.saturating_sub(list_height).saturating_sub(1);
+                    // Fix round 1 (`## 3.2`): the interior is inset inside
+                    // the full 4-sided box -- 2 cells horizontal each side
+                    // (`w - 4`), 1 row vertical each (top + bottom border:
+                    // `(sy - list_height) - 2`). `choose_tree_list_height`'s
+                    // box-size guard (`sy-h <= 4 || w <= 4` drops the
+                    // preview) guarantees both are >= 1 whenever this branch
+                    // is reached (region >= 5 rows -> interior >= 3 rows;
+                    // panel >= 5 cols -> interior >= 1 col), so no extra
+                    // "inset shrank the blit area below 1x1" drop rule is
+                    // needed here.
+                    let interior_h = sy.saturating_sub(list_height).saturating_sub(2);
+                    let interior_w = w.saturating_sub(4);
                     rows.get(sel).map(|r| {
-                        let (title, content_w, content_h, content) = self.build_tree_preview(&r.target, w, interior_h);
+                        let (title, content_w, content_h, content) = self.build_tree_preview(&r.target, interior_w, interior_h);
                         TreePreviewData { title, content_w, content_h, content }
                     })
                 } else {

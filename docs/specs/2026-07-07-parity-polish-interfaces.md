@@ -2132,7 +2132,10 @@ pub struct TreeRowCell {
 }
 
 pub struct PreviewBlock {
-    pub rect: Rect,   // row `rect.y` = border line; rows below = interior
+    /// Full preview region, box borders INCLUDED: row `rect.y` = top
+    /// border, `rect.y + rect.h - 1` = bottom border, columns `rect.x` /
+    /// `rect.x + rect.w - 1` = sides (fix round 1: full 4-sided box).
+    pub rect: Rect,
     pub title: String,
     pub content_w: u16,
     pub content_h: u16,
@@ -2154,12 +2157,26 @@ is `Some`, the row list's visible window is capped to `preview.rect.y`
 (instead of the full panel) and the message-reservation rule only applies
 when there's NO preview (a message, when one is showing alongside a
 preview, is instead painted over the panel's last row unconditionally,
-same call site as before). The preview itself: a `'─'`-filled top border row
-in `Scene::border`'s style with `title` overwritten starting at column 1
-(same style), then `content` blitted verbatim (character AND style, no
-recoloring) into the interior (`rect.y + 1 ..`, full width) — truncated to
-the interior's size when `content` is larger, never scaled, and left as
-whatever the panel's full-clear already put there (blank) when smaller.
+same call site as before). The preview itself (**fix round 1 — chrome
+upgraded from a single top border line to the doc's full `## 3.2` spec,
+tmux's `screen_write_box`**): a full 4-sided single-line box (`┌─┐│└┘`,
+consistent with `border_glyph`'s existing glyph set) around the whole
+`rect` in `Scene::border`'s style, `title` overwritten over the top border
+starting at column `rect.x + 1` (same style, clipped before the right
+corner), then `content` blitted verbatim (character AND style, no
+recoloring) into the interior at the doc's insets — 2 cells horizontal
+(`rect.x + 2`, usable width `rect.w - 4`), 1 row vertical (`rect.y + 1`,
+usable height `rect.h - 2`) — truncated to the interior's size when
+`content` is larger, never scaled, and left as whatever the panel's
+full-clear already put there (blank) when smaller. The server builds
+`content` at exactly the inset interior size (`build_render_overlay` passes
+`w - 4` x `sy - list_height - 2` to `build_tree_preview`); no extra
+"inset shrank the blit below 1x1" drop rule is needed —
+`choose_tree_list_height`'s box-size guard (`sy-h <= 4 || w <= 4` drops
+the preview) already guarantees the interior is >= 1x3 whenever a preview
+is emitted. That guard folds tmux's paint-time "skip the box" check into
+the height function itself — a degenerate-only divergence, ticketed
+`docs/follow-ups.md` #73.
 
 ### TDD evidence (this task)
 

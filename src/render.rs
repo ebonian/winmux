@@ -82,21 +82,26 @@ pub struct TreeRowCell {
 }
 
 /// The live preview box painted below choose-tree's row list (SP6 wave 2
-/// Task 8; `docs/tmux-reference/choose-tree.md` `## 3.2`/`## 6`): a single-
-/// line horizontal border across `rect`'s top row (in `Scene::border`'s
-/// style) with `title` embedded starting at column 1, then `content`
+/// Task 8; fix round 1 upgraded the chrome to the doc's full spec —
+/// `docs/tmux-reference/choose-tree.md` `## 3.2`/`## 6`, tmux's
+/// `screen_write_box`): a full 4-sided single-line box (`┌─┐│└┘`, in
+/// `Scene::border`'s style) around the whole `rect`, with `title` embedded
+/// over the top border starting at column `rect.x + 1`, then `content`
 /// (already-composed filmstrip cells — dividers, per-slot labels, and each
 /// slot's raw pane-cell copy — all pre-blitted by the SERVER, which is the
 /// one place that holds every pane's `Grid`) blitted verbatim into the
-/// interior (the rows below the border line, full width). `content` is
+/// interior at the doc's insets: 2 cells horizontal (`rect.x + 2`, usable
+/// width `rect.w - 4`), 1 row vertical (`rect.y + 1`, usable height
+/// `rect.h - 2` — the top and bottom border rows). `content` is
 /// `content_w * content_h` cells, row-major; it may be LARGER than the
 /// interior (the renderer truncates from the top-left corner, never scales)
 /// or smaller (the renderer leaves the remainder as whatever the panel's
 /// full-clear already put there — blank).
 pub struct PreviewBlock {
-    /// The full preview region: row `rect.y` is the border line, rows
-    /// `rect.y + 1 .. rect.y + rect.h` are the interior. Spans the panel's
-    /// full width.
+    /// The full preview region, box borders included: row `rect.y` is the
+    /// top border, row `rect.y + rect.h - 1` the bottom border, columns
+    /// `rect.x`/`rect.x + rect.w - 1` the sides. Spans the panel's full
+    /// width.
     pub rect: Rect,
     pub title: String,
     pub content_w: u16,
@@ -491,35 +496,63 @@ impl Renderer {
                     }
                 }
 
-                // Preview box (SP6 wave 2 Task 8): single top-border line
-                // with the title embedded, then a raw, truncate-never-scale
-                // blit of the pre-composed filmstrip `content` below it.
+                // Preview box (SP6 wave 2 Task 8; fix round 1): a full
+                // 4-sided single-line box around the whole preview region
+                // (tmux's `screen_write_box`, `docs/tmux-reference/
+                // choose-tree.md` `## 3.2`) with the title embedded over
+                // the top border starting at column `rect.x + 1`, then a
+                // raw, truncate-never-scale blit of the pre-composed
+                // filmstrip `content` into the interior at the doc's
+                // insets: 2 cells horizontal (`rect.x + 2`, width
+                // `rect.w - 4`), 1 row vertical (`rect.y + 1`, height
+                // `rect.h - 2` -- the top and bottom border rows). A rect
+                // under 2x2 can't form a box and paints nothing (never
+                // reachable in production: `choose_tree_list_height`'s
+                // box-size guard already drops the preview outright below
+                // 5 columns / a 5-row region).
                 if let Some(pv) = &list.preview {
-                    if pv.rect.w > 0 && pv.rect.h > 0 && pv.rect.y < rows {
-                        let by = pv.rect.y;
-                        let x_end = pv.rect.x.saturating_add(pv.rect.w).min(cols);
-                        for x in pv.rect.x..x_end {
-                            self.set(x, by, Cell { ch: '─', style: scene.border });
+                    if pv.rect.w >= 2 && pv.rect.h >= 2 && pv.rect.y < rows {
+                        let bs = scene.border;
+                        let x0 = pv.rect.x;
+                        let y0 = pv.rect.y;
+                        let x1 = pv.rect.x + pv.rect.w - 1;
+                        let y1 = pv.rect.y + pv.rect.h - 1;
+                        // Top + bottom fill, then sides, then corners
+                        // (`self.set` already clips to the buffer).
+                        for x in x0..=x1.min(cols.saturating_sub(1)) {
+                            self.set(x, y0, Cell { ch: '─', style: bs });
+                            self.set(x, y1, Cell { ch: '─', style: bs });
                         }
+                        for y in (y0 + 1)..y1 {
+                            self.set(x0, y, Cell { ch: '│', style: bs });
+                            self.set(x1, y, Cell { ch: '│', style: bs });
+                        }
+                        self.set(x0, y0, Cell { ch: '┌', style: bs });
+                        self.set(x1, y0, Cell { ch: '┐', style: bs });
+                        self.set(x0, y1, Cell { ch: '└', style: bs });
+                        self.set(x1, y1, Cell { ch: '┘', style: bs });
+                        // Title over the top border, from column x0+1, never
+                        // overwriting the right corner.
                         for (i, ch) in pv.title.chars().enumerate() {
-                            let x = pv.rect.x + 1 + i as u16;
-                            if x >= x_end {
+                            let x = x0 + 1 + i as u16;
+                            if x >= x1 {
                                 break;
                             }
-                            self.set(x, by, Cell { ch, style: scene.border });
+                            self.set(x, y0, Cell { ch, style: bs });
                         }
-                        let interior_y = by + 1;
-                        let interior_h = pv.rect.h.saturating_sub(1);
-                        let interior_w = pv.rect.w;
+                        // Interior blit at inset (2, 1), truncated (never
+                        // scaled) to the interior's `(rect.w-4) x (rect.h-2)`.
+                        let interior_w = pv.rect.w.saturating_sub(4);
+                        let interior_h = pv.rect.h.saturating_sub(2);
                         let copy_h = pv.content_h.min(interior_h);
                         let copy_w = pv.content_w.min(interior_w);
                         for cy in 0..copy_h {
-                            let yy = interior_y + cy;
+                            let yy = y0 + 1 + cy;
                             if yy >= rows {
                                 break;
                             }
                             for cx in 0..copy_w {
-                                let x = pv.rect.x + cx;
+                                let x = x0 + 2 + cx;
                                 if x >= cols {
                                     break;
                                 }
@@ -1459,18 +1492,25 @@ mod tests {
         assert_eq!(row1, expect1);
     }
 
-    /// The preview box paints a single top-border line (with the title
-    /// embedded starting at column 1, in `Scene::border`'s style) then blits
-    /// `content` verbatim into the interior (the rows below the border), raw
-    /// cell-for-cell (character AND style), no color/attribute changes.
-    /// `rect = (0,2,6,3)`: border row 2, interior rows 3-4 (`rect.h - 1 = 2`
-    /// rows). `content` is `3 x 2` -- narrower than the 6-wide interior, so
-    /// only the first 3 columns of each interior row are touched; the rest
-    /// stay whatever the panel's full-clear already left them (blank,
-    /// default style).
+    /// The preview box (fix round 1: full 4-sided single-line box per
+    /// `docs/tmux-reference/choose-tree.md` `## 3.2`, tmux's
+    /// `screen_write_box`): `┌`/`┐`/`└`/`┘` corners, `─` top/bottom fill,
+    /// `│` sides, all in `Scene::border`'s style; the title embedded over
+    /// the top border starting at column `rect.x + 1`; then `content`
+    /// blitted verbatim (raw cell-for-cell, character AND style, no
+    /// recoloring) into the interior at the doc's insets -- 2 cells
+    /// horizontal (`rect.x + 2`, usable width `rect.w - 4`), 1 row vertical
+    /// (`rect.y + 1`, usable height `rect.h - 2`).
+    /// `rect = (0,1,10,5)`: top border row 1, bottom border row 5, side
+    /// borders columns 0 and 9 on rows 2-4; interior columns 2-7 (10-4 = 6
+    /// wide), rows 2-4 (5-2 = 3 tall). `content` is `3 x 2` -- smaller than
+    /// the 6x3 interior, so only interior columns 2-4, rows 2-3 are
+    /// touched; the rest (e.g. (5,2)), and the 1-cell padding column
+    /// between border and content (x=1), stay whatever the panel's
+    /// full-clear left there (blank, default style).
     #[test]
     fn overlay_preview_blits_grid_cells() {
-        let g = grid_with(6, 5, b"");
+        let g = grid_with(10, 6, b"");
         let s1 = Style { fg: Color::Idx(2), ..Style::default() };
         let s2 = Style { fg: Color::Idx(3), ..Style::default() };
         let content = vec![
@@ -1483,8 +1523,8 @@ mod tests {
         ];
         let border = Style { fg: Color::Idx(8), ..Style::default() };
         let scene = Scene {
-            size: (6, 5),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 6, h: 5 }, grid: &g, focused: true, dead: false, copy: None }],
+            size: (10, 6),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 10, h: 6 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: None,
             message: None,
@@ -1497,49 +1537,73 @@ mod tests {
                 title: String::new(),
                 rows: Vec::new(),
                 top: 0,
-                preview: Some(PreviewBlock { rect: Rect { x: 0, y: 2, w: 6, h: 3 }, title: "foo".to_string(), content_w: 3, content_h: 2, content }),
+                preview: Some(PreviewBlock { rect: Rect { x: 0, y: 1, w: 10, h: 5 }, title: "foo".to_string(), content_w: 3, content_h: 2, content }),
             })),
         };
-        let mut r = Renderer::new(6, 5);
+        let mut r = Renderer::new(10, 6);
         r.compose_back(&scene);
 
-        // Border row (y=2): '─' fill in `border` style; title "foo"
-        // overwrites starting at column 1 (also in `border` style).
-        assert_eq!(r.back_cell(0, 2).ch, '─');
-        assert_eq!(r.back_cell(0, 2).style, border);
-        assert_eq!(r.back_cell(1, 2).ch, 'f');
-        assert_eq!(r.back_cell(2, 2).ch, 'o');
-        assert_eq!(r.back_cell(3, 2).ch, 'o');
-        assert_eq!(r.back_cell(1, 2).style, border);
-        assert_eq!(r.back_cell(4, 2).ch, '─');
+        // Top border row (y=1): '┌' corner, title "foo" from column 1, '─'
+        // fill through column 8, '┐' at column 9 -- all in `border` style.
+        assert_eq!(r.back_cell(0, 1).ch, '┌');
+        assert_eq!(r.back_cell(0, 1).style, border);
+        assert_eq!(r.back_cell(1, 1).ch, 'f');
+        assert_eq!(r.back_cell(2, 1).ch, 'o');
+        assert_eq!(r.back_cell(3, 1).ch, 'o');
+        assert_eq!(r.back_cell(1, 1).style, border);
+        assert_eq!(r.back_cell(4, 1).ch, '─');
+        assert_eq!(r.back_cell(8, 1).ch, '─');
+        assert_eq!(r.back_cell(9, 1).ch, '┐');
+        assert_eq!(r.back_cell(9, 1).style, border);
 
-        // Interior row 0 (y=3): content[0..3] verbatim; columns 3-5 untouched.
-        assert_eq!(r.back_cell(0, 3), Cell { ch: 'A', style: s1 });
-        assert_eq!(r.back_cell(1, 3), Cell { ch: 'B', style: s1 });
-        assert_eq!(r.back_cell(2, 3), Cell { ch: 'C', style: s1 });
-        assert_eq!(r.back_cell(3, 3).ch, ' ');
-        assert_eq!(r.back_cell(3, 3).style, Style::default());
+        // Side borders: '│' at columns 0 and 9 on every row strictly
+        // between the top (1) and bottom (5) border rows.
+        for y in 2..=4u16 {
+            assert_eq!(r.back_cell(0, y).ch, '│', "left border at y={y}");
+            assert_eq!(r.back_cell(0, y).style, border);
+            assert_eq!(r.back_cell(9, y).ch, '│', "right border at y={y}");
+            assert_eq!(r.back_cell(9, y).style, border);
+        }
 
-        // Interior row 1 (y=4): content[3..6] verbatim.
-        assert_eq!(r.back_cell(0, 4), Cell { ch: 'D', style: s2 });
-        assert_eq!(r.back_cell(1, 4), Cell { ch: 'E', style: s2 });
-        assert_eq!(r.back_cell(2, 4), Cell { ch: 'F', style: s2 });
+        // Bottom border row (y=5): '└' + '─' fill + '┘'.
+        assert_eq!(r.back_cell(0, 5).ch, '└');
+        assert_eq!(r.back_cell(0, 5).style, border);
+        assert_eq!(r.back_cell(4, 5).ch, '─');
+        assert_eq!(r.back_cell(9, 5).ch, '┘');
+        assert_eq!(r.back_cell(9, 5).style, border);
+
+        // Interior row 0 (y = rect.y + 1 = 2, x from rect.x + 2 = 2):
+        // content[0..3] verbatim; the padding column between border and
+        // content (x=1) and the interior past the content (x=5) stay
+        // untouched (blank, default style).
+        assert_eq!(r.back_cell(1, 2).ch, ' ');
+        assert_eq!(r.back_cell(1, 2).style, Style::default());
+        assert_eq!(r.back_cell(2, 2), Cell { ch: 'A', style: s1 });
+        assert_eq!(r.back_cell(3, 2), Cell { ch: 'B', style: s1 });
+        assert_eq!(r.back_cell(4, 2), Cell { ch: 'C', style: s1 });
+        assert_eq!(r.back_cell(5, 2).ch, ' ');
+        assert_eq!(r.back_cell(5, 2).style, Style::default());
+
+        // Interior row 1 (y=3): content[3..6] verbatim.
+        assert_eq!(r.back_cell(2, 3), Cell { ch: 'D', style: s2 });
+        assert_eq!(r.back_cell(3, 3), Cell { ch: 'E', style: s2 });
+        assert_eq!(r.back_cell(4, 3), Cell { ch: 'F', style: s2 });
     }
 
-    /// `content` (5 wide x 4 tall) is larger than the preview's interior
-    /// (`rect = (0,0,4,3)` -> interior is `4 wide x (rect.h - 1) = 2` tall):
-    /// the renderer TRUNCATES to the top-left `4x2` corner rather than
-    /// scaling -- column 4 (`'E'`/`'J'` of content's first two rows) and
-    /// content rows 2-3 (`"KLMNO"`/`"PQRST"`) never appear anywhere on
-    /// screen (there isn't even room: a 3-row scene only has one row below
-    /// the border).
+    /// `content` (5 wide x 4 tall) is larger than the boxed preview's
+    /// interior (`rect = (0,0,7,4)` -> interior is `rect.w - 4 = 3` wide by
+    /// `rect.h - 2 = 2` tall, at inset `(2, 1)` per `## 3.2`): the renderer
+    /// TRUNCATES to the top-left `3x2` corner rather than scaling --
+    /// columns 3-4 (`'D'`/`'E'`, `'I'`/`'J'` of content's first two rows)
+    /// and content rows 2-3 (`"KLMNO"`/`"PQRST"`) never appear anywhere on
+    /// screen (row 3 is the box's own bottom border).
     #[test]
     fn overlay_preview_truncates_oversized_grid() {
-        let g = grid_with(4, 3, b"");
+        let g = grid_with(7, 4, b"");
         let content: Vec<Cell> = "ABCDEFGHIJKLMNOPQRST".chars().map(|ch| Cell { ch, style: Style::default() }).collect();
         let scene = Scene {
-            size: (4, 3),
-            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 3 }, grid: &g, focused: true, dead: false, copy: None }],
+            size: (7, 4),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 7, h: 4 }, grid: &g, focused: true, dead: false, copy: None }],
             zoomed: false,
             status: None,
             message: None,
@@ -1552,26 +1616,37 @@ mod tests {
                 title: String::new(),
                 rows: Vec::new(),
                 top: 0,
-                preview: Some(PreviewBlock { rect: Rect { x: 0, y: 0, w: 4, h: 3 }, title: String::new(), content_w: 5, content_h: 4, content }),
+                preview: Some(PreviewBlock { rect: Rect { x: 0, y: 0, w: 7, h: 4 }, title: String::new(), content_w: 5, content_h: 4, content }),
             })),
         };
-        let mut r = Renderer::new(4, 3);
+        let mut r = Renderer::new(7, 4);
         r.compose_back(&scene);
 
-        // Border row (y=0) is the top line, not content.
-        assert_eq!(r.back_cell(0, 0).ch, '─');
+        // Box chrome: top border row 0, bottom border row 3, sides at
+        // columns 0 and 6.
+        assert_eq!(r.back_cell(0, 0).ch, '┌');
+        assert_eq!(r.back_cell(3, 0).ch, '─');
+        assert_eq!(r.back_cell(6, 0).ch, '┐');
+        assert_eq!(r.back_cell(0, 1).ch, '│');
+        assert_eq!(r.back_cell(6, 2).ch, '│');
+        assert_eq!(r.back_cell(0, 3).ch, '└');
+        assert_eq!(r.back_cell(6, 3).ch, '┘');
 
-        // Interior row 0 (y=1): only the first 4 of content's 5-wide row 0
-        // ("ABCDE") appear -- 'E' is truncated.
-        let row1: String = (0..4).map(|x| r.back_cell(x, 1).ch).collect();
-        assert_eq!(row1, "ABCD");
+        // Interior row 0 (y=1, x=2..4): only the first 3 of content's
+        // 5-wide row 0 ("ABCDE") appear -- 'D'/'E' truncated. The padding
+        // column (x=1) and the cell right of the copy (x=5) stay blank:
+        // truncation, not overflow.
+        let row1: String = (2..5).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, "ABC");
+        assert_eq!(r.back_cell(1, 1).ch, ' ');
+        assert_eq!(r.back_cell(5, 1).ch, ' ');
 
-        // Interior row 1 (y=2): content row 1 ("FGHIJ"), again truncated to 4.
-        // This is also the LAST row of the 3-row scene -- content rows 2-3
-        // ("KLMNO"/"PQRST") are structurally unreachable, proving the
-        // renderer never scales down to fit them in.
-        let row2: String = (0..4).map(|x| r.back_cell(x, 2).ch).collect();
-        assert_eq!(row2, "FGHI");
+        // Interior row 1 (y=2): content row 1 ("FGHIJ") truncated to "FGH".
+        // Row 3 is the bottom border -- content rows 2-3 ("KLMNO"/"PQRST")
+        // are structurally unreachable, proving the renderer never scales
+        // down to fit them in.
+        let row2: String = (2..5).map(|x| r.back_cell(x, 2).ch).collect();
+        assert_eq!(row2, "FGH");
     }
 
     /// Sizing math per `docs/tmux-reference/choose-tree.md` `## 3.1`
@@ -1624,9 +1699,13 @@ mod tests {
             let line: String = (0..4).map(|x| r.back_cell(x, i).ch).collect();
             assert_eq!(line, format!("  r{i}"), "row {i} should still be a list row");
         }
-        // Row 10 is the preview's border line, NOT list row 10's text --
-        // proof the list was capped to 10 rows (2/3 of 15), not the full 15.
-        assert_eq!(r.back_cell(0, 10).ch, '─');
+        // Row 10 is the preview box's top border (its '┌' corner at column
+        // 0, fix round 1), NOT list row 10's text -- proof the list was
+        // capped to 10 rows (2/3 of 15), not the full 15. Row 14 (the
+        // panel's last row) is the box's bottom border.
+        assert_eq!(r.back_cell(0, 10).ch, '┌');
+        assert_eq!(r.back_cell(1, 10).ch, '─');
+        assert_eq!(r.back_cell(0, 14).ch, '└');
     }
 
     /// display-panes' 5x5 block digit for `1`, exact cells, in a rect sized

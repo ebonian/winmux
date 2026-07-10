@@ -868,3 +868,16 @@ None block the sub-project 4 merge.
     DECSET 1000/1002/1003/1006 from pane output in grid, re-encode and forward in
     dispatch, and gate copy-mode-entry/wheel translation on the pane's mouse mode.
     MEDIUM effort. Interacts with #67(b) table-driven mouse bindings.
+
+73. **choose-tree degenerate tiny-pane guard reverts to a full-height list where
+    tmux would draw a short list + blank remainder** (SP6 wave 2 Task 8 review,
+    self-found, 2026-07-10, `dispatch::Server::choose_tree_list_height`). winmux
+    folds tmux's mode_tree_draw paint-time guard (`sy <= 4 || h < 2 ||
+    sy - h <= 4 || w <= 4`, mode-tree.c:980-981 — "don't draw the box") into the
+    HEIGHT function by setting `h = sy` (list takes the whole panel). Real tmux
+    keeps the computed `h` and simply skips painting the preview box, leaving rows
+    `h..sy-1` blank — so in a degenerate-size pane (e.g. BIG preview mode in a
+    panel 5-6 rows tall) tmux shows a short list over blank rows where winmux
+    shows a full-height list. Defensible (winmux's behavior is arguably more
+    useful — no dead rows) and reachable only in degenerate geometries; ticketed
+    for the record. TINY. LOW.
