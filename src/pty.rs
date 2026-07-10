@@ -23,9 +23,29 @@ use windows::Win32::System::Threading::{
 /// Not exported as a named constant by windows 0.58; define it ourselves.
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 
-/// Map a `windows::core::Error` into a `std::io::Error` (HRESULT as raw OS error).
+/// Map a `windows::core::Error` into a `std::io::Error`.
+///
+/// Follow-up #7: windows-rs wraps a failed call's `GetLastError()` code as an
+/// HRESULT (`HRESULT_FROM_WIN32`: low 16 bits = the real Win32 code, facility
+/// WIN32 in bits 16-26, sign bit set) — passing that HRESULT-shaped `i32`
+/// straight through to `io::Error::from_raw_os_error` (as this function used
+/// to) means `.kind()` classification (e.g. `ErrorKind::NotFound`) matches
+/// against the WRONG number, since `io::Error`'s Windows `.kind()` mapping
+/// expects the raw Win32 code, not the HRESULT encoding. Unmask it back to
+/// the plain Win32 code first, mirroring `src/pipe.rs`'s `raw_win32_code` +
+/// `win_err` (this module's calls never branched on `.kind()` before, so the
+/// bug was latent — but any future caller that does now gets correct
+/// classification for free).
 fn win_err(e: windows::core::Error) -> io::Error {
-    io::Error::from_raw_os_error(e.code().0)
+    io::Error::from_raw_os_error(raw_win32_code(&e) as i32)
+}
+
+/// Unwrap a `windows::core::Error`'s HRESULT back to the raw Win32 code (see
+/// `win_err`'s doc comment) — identical in shape to `src/pipe.rs`'s helper of
+/// the same name, duplicated rather than shared since the two modules have no
+/// other coupling and this is a two-line pure function.
+fn raw_win32_code(e: &windows::core::Error) -> u32 {
+    (e.code().0 as u32) & 0xFFFF
 }
 
 /// True if any of OUR OWN std streams (stdin/stdout/stderr) is not a live
@@ -99,6 +119,24 @@ pub struct Pty {
 
 pub struct PtyReader {
     file: File,
+}
+
+/// An independent handle onto a `Pty`'s input pipe, for a dedicated per-pane
+/// writer thread (follow-up #14; see [`Pty::try_clone_writer`]'s doc
+/// comment). Not `Clone`/`Send`-derived automatically since `File` already
+/// is `Send` (a plain owned handle) — no unsafe needed here, unlike
+/// `pipe::PipeConn`'s overlapped-I/O event handles.
+pub struct PtyWriter {
+    file: File,
+}
+
+impl PtyWriter {
+    /// Write `bytes` then flush, matching `Pty::write_input`'s own
+    /// write_all+flush shape.
+    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.file.flush()
+    }
 }
 
 impl Pty {
@@ -259,6 +297,19 @@ impl Pty {
         self.input.flush()
     }
 
+    /// Clone the input pipe's write handle for a dedicated per-pane writer
+    /// thread (follow-up #14): a stalled child that stops draining its stdin
+    /// (a hung app, or a huge paste) then only blocks whatever thread owns
+    /// THIS `PtyWriter`, never a caller of `write_input`/`Pty` itself (in
+    /// practice: the server's single main-loop thread, which must never
+    /// block on one pane's stdin). The clone is an independent duplicate
+    /// HANDLE to the same pipe (`std::fs::File::try_clone`), so it keeps
+    /// working even after the original `Pty` (and its own `input` field)
+    /// drops.
+    pub fn try_clone_writer(&self) -> io::Result<PtyWriter> {
+        Ok(PtyWriter { file: self.input.try_clone()? })
+    }
+
     /// Raw process HANDLE value for a waiter thread. The Pty retains ownership;
     /// the waiter only reads/waits on it (safe cross-thread on Windows).
     pub fn process_handle_raw(&self) -> isize {
@@ -293,5 +344,24 @@ impl Drop for Pty {
             ClosePseudoConsole(self.hpcon);
             let _ = CloseHandle(self.process);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::HRESULT;
+
+    /// Follow-up #7: `win_err` must unmask an `HRESULT_FROM_WIN32`-encoded
+    /// error back to the plain Win32 code so `io::Error::kind()`
+    /// classification works — mirrors `src/pipe.rs`'s equivalent test.
+    #[test]
+    fn win_err_unmasks_hresult_to_plain_win32_code() {
+        // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) = 0x8007_0002.
+        let hr = HRESULT(0x8007_0002u32 as i32);
+        let e = windows::core::Error::from_hresult(hr);
+        let io_err = win_err(e);
+        assert_eq!(io_err.raw_os_error(), Some(2), "must be the raw Win32 code, not the HRESULT");
+        assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
     }
 }

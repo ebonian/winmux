@@ -59,7 +59,18 @@ fn invalid_data(msg: &str) -> io::Error {
 
 // ---- low-level frame write/read -------------------------------------------
 
+/// Follow-up #9: enforce `MAX_FRAME` on the WRITE side too (previously only
+/// `read_frame` rejected an oversized declared length on decode). Every
+/// producer today already stays far under the cap (`server.rs`'s
+/// `send_output` chunks pane output via `MAX_FRAME`-sized pieces; every other
+/// payload is bounded by a `u16`/`u8`-sized field count), so this is a
+/// defensive guard against a future caller handing `write_frame` an oversize
+/// payload — an `Err` here, not a silent chunk/truncate (callers already
+/// chunk themselves when a payload could plausibly exceed the cap).
 fn write_frame(w: &mut impl Write, ty: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() as u64 > MAX_FRAME as u64 {
+        return Err(invalid_data("payload exceeds MAX_FRAME"));
+    }
     w.write_all(&[ty])?;
     w.write_all(&(payload.len() as u32).to_le_bytes())?;
     w.write_all(payload)?;
@@ -124,6 +135,21 @@ fn read_str_u32(buf: &mut &[u8]) -> io::Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| invalid_data("invalid utf8"))
 }
 
+/// Follow-up #10: every decoder that parses a fixed set of known fields out
+/// of a frame's payload must call this LAST, after every `read_*` helper —
+/// any bytes still left in `buf` are unaccounted-for trailing garbage (a
+/// newer client talking to an older server, or a corrupted length) and are
+/// now a decode error rather than silently ignored. (`Stdin`/`Output`, whose
+/// entire payload IS the value with no fixed-field structure, don't call
+/// this — there's nothing to be "trailing" relative to.)
+fn expect_consumed(buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_data("trailing bytes in frame payload"))
+    }
+}
+
 // ---- ClientMsg --------------------------------------------------------
 
 pub fn write_client_msg(w: &mut impl Write, m: &ClientMsg) -> io::Result<()> {
@@ -182,6 +208,7 @@ pub fn read_client_msg(r: &mut impl Read) -> io::Result<ClientMsg> {
             let cols = read_u16(&mut buf)?;
             let rows = read_u16(&mut buf)?;
             let name = read_str_u16(&mut buf)?;
+            expect_consumed(buf)?;
             Ok(ClientMsg::Attach {
                 mode,
                 detach_others,
@@ -194,15 +221,20 @@ pub fn read_client_msg(r: &mut impl Read) -> io::Result<ClientMsg> {
         T_RESIZE => {
             let cols = read_u16(&mut buf)?;
             let rows = read_u16(&mut buf)?;
+            expect_consumed(buf)?;
             Ok(ClientMsg::Resize { cols, rows })
         }
-        T_DETACH => Ok(ClientMsg::Detach),
+        T_DETACH => {
+            expect_consumed(buf)?;
+            Ok(ClientMsg::Detach)
+        }
         T_CLI => {
             let argc = read_u16(&mut buf)?;
             let mut args = Vec::with_capacity(argc as usize);
             for _ in 0..argc {
                 args.push(read_str_u16(&mut buf)?);
             }
+            expect_consumed(buf)?;
             Ok(ClientMsg::Cli(args))
         }
         _ => Err(invalid_data("unknown ClientMsg type")),
@@ -244,12 +276,14 @@ pub fn read_server_msg(r: &mut impl Read) -> io::Result<ServerMsg> {
         T_EXIT => {
             let code = read_u8(&mut buf)?;
             let msg = read_str_u16(&mut buf)?;
+            expect_consumed(buf)?;
             Ok(ServerMsg::Exit { code, msg })
         }
         T_CLIDONE => {
             let code = read_u8(&mut buf)?;
             let out = read_str_u32(&mut buf)?;
             let err = read_str_u32(&mut buf)?;
+            expect_consumed(buf)?;
             Ok(ServerMsg::CliDone { code, out, err })
         }
         _ => Err(invalid_data("unknown ServerMsg type")),
@@ -401,5 +435,103 @@ mod tests {
         buf.extend_from_slice(&[1, 2, 3]);
         let err = read_client_msg(&mut Cursor::new(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    // ---- follow-up #9: write_frame rejects oversized payloads --------------
+
+    #[test]
+    fn write_frame_rejects_oversized_payload() {
+        // `Stdin` is the one variant whose payload is caller-controlled with
+        // no length cap of its own (unlike e.g. `Attach`'s u16-bounded name).
+        // A payload one byte over MAX_FRAME must be rejected by the WRITE
+        // side itself, not silently written as a wire-format-violating frame
+        // for the peer's `read_frame` to catch after the fact.
+        let oversized = vec![0u8; MAX_FRAME as usize + 1];
+        let msg = ClientMsg::Stdin(oversized);
+        let mut buf = Vec::new();
+        let err = write_client_msg(&mut buf, &msg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Nothing was written to the sink on the rejected write.
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn write_frame_accepts_exactly_max_frame() {
+        // The boundary itself is still legal.
+        let msg = ClientMsg::Stdin(vec![0u8; MAX_FRAME as usize]);
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &msg).unwrap();
+        let got = read_client_msg(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, msg);
+    }
+
+    // ---- follow-up #10: decoders reject trailing payload bytes -------------
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_attach() {
+        // A well-formed Attach payload with one extra trailing byte appended
+        // (simulating a newer client / corrupted length) must be rejected,
+        // not silently accepted with the extra byte ignored.
+        let msg = ClientMsg::Attach {
+            mode: AttachMode::Existing,
+            detach_others: false,
+            cols: 80,
+            rows: 24,
+            name: "main".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &msg).unwrap();
+        // buf = [type, len_le(4), payload...]; append one extra payload byte
+        // and bump the declared length to match so `read_frame` itself still
+        // hands the full (now-too-long) slice to the decoder.
+        let extra_len = (buf.len() - 5 + 1) as u32;
+        buf[1..5].copy_from_slice(&extra_len.to_le_bytes());
+        buf.push(0xAA);
+        let err = read_client_msg(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_resize() {
+        let msg = ClientMsg::Resize { cols: 100, rows: 40 };
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &msg).unwrap();
+        let extra_len = (buf.len() - 5 + 1) as u32;
+        buf[1..5].copy_from_slice(&extra_len.to_le_bytes());
+        buf.push(0xAA);
+        let err = read_client_msg(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_exit() {
+        let msg = ServerMsg::Exit { code: 1, msg: "[exited]".to_string() };
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &msg).unwrap();
+        let extra_len = (buf.len() - 5 + 1) as u32;
+        buf[1..5].copy_from_slice(&extra_len.to_le_bytes());
+        buf.push(0xAA);
+        let err = read_server_msg(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_detach() {
+        // Detach's payload should be empty; any bytes at all are trailing.
+        let buf = vec![T_DETACH, 1, 0, 0, 0, 0xAA];
+        let err = read_client_msg(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_cli() {
+        let msg = ClientMsg::Cli(vec!["ls".to_string()]);
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &msg).unwrap();
+        let extra_len = (buf.len() - 5 + 1) as u32;
+        buf[1..5].copy_from_slice(&extra_len.to_le_bytes());
+        buf.push(0xAA);
+        let err = read_client_msg(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

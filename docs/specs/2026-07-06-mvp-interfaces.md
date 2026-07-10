@@ -454,6 +454,17 @@ pub struct StatusRow {
 /// ChooseTree`/`DisplayPanes`, the hardcoded key tables, the `cmd`/
 /// `bindings`/`options` amendments).
 ///
+/// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):**
+/// `render::CopyView` loses its `cursor: (u16, u16)` field — it was dead
+/// (`Renderer::compose_back` never read it; the real copy-mode cursor
+/// placement is computed independently by `server::render_one`'s own
+/// `(cursor, cursor_visible)` match, never routed through `CopyView`). The
+/// ONE construction site (`src/server.rs`'s `render_one`) drops the
+/// `cursor: (cs.cx, cs.cy)` field from its `CopyView { .. }` literal in the
+/// same commit. See the sibling `2026-07-07-parity-polish-interfaces.md`
+/// contract's `## render` amendment (under `## copy-mode`) for the full
+/// updated struct.
+///
 /// **LOCKED-CONTRACT AMENDMENT (2026-07-10, sub-project 6 wave 2, Task 11 —
 /// half-border active indication + `pane-border-indicators`):** `Scene`
 /// gains `border_indicators: render::BorderIndicators`:
@@ -761,6 +772,37 @@ EOF when the child exits; a waiter thread per pane does
 `WaitForSingleObject(process_handle)` and sends `Event::Exited(pane_id)`. The
 app then marks the pane dead and drops the `Pty`, which closes the
 pseudoconsole and unblocks the reader thread.
+
+**LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #14, per-pane writer
+thread):** `Pty` gains one new method and one new public type:
+
+```rust
+pub struct PtyWriter { /* private: an independent duplicate of the input
+                          pipe's write handle */ }
+
+impl Pty {
+    /// Clone the input pipe's write handle for a dedicated per-pane writer
+    /// thread. Independent of `write_input`/the `Pty` itself: a stalled
+    /// child's blocked stdin only stalls whichever thread owns the returned
+    /// `PtyWriter`, never a caller of `write_input` (in practice, the
+    /// server's single main-loop thread) — see the `## server` section of
+    /// `2026-07-07-server-client-interfaces.md` for the consuming
+    /// architecture. The clone keeps working even after the original `Pty`
+    /// drops.
+    pub fn try_clone_writer(&self) -> std::io::Result<PtyWriter>;
+}
+impl PtyWriter {
+    /// write_all + flush, matching `Pty::write_input`'s own shape.
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+```
+
+No existing signature changed; `write_input` is unchanged and still used
+directly by `src/server/dispatch.rs`'s lower-volume write sites (send-keys,
+paste-buffer, mouse-drag forwarding) — only the server's own hot
+Forward/Key-forwarding path (`src/server.rs`) was moved onto a
+`PtyWriter`-backed channel+thread. See the `## server` section referenced
+above for the full architecture note.
 
 ## `host` — host terminal control
 

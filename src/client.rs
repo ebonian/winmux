@@ -100,29 +100,48 @@ pub fn attach(pipe_full_name: &str, first: ClientMsg) -> Result<i32, Box<dyn Err
     let mut conn = PipeConn::connect(pipe_full_name)?;
     protocol::write_client_msg(&mut conn, &first)?;
 
+    // Shared with the reader thread below: the stdin thread also gets its own
+    // clone of `tx` (follow-up #16) so a panic in it can signal the main loop
+    // through the SAME channel the reader thread already uses, rather than
+    // leaving the main loop waiting on server messages forever with no way
+    // to know stdin forwarding silently died.
+    let (tx, rx) = channel::<io::Result<ServerMsg>>();
+
     // Stdin thread: forwards raw console input as Stdin frames over its own
     // cloned connection. On read failure/EOF (console closing), it sends a
-    // best-effort Detach frame before exiting.
+    // best-effort Detach frame before exiting. Wrapped in `catch_unwind`
+    // (follow-up #16): a panic here previously left the main loop waiting on
+    // `rx` forever (no more stdin would ever be forwarded again, but nothing
+    // told the main loop the client was now useless) — now it sends an `Err`
+    // through `tx`, which the main loop's existing "lost server" handling
+    // already treats as fatal (drop `Host`, exit non-zero).
     let mut stdin_conn = conn.try_clone()?;
+    let stdin_tx = tx.clone();
     thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match host::read_stdin(&mut buf) {
-                Ok(0) => {
-                    let _ = protocol::write_client_msg(&mut stdin_conn, &ClientMsg::Detach);
-                    break;
-                }
-                Ok(n) => {
-                    let msg = ClientMsg::Stdin(buf[..n].to_vec());
-                    if protocol::write_client_msg(&mut stdin_conn, &msg).is_err() {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = [0u8; 4096];
+            loop {
+                match host::read_stdin(&mut buf) {
+                    Ok(0) => {
+                        let _ = protocol::write_client_msg(&mut stdin_conn, &ClientMsg::Detach);
+                        break;
+                    }
+                    Ok(n) => {
+                        let msg = ClientMsg::Stdin(buf[..n].to_vec());
+                        if protocol::write_client_msg(&mut stdin_conn, &msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = protocol::write_client_msg(&mut stdin_conn, &ClientMsg::Detach);
                         break;
                     }
                 }
-                Err(_) => {
-                    let _ = protocol::write_client_msg(&mut stdin_conn, &ClientMsg::Detach);
-                    break;
-                }
             }
+        }))
+        .is_err();
+        if panicked {
+            let _ = stdin_tx.send(Err(io::Error::other("stdin reader thread panicked")));
         }
     });
 
@@ -131,7 +150,6 @@ pub fn attach(pipe_full_name: &str, first: ClientMsg) -> Result<i32, Box<dyn Err
     // tick (to poll for a terminal resize) — a plain blocking read on the
     // main thread couldn't do both.
     let mut reader_conn = conn.try_clone()?;
-    let (tx, rx) = channel::<io::Result<ServerMsg>>();
     thread::spawn(move || loop {
         let msg = protocol::read_server_msg(&mut reader_conn);
         let is_err = msg.is_err();
@@ -140,9 +158,24 @@ pub fn attach(pipe_full_name: &str, first: ClientMsg) -> Result<i32, Box<dyn Err
         }
     });
 
+    // Follow-up #19: a client can connect (and send its `Attach` frame
+    // successfully) during a `kill-server` command's teardown window — the
+    // pipe accepted the connection, but the server is already tearing itself
+    // down and never gets around to actually serving this client so much as
+    // ONE reply. Without ever having received a real message, losing the
+    // connection is indistinguishable in effect from the pipe never having
+    // existed at all — the cleaner `no server running on <pipe>` a client
+    // connecting slightly LATER (once the pipe is fully gone) would get from
+    // `main.rs`'s `report_connect_error`, not the vaguer `[lost server]` this
+    // used to print unconditionally. Once at least one real message has
+    // arrived, this WAS a live, working session, so a later disconnect is
+    // genuinely "lost server", not "never running".
+    let mut received_any_msg = false;
+
     loop {
         match rx.recv_timeout(TICK) {
             Ok(Ok(ServerMsg::Output(bytes))) => {
+                received_any_msg = true;
                 host.write(&bytes)?;
             }
             Ok(Ok(ServerMsg::Exit { code, msg })) => {
@@ -157,11 +190,17 @@ pub fn attach(pipe_full_name: &str, first: ClientMsg) -> Result<i32, Box<dyn Err
                 return Ok(code as i32);
             }
             Ok(Ok(ServerMsg::CliDone { .. })) => {
-                // Not expected on an attached connection; ignore.
+                // Not expected on an attached connection; ignore (but it IS
+                // still proof the connection was genuinely alive).
+                received_any_msg = true;
             }
             Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                 drop(host);
-                eprintln!("[lost server]");
+                if received_any_msg {
+                    eprintln!("[lost server]");
+                } else {
+                    eprintln!("no server running on {pipe_full_name}");
+                }
                 return Ok(1);
             }
             Err(RecvTimeoutError::Timeout) => {

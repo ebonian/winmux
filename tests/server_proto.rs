@@ -469,6 +469,41 @@ fn two_clients_smallest_size_wins() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Follow-up #17: an `attach -d` (steal) evicts every OTHER client already
+/// attached to the target session with `Exit{0, "[detached (from session
+/// <name>)]"}` — previously a bare `[detached]` with no session name,
+/// inconsistent with every other detach exit path (`d`-key/`Detach` frame,
+/// `detach-client` CLI) which already name the session.
+#[test]
+fn steal_attach_eviction_message_names_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "steal-me", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // B attaches with detach_others = true (`attach -d`): A must be evicted
+    // with the session-naming message, not a bare "[detached]".
+    let mut b = Client::connect(&name);
+    b.send(&ClientMsg::Attach {
+        mode: AttachMode::Existing,
+        detach_others: true,
+        cols: 80,
+        rows: 24,
+        name: "steal-me".to_string(),
+    });
+    a.expect_exit(0, "[detached (from session steal-me)]");
+
+    // B is now the sole attached client and can drive the session normally.
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 // ---- Task 7: window ops, prompts, CLI --------------------------------------
 
 #[test]
@@ -1405,6 +1440,75 @@ fn show_options_output() {
     cli.send(&ClientMsg::Cli(vec!["show".into(), "prefix".into()]));
     let (out, _) = expect_cli_done(&cli, 0);
     assert_eq!(out, "prefix C-b\n");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Follow-up #14: the server's main-loop pane-input writes must never block
+/// on one pane's stalled stdin. `default-command` is set to a shell that
+/// NEVER reads stdin at all (`Start-Sleep`, unlike even a hung interactive
+/// shell which at least occasionally drains some bytes) before creating
+/// session B, whose one pane runs it; B is then flooded with a large volume
+/// of raw `Stdin` frames (a "huge paste onto a hung app", per the ticket's
+/// own framing). Concurrently, a trivial CLI round trip (`list-sessions`)
+/// against the SAME server shares the identical single-threaded main event
+/// loop. Before the per-pane writer-thread fix, every one of B's flooded
+/// frames dispatched `pty.write_input` INLINE on the main loop; with enough
+/// queued frames against a non-draining child, this could stall the loop for
+/// a real, measurable stretch, delaying the concurrent CLI reply. With the
+/// fix, B's writes hand off to its own writer thread (non-blocking channel
+/// sends), so the CLI reply stays fast regardless of how much is queued for
+/// B.
+#[test]
+fn stalled_pane_stdin_does_not_block_other_sessions() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut setup = cli_client(&name);
+    setup.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "default-command".into(),
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        "Start-Sleep".into(),
+        "-Seconds".into(),
+        "60".into(),
+    ]));
+    expect_cli_done(&setup, 0);
+
+    // B: a session whose one pane never reads stdin at all. Nothing to wait
+    // for on-screen (Start-Sleep prints nothing) -- give the pane a moment to
+    // actually spawn before flooding it.
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "stalled", 80, 24);
+    thread::sleep(Duration::from_millis(300));
+
+    // Flood B with a large volume of raw stdin bytes across many frames, all
+    // sent (and, per this test's timing, already read off the wire by the
+    // server's per-client reader thread) before the concurrent CLI request
+    // below even connects.
+    let chunk = vec![b'a'; 4096];
+    for _ in 0..1500 {
+        b.send(&ClientMsg::Stdin(chunk.clone()));
+    }
+
+    // A trivial CLI round trip against the SAME server, sharing the SAME
+    // single main-loop thread B's flood is contending for.
+    let cli_start = Instant::now();
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-sessions".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    let elapsed = cli_start.elapsed();
+    assert!(out.contains("stalled"), "out: {out:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "CLI round trip took {elapsed:?} -- main loop was blocked by pane B's stalled stdin"
+    );
 
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);

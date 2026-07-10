@@ -125,10 +125,15 @@ fn flush_key_forward(fwd: &mut Vec<u8>, out: &mut Vec<KeyInputEvent>) {
 ///   window) rather than being swallowed by it.
 /// - `set_capture(true)`: every byte, including the prefix byte and escape
 ///   sequences, passes through verbatim as `Captured`, bypassing prefix/
-///   repeat entirely (mirrors the legacy machine's `set_capture`). Turning
-///   capture on or off discards (does not re-emit) any incomplete decoder
-///   buffer from before the transition; turning off also resets to `Normal`
-///   table state.
+///   repeat entirely (mirrors the legacy machine's `set_capture`). Both
+///   directions of the transition discard (do not re-emit) any incomplete
+///   decoder buffer from before it. **Precise ON/OFF split (follow-up #20 —
+///   the previous wording here was vaguer about which direction does what):**
+///   turning capture ON leaves any already-armed `Prefixed`/repeat-window
+///   state untouched (irrelevant while capturing, since dispatch is bypassed
+///   entirely) — it is turning capture OFF that resets to `Normal` table
+///   state and clears the repeat window, so a `Prefixed` state armed before
+///   entering capture does NOT survive capture ending.
 pub struct KeyMachine {
     decoder: keys::KeyDecoder,
     prefix: keys::Key,
@@ -427,8 +432,14 @@ mod key_machine_tests {
         );
     }
 
+    /// Follow-up #20 (renamed from `capture_mode_clears_pending_prefix_state`,
+    /// a name left over from the sub-project 2 `InputMachine` this module
+    /// replaced — that exact name/test no longer exists post-rewrite, but the
+    /// naming-precision gap it flagged is worth closing here too): the name
+    /// now says exactly what's asserted — bypass DURING capture, plus OFF
+    /// (not ON) is what clears armed `Prefixed` state.
     #[test]
-    fn capture_bypasses_prefix() {
+    fn capture_bypasses_prefix_and_off_clears_prefix_state() {
         let now = Instant::now();
         let mut m = km();
         // Arm Prefixed, then flip into capture mode mid-sequence.
