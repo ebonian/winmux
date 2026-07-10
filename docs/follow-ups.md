@@ -1261,34 +1261,46 @@ None block the sub-project 4 merge.
 
 ## Follow-ups from Task 9 (SP6 parity wave 2 closeout, 2026-07-10)
 
-74. **Alerts subsystem (`visual-activity`/`visual-bell`/`visual-silence`/
-    `bell-action`/`monitor-activity`) is accepted/stored but has zero runtime
-    effect.** `src/options.rs` has typed getters for all five
-    (`visual_activity`/`visual_bell`/`visual_silence`/`bell_action`/
-    `monitor_activity`), round-tripping through `set`/`show` with tmux's real
-    defaults, but no other module in the codebase calls any of them (`grep`
-    confirms every reference outside `options.rs` itself is in that same
-    file's own unit tests) — there is no bell/activity DETECTION at all (no
-    code watches for a BEL byte, an inactive window's pane producing new
-    output, or a window going silent for `silence-monitor` seconds), let
-    alone the window-flag (`#F` `~`/`#`/`!`) or visual-flash/message
-    reaction real tmux would produce. The user's real `.tmux.conf` fixture
-    (`tests/fixtures/user.tmux.conf`) sets all five to their
-    least-surprising values (`off`/`off`/`off`/`none`/`off`) precisely
-    because they don't want alerts, so this gap is invisible to that
-    config's own test coverage — SP6's config-compat batch made every one of
-    these options PARSE cleanly (closing the "unknown option" class of
-    error), but implementing the alert-detection/reaction behavior itself
-    was out of that batch's scope. Fix sketch: bell detection needs a BEL
-    (`\x07`) hook in `grid`'s VT parser surfaced as a pane event; activity
-    detection needs an "this pane produced output and its window isn't
-    focused" check in the server's output-handling path; both would then
-    feed a window-flags bit (already partially modeled via `#F`'s existing
-    `*`/`-` flags, `src/options.rs`'s `expand_format`) plus, for the visual-*
-    variants, a status-line flash/message. MEDIUM effort (new detection
-    machinery, not just wiring an existing signal to an existing option).
-    LOW priority (no known user config actually turns these on and depends
-    on the behavior; the one polled fixture explicitly turns them off).
+74. **RESOLVED (SP7 Task 17, 2026-07-10).** Alerts subsystem
+    (`visual-activity`/`visual-bell`/`visual-silence`/`bell-action`/
+    `monitor-activity`) implemented end to end: `Grid::take_bell` (Wave 1
+    Task 3) is now consumed by `server::Server::note_bell` in the pane-
+    output path; `note_activity` runs on every output event (mirrors tmux's
+    `window_update_activity`); `check_silence` runs on every 50ms Tick.
+    Window-flag detection (`model::Window::mark_bell`/`mark_activity`/
+    `mark_silence`, gated by `monitor-bell`/`monitor-activity`/
+    `monitor-silence`) is a SEPARATE gate from the notify/visual REACTION
+    (`Server::react_alert`/`alert_action_applies`, gated by that AND
+    `bell-action`/`activity-action`/`silence-action`) — exactly tmux's own
+    split (`alerts_check_bell` never consults `bell-action` before setting
+    the flag). New options: `monitor-bell` (window, default ON — the
+    OPPOSITE default of `monitor-activity`), `monitor-silence` (window,
+    seconds, default 0=off), `activity-action`/`silence-action` (session,
+    default `other`/`other` vs. `bell-action`'s `any`), `window-status-
+    activity-style` (window, default `reverse`). `status::flags` gains the
+    `#`/`!`/`~` chars (tmux's fixed order, ahead of `*`/`-`/`Z`);
+    `window-status-bell-style`/`-activity-style` layer over a flagged tab's
+    base style (bell beats activity/silence, `docs/tmux-reference/
+    status-line-and-messages.md` §2.2). Clear-on-visit
+    (`model::Window::clear_alerts`) is wired into every real
+    current-window-changing call site, both in `model.rs`'s own methods AND
+    the several `server/dispatch.rs` sites that mutate `session.current`
+    directly (a discovery made mid-task: `model::Session::select_window`
+    etc. turned out NOT to be the dispatch layer's actual call path for
+    `select-window`/`find-window`/the status-row click/choose-tree's Enter
+    commit/`break-pane -d` — see `model::Session::clear_alerts_for`'s doc
+    comment for the full list). Tests: `tests/server_proto.rs`
+    `bel_in_unfocused_window_sets_bang_flag_and_bell_style`,
+    `activity_flag_hash_when_monitor_activity_on`,
+    `flags_clear_on_selecting_window`, `bell_action_none_suppresses`,
+    `visual_bell_on_shows_message_instead_of_passthrough`,
+    `monitor_silence_flags_after_interval`; `src/status.rs`
+    `flags_bell_activity_silence_order`. The user's real `.tmux.conf`
+    fixture (`tests/fixtures/user.tmux.conf`, all five ORIGINAL options set
+    off/none) still loads with zero errors (`user_config_loads_clean`/
+    `user_tmux_conf_loads_without_errors`) — see follow-up #78 for the one
+    real behavioral nuance this surfaced (that fixture never explicitly sets
+    the NEW `monitor-bell`, so it inherits tmux's real ON default).
 
 ## Follow-ups from SP7 Task 6 (option scopes, 2026-07-10)
 
@@ -1340,3 +1352,38 @@ None block the sub-project 4 merge.
     tmux prints nothing unless `-A` is given. Both chosen for usefulness
     over strictness; revisit if a real config depends on the strict
     semantics. SMALL. LOW.
+
+## Follow-ups from SP7 Task 17 (alerts subsystem, 2026-07-10)
+
+78. **Alerts subsystem: two small, deliberate simplifications vs. real
+    tmux, both self-found during this task.** (a) **`monitor-bell`'s real
+    tmux default is ON**, unlike the four other alert options this task's
+    predecessor (SP6 Task 2) already had in the option table, all of which
+    default OFF/`any`. The `.tmux.conf` fixture (`tests/fixtures/user.
+    tmux.conf`) never mentions `monitor-bell` (it wasn't a recognized
+    option before this task), so a real bell in that user's session now
+    sets the `!` flag on a background window even though the user turned
+    every OTHER alert option off — this is CORRECT real-tmux behavior for
+    that exact config (their `bell-action none` still suppresses the
+    active notification/message, matching their evident "don't bother me"
+    intent), not a winmux bug, but is a genuine user-visible BEHAVIOR
+    CHANGE relative to pre-Task-17 winmux (where the whole subsystem was
+    inert). Flagged here for the record, not for a fix — this IS tmux
+    parity. (b) **The `s->attached == 0` half of tmux's flag-setting
+    condition is not modeled.** Real tmux's `alerts_check_bell`/`_activity`/
+    `_silence` set a window's alert flag when `wl->session->curw != wl ||
+    wl->session->attached == 0` — i.e. ALSO for a session's own current
+    window, if that session currently has zero attached clients (nobody is
+    looking at it right now either way). winmux's `model::Window::mark_
+    bell`/`mark_activity`/`mark_silence` only check `is_current` (`session.
+    current == wid`), not attachment count, because there's no cheap
+    "session's live attached-client count" already threaded to `model.rs`
+    at the point these are called (`server.rs` would need to pass it in).
+    Practical effect: a session's current window in a fully-DETACHED
+    session never gets flagged even though nobody would see it happen live
+    either — a narrow, low-value edge case (a detached session's current
+    window bell/activity/silence going unflagged until someone reattaches
+    AND leaves it, or moves on). SMALL effort to add (thread an `is_
+    attached: bool` alongside `is_current` through `note_bell`/`note_
+    activity`/`check_silence`). LOW priority (no test or real config
+    exercises a fully-detached session receiving pane output).

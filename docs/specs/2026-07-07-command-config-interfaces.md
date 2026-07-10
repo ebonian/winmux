@@ -2265,3 +2265,104 @@ rejected_same_as_global`, `overlay_user_option_roundtrip`,
 `set_without_g_targets_current_session`,
 `show_gqv_user_option_prints_value_only`,
 `pane_base_index_shifts_display_panes_digits_and_hash_p`.
+
+### Task 17 (SP7): alerts subsystem, closes follow-up #74
+
+Wires up the five SP6-Task-2 accepted-but-inert options
+(`visual-activity`/`visual-bell`/`visual-silence`/`bell-action`/
+`monitor-activity`) and adds the tmux options they're verified (against
+`docs/tmux-reference/status-line-and-messages.md` §4.4/§9 and, where that
+doc is thin on defaults, tmux's own `options-table.c`) to be paired with:
+
+```rust
+impl Options {
+    pub fn activity_action(&self) -> &'static str;      // default "other"
+    pub fn silence_action(&self) -> &'static str;        // default "other"
+    pub fn monitor_bell(&self) -> bool;                   // default true (ON)
+    pub fn monitor_silence(&self) -> std::time::Duration; // seconds, default 0 = off
+    pub fn window_status_activity_style(&self) -> &crate::style::PartialStyle; // default "reverse"
+
+    pub fn visual_activity_for(&self, session: &Overlay) -> &'static str;
+    pub fn visual_bell_for(&self, session: &Overlay) -> &'static str;
+    pub fn visual_silence_for(&self, session: &Overlay) -> &'static str;
+    pub fn bell_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn activity_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn silence_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn monitor_bell_for(&self, window: &Overlay) -> bool;
+    pub fn monitor_silence_for(&self, window: &Overlay) -> std::time::Duration;
+    pub fn window_status_bell_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_activity_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+}
+```
+
+New SPECS entries and their [`Scope`] classification (per Appendix B, same
+rule as the existing table above): `activity-action`/`silence-action`
+(Session — same choice set as `bell-action`, `any|none|current|other`);
+`monitor-bell` (Window, flag, default ON — note this is the OPPOSITE
+default of `monitor-activity`, which stays OFF); `monitor-silence` (Window,
+number, seconds, default `0` = off); `window-status-activity-style`
+(Window, style, default `reverse`, same as the pre-existing
+`window-status-bell-style`).
+
+**`model::Window` new fields** (this task; `## model` amendment lives in
+`docs/specs/2026-07-07-server-client-interfaces.md`): `alert_bell`/
+`alert_activity`/`alert_silence: bool` (tmux's `WINLINK_BELL`/`_ACTIVITY`/
+`_SILENCE`, collapsed onto the window since a winmux window belongs to
+exactly one session) and `last_output: std::time::Instant` (tmux's
+`activity_time`, the silence-monitor clock). New methods:
+`clear_alerts(&mut self)` (tmux's clear-on-visit), `mark_bell(&mut self,
+is_current: bool)` (unconditional — bell is "allowed even if there is an
+existing bell"), `mark_activity(&mut self, is_current: bool) -> bool` /
+`mark_silence(&mut self, is_current: bool) -> bool` (edge-triggered: `false`
+means "already flagged since the last visit, do nothing more"). `Session`
+gains `pub(crate) fn clear_alerts_for(&mut self, id: WindowId)`, called from
+every method that reassigns `self.current` (in `model.rs` AND every real
+current-changing dispatch-level call site in `server/dispatch.rs` that
+mutates `session.current` directly rather than through one of `model.rs`'s
+own methods — `exec_select_window`, `find-window`, the status-row window
+click, choose-tree's Enter commit, `break-pane -d`). `Registry` gains `pub
+fn sessions_mut(&mut self) -> &mut [Session]` (the Tick-driven silence
+check's one-pass walk).
+
+**`status::WindowEntry` new fields** (`## status` amendment, same doc):
+`activity`/`bell`/`silence: bool`, feeding `status::flags`'s (private)
+`#`/`!`/`~` chars — tmux's fixed `window_printable_flags` order: `#`
+(activity), `!` (bell), `~` (silence), then the pre-existing `*`/`-` (current/
+last), then `Z` (zoomed). `window_flags` (the general format engine's
+`FormatCtx` field, `src/format.rs`) is UNCHANGED — it is fed a
+caller-computed string, and the caller (`status::flags`, used by both
+`server::render_one`'s live status-bar entries AND `server/dispatch.rs`'s
+status-row click hit-test entries — both MUST match, since the flag chars
+affect a tab's rendered width) is what changed, not the format engine
+itself.
+
+**Detection/reaction** (`server.rs`, private — no new public surface beyond
+the `model`/`status`/`options` additions above): `Server::note_bell`/
+`note_activity` (called from the `Output` event handler — `note_bell` only
+when `Grid::take_bell()` reported a BEL that chunk; `note_activity`
+unconditionally, mirroring tmux's `window_update_activity`), `Server::
+check_silence` (called every `Tick`, mirroring tmux's per-window silence
+timer via the server's existing 50ms tick rather than a real libevent
+timer), `Server::react_alert` (the shared bell/activity/silence
+notify/visual reaction: BEL passthrough and/or a status-line message,
+`docs/tmux-reference/status-line-and-messages.md` §4.4's `alerts_set_
+message`), `Server::alert_action_applies` (the `any`/`none`/`current`/
+`other` scoping, `alerts_action_applies`). The `!`/`#`/`~` FLAG itself is
+gated only by `monitor-bell`/`monitor-activity`/`monitor-silence`; the
+notify/visual REACTION is gated by that AND `bell-action`/`activity-action`/
+`silence-action` — a window can show `!` with zero user-visible reaction
+(`bell-action none`), matching tmux's own `alerts_check_bell` (the flag-set
+condition never consults `bell-action`).
+
+### Tests (Task 17)
+
+`src/model.rs`: none added beyond the existing `Window`/`Session` test
+module (covered transitively by `src/status.rs`'s and `tests/server_proto.
+rs`'s tests below). `src/options.rs`: covered by `specs_and_defaults_stay_
+in_sync`/`show_all_sorted` (both generic over `SPECS`, no per-option test
+needed for typed round-trip). `src/status.rs`: `flags_bell_activity_silence_
+order`. `tests/server_proto.rs`: `bel_in_unfocused_window_sets_bang_flag_
+and_bell_style`, `activity_flag_hash_when_monitor_activity_on`, `flags_
+clear_on_selecting_window`, `bell_action_none_suppresses`, `visual_bell_on_
+shows_message_instead_of_passthrough`, `monitor_silence_flags_after_
+interval`.

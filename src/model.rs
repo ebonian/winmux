@@ -72,6 +72,85 @@ pub struct Window {
     /// table for everything), so a window that never runs `setw` behaves
     /// byte-identically to every pre-Task-6 window.
     pub window_options: options::Overlay,
+    /// Alerts subsystem (SP7 Task 17, closes follow-up #74): tmux's
+    /// `WINLINK_BELL`/`WINLINK_ACTIVITY`/`WINLINK_SILENCE` display flags,
+    /// collapsed onto the window itself (winmux windows belong to exactly
+    /// one session, unlike tmux's `winlink`, which can share a `window`
+    /// across sessions -- so there is exactly one "winlink" per window
+    /// here). Set by `server.rs`'s pane-output/Tick detection paths (see
+    /// [`Window::mark_bell`]/[`Window::mark_activity`]/
+    /// [`Window::mark_silence`]); cleared only when this window becomes its
+    /// session's current window again (tmux's clear-on-visit,
+    /// `winlink_clear_flags` — see [`Window::clear_alerts`] and every
+    /// `Session` method that reassigns `current`). Consumed by
+    /// `status.rs`'s `flags()` (`#`/`!`/`~` chars, tmux's fixed
+    /// `window_printable_flags` order) and `server.rs`'s
+    /// `window-status-bell-style`/`-activity-style` layering.
+    pub alert_bell: bool,
+    pub alert_activity: bool,
+    pub alert_silence: bool,
+    /// Last time this window had ANY pane output (tmux `window_update_
+    /// activity`'s `activity_time`) — the silence-monitor clock
+    /// `server.rs`'s Tick handler compares against `monitor-silence`
+    /// seconds. Reset on every pane-output event routed to this window via
+    /// [`Window::note_output`], regardless of `monitor-activity`/
+    /// `monitor-silence` (mirrors tmux: `window_update_activity` runs
+    /// unconditionally from the input parser).
+    pub last_output: Instant,
+}
+
+impl Window {
+    /// tmux clear-on-visit (`winlink_clear_flags`, window.c:2085-2096): all
+    /// three alert flags reset when this window becomes its session's
+    /// current window. Idempotent (a window with no flags set is a no-op).
+    pub fn clear_alerts(&mut self) {
+        self.alert_bell = false;
+        self.alert_activity = false;
+        self.alert_silence = false;
+    }
+
+    /// Bell detection (tmux `alerts_check_bell`, alerts.c:182-218): sets
+    /// the `!` flag when this window ISN'T its session's current window.
+    /// UNCONDITIONAL — unlike activity/silence, a bell is "allowed even if
+    /// there is an existing bell" (no edge-triggering skip guard); the
+    /// caller (`server::Server::note_bell`) still separately evaluates the
+    /// notify/visual-bell REACTION on every call, regardless of whether the
+    /// flag here actually changed.
+    pub fn mark_bell(&mut self, is_current: bool) {
+        if !is_current {
+            self.alert_bell = true;
+        }
+    }
+
+    /// Activity detection (tmux `alerts_check_activity`, alerts.c:220-254):
+    /// EDGE-TRIGGERED — once `alert_activity` is set, every further call
+    /// is a no-op (`false`) until the window is visited and the flag
+    /// clears; the caller only evaluates the activity-action/visual-
+    /// activity reaction on a `true` return (tmux's `if (wl->flags &
+    /// WINLINK_ACTIVITY) continue;`).
+    pub fn mark_activity(&mut self, is_current: bool) -> bool {
+        if self.alert_activity {
+            return false;
+        }
+        if !is_current {
+            self.alert_activity = true;
+        }
+        true
+    }
+
+    /// Silence detection (tmux `alerts_check_silence`, alerts.c:256-290):
+    /// same edge-triggered shape as [`Window::mark_activity`], checked by
+    /// `server::Server`'s Tick handler once `now - last_output` has crossed
+    /// `monitor-silence` seconds.
+    pub fn mark_silence(&mut self, is_current: bool) -> bool {
+        if self.alert_silence {
+            return false;
+        }
+        if !is_current {
+            self.alert_silence = true;
+        }
+        true
+    }
 }
 
 pub struct Session {
@@ -197,6 +276,10 @@ impl Registry {
             auto_rename: true,
             last_auto_rename: None,
             window_options: options::Overlay::new(),
+            alert_bell: false,
+            alert_activity: false,
+            alert_silence: false,
+            last_output: Instant::now(),
         };
         let session = Session {
             name,
@@ -266,6 +349,14 @@ impl Registry {
         &self.sessions
     }
 
+    /// Mutable sibling of [`Registry::sessions`] (SP7 Task 17, closes
+    /// follow-up #74): the alerts subsystem's Tick-driven silence check
+    /// (`server::Server::check_silence`) needs to walk every session's
+    /// every window and mutate per-window alert flags in one pass.
+    pub fn sessions_mut(&mut self) -> &mut [Session] {
+        &mut self.sessions
+    }
+
     /// Exact-name lookup (no prefix matching, no `=` handling — see `find`
     /// for tmux `-t` target resolution).
     pub fn session_mut(&mut self, name: &str) -> Option<&mut Session> {
@@ -311,6 +402,21 @@ impl Registry {
 }
 
 impl Session {
+    /// tmux clear-on-visit (SP7 Task 17, closes follow-up #74): clears
+    /// window `id`'s alert flags, if it exists in this session. Called from
+    /// every method below that reassigns `self.current` to `id`, AND
+    /// (`pub(crate)`, since several real current-changing dispatch paths --
+    /// `exec_select_window`, `find-window`, the status-row window click,
+    /// choose-tree's Enter commit, `break-pane -d` -- mutate `session.
+    /// current`/`session.last` directly in `server/dispatch.rs` rather than
+    /// going through one of this module's own methods) by every one of
+    /// those call sites too.
+    pub(crate) fn clear_alerts_for(&mut self, id: WindowId) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.clear_alerts();
+        }
+    }
+
     /// Index = lowest unused >= this session's `base_index`. The new window
     /// becomes current (`last` <- previous current).
     pub fn new_window(&mut self, id: WindowId, first_pane: PaneId) -> &mut Window {
@@ -324,6 +430,10 @@ impl Session {
             auto_rename: true,
             last_auto_rename: None,
             window_options: options::Overlay::new(),
+            alert_bell: false,
+            alert_activity: false,
+            alert_silence: false,
+            last_output: Instant::now(),
         };
         let pos = self
             .windows
@@ -360,6 +470,7 @@ impl Session {
                 .take()
                 .filter(|&l| self.windows.iter().any(|w| w.id == l));
             self.current = fallback.unwrap_or_else(|| self.nearest_by_index(killed_index));
+            self.clear_alerts_for(self.current);
         }
         true
     }
@@ -386,6 +497,7 @@ impl Session {
                 if id != self.current {
                     self.last = Some(self.current);
                     self.current = id;
+                    self.clear_alerts_for(id);
                 }
                 true
             }
@@ -416,6 +528,7 @@ impl Session {
         let new_id = self.windows[new_pos].id;
         self.last = Some(self.current);
         self.current = new_id;
+        self.clear_alerts_for(new_id);
     }
 
     /// Toggle current <-> last, if `last` still exists. `false` if there is
@@ -426,6 +539,7 @@ impl Session {
                 let old = self.current;
                 self.current = l;
                 self.last = Some(old);
+                self.clear_alerts_for(l);
                 return true;
             }
         }
@@ -607,6 +721,7 @@ impl Session {
             self.current = flipped_current;
             self.last = self.last.map(flip);
         }
+        self.clear_alerts_for(self.current);
         true
     }
 }

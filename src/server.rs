@@ -1347,8 +1347,16 @@ impl Server {
     fn handle_event(&mut self, ev: ServerEvent) -> bool {
         match ev {
             ServerEvent::Output(id, bytes) => {
+                let mut bell = false;
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.grid.feed(&bytes);
+                    // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                    // `Grid::take_bell` is edge-triggered per `feed()` call
+                    // (Wave 1 Task 3) -- captured here, acted on below
+                    // (`note_bell`) once `p`'s borrow of `self.panes` has
+                    // ended, since that needs `self.registry`/`self.options`/
+                    // `self.clients` too.
+                    bell = p.grid.take_bell();
                     // automatic-rename (Task 9, sub-project 4): OSC 0/2 and
                     // ESC-k (SP7 Task 3, closes follow-up #52) titles are
                     // both edge-triggered (`take_title_changed`) -- refresh
@@ -1382,6 +1390,15 @@ impl Server {
                         }
                     }
                 }
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // activity is tracked on EVERY output event (mirrors tmux's
+                // `window_update_activity`, called unconditionally from the
+                // input parser); bell only when this chunk actually
+                // contained a BEL byte.
+                self.note_activity(id);
+                if bell {
+                    self.note_bell(id);
+                }
                 true
             }
             ServerEvent::Exited(id) => self.handle_exited(id),
@@ -1414,6 +1431,12 @@ impl Server {
                 let interval = self.options.status_interval();
                 if interval > Duration::ZERO && deadline.duration_since(self.last_status_render) >= interval {
                     self.last_status_render = deadline;
+                    dirty = true;
+                }
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // per-window silence monitoring, checked on every tick (see
+                // `check_silence`'s doc comment).
+                if self.check_silence() {
                     dirty = true;
                 }
                 // escape-time (Task 9, sub-project 4): collected during the
@@ -1552,6 +1575,173 @@ impl Server {
             .sessions()
             .iter()
             .find_map(|s| s.windows.iter().find(|w| w.layout.panes().contains(&pane_id)))
+    }
+
+    /// Like [`Server::window_for_active_pane`], but matches ANY pane in the
+    /// window (mirrors [`Server::window_containing_pane`], adding the
+    /// session name) -- the alerts subsystem (SP7 Task 17) must detect
+    /// output/bell on a BACKGROUND pane too, not just a window's active one
+    /// (tmux monitors every pane in a window for activity/bell).
+    fn session_and_window_for_pane(&self, pane_id: PaneId) -> Option<(String, WindowId)> {
+        self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.panes().contains(&pane_id))
+                .map(|w| (s.name.clone(), w.id))
+        })
+    }
+
+    /// `<kind>-action` scoping (tmux `alerts_action_applies`,
+    /// alerts.c:70-89): whether the notify/visual REACTION applies to a
+    /// window, given whether it's currently the acting session's current
+    /// window. `any` -> always; `current` -> only the current window;
+    /// `other` -> only non-current windows; `none`/anything else -> never.
+    fn alert_action_applies(action: &str, is_current: bool) -> bool {
+        match action {
+            "any" => true,
+            "current" => is_current,
+            "other" => !is_current,
+            _ => false, // "none"
+        }
+    }
+
+    /// The shared bell/activity/silence REACTION (tmux `alerts_set_message`,
+    /// alerts.c:292-325): for every client attached to `session_name`,
+    /// `visual` (`off`/`on`/`both`) selects a terminal-BEL passthrough
+    /// (`off`/`both`) and/or a status-line message (`on`/`both`). Message
+    /// wording matches tmux exactly: `"<kind> in current window"` when
+    /// `is_current`, else `"<kind> in window <window_index>"`. `kind`:
+    /// `"Bell"`/`"Activity"`/`"Silence"`.
+    fn react_alert(&mut self, session_name: &str, kind: &str, is_current: bool, window_index: u32, visual: &str) {
+        let bell_passthrough = visual == "off" || visual == "both";
+        let message = visual != "off";
+        if !bell_passthrough && !message {
+            return;
+        }
+        let text = if is_current {
+            format!("{kind} in current window")
+        } else {
+            format!("{kind} in window {window_index}")
+        };
+        for client in self.clients.values_mut() {
+            if client.session.as_deref() != Some(session_name) {
+                continue;
+            }
+            if bell_passthrough {
+                send_output(&client.tx, vec![0x07]);
+            }
+            if message {
+                client.message = Some((text.clone(), Instant::now()));
+            }
+        }
+    }
+
+    /// BEL detection (SP7 Task 17, closes follow-up #74): called once per
+    /// `Output` event whose fed bytes contained a BEL, for the pane's
+    /// owning window. Mirrors tmux's `alerts_check_bell` (alerts.c:
+    /// 182-218): `!` is set unconditionally (via `model::Window::
+    /// mark_bell`) for a non-current window, gated by the window-scoped
+    /// `monitor-bell` option; the `bell-action`-scoped notify/visual-bell
+    /// REACTION is evaluated separately (and unconditionally re-evaluated
+    /// on every bell, unlike activity/silence's edge-triggering).
+    fn note_bell(&mut self, pane_id: PaneId) {
+        let Some((session_name, wid)) = self.session_and_window_for_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let is_current = session.current == wid;
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        if !self.options.monitor_bell_for(&window.window_options) {
+            return;
+        }
+        window.mark_bell(is_current);
+        let window_index = window.index;
+        let action = self.options.bell_action_for(&session.session_options);
+        if !Server::alert_action_applies(action, is_current) {
+            return;
+        }
+        let visual = self.options.visual_bell_for(&session.session_options);
+        self.react_alert(&session_name, "Bell", is_current, window_index, visual);
+    }
+
+    /// Activity detection (SP7 Task 17, closes follow-up #74): called on
+    /// EVERY `Output` event for the pane's owning window (mirrors tmux's
+    /// `window_update_activity`, called unconditionally from the input
+    /// parser). Always refreshes `last_output` (the silence-monitor clock),
+    /// regardless of `monitor-activity`; the `#` flag/reaction is
+    /// EDGE-TRIGGERED (`model::Window::mark_activity`'s `false` return
+    /// means "already flagged since the last visit, do nothing more" --
+    /// tmux's `if (wl->flags & WINLINK_ACTIVITY) continue;`).
+    fn note_activity(&mut self, pane_id: PaneId) {
+        let Some((session_name, wid)) = self.session_and_window_for_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let is_current = session.current == wid;
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        window.last_output = Instant::now();
+        if !self.options.monitor_activity_for(&window.window_options) {
+            return;
+        }
+        if !window.mark_activity(is_current) {
+            return;
+        }
+        let window_index = window.index;
+        let action = self.options.activity_action_for(&session.session_options);
+        if !Server::alert_action_applies(action, is_current) {
+            return;
+        }
+        let visual = self.options.visual_activity_for(&session.session_options);
+        self.react_alert(&session_name, "Activity", is_current, window_index, visual);
+    }
+
+    /// Silence detection (SP7 Task 17, closes follow-up #74): checked on
+    /// every `Tick` (mirrors tmux's per-window silence timer,
+    /// `alerts_timer`/`alerts_reset`, alerts.c:42-49/138-155, collapsed
+    /// onto the server's existing 50ms tick rather than a real per-window
+    /// libevent timer). For every window with a non-zero window-scoped
+    /// `monitor-silence` and no ALREADY-set `~` flag (edge-triggered, same
+    /// shape as activity) whose `last_output` has aged past that interval:
+    /// sets the flag (non-current windows only) and evaluates the
+    /// `silence-action`-scoped reaction exactly like bell/activity. Reacts
+    /// AFTER the registry walk (collected into `fires`) so the reaction's
+    /// `&mut self.clients` borrow never overlaps the `&mut self.registry`
+    /// walk. Returns whether any window's flag changed (the caller ORs this
+    /// into the tick's overall "needs a render pass" flag).
+    fn check_silence(&mut self) -> bool {
+        let now = Instant::now();
+        struct Fire {
+            session: String,
+            window_index: u32,
+            is_current: bool,
+            visual: &'static str,
+        }
+        let mut fires: Vec<Fire> = Vec::new();
+        let mut dirty = false;
+        for session in self.registry.sessions_mut() {
+            let current = session.current;
+            for window in session.windows.iter_mut() {
+                if window.alert_silence {
+                    continue;
+                }
+                let secs = self.options.monitor_silence_for(&window.window_options);
+                if secs.is_zero() {
+                    continue;
+                }
+                if now.duration_since(window.last_output) < secs {
+                    continue;
+                }
+                let is_current = window.id == current;
+                window.mark_silence(is_current);
+                dirty = true;
+                let action = self.options.silence_action_for(&session.session_options);
+                if !Server::alert_action_applies(action, is_current) {
+                    continue;
+                }
+                let visual = self.options.visual_silence_for(&session.session_options);
+                fires.push(Fire { session: session.name.clone(), window_index: window.index, is_current, visual });
+            }
+        }
+        for f in fires {
+            self.react_alert(&f.session, "Silence", f.is_current, f.window_index, f.visual);
+        }
+        dirty
     }
 
     /// `mode-keys` is window-scoped (#26): which copy-mode key table
@@ -2914,10 +3104,38 @@ fn render_one(
                 } else {
                     options.window_status_format_for(&w.window_options)
                 };
-                let style = if is_current {
+                let base_style = if is_current {
                     options.window_status_current_style_for(&w.window_options)
                 } else {
                     options.window_status_style_for(&w.window_options)
+                };
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // bell-style layers over the base if `alert_bell` is set AND
+                // the style isn't the literal `default` (an unmentioned/
+                // `default`-keyword style parses to `PartialStyle::
+                // default()`); ELSE (only when bell did NOT already apply --
+                // `docs/tmux-reference/status-line-and-messages.md` §2.2)
+                // activity-style layers if `alert_activity` or
+                // `alert_silence` is set and its style isn't `default`
+                // either. A current window's alert flags are always false
+                // (clear-on-visit, `model::Window::clear_alerts`), so this
+                // is a no-op for the current tab in practice.
+                let style: crate::style::PartialStyle = if w.alert_bell {
+                    let bell_style = options.window_status_bell_style_for(&w.window_options);
+                    if *bell_style != crate::style::PartialStyle::default() {
+                        base_style.merge(bell_style)
+                    } else {
+                        *base_style
+                    }
+                } else if w.alert_activity || w.alert_silence {
+                    let activity_style = options.window_status_activity_style_for(&w.window_options);
+                    if *activity_style != crate::style::PartialStyle::default() {
+                        base_style.merge(activity_style)
+                    } else {
+                        *base_style
+                    }
+                } else {
+                    *base_style
                 };
                 // SP7 Task 7 (closes follow-up #71): THIS window's own
                 // active pane, not the acting client's focused pane in the
@@ -2936,8 +3154,11 @@ fn render_one(
                     current: is_current,
                     last: Some(w.id) == session.last,
                     zoomed: w.layout.is_zoomed(),
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
                     format_override: Some(fmt.to_string()),
-                    style_override: Some(*style),
+                    style_override: Some(style),
                     pane_index: w_pane_index,
                     pane_title: w_pane_title,
                 }
