@@ -343,13 +343,41 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     from SP2), not on the configured interval — a custom `status-right`
     format with sub-minute-sensitive content (were the format engine to
     support one, see #27) would not refresh on schedule.
-30. **`bind -n` (no-prefix bindings) can't be given a bare printable
-    character.** The `-n` (root-table, no-prefix-required) binding path
-    exists and is tested against non-printable/special keys, but tmux's
-    real semantics — binding a bare letter with `-n` shadows normal typing
-    in that pane entirely — is not exercised or specifically guarded against
-    for printable characters; SP3's key-machine dispatch order for that case
-    is unverified.
+30. **CONFIRMED, STILL OPEN** (SP7, Task 5 verification pass). `bind -n`
+    (no-prefix bindings) can't be given a bare printable character. The `-n`
+    (root-table, no-prefix-required) binding path exists and is tested
+    against non-printable/special keys, but tmux's real semantics — binding
+    a bare letter with `-n` shadows normal typing in that pane entirely —
+    was previously unexercised for printable characters ("SP3's key-machine
+    dispatch order for that case is unverified"). SP7 Task 5 added
+    `tests/server_proto.rs::bind_dash_n_printable_shadows_typing`
+    (`bind -n x split-window -h`, then a bare `x` keystroke with no prefix)
+    and confirmed the gap is REAL, not just unverified: the keystroke leaks
+    straight to the shell prompt (`PS ...> x`), no split occurs. Root
+    cause: `input::is_plain_forwardable` (`src/input.rs`) is a *static*
+    per-key-shape check with no knowledge of the live `Bindings` table — any
+    unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key in `Normal` state
+    always resolves to a coalesced `KeyInputEvent::Forward` blob, which
+    `src/server.rs`'s live-pane branch (`process_key_events`, the
+    non-modal/non-`Copy`/non-`ChooseTree` arm) writes straight to the pty
+    with **no root-table lookup at all** — unlike the `Copy`/`ChooseTree`/
+    `DisplayPanes` branches just above it, which already re-decode a
+    `Forward` blob and resolve each key against their own table. A `Key`
+    event only ever reaches `Bindings::lookup` for keys `is_plain_forwardable`
+    excludes (i.e. anything carrying a modifier, or a named/special key
+    outside that set) — confirming the current code comment's "documented
+    deviation" is accurate and not merely theoretical.
+    **Not fixed in SP7 Task 5**: doing so requires either (a) giving
+    `KeyMachine` a live query hook into `Bindings` (a `feed`/`new` signature
+    change plus a `src/server.rs` call-site update to wire it), or (b)
+    adding a root-table re-decode-and-lookup pass to `process_key_events`'s
+    live-pane `Forward` branch, mirroring what the `Copy`/`ChooseTree`
+    branches already do. Both require editing `src/server.rs`, which was
+    out of Task 5's file scope (isolated to `src/bindings.rs`/`src/input.rs`
+    to avoid stepping on parallel SP7 tracks). The reproduction test is kept
+    in the suite as `#[ignore]` (with the diagnosis above in its doc
+    comment) rather than left red, so `cargo test` stays green until a
+    task with `src/server.rs` in scope closes this out.
 31. **`status-right`'s inline `#[...]` per-segment style overrides are not
     parsed.** Real tmux lets `status-right`/`status-left` embed
     `#[fg=red,bold]`-style directives mid-string to change color partway
@@ -381,34 +409,49 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
 
 ## Discovered during sub-project 4 (parity polish)
 
-34. **`Key{code: KeyCode::Space}` is unreachable by a real spacebar
-    keypress** (discovered implementing Task 3, selection + paste buffers).
-    `keys::classify_single_byte` (the live input decoder) only ever produces
-    the `Space` code variant for `Ctrl-Space` (byte `0x00`, explicitly
-    special-cased); an ordinary bare spacebar press (byte `0x20`) decodes to
-    `Key{code: KeyCode::Char(' ')}` instead. `KeyCode::Space` otherwise
-    exists purely for `parse_key("Space")`/`send-keys Space`/`key_name`
-    notation (config files, `list-keys` output), not live keyboard input.
-    Consequence: ANY default or user binding registered via
-    `named("Space")`/`bind ... Space ...` targeting the ROOT, PREFIX, or a
-    copy-mode table is unreachable by an actual spacebar press — confirmed
-    live via Task 2's pre-existing emacs `copy-mode` default `Space →
-    copy-page-down` (`src/bindings.rs`). BOTH default-table cases are now
-    fixed at the bindings level: Task 3's own `copy-mode-vi` `Space →
-    copy-begin-selection` was written around the gap from the start (bound
-    under `Char(' ')`, not `named("Space")`), and the Task 3 REVIEW FIX
-    rebound the emacs `Space → copy-page-down` default under `Char(' ')`
-    too. What remains open here is only the general decoder-level gap
-    (a USER's `bind ... Space ...` config line still silently produces an
-    unreachable binding). A real fix belongs in `keys::classify_single_byte`
-    (making a
-    bare `0x20` decode as `KeyCode::Space` instead of `Char(' ')`, or
-    equivalently normalizing `Char(' ')` to `Space` wherever keys are
-    looked up) — deferred since it's a decoder-level change with unknown
-    blast radius across every existing table/test that relies on today's
-    `Char(' ')` semantics for plain-space forwarding to a pane (see
-    `input::is_plain_forwardable`, which currently forwards `Char(' ')` as
-    ordinary typed input — changing the decode would need to preserve that).
+34. **RESOLVED** (SP7, Task 5). `Key{code: KeyCode::Space}` was
+    unreachable by a real spacebar keypress (discovered implementing Task 3,
+    selection + paste buffers). `keys::classify_single_byte` (the live input
+    decoder) only ever produces the `Space` code variant for `Ctrl-Space`
+    (byte `0x00`, explicitly special-cased); an ordinary bare spacebar press
+    (byte `0x20`) decodes to `Key{code: KeyCode::Char(' ')}` instead.
+    `KeyCode::Space` otherwise exists purely for `parse_key("Space")`/
+    `send-keys Space`/`key_name` notation (config files, `list-keys`
+    output), not live keyboard input. Consequence: ANY default or user
+    binding registered via `named("Space")`/`bind ... Space ...` targeting
+    the ROOT, PREFIX, or a copy-mode table was unreachable by an actual
+    spacebar press — confirmed live via Task 2's pre-existing emacs
+    `copy-mode` default `Space → copy-page-down` (`src/bindings.rs`). Both
+    default-table cases were already worked around at the bindings level
+    (Task 3's own `copy-mode-vi` `Space → copy-begin-selection` bound under
+    `Char(' ')` from the start; the Task 3 REVIEW FIX rebound the emacs
+    `Space → copy-page-down` default under `Char(' ')` too) — but a USER's
+    own `bind ... Space ...` config/runtime line still silently produced an
+    unreachable binding.
+    **The decoder-level fix sketched here (making a bare `0x20` decode as
+    `KeyCode::Space`) was deliberately NOT taken** — still rejected for
+    blast radius across every existing table/test relying on today's
+    `Char(' ')` semantics for plain-space forwarding. Instead, SP7 Task 5
+    took the OTHER sketched option: `Bindings::bind`/`unbind`/`lookup`
+    (`src/bindings.rs`) now canonicalize `KeyCode::Space` → `KeyCode::Char(' ')`
+    (preserving `ctrl`/`meta`/`shift`) at every point a `Key` enters or
+    leaves any of the four tables — including the internal default-table
+    construction closures (`Default::default()`'s `b`, and both
+    `copy_mode_emacs_defaults`/`copy_mode_vi_defaults`'s `b`, which insert
+    directly into the raw `HashMap` and needed the same canonicalization
+    applied). This makes `Char(' ')` the single internal representation for
+    "space" reachable equally from `named("Space")` config notation and a
+    real keypress, in every table, with NO change to `keys::classify_single_byte`
+    or `input::is_plain_forwardable` (a real Ctrl-Space press, `Key{code:
+    Space, ctrl: true}`, still canonicalizes to a key DISTINCT from plain
+    Space — `ctrl` is preserved, not dropped — so `C-Space` and bare `Space`
+    remain independently bindable, per `bindings::tests::
+    ctrl_space_and_plain_space_remain_distinct`). Proven end-to-end by
+    `tests/server_proto.rs`'s `config_bind_space_reachable_by_real_spacebar`
+    (a config `bind Space split-window -h` line fires on a real `0x20` byte)
+    and `unbound_space_still_forwards_to_pane` (regression guard: an
+    UNBOUND space still forwards to the pane as ordinary typed input,
+    exactly as before).
 
 35. **Mouse clicks/drags are never forwarded to the pane application's own
     mouse-reporting mode** (Task 5, mouse). tmux, when a pane's own

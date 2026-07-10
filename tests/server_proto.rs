@@ -6144,3 +6144,111 @@ fn pane_title_format_expands() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+// ---- SP7 Task 5: Space-key normalization + `bind -n` printable verification
+// (closes follow-ups #34, #30) -----------------------------------------------
+
+/// #34: a config-loaded `bind Space ...` line must fire on a REAL spacebar
+/// keypress (raw byte `0x20`, which decodes as `Key{code: Char(' ')}` per
+/// `keys::classify_single_byte` -- NEVER `KeyCode::Space`, see the follow-up).
+/// Prior to the `Bindings` canonicalization fix, the config line stored the
+/// binding under `Key{code: Space, ..}`, which a real spacebar press could
+/// never look up successfully.
+#[test]
+fn config_bind_space_reachable_by_real_spacebar() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("bind-space");
+    std::fs::write(&conf_path, "bind Space split-window -h\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Default prefix (C-b) + a literal 0x20 (real spacebar byte, NOT the
+    // "Space" key-notation string) must resolve the config's `Space`
+    // binding and split the window.
+    c.send(&ClientMsg::Stdin(vec![0x02, 0x20]));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// #30: real tmux `bind -n <printable>` shadows normal typing in that pane
+/// entirely -- the bound command fires and the character never reaches the
+/// shell. Verifies winmux's root-table dispatch order does the same for a
+/// bare, unmodified printable character (previously unexercised by any
+/// test -- follow-up #30 flagged this as "unverified").
+///
+/// CONFIRMED RED, currently `#[ignore]`d (see follow-up #30 for the full
+/// diagnosis): `input::is_plain_forwardable` always coalesces an unmodified
+/// printable into a `KeyInputEvent::Forward` blob with no root-table
+/// lookup at all, so a bare `x` keystroke leaks straight to the shell
+/// (`PS ...> x`) instead of firing the `-n` binding. A real fix needs
+/// either a live `Bindings` query hook wired into `KeyMachine`, or a
+/// root-table re-decode-and-lookup pass in `server.rs`'s live-pane
+/// `Forward` branch (mirroring what its `Copy`/`ChooseTree` branches
+/// already do) -- both require editing `src/server.rs`, out of this task's
+/// file scope. Left in the suite (ignored, not deleted) so the repro and
+/// diagnosis travel with the code for whoever picks up the real fix.
+#[test]
+#[ignore = "confirmed real gap (follow-up #30): fixing requires src/server.rs, out of this task's scope -- see doc comment"]
+fn bind_dash_n_printable_shadows_typing() {
+    let name = unique_pipe_name();
+    let _server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "x".into(),
+        "split-window".into(),
+        "-h".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    // A bare "x" keypress with NO prefix must fire the -n binding (a split)
+    // -- NOT get typed onto the shell's command line.
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // Prove "x" never reached either pane's shell: an "echo" run in the
+    // now-focused (new, right-hand) pane must echo cleanly, not as a
+    // mangled "xecho ..." command line that a leaked "x" would have
+    // produced.
+    c.send(&ClientMsg::Stdin(b"echo after-x-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("after-x-marker")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("xecho") || l.contains("is not recognized")),
+        "a leaked 'x' must not have reached the shell; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    // The other pane (left) is still alive; leave the server thread running
+    // rather than juggling both exits, matching this file's convention.
+}
+
+/// Regression guard for the #34 canonicalization fix: with NO binding
+/// registered anywhere for Space (the default root table is empty), a real
+/// spacebar keypress must still forward as ordinary typed input to the
+/// focused pane, exactly as before the fix.
+#[test]
+fn unbound_space_still_forwards_to_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo a".to_vec()));
+    c.send(&ClientMsg::Stdin(vec![0x20])); // a real spacebar byte
+    c.send(&ClientMsg::Stdin(b"b\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("a b")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

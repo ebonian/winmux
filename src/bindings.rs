@@ -82,7 +82,7 @@ impl Default for Bindings {
         let mut prefix: HashMap<Key, Binding> = HashMap::new();
 
         let mut b = |k: Key, cmds: Vec<RawCmd>, repeat: bool| {
-            prefix.insert(k, Binding { cmds, repeat });
+            prefix.insert(canonical_key(k), Binding { cmds, repeat });
         };
 
         b(char_key('%'), vec![cmd1("split-window", &["-h"])], false);
@@ -203,7 +203,7 @@ impl Default for Bindings {
 fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     let mut t: HashMap<Key, Binding> = HashMap::new();
     let mut b = |k: Key, name: &str, args: &[&str]| {
-        t.insert(k, Binding { cmds: vec![cmd1(name, args)], repeat: false });
+        t.insert(canonical_key(k), Binding { cmds: vec![cmd1(name, args)], repeat: false });
     };
 
     b(named("Left"), "copy-cursor-left", &[]);
@@ -227,13 +227,8 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(named("C-v"), "copy-page-down", &[]);
     b(named("PPage"), "copy-page-up", &[]);
     b(named("NPage"), "copy-page-down", &[]);
-    // Bound under the literal space CHARACTER, not `named("Space")` (Task 3
-    // review fix): a real spacebar press decodes as `Key{Char(' ')}` -- the
-    // decoder only ever produces `KeyCode::Space` for `Ctrl-Space` (byte
-    // 0x00), so Task 2's original `named("Space")` registration was
-    // unreachable by an actual keypress. Same rule as the vi table's
-    // `Space -> copy-begin-selection`; decoder-level `Char(' ')`/`Space`
-    // normalization stays follow-up #34.
+    // Bound under the literal space CHARACTER, not `named("Space")` -- follows
+    // up #34, now resolved via Bindings-layer `canonical_key` normalization.
     b(char_key(' '), "copy-page-down", &[]);
 
     b(char_key('q'), "copy-cancel", &[]);
@@ -262,7 +257,7 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
 fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     let mut t: HashMap<Key, Binding> = HashMap::new();
     let mut b = |k: Key, name: &str, args: &[&str]| {
-        t.insert(k, Binding { cmds: vec![cmd1(name, args)], repeat: false });
+        t.insert(canonical_key(k), Binding { cmds: vec![cmd1(name, args)], repeat: false });
     };
 
     b(char_key('h'), "copy-cursor-left", &[]);
@@ -328,14 +323,40 @@ fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     t
 }
 
+/// #34: `keys::classify_single_byte` (the live input decoder) never
+/// produces `KeyCode::Space` for a real bare spacebar press (byte `0x20`
+/// decodes as `KeyCode::Char(' ')`) -- `KeyCode::Space` only ever comes from
+/// `keys::parse_key("Space")` (config/notation) or a real Ctrl-Space
+/// keypress (byte `0x00`, which the decoder DOES special-case to
+/// `KeyCode::Space` with `ctrl: true`). So a config/runtime
+/// `bind ... Space ...` line stores a `Key{code: Space, ..}` that a real
+/// spacebar keypress's decoded `Key{code: Char(' '), ..}` would never match
+/// in a plain `HashMap` lookup.
+///
+/// Fix: canonicalize `KeyCode::Space` to `KeyCode::Char(' ')` -- preserving
+/// `ctrl`/`meta`/`shift` as-is -- at every point a `Key` enters or leaves the
+/// table (`bind`, `unbind`, `lookup`). This makes `Char(' ')` the single
+/// canonical internal representation for the space key in every table,
+/// reachable equally from `named("Space")` notation and a real keypress,
+/// while a real Ctrl-Space press (`Key{code: Space, ctrl: true}`) still
+/// canonicalizes to a DISTINCT key (`Key{code: Char(' '), ctrl: true}`) from
+/// plain Space (`ctrl: false`) -- the two remain independently bindable
+/// (see `ctrl_space_and_plain_space_remain_distinct`).
+fn canonical_key(mut key: Key) -> Key {
+    if key.code == KeyCode::Space {
+        key.code = KeyCode::Char(' ');
+    }
+    key
+}
+
 impl Bindings {
     pub fn bind(&mut self, table: WhichTable, key: Key, binding: Binding) {
-        self.table_mut(table).insert(key, binding);
+        self.table_mut(table).insert(canonical_key(key), binding);
     }
 
     /// Remove a binding; `true` if one was present.
     pub fn unbind(&mut self, table: WhichTable, key: &Key) -> bool {
-        self.table_mut(table).remove(key).is_some()
+        self.table_mut(table).remove(&canonical_key(*key)).is_some()
     }
 
     pub fn unbind_all(&mut self, table: WhichTable) {
@@ -343,7 +364,7 @@ impl Bindings {
     }
 
     pub fn lookup(&self, table: WhichTable, key: &Key) -> Option<&Binding> {
-        self.table_ref(table).get(key)
+        self.table_ref(table).get(&canonical_key(*key))
     }
 
     fn table_mut(&mut self, table: WhichTable) -> &mut HashMap<Key, Binding> {
@@ -510,6 +531,82 @@ mod tests {
 
         // Root table has no defaults in SP3.
         assert!(b.root.is_empty());
+    }
+
+    /// #34 (Space/`Char(' ')` binding equivalence): a binding registered
+    /// under the `named("Space")` key-notation form must be reachable when
+    /// looked up under `Char(' ')` -- the shape a REAL spacebar keypress
+    /// actually decodes to (`keys::classify_single_byte` never produces
+    /// `KeyCode::Space` for a bare 0x20 byte; see follow-up #34). And the
+    /// reverse: a binding stored under `Char(' ')` is reachable via a
+    /// `named("Space")` lookup key too -- both directions canonicalize to
+    /// the same internal HashMap key.
+    #[test]
+    fn bind_named_space_fires_on_char_space_lookup() {
+        let mut b = Bindings::default();
+        b.bind(
+            WhichTable::Root,
+            key("Space"),
+            Binding { cmds: vec![cmd1("next-layout", &[])], repeat: false },
+        );
+        let found = b
+            .lookup(WhichTable::Root, &char_key(' '))
+            .expect("Space-registered binding must be reachable via Char(' ') lookup");
+        assert_eq!(found.cmds, vec![cmd1("next-layout", &[])]);
+
+        // Reverse: store under Char(' '), look up via named("Space").
+        let mut b2 = Bindings::default();
+        b2.bind(WhichTable::Root, char_key(' '), Binding { cmds: vec![cmd1("select-pane", &["-U"])], repeat: false });
+        let found2 = b2
+            .lookup(WhichTable::Root, &key("Space"))
+            .expect("Char(' ')-registered binding must be reachable via named(\"Space\") lookup");
+        assert_eq!(found2.cmds, vec![cmd1("select-pane", &["-U"])]);
+    }
+
+    /// Cross-notation unbind: when a binding is stored under one Space
+    /// notation (named or Char), unbind must work with the other notation too.
+    /// Direction 1: bind via `named("Space")`, unbind via `Char(' ')`.
+    /// Direction 2: bind via `Char(' ')`, unbind via `named("Space")`.
+    #[test]
+    fn unbind_space_across_notations_removes_binding() {
+        // Direction 1: bind under named("Space"), unbind using Char(' ')
+        let mut b = Bindings::default();
+        b.bind(
+            WhichTable::Root,
+            key("Space"),
+            Binding { cmds: vec![cmd1("next-layout", &[])], repeat: false },
+        );
+        assert!(b.lookup(WhichTable::Root, &key("Space")).is_some());
+        // Now unbind using the Char(' ') form
+        assert!(b.unbind(WhichTable::Root, &char_key(' ')));
+        assert!(b.lookup(WhichTable::Root, &key("Space")).is_none());
+
+        // Direction 2: bind under Char(' '), unbind via named("Space")
+        let mut b2 = Bindings::default();
+        b2.bind(
+            WhichTable::Root,
+            char_key(' '),
+            Binding { cmds: vec![cmd1("select-pane", &["-U"])], repeat: false },
+        );
+        assert!(b2.lookup(WhichTable::Root, &char_key(' ')).is_some());
+        // Now unbind using the named("Space") form
+        assert!(b2.unbind(WhichTable::Root, &key("Space")));
+        assert!(b2.lookup(WhichTable::Root, &char_key(' ')).is_none());
+    }
+
+    /// A real Ctrl-Space keypress decodes as `Key{code: Space, ctrl: true}`
+    /// (`keys::classify_single_byte`'s byte-0x00 special case) -- distinct
+    /// from a bare spacebar. The Space/`Char(' ')` canonicalization must not
+    /// collide the two: `C-Space` and plain `Space` remain independently
+    /// bindable, matching the pre-existing `copy-mode` emacs defaults
+    /// (`C-Space` -> copy-begin-selection, plain `Space` -> copy-page-down).
+    #[test]
+    fn ctrl_space_and_plain_space_remain_distinct() {
+        let b = Bindings::default();
+        let plain = b.lookup(WhichTable::CopyMode, &char_key(' ')).expect("plain Space binding");
+        assert_eq!(plain.cmds, vec![cmd1("copy-page-down", &[])]);
+        let ctrl = b.lookup(WhichTable::CopyMode, &key("C-Space")).expect("C-Space binding");
+        assert_eq!(ctrl.cmds, vec![cmd1("copy-begin-selection", &[])]);
     }
 
     #[test]
