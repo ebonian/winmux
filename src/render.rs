@@ -87,6 +87,12 @@ pub struct TreeRowCell {
     /// Painted in `Scene::mode_style` (reversed against the panel's default-
     /// style rows) when this is the current selection.
     pub selected: bool,
+    /// SP7 Task 15 (closes #50's remainder; `docs/tmux-reference/
+    /// choose-tree.md` `## 3.3`): `true` when this row is in the tagged
+    /// set. Drawn as a fixed-width `"* "` tag slot (mirroring the marker
+    /// slot's own fixed two-column width so sibling rows stay aligned)
+    /// right after the marker slot, before the row's own text.
+    pub tagged: bool,
 }
 
 /// The live preview box painted below choose-tree's row list (SP6 wave 2
@@ -133,9 +139,20 @@ pub struct ListOverlay {
     pub top: usize,
     /// `Some` when the `v`-cycled preview mode is BIG or NORMAL (never OFF)
     /// AND the panel is tall/wide enough per the sizing rule (`## 3.1`) --
-    /// `None` means the row list gets the WHOLE panel height, exactly the
-    /// pre-Task-8-wave-2 behavior.
+    /// `None` means no preview box is painted.
     pub preview: Option<PreviewBlock>,
+    /// SP7 Task 15 (closes #73): the row list's own height in panel rows,
+    /// from `Server::choose_tree_list_height` -- the AUTHORITATIVE cap on
+    /// how many rows the list paints, REGARDLESS of whether `preview` is
+    /// `Some` (list height == `preview.rect.y`, by construction) or `None`
+    /// (either a legitimate full-height list, e.g. preview OFF, in which
+    /// case this equals the panel height; OR a degenerate geometry where the
+    /// preview box couldn't be painted at all, in which case this stays at
+    /// the SMALL sizing-formula value and the rows below it are left blank
+    /// -- see `dispatch::Server::choose_tree_preview_paintable`'s doc
+    /// comment for why the list must NOT silently expand to fill that
+    /// space).
+    pub list_height: u16,
 }
 
 /// Everything [`Scene::overlay`] can paint OVER the already-composed frame
@@ -597,15 +614,12 @@ impl Renderer {
                     }
                     y += 1;
                 }
-                // With a preview box present, the row list is already capped
-                // to `preview.rect.y` by the sizing rule (`## 3.1`) -- the
-                // message reservation below (pre-Task-8-wave-2 behavior) only
-                // applies when there's no preview eating into the panel, same
-                // as before this amendment.
-                let list_cap: u16 = match &list.preview {
-                    Some(pv) => pv.rect.y,
-                    None => rows,
-                };
+                // SP7 Task 15 (closes #73): the row list is ALWAYS capped to
+                // `list.list_height`, whether or not a preview box is
+                // actually painted -- a `None` preview no longer implies
+                // "list gets the whole panel" (see `ListOverlay::list_height`'s
+                // doc comment for the degenerate-geometry case this fixes).
+                let list_cap: u16 = list.list_height.min(rows);
                 // A message (e.g. choose-tree's `x` kill-confirm prompt, see
                 // `ClientMode::ChooseTree`'s `pending_kill`) takes the panel's
                 // LAST row, same as it takes the status row outside the
@@ -630,7 +644,8 @@ impl Renderer {
                         Some(c) => format!("{c} "),
                         None => "  ".to_string(),
                     };
-                    let line = format!("{indent}{marker_slot}{}", row.text);
+                    let tag_slot = if row.tagged { "* " } else { "  " };
+                    let line = format!("{indent}{marker_slot}{tag_slot}{}", row.text);
                     for (cx, ch) in line.chars().enumerate() {
                         if cx as u16 >= cols {
                             break;
@@ -1956,21 +1971,23 @@ mod tests {
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
-                    TreeRowCell { text: "row0".to_string(), depth: 0, marker: None, selected: false },
-                    TreeRowCell { text: "row1".to_string(), depth: 0, marker: None, selected: true },
+                    TreeRowCell { text: "row0".to_string(), depth: 0, marker: None, selected: false, tagged: false },
+                    TreeRowCell { text: "row1".to_string(), depth: 0, marker: None, selected: true, tagged: false },
                 ],
                 top: 0,
                 preview: None,
+                list_height: 3,
             })),
         };
         let mut r = Renderer::new(10, 3);
         r.compose_back(&scene);
 
         // Row 0 (unselected): depth 0 / no marker -> a 2-space blank marker
-        // slot precedes the text (no indent at depth 0), then the text,
-        // default style.
-        let row0: String = (0..6).map(|x| r.back_cell(x, 0).ch).collect();
-        assert_eq!(row0, "  row0");
+        // slot, then (SP7 Task 15) a 2-space blank tag slot (untagged),
+        // precede the text (no indent at depth 0), then the text, default
+        // style.
+        let row0: String = (0..8).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, "    row0");
         assert_eq!(r.back_cell(0, 0).style, Style::default());
         // Padding past the text is still cleared to the row's style (full
         // client-area clear, not just the text run).
@@ -1978,8 +1995,8 @@ mod tests {
         assert_eq!(r.back_cell(9, 0).style, Style::default());
 
         // Row 1 (selected): text painted in mode_style, including padding.
-        let row1: String = (0..6).map(|x| r.back_cell(x, 1).ch).collect();
-        assert_eq!(row1, "  row1");
+        let row1: String = (0..8).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, "    row1");
         assert_eq!(r.back_cell(0, 1).style, mode_style);
         assert_eq!(r.back_cell(9, 1).ch, ' ');
         assert_eq!(r.back_cell(9, 1).style, mode_style);
@@ -2013,21 +2030,67 @@ mod tests {
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
-                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false },
-                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false },
+                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false, tagged: false },
+                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false, tagged: false },
                 ],
                 top: 0,
                 preview: None,
+                list_height: 2,
             })),
         };
         let mut r = Renderer::new(20, 2);
         r.compose_back(&scene);
 
-        let expect0 = "- main: 2 windows";
+        // "- " marker slot + "  " blank (untagged) tag slot (SP7 Task 15) + text.
+        let expect0 = "-   main: 2 windows";
         let row0: String = (0..expect0.chars().count() as u16).map(|x| r.back_cell(x, 0).ch).collect();
         assert_eq!(row0, expect0);
 
-        let expect1 = "    0: bash*"; // depth 1 -> "  " indent + "  " blank marker slot
+        // depth 1 -> "  " indent + "  " blank marker slot + "  " blank tag slot.
+        let expect1 = "      0: bash*";
+        let row1: String = (0..expect1.chars().count() as u16).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, expect1);
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): a TAGGED row's tag slot renders
+    /// `"* "` instead of two blanks, right after the marker slot and before
+    /// the row's own text (`## 3.3`: "then `*` if the item is tagged").
+    #[test]
+    fn overlay_tagged_row_shows_asterisk_marker() {
+        let g = grid_with(20, 2, b"");
+        let scene = Scene {
+            size: (20, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 20, h: 2 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
+            overlay: Some(Overlay::List(ListOverlay {
+                title: String::new(),
+                rows: vec![
+                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false, tagged: true },
+                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false, tagged: false },
+                ],
+                top: 0,
+                preview: None,
+                list_height: 2,
+            })),
+        };
+        let mut r = Renderer::new(20, 2);
+        r.compose_back(&scene);
+
+        // "- " marker slot + "* " tag slot (TAGGED) + text.
+        let expect0 = "- * main: 2 windows";
+        let row0: String = (0..expect0.chars().count() as u16).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, expect0);
+
+        // Untagged sibling still gets the blank tag slot.
+        let expect1 = "      0: bash*";
         let row1: String = (0..expect1.chars().count() as u16).map(|x| r.back_cell(x, 1).ch).collect();
         assert_eq!(row1, expect1);
     }
@@ -2079,6 +2142,7 @@ mod tests {
                 rows: Vec::new(),
                 top: 0,
                 preview: Some(PreviewBlock { rect: Rect { x: 0, y: 1, w: 10, h: 5 }, title: "foo".to_string(), content_w: 3, content_h: 2, content }),
+                list_height: 1,
             })),
         };
         let mut r = Renderer::new(10, 6);
@@ -2159,6 +2223,7 @@ mod tests {
                 rows: Vec::new(),
                 top: 0,
                 preview: Some(PreviewBlock { rect: Rect { x: 0, y: 0, w: 7, h: 4 }, title: String::new(), content_w: 5, content_h: 4, content }),
+                list_height: 0,
             })),
         };
         let mut r = Renderer::new(7, 4);
@@ -2207,7 +2272,8 @@ mod tests {
     #[test]
     fn overlay_list_shrinks_to_two_thirds_when_preview_on() {
         let g = grid_with(20, 15, b"");
-        let rows: Vec<TreeRowCell> = (0..15).map(|i| TreeRowCell { text: format!("r{i}"), depth: 0, marker: None, selected: false }).collect();
+        let rows: Vec<TreeRowCell> =
+            (0..15).map(|i| TreeRowCell { text: format!("r{i}"), depth: 0, marker: None, selected: false, tagged: false }).collect();
         let scene = Scene {
             size: (20, 15),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 20, h: 15 }, grid: &g, focused: true, dead: false, copy: None }],
@@ -2231,16 +2297,17 @@ mod tests {
                     content_h: 0,
                     content: Vec::new(),
                 }),
+                list_height: 10,
             })),
         };
         let mut r = Renderer::new(20, 15);
         r.compose_back(&scene);
 
-        // Rows 0-9: list text "  r0".."  r9" (marker slot + text) -- all 10
-        // rows the 2/3 split allots.
+        // Rows 0-9: list text "    r0".."    r9" (marker slot + tag slot +
+        // text, SP7 Task 15) -- all 10 rows the 2/3 split allots.
         for i in 0..10u16 {
-            let line: String = (0..4).map(|x| r.back_cell(x, i).ch).collect();
-            assert_eq!(line, format!("  r{i}"), "row {i} should still be a list row");
+            let line: String = (0..6).map(|x| r.back_cell(x, i).ch).collect();
+            assert_eq!(line, format!("    r{i}"), "row {i} should still be a list row");
         }
         // Row 10 is the preview box's top border (its '┌' corner at column
         // 0, fix round 1), NOT list row 10's text -- proof the list was

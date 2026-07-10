@@ -6286,6 +6286,390 @@ fn choose_tree_v_toggles_preview() {
     server.join().expect("server exits after last session dies");
 }
 
+// ---- SP7 Task 14: choose-buffer (`=`) + choose-client (`D`) overlays,
+// closes #48/#49 -- reuse the choose-tree overlay machinery (generalized
+// `TreeTarget`/`ChooseTreeView`), see `docs/tmux-reference/choose-tree.md`
+// `## 9`/`## 10`. ----------------------------------------------------------
+
+/// `## 10`: choose-buffer's default template is `paste-buffer -p -b '%%'` --
+/// Enter pastes the selected buffer into the acting client's focused pane
+/// and closes the overlay.
+#[test]
+fn choose_buffer_lists_buffers_enter_pastes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "BUFPASTE123".into()]));
+    expect_cli_done(&cli, 0);
+    let baseline = screen_text(&grid).iter().filter(|l| l.contains("BUFPASTE123")).count();
+
+    // `=` (choose-buffer): the row shows the buffer's name + sample text.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'=']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("buffer0") && l.contains("BUFPASTE123")));
+
+    // Enter runs the default template and exits -- the pasted text has no
+    // embedded newline, so it lands as pending, unsubmitted input on the
+    // prompt line (same verification style as `copy_selection_to_buffer_
+    // and_paste`): one more on-screen line now contains it, and the overlay
+    // is closed (status bar visible again).
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*"))
+            && screen_text(g).iter().filter(|l| l.contains("BUFPASTE123")).count() > baseline
+    });
+
+    // The pasted text is pending, unsubmitted input -- no shell-specific
+    // line-editing assumptions needed for cleanup, kill the server directly.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 10`: `x` deletes the selected buffer IMMEDIATELY, no confirm prompt
+/// (unlike choose-tree's session/window `x`, which always confirms) -- and
+/// the deletion is real (`delete-buffer`), not just cosmetic to the row
+/// list.
+#[test]
+fn choose_buffer_x_deletes_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "DELETEME456".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'=']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("DELETEME456")));
+
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("DELETEME456")));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert_eq!(out, "", "buffer must be gone from the store, not just the row list: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `## 9`: a flat row per ATTACHED client (winmux has no tty path, so the
+/// row identity/name is the synthetic `client-<id>` label, `dispatch::
+/// client_label`), each naming the session it's attached to.
+#[test]
+fn choose_client_lists_attached_clients() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "cliA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "cliB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // `D` (choose-client) from A.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'D']));
+    a.recv_output_until(&mut grid_a, |g| {
+        // `.contains(": session ")` (not just "client-") -- the box title
+        // (SP7 Task 15) also embeds the selected item's `client-<id>` name,
+        // so a bare "client-" count would over-count by one.
+        let lines = screen_text(g);
+        lines.iter().filter(|l| l.contains(": session ")).count() == 2
+            && lines.iter().any(|l| l.contains("session cliA"))
+            && lines.iter().any(|l| l.contains("session cliB"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 9`: `x`/Enter both detach the selected client IMMEDIATELY, no
+/// confirm ("No confirm prompts"). Detaching an OTHER client (not the
+/// acting one) sends IT the `[detached (from session ...)]` exit and
+/// leaves the acting client attached, with its row list shrunk by one.
+#[test]
+fn choose_client_x_detaches_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "cliA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "cliB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    a.send(&ClientMsg::Stdin(vec![0x02, b'D']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().filter(|l| l.contains(": session ")).count() == 2);
+
+    // Default sort is by NAME (`client-<id>`); A connected first so its id
+    // is lower and its row sorts first -- Down selects B's row.
+    a.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    a.send(&ClientMsg::Stdin(b"x".to_vec()));
+    b.expect_exit(0, "[detached (from session cliB)]");
+
+    // A remains attached; the row list shrank to just its own row.
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().filter(|l| l.contains(": session ")).count() == 1);
+
+    a.send(&ClientMsg::Stdin(b"q".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[cliA]")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- SP7 Task 15: choose-tree tagging, sort, filter + tiny-pane parity,
+// closes #50 (remainder) / #73. -------------------------------------------
+
+/// `## 7.1`: `t` toggles a tag on the current row (visible as a leading `*`
+/// marker, `## 3.3`); when any row is tagged, `x` applies to EVERY tagged
+/// row instead of just the current one (winmux's collapsed `x`/`X`, per the
+/// task brief) -- confirmed with a single `"kill N tagged?"` prompt, `y`
+/// kills them all.
+#[test]
+fn choose_tree_t_tags_row_and_x_kills_all_tagged() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell  1:powershell- 2:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2: powershell*")));
+
+    // Tag the default selection (window 2, current) and window 1.
+    c.send(&ClientMsg::Stdin(b"t".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("* 2: powershell*")));
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec())); // Up -> window 1's row
+    c.send(&ClientMsg::Stdin(b"t".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("* 1: powershell-")));
+
+    // `x` with two tagged rows: the confirm covers BOTH, not just the
+    // current row.
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill 2 tagged? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("0: powershell"))
+            && !lines.iter().any(|l| l.contains("1: powershell"))
+            && !lines.iter().any(|l| l.contains("2: powershell"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `## 4.1`: `O` cycles the sort field (choose-tree's restricted sequence
+/// is `index` -> `name`, `dispatch::sort_seq`); `r` reverses it. Three
+/// windows renamed out of index order (`0:ccc`, `1:aaa`, `2:bbb`) make the
+/// reordering directly observable in the row list.
+#[test]
+fn choose_tree_o_cycles_sort_r_reverses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "ccc".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:ccc*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:")));
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "aaa".into()]));
+    expect_cli_done(&cli2, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:aaa*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:")));
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["rename-window".into(), "bbb".into()]));
+    expect_cli_done(&cli3, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:bbb*")));
+
+    // A row's ORDER (not just presence) matters here, so find each window's
+    // position by NAME rather than assuming a fixed row index (robust to
+    // the SP7 Task 15 title row now always occupying the panel's own first
+    // line).
+    // Skip row 0: the SP7 Task 15 title row embeds the CURRENTLY SELECTED
+    // item's own name (e.g. "2:bbb"), which would otherwise falsely match
+    // whichever window happens to be selected regardless of its row
+    // position in the list.
+    let pos = |g: &Grid, needle: &str| screen_text(g).iter().skip(1).position(|l| l.contains(needle));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    // Default sort is Index: creation order ccc, aaa, bbb.
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "ccc"), pos(g, "aaa"), pos(g, "bbb")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    // `O` -> Name: alphabetical aaa, bbb, ccc.
+    c.send(&ClientMsg::Stdin(b"O".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "aaa"), pos(g, "bbb"), pos(g, "ccc")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    // `r` -> reversed Name: ccc, bbb, aaa.
+    c.send(&ClientMsg::Stdin(b"r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "ccc"), pos(g, "bbb"), pos(g, "aaa")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:bbb*")));
+
+    let mut cli4 = cli_client(&name);
+    cli4.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli4, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 7.1`: `f` opens a filter prompt; committing it narrows the row list
+/// to rows whose text (or, for a session/header row, ANY child's text)
+/// matches, case-insensitively (a documented substring simplification of
+/// tmux's real per-pane FORMAT filter). `c` clears the filter.
+#[test]
+fn choose_tree_filter_narrows_rows() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "apple".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:apple*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:")));
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "cherry".into()]));
+    expect_cli_done(&cli2, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:cherry*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("apple")) && lines.iter().any(|l| l.contains("cherry"))
+    });
+
+    // `f`, type "cherry", Enter commits the filter.
+    c.send(&ClientMsg::Stdin(b"f".to_vec()));
+    c.send(&ClientMsg::Stdin(b"cherry\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("cherry"))
+            && !lines.iter().any(|l| l.contains("apple"))
+            && !lines.iter().any(|l| l.contains("powershell"))
+            && lines.iter().any(|l| l.contains("(filter: active)"))
+    });
+
+    // `c` clears the filter -- every row is back.
+    c.send(&ClientMsg::Stdin(b"c".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("apple")) && lines.iter().any(|l| l.contains("cherry")) && lines.iter().any(|l| l.contains("powershell"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:cherry*")));
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #73 (mode-tree.c:980-981's SEPARATE paint-time box-size guard): in a
+/// pane too small for the preview BOX to be drawn at all, the row list must
+/// keep its own (small) computed height rather than silently expanding to
+/// fill the freed rows -- those stay blank, matching real tmux (see
+/// `dispatch::Server::choose_tree_preview_paintable`'s doc comment). A
+/// 80x6 client with 4 windows (5 total rows of tree content) in BIG preview
+/// mode: `sy=6, h` clamps to 2, but `sy - h = 4 <= 4` fails the paint-time
+/// guard, so no box is painted -- yet only `list_height` (2, minus 1 for
+/// the always-shown title row) worth of list content should appear; the
+/// remaining rows must be blank, not more window rows.
+#[test]
+fn choose_tree_tiny_pane_keeps_short_list_blank_remainder() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    // Attach at a normal size first (window creation is more reliable with
+    // real screen space), THEN shrink to the tiny 80x6 geometry -- a real
+    // terminal resizes independent of window count, so this reaches the
+    // same degenerate-geometry state a genuinely tiny terminal would.
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    for _ in 0..3 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+        c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    }
+
+    c.send(&ClientMsg::Resize { cols: 80, rows: 6 });
+    grid.resize(80, 6);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("windows")));
+
+    // v -> OFF, v -> BIG (the degenerate case above).
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[2].trim().is_empty());
+
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains('┌') || l.contains('│') || l.contains('└')),
+        "no preview box should be painted in degenerate geometry: {lines:?}"
+    );
+    for (row, line) in lines.iter().enumerate().take(6).skip(2) {
+        assert!(
+            line.trim().is_empty(),
+            "row {row} should be blank (the list must not expand into the freed preview space): {line:?}"
+        );
+    }
+
+    // Cleanup via a fresh CLI connection (avoids any further interaction
+    // with the deliberately tiny/degenerate pane).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// automatic-rename (Task 9, sub-project 4): PowerShell's
 /// `$Host.UI.RawUI.WindowTitle` assignment round-trips through ConPTY as an
 /// OSC 0/2 title, which `Grid` captures (`grid-v2`, Task 1) and the server

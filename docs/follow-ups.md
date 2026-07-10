@@ -762,16 +762,33 @@ None block the sub-project 4 merge.
     on resize ... documented winmux divergence, ticket"). A resize mid-copy-
     mode-scroll can therefore show ragged/truncated historical lines that
     don't match what a reflowing terminal would show.
-48. **`choose-buffer` (`=`) is not implemented** (Task 3, paste buffers). The
-    design spec explicitly deferred a picker UI for selecting among multiple
-    named/automatic paste buffers; `paste-buffer`/`delete-buffer` always
-    default to the newest buffer (or an explicit `-b name`) with no
-    interactive chooser.
-49. **`D` (choose-client) is not implemented** (Task 7, window ops; design
-    spec `## 6. Window ops`: "`D` choose-client: DEFERRED"). There is
-    no way to list and switch/detach OTHER attached clients from within a
-    session; only `switch-client`'s session-level `(`/`)` and the CLI's
-    `detach-client` exist.
+48. **RESOLVED (SP7 Task 14, 2026-07-10).** `choose-buffer` (`=`) is now
+    implemented: reuses the choose-tree overlay machinery, generalized
+    (`ChooseTreeView::Buffers`, `TreeTarget::Buffer`) rather than
+    duplicated. Rows are `"<name>: <size> bytes: \"<sample>\""`, default
+    sort NEWEST-first (`docs/tmux-reference/choose-tree.md` `## 10`); Enter
+    runs the default `paste-buffer -p -b '%%'` template and exits; `x`
+    deletes the selected buffer immediately (no confirm, matching real
+    tmux). *Original text:* **`choose-buffer` (`=`) is not implemented**
+    (Task 3, paste buffers). The design spec explicitly deferred a picker
+    UI for selecting among multiple named/automatic paste buffers;
+    `paste-buffer`/`delete-buffer` always default to the newest buffer (or
+    an explicit `-b name`) with no interactive chooser.
+49. **RESOLVED (SP7 Task 14, 2026-07-10).** `D` (choose-client) is now
+    implemented on the same generalized machinery (`ChooseTreeView::
+    Clients`, `TreeTarget::Client(ClientId)` — winmux has no tty path, so
+    the client id itself is the row identity, displayed as a synthetic
+    `client-<id>` label). Rows list every attached client and the session
+    it's on; Enter and `x` both detach the selected client immediately (no
+    confirm, `## 9`: "No confirm prompts") — detaching another client sends
+    it the same `[detached (from session ...)]` exit the CLI's
+    `detach-client` does; detaching yourself exits this client the same way
+    `d`/`detach-client` (bare) does. *Original text:* **`D` (choose-client)
+    is not implemented** (Task 7, window ops; design spec `## 6. Window
+    ops`: "`D` choose-client: DEFERRED"). There is no way to list and
+    switch/detach OTHER attached clients from within a session; only
+    `switch-client`'s session-level `(`/`)` and the CLI's `detach-client`
+    exist.
 50. **`choose-tree` has no preview, tagging, filtering, or sort options**
     (Task 8, overlays). The design spec's `## 7. Overlays` section is
     explicit ("No preview, no tagging (documented)"); winmux's `w`/`s`
