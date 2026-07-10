@@ -96,6 +96,10 @@ const SPECS: &[Spec] = &[
     Spec { name: "message-style", kind: Kind::Style, choices: &[] },
     Spec { name: "pane-border-style", kind: Kind::Style, choices: &[] },
     Spec { name: "pane-active-border-style", kind: Kind::Style, choices: &[] },
+    // Active-pane border indication (Task 11, sub-project 6 wave 2):
+    // `off`/`colour`/`arrows`/`both`, default `colour` -- see the
+    // `pane_border_indicators` getter below.
+    Spec { name: "pane-border-indicators", kind: Kind::Choice, choices: &["off", "colour", "arrows", "both"] },
     Spec { name: "display-time", kind: Kind::Number, choices: &[] },
     Spec { name: "repeat-time", kind: Kind::Number, choices: &[] },
     Spec { name: "default-command", kind: Kind::Str, choices: &[] },
@@ -227,6 +231,7 @@ fn default_value(name: &str) -> Value {
             let s = "fg=green";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
+        "pane-border-indicators" => Value::Choice("colour"),
         "display-time" => Value::Number(750),
         "repeat-time" => Value::Number(500),
         "default-command" => Value::Str("powershell.exe -NoLogo".to_string()),
@@ -577,6 +582,22 @@ impl Options {
 
     pub fn pane_active_border_style(&self) -> &PartialStyle {
         self.style_ref("pane-active-border-style")
+    }
+
+    /// `pane-border-indicators` (Task 11, sub-project 6 wave 2): how a
+    /// border cell shows which pane is active -- `off` (no indication),
+    /// `colour` (default; half-border cosmetic split on a 2-pane divider,
+    /// general per-cell adjacency colouring otherwise), `arrows` (four
+    /// glyphs on the active pane's own border, no colouring), `both` (both).
+    /// See `render::BorderIndicators`, which this maps onto 1:1.
+    pub fn pane_border_indicators(&self) -> crate::render::BorderIndicators {
+        use crate::render::BorderIndicators;
+        match self.values.get("pane-border-indicators") {
+            Some(Value::Choice("off")) => BorderIndicators::Off,
+            Some(Value::Choice("arrows")) => BorderIndicators::Arrows,
+            Some(Value::Choice("both")) => BorderIndicators::Both,
+            _ => BorderIndicators::Colour,
+        }
     }
 
     pub fn display_time(&self) -> Duration {

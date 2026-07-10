@@ -1910,3 +1910,50 @@ false)` entry (`bindings`), `clock_mode_opens_and_any_key_exits`
 prefix sequence typed while open both dismisses the overlay AND does not
 execute the bound command underneath it, pane content is genuinely
 restored afterward).
+
+## `pane-border-indicators` — active-pane border indication (sub-project 6 wave 2, Task 11)
+
+Adds a `pane-border-indicators` option (`options`) and, on the `render`
+side, `render::BorderIndicators` + `Scene::border_indicators` plus a
+reworked border-cell OWNER attribution in `Renderer::compose_back`'s border
+pass -- fixing the user-visible bug that a 1:1 two-pane split painted the
+ENTIRE shared divider in the active style (indicating nothing). Full spec:
+`docs/tmux-reference/panes-and-layout.md` §7.1 (the half-border rule) and
+§7.4 (`pane-border-indicators`). The `render` changes are documented as a
+**LOCKED-CONTRACT AMENDMENT** directly on `docs/specs/2026-07-06-mvp-
+interfaces.md`'s `## render` section (following that file's own precedent
+for amending `Scene` in place, e.g. the SP4 Task 8 overlay amendment) --
+not repeated here; this section covers only the new `options` surface.
+
+### `options` (`src/options.rs`)
+
+One new `Spec`:
+
+| Name | Kind | Default |
+|---|---|---|
+| `pane-border-indicators` | Choice (`off`, `colour`, `arrows`, `both`) | `colour` |
+
+```rust
+impl Options {
+    /// `pane-border-indicators`: `off` (no indication), `colour` (default;
+    /// half-border cosmetic split on an exactly-two-tiled-pane divider,
+    /// general per-cell adjacency colouring otherwise), `arrows` (four
+    /// glyphs on the active pane's own border, no colouring), `both`.
+    /// 1:1 mapping onto `render::BorderIndicators`.
+    pub fn pane_border_indicators(&self) -> crate::render::BorderIndicators;
+}
+```
+
+This is the one option getter in this file that returns a type owned by
+`render` rather than `grid`/`style`/`keys` (already-established
+cross-module return types for other getters, e.g. `clock_mode_colour() ->
+crate::grid::Color`) -- a one-directional `options -> render` dependency,
+introducing no cycle (`render` has no dependency on `options`).
+
+Tests: `two_pane_vertical_divider_half_styled`,
+`two_pane_horizontal_divider_half_styled` (incl. the focus-flip inversion),
+`border_indicators_off_suppresses_active_styling`,
+`border_indicators_arrows_draws_glyphs_at_active_corners`,
+`three_pane_left_tall_right_split_general_rule_unchanged` (`render`);
+`pane_active_border_style_runtime` (`tests/server_proto.rs`, amended --
+see the Task 11 report for the sanctioned inversion).

@@ -2569,6 +2569,7 @@ fn render_one(
 
     let border = options.pane_border_style().apply_to(default_style);
     let border_active = options.pane_active_border_style().apply_to(default_style);
+    let border_indicators = options.pane_border_indicators();
     let mode_style = options.mode_style().apply_to(default_style);
     let display_panes_colour = Style { bg: options.display_panes_colour(), ..default_style };
     let display_panes_active_colour = Style { bg: options.display_panes_active_colour(), ..default_style };
@@ -2583,6 +2584,7 @@ fn render_one(
             message,
             border,
             border_active,
+            border_indicators,
             mode_style,
             display_panes_colour,
             display_panes_active_colour,
@@ -2716,6 +2718,7 @@ fn render_one(
         message,
         border,
         border_active,
+        border_indicators,
         mode_style,
         display_panes_colour,
         display_panes_active_colour,

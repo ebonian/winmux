@@ -453,6 +453,30 @@ pub struct StatusRow {
 /// `## overlays` section for the server-side building rules (`ClientMode::
 /// ChooseTree`/`DisplayPanes`, the hardcoded key tables, the `cmd`/
 /// `bindings`/`options` amendments).
+///
+/// **LOCKED-CONTRACT AMENDMENT (2026-07-10, sub-project 6 wave 2, Task 11 —
+/// half-border active indication + `pane-border-indicators`):** `Scene`
+/// gains `border_indicators: render::BorderIndicators`:
+///
+/// ```rust
+/// pub enum BorderIndicators { Off, Colour, Arrows, Both }
+/// ```
+///
+/// This REPLACES the border-styling rule stated in the compositing rules
+/// below ("Border cells adjacent to the focused pane use
+/// `Scene::border_active`; all other border cells use `Scene::border`") —
+/// see the updated compositing rule further down for the exact per-cell
+/// OWNER attribution (general adjacency vs. the two-pane half-border rule)
+/// and the arrow-glyph pass, both gated by this new field. Maps 1:1 from
+/// the new `pane-border-indicators` option
+/// (`2026-07-07-command-config-interfaces.md`'s `## pane-border-indicators`
+/// section, `Options::pane_border_indicators`); default `Colour` reproduces
+/// tmux's own default and is the ONLY thing that changes the DEFAULT-byte
+/// output of a two-pane window versus pre-Task-11 winmux (the whole shared
+/// divider no longer reads uniformly active — this was the bug the task
+/// fixes, a sanctioned, documented default-output change scoped to exactly
+/// that layout shape; 1-pane and 3+-pane windows are byte-identical to
+/// before).
 pub struct Scene<'a> {
     /// Host terminal size (cols, rows).
     pub size: (u16, u16),
@@ -471,9 +495,13 @@ pub struct Scene<'a> {
     /// Border cell style (`pane-border-style` resolved; default = default
     /// style).
     pub border: grid::Style,
-    /// Style for border cells adjacent to the focused pane
-    /// (`pane-active-border-style` resolved; default fg green).
+    /// Style for border cells whose OWNER is the focused pane (Task 11 —
+    /// see `BorderIndicators` above for exactly what "owner" means and the
+    /// updated compositing rule below for the full per-cell attribution;
+    /// `pane-active-border-style` resolved, default fg green).
     pub border_active: grid::Style,
+    /// See `BorderIndicators` above (Task 11).
+    pub border_indicators: BorderIndicators,
     /// Copy mode's position-indicator/selection style (`mode-style`
     /// resolved; default `bg=yellow,fg=black`) — ALSO the choose-tree
     /// selected-row highlight style (SP4 Task 8).
@@ -506,15 +534,46 @@ impl Renderer {
 }
 ```
 
-**Compositing rules (amended SP3 Task 8 — option-driven styles):**
+**Compositing rules (amended SP3 Task 8 — option-driven styles; border rule
+amended again by Task 11, sub-project 6 wave 2, below):**
 - Pane cells copy from `grid.cell(...)` into the pane's rect; cells outside
   any pane rect (borders) are drawn with box chars `─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼`
-  (junction-aware; glyph logic unchanged since the MVP). Border cells
-  adjacent to the focused pane use `Scene::border_active`; all other border
-  cells use `Scene::border` (defaults reproduce the old hardcoded fg-green /
-  fg-default). When zoomed, no borders. Panes and borders never draw on the
-  status row (whichever row `StatusRow::top` selects); with `status: None`
-  they may occupy every row, including the bottom one.
+  (junction-aware; glyph logic unchanged since the MVP). When zoomed, no
+  borders. Panes and borders never draw on the status row (whichever row
+  `StatusRow::top` selects); with `status: None` they may occupy every row,
+  including the bottom one.
+- **Border colouring (Task 11 — supersedes the pre-Task-11 "adjacent to the
+  focused pane" rule stated by earlier revisions of this section):** gated
+  by `Scene::border_indicators`. `Off`: every border cell uses
+  `Scene::border`, no exceptions. `Colour`/`Both`: a border cell's OWNER
+  determines `Scene::border_active` (owner is focused) vs. `Scene::border`
+  (owner isn't) --- ownership is, by default, "any pane the cell is
+  orthogonally adjacent to that happens to be focused" (the general rule,
+  unchanged since SP3 Task 8, still governing 1-pane and 3+-pane windows
+  exactly as before), EXCEPT when the window has exactly two tiled panes:
+  then the ONE shared divider between them is split cosmetically instead —
+  for a side-by-side split, divider cells with `wy <= sy/2` (0-based row
+  offset from the pane pair's shared top edge; `sy` = their shared height)
+  are owned by the LEFT pane, the rest by the RIGHT; for a stacked split,
+  `wx <= sx/2` is owned by the TOP pane, the rest by the BOTTOM
+  (`docs/tmux-reference/panes-and-layout.md` §7.1's two-pane special case —
+  this is the fix for the reported bug where a 1:1 two-pane split painted
+  the WHOLE shared divider active, since the general rule alone considers
+  both panes adjacent to every cell of it). `Arrows`/`Off` never apply
+  `border_active` — with `Arrows` the divider is always plain `border`, only
+  the glyph pass below adds indication.
+- **Border arrows (Task 11):** `Arrows`/`Both` additionally paint, AFTER the
+  colouring pass, up to four glyphs just inside each corner of the focused
+  pane's own border — one per side that actually has a border cell there (a
+  pane flush against the window edge has no border on that side, so gets no
+  arrow there). Position: top/bottom borders at `x = pane.rect.x + 1`;
+  left/right borders at `y = pane.rect.y + 1`. Each glyph points INTO the
+  focused pane: top border → `↓` (U+2193), bottom border → `↑` (U+2191),
+  left border → `→` (U+2192), right border → `←` (U+2190) — the doc's
+  Windows-note substitution for tmux's ACS arrow characters. The glyph
+  reuses whatever style the colouring pass already painted onto that cell
+  (only the character changes), so `Arrows` alone draws it on the plain
+  `pane-border-style` and `Both` draws it on the active colour.
 - Dead pane: its grid still renders; the string `[exited]` is overlaid in
   reverse video at the pane rect's top-left (skipped if the rect's top row
   IS the status row).

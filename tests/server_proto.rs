@@ -1990,12 +1990,19 @@ fn pane_active_border_style_runtime() {
     ]));
     expect_cli_done(&cli, 0);
 
-    // The split border column (adjacent to the focused right pane) turns
-    // red (fg Idx(1)) instead of the default green.
+    // The split border column turns red (fg Idx(1)) on the half owned by
+    // the focused right pane instead of the default green (Task 11:
+    // exactly two tiled panes -> the divider is cosmetically split in half,
+    // `docs/tmux-reference/panes-and-layout.md` §7.1 -- the RIGHT pane owns
+    // the bottom half of a side-by-side divider, so row 0 specifically is
+    // no longer guaranteed red; check across every row instead). Pre-Task
+    // 11 the whole column read active/red at row 0 -- sanctioned inversion,
+    // see the Task 11 report.
     c.recv_output_until(&mut grid, |g| {
         let pane_rows = g.rows().saturating_sub(1);
         (1..g.cols().saturating_sub(1)).any(|col| {
-            (0..pane_rows).all(|r| g.cell(col, r).ch == '│') && g.cell(col, 0).style.fg == Color::Idx(1)
+            (0..pane_rows).all(|r| g.cell(col, r).ch == '│')
+                && (0..pane_rows).any(|r| g.cell(col, r).style.fg == Color::Idx(1))
         })
     });
 

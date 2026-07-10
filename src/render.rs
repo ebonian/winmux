@@ -153,6 +153,23 @@ pub enum Overlay {
     Clock(Rect, String, Color),
 }
 
+/// `pane-border-indicators` (Task 11, sub-project 6 wave 2 --
+/// `docs/tmux-reference/panes-and-layout.md` §7.4): gates BOTH the
+/// active-pane border COLOURING (`Colour`/`Both` -- see the half-border rule
+/// documented on [`Scene::border_active`] and in `compose_back`'s border
+/// pass) and the four active-pane ARROW glyphs (`Arrows`/`Both`, drawn just
+/// inside each corner of the focused pane's own border, pointing at it).
+/// `Off` = plain [`Scene::border`] everywhere and no arrows -- tmux's
+/// literal "neither colour nor arrows indicate activity" (§7.4). Default
+/// (tmux and winmux) is `Colour`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderIndicators {
+    Off,
+    Colour,
+    Arrows,
+    Both,
+}
+
 pub struct Scene<'a> {
     pub size: (u16, u16),
     pub panes: Vec<PaneView<'a>>,
@@ -166,9 +183,21 @@ pub struct Scene<'a> {
     pub message: Option<(String, Style)>,
     /// Border cell style (`pane-border-style` applied to the default style).
     pub border: Style,
-    /// Border cells adjacent to the focused pane (`pane-active-border-style`,
-    /// tmux default `fg=green`).
+    /// Style used for border cells whose OWNER (see `compose_back`'s border
+    /// pass) is the focused pane (`pane-active-border-style`, tmux default
+    /// `fg=green`) -- gated by [`Scene::border_indicators`] being `Colour`
+    /// or `Both`. Ownership of a border cell is normally "any pane it's
+    /// orthogonally adjacent to that happens to be the focused one"
+    /// (`docs/tmux-reference/panes-and-layout.md` §7.1's general per-cell
+    /// adjacency rule), EXCEPT when the window has exactly two tiled panes:
+    /// then the ONE shared divider between them is split cosmetically in
+    /// half (`wy <= sy/2` owned by the left pane for a side-by-side split,
+    /// `wx <= sx/2` owned by the top pane for a stacked split; the remainder
+    /// owned by the other pane) instead of the whole divider reading as
+    /// adjacent to both -- see the doc's two-pane special case, §7.1.
     pub border_active: Style,
+    /// See [`BorderIndicators`].
+    pub border_indicators: BorderIndicators,
     /// Copy mode's position-indicator (and, from Task 3, selection
     /// highlight) style (`mode-style` applied to the default style, tmux
     /// default `bg=yellow,fg=black`).
@@ -346,6 +375,20 @@ impl Renderer {
                 !covered[y as usize * w + x as usize]
             };
             let focused_rect = scene.panes.iter().find(|p| p.focused).map(|p| p.rect);
+
+            // General N-pane rule (`redraw_get_pane_for_border_style`'s "if
+            // active adjacent, return active" branch, screen-redraw.c:1108-
+            // 1131, per doc §7.1): a border cell's owner is the focused pane
+            // if any of its 4 orthogonal neighbor cells falls inside the
+            // focused pane's rect (ties among non-focused neighbors never
+            // matter here since every non-focused pane shares one style).
+            // This is the ONLY rule for windows that do NOT have exactly two
+            // tiled panes -- unchanged from pre-Task-11 behavior, so a
+            // 3+-pane window (e.g. a full-height left pane with the right
+            // column split top/bottom, this task's target bug-report
+            // layout) keeps its exact prior per-cell adjacency styling; see
+            // `three_pane_left_tall_right_split_general_rule_unchanged`
+            // below for the worked example.
             let touches_focused = |x: i32, y: i32| -> bool {
                 match focused_rect {
                     Some(fr) => {
@@ -360,6 +403,54 @@ impl Renderer {
                     None => false,
                 }
             };
+
+            // Two-pane half-border rule (`redraw_check_two_pane_colours` +
+            // `redraw_mark_two_pane_colours`, screen-redraw.c:404-420,788-
+            // 829, doc §7.1's two-pane special case): ONLY when the window
+            // has EXACTLY two tiled panes, the general rule above is
+            // overridden -- otherwise it would colour the ENTIRE shared
+            // divider active, since both panes are adjacent to every cell of
+            // it (the user-visible bug this task fixes). Instead the single
+            // shared divider is split cosmetically: for a side-by-side
+            // (LEFTRIGHT) split, divider cells with `wy <= sy/2` (0-based row
+            // offset from the pane pair's shared top edge; `sy` = their
+            // shared height) belong to the LEFT pane, the rest to the RIGHT;
+            // for a stacked (TOPBOTTOM) split, `wx <= sx/2` belongs to the
+            // TOP pane, the rest to the BOTTOM. `half_rule` is `None` (general
+            // rule applies) whenever there aren't exactly two panes, or the
+            // two rects aren't axis-aligned the way a real tiled 2-pane split
+            // always is (defensive; unreachable via any real layout).
+            let half_rule: Option<(bool, u16, u16, Rect, Rect)> = if scene.panes.len() == 2 {
+                let a = scene.panes[0].rect;
+                let b = scene.panes[1].rect;
+                if a.y == b.y && a.h == b.h {
+                    // side-by-side: vertical divider between them.
+                    let (left, right) = if a.x <= b.x { (a, b) } else { (b, a) };
+                    Some((true, a.y, a.h, left, right))
+                } else if a.x == b.x && a.w == b.w {
+                    // stacked: horizontal divider between them.
+                    let (top, bottom) = if a.y <= b.y { (a, b) } else { (b, a) };
+                    Some((false, a.x, a.w, top, bottom))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let owner_is_focused = |x: i32, y: i32| -> bool {
+                match &half_rule {
+                    Some((vertical, origin, extent, first, second)) => {
+                        let midpoint = extent / 2;
+                        let owner_is_first =
+                            if *vertical { (y as u16).saturating_sub(*origin) <= midpoint } else { (x as u16).saturating_sub(*origin) <= midpoint };
+                        let owner = if owner_is_first { first } else { second };
+                        focused_rect == Some(*owner)
+                    }
+                    None => touches_focused(x, y),
+                }
+            };
+
+            let colour_enabled = matches!(scene.border_indicators, BorderIndicators::Colour | BorderIndicators::Both);
             for y in 0..rows as i32 {
                 if !in_band(y as u16) {
                     continue;
@@ -374,8 +465,43 @@ impl Renderer {
                         is_border(x - 1, y),
                         is_border(x + 1, y),
                     );
-                    let style = if touches_focused(x, y) { scene.border_active } else { scene.border };
+                    let style = if colour_enabled && owner_is_focused(x, y) { scene.border_active } else { scene.border };
                     self.set(x as u16, y as u16, Cell { ch, style });
+                }
+            }
+
+            // Arrow-indicator pass (`pane-border-indicators` arrows/both,
+            // doc §7.4, `redraw_mark_border_arrows`, screen-redraw.c:615-
+            // 658): four glyphs placed just inside each corner of the
+            // FOCUSED pane's own border -- one per side that actually HAS a
+            // border cell there (a pane flush against the window edge has no
+            // border on that side, so gets no arrow there, via the
+            // `is_border` guard below). Each glyph points INTO the focused
+            // pane (the direction from the border cell toward the pane),
+            // reproducing tmux's `left_wp`/`right_wp`/`top_wp`/`bottom_wp
+            // == active` ladder; per the doc's Windows note, glyphs are
+            // U+2190 LEFTWARDS ARROW .. U+2193 DOWNWARDS ARROW rather than
+            // the original ACS characters. Runs AFTER the colouring pass
+            // above and reuses whatever style that pass already painted onto
+            // the cell (so `arrows` alone -- colour disabled -- draws the
+            // glyph on the plain `pane-border-style`, and `both` draws it on
+            // the just-painted active colour); only the CHARACTER changes.
+            let arrows_enabled = matches!(scene.border_indicators, BorderIndicators::Arrows | BorderIndicators::Both);
+            if arrows_enabled {
+                if let Some(fr) = focused_rect {
+                    let sides: [(i32, i32, char); 4] = [
+                        (fr.x as i32 + 1, fr.y as i32 - 1, '\u{2193}'), // top border: points down, into the pane
+                        (fr.x as i32 + 1, fr.y as i32 + fr.h as i32, '\u{2191}'), // bottom border: points up
+                        (fr.x as i32 - 1, fr.y as i32 + 1, '\u{2192}'), // left border: points right
+                        (fr.x as i32 + fr.w as i32, fr.y as i32 + 1, '\u{2190}'), // right border: points left
+                    ];
+                    for (ax, ay, ch) in sides {
+                        if is_border(ax, ay) {
+                            let idx = ay as usize * w + ax as usize;
+                            let style = self.back[idx].style;
+                            self.set(ax as u16, ay as u16, Cell { ch, style });
+                        }
+                    }
                 }
             }
         }
@@ -957,7 +1083,12 @@ mod tests {
     }
 
     // 7x4 terminal: two panes side-by-side, vertical border column at x=3,
-    // status row at y=3. Right pane is focused (its border is green).
+    // status row at y=3. Right pane is focused. Task 11: with exactly two
+    // tiled panes the half-border rule applies (sy=3, midpoint=3/2=1) --
+    // wy<=1 (rows 0,1) owned by the LEFT pane (not focused -> default),
+    // wy=2 (row 2) owned by the RIGHT pane (focused -> green). Superseded
+    // by (but kept alongside, for the glyph/content assertions) the more
+    // thorough `two_pane_vertical_divider_half_styled` below.
     #[test]
     fn two_panes_content_and_focused_border() {
         let left = grid_with(3, 3, b"L");
@@ -976,6 +1107,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(7, 4);
@@ -988,8 +1120,14 @@ mod tests {
         assert_eq!(r.back_cell(3, 0).ch, '│');
         assert_eq!(r.back_cell(3, 1).ch, '│');
         assert_eq!(r.back_cell(3, 2).ch, '│');
-        // border adjoins the focused (right) pane -> green fg = Idx(2)
-        assert_eq!(r.back_cell(3, 0).style.fg, Color::Idx(2));
+        // half-border rule (Task 11): rows 0,1 owned by the LEFT (inactive)
+        // pane -> default fg; row 2 owned by the RIGHT (focused) pane ->
+        // green fg = Idx(2). Pre-Task-11 this asserted the WHOLE column
+        // green (the bug this task fixes: an inactive divider row read as
+        // active) -- sanctioned inversion, see task report.
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 2).style.fg, Color::Idx(2));
     }
 
     // 7x5 terminal: full-height left pane, right side split into top(1 row)
@@ -1015,6 +1153,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(7, 5);
@@ -1026,6 +1165,268 @@ mod tests {
         assert_eq!(r.back_cell(6, 1).ch, '─'); // horizontal arm to edge
         // horizontal arm cell touches focused bottom-right pane -> green
         assert_eq!(r.back_cell(4, 1).style.fg, Color::Idx(2));
+    }
+
+    // ---- Task 11 (sub-project 6 wave 2): half-border active indication +
+    // pane-border-indicators ----
+
+    /// Builds the 7x4 two-pane-side-by-side scene from
+    /// `two_panes_content_and_focused_border`, parameterized on which side
+    /// is focused, so the focus-flip half of the required test is a plain
+    /// re-invocation with the other side true.
+    fn two_pane_vertical_scene<'a>(left: &'a Grid, right: &'a Grid, left_focused: bool, indicators: BorderIndicators) -> Scene<'a> {
+        Scene {
+            size: (7, 4),
+            panes: vec![
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 3 }, grid: left, focused: left_focused, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 3 }, grid: right, focused: !left_focused, dead: false, copy: None },
+            ],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: indicators,
+            overlay: None,
+        }
+    }
+
+    // Side-by-side split, vertical divider column x=3, rows 0..=2 (sy=3,
+    // rows shared by both panes, midpoint = sy/2 = 1 floor-divided): rows
+    // 0,1 (wy<=1) are owned by the LEFT pane, row 2 (wy=2) by the RIGHT pane
+    // (doc §7.1's two-pane special case, LEFTRIGHT: "top half...left pane's
+    // border and the bottom half...right pane's"). Left focused -> rows 0,1
+    // green, row 2 default; flipping focus to the right pane inverts EVERY
+    // row's verdict (not just a recolor of the same cells -- the OWNER
+    // assignment per row is fixed by geometry, only which owner counts as
+    // "active" flips).
+    #[test]
+    fn two_pane_vertical_divider_half_styled() {
+        let left = grid_with(3, 3, b"");
+        let right = grid_with(3, 3, b"");
+
+        let scene = two_pane_vertical_scene(&left, &right, true, BorderIndicators::Colour);
+        let mut r = Renderer::new(7, 4);
+        r.compose_back(&scene);
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Idx(2)); // row 0: left owner, left focused -> green
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Idx(2)); // row 1: left owner, left focused -> green
+        assert_eq!(r.back_cell(3, 2).style.fg, Color::Default); // row 2: right owner, left focused -> default
+
+        // focus-flip: right pane now active.
+        let scene = two_pane_vertical_scene(&left, &right, false, BorderIndicators::Colour);
+        let mut r = Renderer::new(7, 4);
+        r.compose_back(&scene);
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Default); // row 0: left owner, right focused -> default
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Default); // row 1: left owner, right focused -> default
+        assert_eq!(r.back_cell(3, 2).style.fg, Color::Idx(2)); // row 2: right owner, right focused -> green
+    }
+
+    /// Builds a 7x6 two-pane-stacked scene (top pane rows 0-1, horizontal
+    /// divider row y=2, bottom pane rows 3-4, status row y=5), parameterized
+    /// on which side is focused.
+    fn two_pane_horizontal_scene<'a>(top: &'a Grid, bottom: &'a Grid, top_focused: bool, indicators: BorderIndicators) -> Scene<'a> {
+        Scene {
+            size: (7, 6),
+            panes: vec![
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 7, h: 2 }, grid: top, focused: top_focused, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 0, y: 3, w: 7, h: 2 }, grid: bottom, focused: !top_focused, dead: false, copy: None },
+            ],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: indicators,
+            overlay: None,
+        }
+    }
+
+    // Stacked split, horizontal divider row y=2, columns 0..=6 (sx=7, width
+    // shared by both panes, midpoint = sx/2 = 3 floor-divided): columns
+    // 0-3 (wx<=3, 4 cols) owned by the TOP pane, columns 4-6 (3 cols) by the
+    // BOTTOM pane (doc §7.1's two-pane special case, TOPBOTTOM: "left
+    // half...top pane's border and...right...bottom pane's"). Top focused
+    // -> cols 0-3 green, cols 4-6 default; flipping focus to the bottom pane
+    // inverts every column's verdict, same as the vertical-divider test.
+    #[test]
+    fn two_pane_horizontal_divider_half_styled() {
+        let top = grid_with(7, 2, b"");
+        let bottom = grid_with(7, 2, b"");
+
+        let scene = two_pane_horizontal_scene(&top, &bottom, true, BorderIndicators::Colour);
+        let mut r = Renderer::new(7, 6);
+        r.compose_back(&scene);
+        for x in 0..=3u16 {
+            assert_eq!(r.back_cell(x, 2).style.fg, Color::Idx(2), "col {x} top-owned, top focused -> green");
+        }
+        for x in 4..=6u16 {
+            assert_eq!(r.back_cell(x, 2).style.fg, Color::Default, "col {x} bottom-owned, top focused -> default");
+        }
+
+        // focus-flip: bottom pane now active.
+        let scene = two_pane_horizontal_scene(&top, &bottom, false, BorderIndicators::Colour);
+        let mut r = Renderer::new(7, 6);
+        r.compose_back(&scene);
+        for x in 0..=3u16 {
+            assert_eq!(r.back_cell(x, 2).style.fg, Color::Default, "col {x} top-owned, bottom focused -> default");
+        }
+        for x in 4..=6u16 {
+            assert_eq!(r.back_cell(x, 2).style.fg, Color::Idx(2), "col {x} bottom-owned, bottom focused -> green");
+        }
+    }
+
+    // `pane-border-indicators off`: no active colouring anywhere, even on a
+    // two-pane divider where SOME row would otherwise be green (row 2,
+    // right-owned, right focused, per `two_pane_vertical_divider_half_styled`
+    // above) -- every divider cell stays the plain (default) border style.
+    #[test]
+    fn border_indicators_off_suppresses_active_styling() {
+        let left = grid_with(3, 3, b"");
+        let right = grid_with(3, 3, b"");
+        let scene = two_pane_vertical_scene(&left, &right, false, BorderIndicators::Off);
+        let mut r = Renderer::new(7, 4);
+        r.compose_back(&scene);
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 2).style.fg, Color::Default);
+    }
+
+    // `pane-border-indicators arrows`: a 9x7 "plus" arrangement (no status
+    // row) where the CENTER pane (focused) has a border on all four sides,
+    // so all four arrow glyphs/positions/directions can be asserted in one
+    // scene (doc §7.4, `redraw_mark_border_arrows`):
+    //   top    Rect{x:3,y:0,w:3,h:1}   (row 0, cols 3-5)
+    //   left   Rect{x:0,y:2,w:2,h:3}   (cols 0-1, rows 2-4)
+    //   center Rect{x:3,y:2,w:3,h:3}   (cols 3-5, rows 2-4) -- FOCUSED
+    //   right  Rect{x:7,y:2,w:2,h:3}   (cols 7-8, rows 2-4)
+    //   bottom Rect{x:3,y:6,w:3,h:1}   (row 6, cols 3-5)
+    // Border gaps: row 1 (between top and center) and row 5 (between center
+    // and bottom) are fully uncovered across every column; column 2
+    // (between left and center) and column 6 (between center and right) are
+    // uncovered for rows 2-4. The doc's fixed spots relative to the
+    // FOCUSED (center) pane's own xoff=3/yoff=2/sx=3/sy=3:
+    //   top border:    (xoff+1, yoff-1)      = (4, 1) -> arrow points DOWN
+    //   bottom border: (xoff+1, yoff+sy)     = (4, 5) -> arrow points UP
+    //   left border:   (xoff-1, yoff+1)      = (2, 3) -> arrow points RIGHT
+    //   right border:  (xoff+sx, yoff+1)     = (6, 3) -> arrow points LEFT
+    // `arrows` alone (not `both`) also proves colouring stays OFF: none of
+    // these cells (nor the general adjacency-active tee cells) turn green.
+    #[test]
+    fn border_indicators_arrows_draws_glyphs_at_active_corners() {
+        let top = grid_with(3, 1, b"");
+        let left = grid_with(2, 3, b"");
+        let center = grid_with(3, 3, b"");
+        let right = grid_with(2, 3, b"");
+        let bottom = grid_with(3, 1, b"");
+        let scene = Scene {
+            size: (9, 7),
+            panes: vec![
+                PaneView { id: 1, rect: Rect { x: 3, y: 0, w: 3, h: 1 }, grid: &top, focused: false, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 0, y: 2, w: 2, h: 3 }, grid: &left, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 3, y: 2, w: 3, h: 3 }, grid: &center, focused: true, dead: false, copy: None },
+                PaneView { id: 4, rect: Rect { x: 7, y: 2, w: 2, h: 3 }, grid: &right, focused: false, dead: false, copy: None },
+                PaneView { id: 5, rect: Rect { x: 3, y: 6, w: 3, h: 1 }, grid: &bottom, focused: false, dead: false, copy: None },
+            ],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Arrows,
+            overlay: None,
+        };
+        let mut r = Renderer::new(9, 7);
+        r.compose_back(&scene);
+
+        assert_eq!(r.back_cell(4, 1).ch, '\u{2193}'); // top border: down arrow
+        assert_eq!(r.back_cell(4, 5).ch, '\u{2191}'); // bottom border: up arrow
+        assert_eq!(r.back_cell(2, 3).ch, '\u{2192}'); // left border: right arrow
+        assert_eq!(r.back_cell(6, 3).ch, '\u{2190}'); // right border: left arrow
+        // colouring stayed off (mode is `arrows`, not `both`/`colour`):
+        // every arrow cell (and, spot-checked, the tee cell (3,1) that
+        // would read general-adjacency-active under `colour`) is plain.
+        assert_eq!(r.back_cell(4, 1).style.fg, Color::Default);
+        assert_eq!(r.back_cell(4, 5).style.fg, Color::Default);
+        assert_eq!(r.back_cell(2, 3).style.fg, Color::Default);
+        assert_eq!(r.back_cell(6, 3).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Default);
+    }
+
+    // Worked example for the task's target bug-report layout: a full-height
+    // left pane with the right column split top/bottom (identical geometry
+    // to `border_tee_junction`/`border_style_applied` above) -- with THREE
+    // tiled panes, the two-pane half-border rule does NOT apply (doc §7.1
+    // scopes it to "exactly two (tiled) panes"), so every border cell keeps
+    // the pre-Task-11 general per-cell adjacency rule unchanged. This test
+    // exhaustively covers every border cell for BOTH focus configurations to
+    // confirm the refactor didn't regress it (computed by hand):
+    //   left pane:  Rect{x:0,y:0,w:3,h:4}  (id 1)
+    //   right-top:  Rect{x:4,y:0,w:3,h:1}  (id 2)
+    //   right-bot:  Rect{x:4,y:2,w:3,h:2}  (id 3)
+    // Border cells: vertical column x=3 rows 0-3; horizontal arm row 1,
+    // cols 4-6 (the tee at (3,1) is part of the vertical column).
+    //   left focused:   column x=3 rows 0-3 ALL touch the left pane's left
+    //     edge -> ALL active; the horizontal arm (4,1)/(5,1)/(6,1) touches
+    //     neither right pane at that position -> ALL default.
+    //   right-bottom focused: column rows 0,1 don't touch right-bot (which
+    //     only spans y=2-3) -> default; rows 2,3 do -> active. The
+    //     horizontal arm's DOWN neighbor (y=2) is inside right-bot's rect
+    //     for every one of its columns -> ALL active.
+    #[test]
+    fn three_pane_left_tall_right_split_general_rule_unchanged() {
+        let left = grid_with(3, 4, b"");
+        let rt = grid_with(3, 1, b"");
+        let rb = grid_with(3, 2, b"");
+        let build = |left_focused: bool, rb_focused: bool| Scene {
+            size: (7, 5),
+            panes: vec![
+                PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 3, h: 4 }, grid: &left, focused: left_focused, dead: false, copy: None },
+                PaneView { id: 2, rect: Rect { x: 4, y: 0, w: 3, h: 1 }, grid: &rt, focused: false, dead: false, copy: None },
+                PaneView { id: 3, rect: Rect { x: 4, y: 2, w: 3, h: 2 }, grid: &rb, focused: rb_focused, dead: false, copy: None },
+            ],
+            zoomed: false,
+            status: Some(default_status(Vec::new(), "")),
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
+            overlay: None,
+        };
+
+        // left pane focused
+        let scene = build(true, false);
+        let mut r = Renderer::new(7, 5);
+        r.compose_back(&scene);
+        for y in 0..=3u16 {
+            assert_eq!(r.back_cell(3, y).style.fg, Color::Idx(2), "column row {y}: left focused -> active");
+        }
+        for x in 4..=6u16 {
+            assert_eq!(r.back_cell(x, 1).style.fg, Color::Default, "arm col {x}: left focused -> default");
+        }
+
+        // right-bottom pane focused
+        let scene = build(false, true);
+        let mut r = Renderer::new(7, 5);
+        r.compose_back(&scene);
+        assert_eq!(r.back_cell(3, 0).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 1).style.fg, Color::Default);
+        assert_eq!(r.back_cell(3, 2).style.fg, Color::Idx(2));
+        assert_eq!(r.back_cell(3, 3).style.fg, Color::Idx(2));
+        for x in 4..=6u16 {
+            assert_eq!(r.back_cell(x, 1).style.fg, Color::Idx(2), "arm col {x}: right-bottom focused -> active");
+        }
     }
 
     #[test]
@@ -1042,6 +1443,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(10, 2);
@@ -1072,6 +1474,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(6, 2);
@@ -1095,6 +1498,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(5, 2);
@@ -1122,6 +1526,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(10, 2);
@@ -1153,6 +1558,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(7, 2);
@@ -1183,6 +1589,7 @@ mod tests {
                 mode_style: Style::default(),
                 display_panes_colour: Style::default(),
                 display_panes_active_colour: Style::default(),
+                border_indicators: BorderIndicators::Colour,
                 overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
@@ -1202,6 +1609,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let out = r.compose(&scene, Some((1, 0)), true);
@@ -1226,6 +1634,7 @@ mod tests {
                 mode_style: Style::default(),
                 display_panes_colour: Style::default(),
                 display_panes_active_colour: Style::default(),
+                border_indicators: BorderIndicators::Colour,
                 overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true);
@@ -1245,6 +1654,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let out = r.compose(&scene, Some((2, 0)), true);
@@ -1269,6 +1679,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let _ = r.compose(&scene, Some((0, 0)), true); // prime
@@ -1293,6 +1704,7 @@ mod tests {
                 mode_style: Style::default(),
                 display_panes_colour: Style::default(),
                 display_panes_active_colour: Style::default(),
+                border_indicators: BorderIndicators::Colour,
                 overlay: None,
             };
             let _ = r.compose(&scene, Some((0, 0)), true); // prime
@@ -1311,6 +1723,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let out = r.compose(&scene, Some((0, 0)), true);
@@ -1346,6 +1759,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(10, 2);
@@ -1381,6 +1795,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(4, 2);
@@ -1409,6 +1824,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(4, 2);
@@ -1436,6 +1852,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(6, 2);
@@ -1468,6 +1885,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(7, 5);
@@ -1497,6 +1915,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: None,
         };
         let mut r = Renderer::new(5, 2);
@@ -1525,6 +1944,7 @@ mod tests {
             mode_style,
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
@@ -1581,6 +2001,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
@@ -1644,6 +2065,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: Vec::new(),
@@ -1723,6 +2145,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: Vec::new(),
@@ -1788,6 +2211,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows,
@@ -1841,6 +2265,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: blue,
             display_panes_active_colour: red,
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 6, h: 5 }, 1, true)])),
         };
         let mut r = Renderer::new(6, 5);
@@ -1880,6 +2305,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: blue,
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::PaneDigits(vec![(Rect { x: 0, y: 0, w: 3, h: 3 }, 7, false)])),
         };
         let mut r = Renderer::new(3, 3);
@@ -1923,6 +2349,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::Clock(Rect { x: 0, y: 0, w: 30, h: 6 }, "12:34".to_string(), blue)),
         };
         let mut r = Renderer::new(30, 6);
@@ -1965,6 +2392,7 @@ mod tests {
             mode_style: Style::default(),
             display_panes_colour: Style::default(),
             display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
             overlay: Some(Overlay::Clock(Rect { x: 0, y: 0, w: 7, h: 3 }, "12:34".to_string(), blue)),
         };
         let mut r = Renderer::new(7, 3);
