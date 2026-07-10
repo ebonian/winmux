@@ -85,6 +85,112 @@ fn spawn_failure_does_not_hang_or_leak() {
     }
 }
 
+/// **Platform gotcha, verified here (SP7 Task 19 closeout, 2026-07-11):**
+/// Windows ConPTY does NOT relay a hosted process's `CSI ?1000h`-class
+/// mouse-mode DECSET private-mode sequence through to the reader of the
+/// pseudoconsole's output pipe -- it is silently CONSUMED (not garbled, not
+/// delayed, just entirely absent from the byte stream we read), unlike an
+/// ordinary SGR sequence (`CSI 31 m`), which survives byte-for-byte. This
+/// was discovered investigating a closeout e2e test for application mouse
+/// passthrough (follow-ups #35/#72): a real `powershell.exe` pane emitting
+/// `ESC[?1000h` via `Write-Host` or `[Console]::Out.Write` (both tried, same
+/// result) never produces that byte sequence in `Pty`'s raw output, so
+/// `Grid::mouse_proto` (which parses exactly this sequence) can never
+/// observe a real hosted app's mouse-mode request over ConPTY on this
+/// platform -- the feature is correctly implemented in software (unit-tested
+/// end to end from a synthetic byte feed) but structurally unobservable via
+/// a real child process's own escape-sequence emission in this project's e2e
+/// harness. This explains, with a concrete confirmed mechanism, three
+/// previously-separate "investigated and gave up" notes in
+/// `docs/follow-ups.md`: the SP4 abandonment of `alt_screen_wheel_
+/// sends_arrows` (a synthetic `?1049h` alt-screen CSI), follow-up #35/#72's
+/// "no live-process byte-receipt e2e proof was attempted", and follow-up
+/// #53's bracketed-paste (`?2004h`) positive path being "found to be
+/// fundamentally unprovable black-box" -- all three were hitting the SAME
+/// ConPTY behavior, not three unrelated obstacles. See
+/// `docs/follow-ups.md`'s SP7 Task 19 closeout section for the full writeup
+/// and `CLAUDE.md`'s "Hard-won platform gotchas" section for the one-line
+/// summary. This test pins the finding (and its SGR-survives control) so a
+/// future ConPTY/Windows update that changes this behavior is caught, not
+/// silently assumed to still hold.
+#[test]
+fn mouse_decset_private_mode_is_not_relayed_by_conpty() {
+    let mut pty =
+        Pty::spawn("powershell.exe -NoProfile -NoLogo", 80, 24).expect("spawn powershell through ConPTY");
+    let mut reader = pty.take_reader().expect("take reader once");
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut all: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            all.extend(chunk);
+        }
+        if String::from_utf8_lossy(&all).contains("PS ") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "prompt never appeared: {:?}", String::from_utf8_lossy(&all));
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // One command emits BOTH a mouse-mode DECSET and an ordinary SGR color
+    // sequence, so a single capture proves the discrimination: SGR survives,
+    // DECSET does not (ruling out "the reader just isn't working").
+    pty.write_input(
+        b"[Console]::Out.Write([char]27 + '[?1000h' + [char]27 + '[31mRED' + [char]27 + '[0m'); \
+          Write-Host 'MARKERDONE'\r",
+    )
+    .expect("send probe command");
+
+    let mut all2: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            all2.extend(chunk);
+        }
+        if all2.windows(b"MARKERDONE".len()).any(|w| w == b"MARKERDONE") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "'MARKERDONE' never appeared; got:\n{}",
+            String::from_utf8_lossy(&all2)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        all2.windows(b"\x1b[31mRED".len()).any(|w| w == b"\x1b[31mRED"),
+        "control failed: an ordinary SGR sequence did not survive the ConPTY round trip either \
+         (reader/harness problem, not the DECSET-specific finding this test pins); got:\n{}",
+        String::from_utf8_lossy(&all2)
+    );
+    assert!(
+        !all2.windows(b"\x1b[?1000h".len()).any(|w| w == b"\x1b[?1000h"),
+        "CSI ?1000h now DOES survive the ConPTY round trip -- the platform gotcha this test pins \
+         (docs/follow-ups.md's SP7 Task 19 closeout entry, CLAUDE.md's platform gotchas section) \
+         may no longer hold; if a genuine Windows/ConPTY behavior change, update both docs and \
+         reconsider whether the app-mouse-passthrough e2e gap (follow-ups #35/#72) can now be \
+         closed for real; got:\n{}",
+        String::from_utf8_lossy(&all2)
+    );
+}
+
 /// The exit-waiter protocol: a child that exits immediately must signal its
 /// process handle so a waiter thread's WaitForSingleObject returns.
 #[test]

@@ -388,3 +388,253 @@ fn e2e_send_keys_cli() {
         process_exited(proc_raw)
     });
 }
+
+/// True if any pane row shows a `[N/M]` copy-mode position indicator
+/// (mirrors `tests/e2e_copy_mouse.rs`'s `parse_indicator`, duplicated here
+/// rather than shared since it's a small, self-contained string check and
+/// the two files don't otherwise share test-specific helpers).
+fn has_scroll_indicator(grid: &Grid) -> bool {
+    screen_text(grid).iter().any(|l| {
+        let Some(start) = l.rfind('[') else { return false };
+        let Some(end) = l[start..].find(']').map(|i| i + start) else { return false };
+        let inner = &l[start + 1..end];
+        let mut parts = inner.split('/');
+        let a = parts.next().and_then(|p| p.parse::<u32>().ok());
+        let b = parts.next().and_then(|p| p.parse::<u32>().ok());
+        a.is_some() && b.is_some() && parts.next().is_none()
+    })
+}
+
+/// `config_sp7_surface_takes_effect` (SP7 Task 19 closeout): a single
+/// `.tmux.conf`, loaded via `-f` at real server startup, exercising several
+/// distinct SP7 surface additions together -- proving each loads clean AND
+/// actually takes effect through the real ConPTY client, not just that it
+/// parses:
+///
+/// - **`setw` window-scoped `set`** (closes follow-up #26 for the write
+///   side), proven in TWO steps because a CONFIG-loaded `setw` and a
+///   RUNTIME one resolve differently by design (follow-up #26: "headless
+///   \[CLI/config\] calls with no acting session fall back to the global
+///   table"): (1) the config's own `setw pane-base-index 5` (no `-g`, no
+///   acting window at load time) lands as a GLOBAL default -- proven by
+///   window 0 showing `P5` immediately after load; (2) a SECOND `setw
+///   pane-base-index 9` issued at RUNTIME via the `:` command prompt (which
+///   DOES have an acting client bound to window 0) lands as a LOCAL
+///   override on window 0 ONLY -- proven by window 0 flipping to `P9` while
+///   a brand new window (`prefix c`, created afterward) shows `P5` (the
+///   untouched global default from the config), not `P9`.
+/// - **The general `#{?...}` format engine + `#{==:...}` string comparison**
+///   (closes follow-ups #27/#70): `status-right` uses
+///   `#{?#{==:#F,*},NOZ,ZOOMED}` -- a conditional whose condition is itself
+///   a nested string-comparison expression, evaluated against LIVE data
+///   (`#F`/`window_flags`) that changes at runtime (`prefix z` toggles
+///   zoom), proven by the rendered status text actually flipping from
+///   `NOZ` to `ZOOMED` after a real zoom keystroke, not just rendering some
+///   static text once.
+/// - **A config `bind` on a mouse pseudo-key name** (closes follow-up #57):
+///   `bind -T root WheelUpPane display-message "WU-OK"` replaces the
+///   default wheel-up-enters-copy-mode action -- proven two ways at once: a
+///   real SGR wheel-up event shows the `WU-OK` message (the custom command
+///   ran) AND does NOT show the `[N/M]` copy-mode indicator (the default
+///   action it replaced did NOT also run).
+/// - **`set-clipboard`** (closes follow-up #55): `set -g set-clipboard on`
+///   from the CONFIG FILE (not just a runtime `set`, which
+///   `tests/server_proto.rs::osc52_emitted_to_client_on_copy` already
+///   covers) makes a real copy-mode copy emit the OSC 52 sequence on the
+///   raw byte stream this ConPTY client actually receives.
+#[test]
+fn config_sp7_surface_takes_effect() {
+    let conf = TempConf::write(
+        "sp7-surface",
+        "set -g mouse on\n\
+         set -g set-clipboard on\n\
+         setw pane-base-index 5\n\
+         set -g status-right \"#{?#{==:#F,*},NOZ,ZOOMED}-P#P\"\n\
+         bind -T root WheelUpPane display-message \"WU-OK\"\n",
+    );
+    let socket = unique_socket("sp7-surface");
+    let _guard = ServerGuard { socket: socket.clone() };
+
+    let (mut pty, proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", conf.path_str()]);
+    let mut grid = Grid::new(COLS, ROWS, 0);
+    let mut raw: Vec<u8> = Vec::new();
+
+    // Initial render: unzoomed ("NOZ") + window-scoped pane-base-index 5
+    // ("P5") on window 0's sole pane -- proves the conditional/comparison
+    // engine AND the setw write both took effect from the config alone.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("NOZ-P5"))
+        }),
+        "expected status-right 'NOZ-P5' (conditional + setw pane-base-index) never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Zoom the sole pane (prefix z): the SAME format now reads "ZOOMED"
+    // instead of "NOZ" -- the conditional re-evaluates against LIVE
+    // window_flags, not a one-shot render-time snapshot.
+    pty.write_input(b"\x02z").expect("send prefix-z (resize-pane -Z)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("ZOOMED-P5"))
+        }),
+        "status-right did not flip to 'ZOOMED-P5' after prefix-z; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    // Unzoom again for the rest of the test.
+    pty.write_input(b"\x02z").expect("send prefix-z (un-zoom)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("NOZ-P5"))
+        }),
+        "status-right did not flip back to 'NOZ-P5' after un-zoom; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // A CONFIG-loaded `setw` (no acting client/window at load time) falls
+    // back to the GLOBAL table (documented follow-up #26 behavior: headless
+    // calls with no acting session/window preserve pre-Task-6 global-only
+    // semantics) -- so `P5` above is currently a GLOBAL default, not yet a
+    // per-window override. To prove genuine window scoping, run `setw`
+    // again at RUNTIME, through the `:` command prompt, which DOES have a
+    // real acting client bound to window 0 -- this time it must land as a
+    // LOCAL override on window 0 only.
+    pty.write_input(b"\x02:").expect("send prefix-: (open command prompt)");
+    let status_row = (ROWS - 1) as usize;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid)[status_row].trim_end() == ":"
+        }),
+        "command-prompt ':' editor line never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    pty.write_input(b"setw pane-base-index 9\r").expect("send runtime setw pane-base-index 9");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("NOZ-P9"))
+        }),
+        "window 0's status-right did not pick up the runtime 'setw pane-base-index 9' local \
+         override (still expected to show 'NOZ-P9'); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // New window (prefix c): its OWN pane starts at the GLOBAL value (5,
+    // from the config -- see above), NOT window 0's fresh LOCAL override
+    // (9) -- proves the runtime `setw` really was window-scoped to window
+    // 0 alone, not a global write in disguise.
+    pty.write_input(b"\x02c").expect("send prefix-c (new-window)");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("NOZ-P5"))
+        }),
+        "new window's status-right never showed 'NOZ-P5' (global pane-base-index, NOT window 0's \
+         local override of 9); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("PS "))
+        }),
+        "PowerShell prompt never appeared in the new window; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Config-bound mouse action: SGR wheel-up over this LIVE pane runs the
+    // config's `display-message "WU-OK"` INSTEAD OF the default
+    // wheel-up-enters-copy-mode action.
+    let wheel = "\x1b[<64;40;10M";
+    pty.write_input(wheel.as_bytes()).expect("send SGR wheel-up");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("WU-OK"))
+        }),
+        "config-bound WheelUpPane -> display-message 'WU-OK' never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    assert!(
+        !has_scroll_indicator(&grid),
+        "copy-mode indicator appeared even though WheelUpPane was rebound away from the default \
+         copy-mode-entry action; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // set-clipboard: a real copy-mode copy of a known line emits OSC 52 on
+    // the raw byte stream (same payload `tests/server_proto.rs`'s
+    // `osc52_emitted_to_client_on_copy` proves at the headless/runtime-`set`
+    // level; this proves the SAME option, set from a CONFIG FILE, reaches a
+    // real attached ConPTY client).
+    pty.write_input(b"echo hello123\r").expect("send echo hello123");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.trim_end() == "hello123")
+        }),
+        "echoed 'hello123' line never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    pty.write_input(b"\x02[").expect("send prefix-[ (enter copy mode)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            has_scroll_indicator(&grid)
+        }),
+        "copy-mode indicator never appeared after prefix-[; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    pump_raw(&mut grid, &rx, &mut raw);
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        pty.write_input(&vec![0x10u8; (entry_row - target_row) as usize]).expect("send C-p x n (cursor-up)");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            wait_until(deadline, || {
+                pump_raw(&mut grid, &rx, &mut raw);
+                grid.cursor().1 == target_row
+            }),
+            "cursor never reached the 'hello123' row; screen:\n{}",
+            screen_text(&grid).join("\n")
+        );
+    }
+    pty.write_input(&[0x01]).expect("send C-a (start-of-line)");
+    pty.write_input(&[0x00]).expect("send C-Space (begin-selection)");
+    pty.write_input(&[0x05]).expect("send C-e (end-of-line)");
+    pty.write_input(&[0x17]).expect("send C-w (copy-selection-and-cancel)");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            raw.windows(b"\x1b]52;c;aGVsbG8xMjM=\x07".len()).any(|w| w == b"\x1b]52;c;aGVsbG8xMjM=\x07")
+        }),
+        "OSC 52 clipboard sequence for 'hello123' never appeared in the raw output stream; \
+         raw tail: {:?}",
+        String::from_utf8_lossy(&raw[raw.len().saturating_sub(400)..])
+    );
+
+    // Best-effort cleanup.
+    let _ = pty.write_input(b"\x02d");
+    let _ = wait_until(Instant::now() + Duration::from_secs(10), || {
+        pump_raw(&mut grid, &rx, &mut raw);
+        process_exited(proc_raw)
+    });
+}

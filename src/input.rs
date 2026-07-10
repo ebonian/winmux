@@ -79,11 +79,15 @@ pub enum KeyInputEvent {
 /// Keys that report directly as `Forward` in `Normal` state with no repeat
 /// window active, instead of `Key { table: Root, .. }` — a throughput
 /// simplification: plain runs of printable input become one coalesced
-/// `Forward` event instead of one `Key` event per keystroke. **Documented
-/// deviation** (see the `## input-v2` contract section): `bind -n` on a bare
-/// unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key is accepted by
-/// `cmd`/`bindings` but never fires in SP3 — only keys carrying a modifier,
-/// or a named/special key outside this set, can be bound in the root table.
+/// `Forward` event instead of one `Key` event per keystroke. **This is a
+/// coalescing-shape decision only, not the last word on bindability** (see
+/// the `## input-v2` contract section): as of SP7's follow-up #30 fix,
+/// `server.rs`'s `Forward`-blob consumption re-decodes and looks up every
+/// key in this blob against the LIVE root table before forwarding it, so a
+/// `bind -n` on a bare unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key
+/// DOES fire (it dispatches and is swallowed instead of forwarded) — this
+/// function no longer implies "never bindable," only "batched with its
+/// neighbors instead of decoded as its own `Key` event here."
 fn is_plain_forwardable(k: &keys::Key) -> bool {
     if k.ctrl || k.meta || k.shift {
         return false;
