@@ -121,12 +121,17 @@ impl Grid {
     pub fn title_from_esc_k(&self) -> bool;
     /// Task 5 (mouse) addition: `true` while the pane is showing the
     /// alternate screen (`CSI ?1049h` seen more recently than a matching
-    /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide
-    /// whether a wheel event scrolls winmux's own copy-mode/scrollback
-    /// (primary screen) or is translated into 3 synthesized arrow-key
-    /// presses sent to the pane (alt screen — tmux's own alt-screen wheel
-    /// translation, since alt-screen apps like `less`/vim have their own
-    /// paging, not winmux's). See the `## mouse` section below.
+    /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide how
+    /// to handle a wheel event: on the primary screen, wheel-up enters/
+    /// scrolls winmux's own copy-mode/scrollback. **Superseded by SP7 Task
+    /// 9** (see the "Task 9 amendment" section below, closes follow-ups
+    /// #35/#72) — the alt-screen branch no longer translates a wheel event
+    /// into 3 synthesized arrow-key presses; that was a since-removed SP6
+    /// hack. Current behavior: an alt-screen wheel event is forwarded to
+    /// the pane app as a real mouse escape sequence if that app has
+    /// requested mouse reporting (`mouse_proto() != Off`), else silently
+    /// swallowed (no arrow-key synthesis, matching `docs/tmux-reference/
+    /// mouse.md` §9: tmux never converts wheel to arrow keys).
     pub fn alt_screen(&self) -> bool;
 
     /// **NEW (SP7, Task 3 — closes follow-up #52; prerequisite for Task 9's

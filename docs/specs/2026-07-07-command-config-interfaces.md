@@ -2185,8 +2185,8 @@ impl Options {
     pub fn pane_border_indicators_for(&self, window: &Overlay) -> crate::render::BorderIndicators;
     pub fn mode_keys_vi_for(&self, window: &Overlay) -> bool;
     pub fn mode_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
-    pub fn main_pane_width_for(&self, window: &Overlay) -> u16;
-    pub fn main_pane_height_for(&self, window: &Overlay) -> u16;
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16;
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16;
     pub fn automatic_rename_for(&self, window: &Overlay) -> bool;
     pub fn allow_rename_for(&self, window: &Overlay) -> bool;
     pub fn clock_mode_colour_for(&self, window: &Overlay) -> crate::grid::Color;
@@ -2194,6 +2194,13 @@ impl Options {
     pub fn monitor_activity_for(&self, window: &Overlay) -> bool;
 }
 ```
+
+Note: `main_pane_width_for`/`main_pane_height_for`'s `total: u16` parameter was
+added after this Task 6 section was first written, by SP7 Task 12 (closes
+#43/#46/#54, percentage-aware `main-pane-width`/`-height` sizing) — see
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `options` amendment for
+the authoritative signature and rationale. This section is kept in sync with
+that amendment (final-gate regression review MUST-FIX #3).
 
 ### Scope classification (per Appendix B of the reference doc)
 

@@ -189,9 +189,14 @@ merge blockers).
     main loop's hot Forward/Key-forwarding path now enqueues onto this
     channel instead of calling `pty.write_input` inline — a stalled pane's
     writer thread can block, but never the main loop, never another session.
-    `src/server/dispatch.rs`'s lower-volume write sites (send-keys,
-    paste-buffer, mouse-drag forwarding) are unchanged, still direct
-    `pty.write_input` calls — only the two hottest call sites moved. Contract
+    **Update (SP7 final-fix wave, 2026-07-11):** the remaining lower-volume
+    write sites — `exec_send_keys`, `exec_send_prefix`, `exec_paste_buffer`
+    (`src/server/dispatch.rs`) — and the new SP7-Task-9 mouse-passthrough
+    primitive `forward_mouse_to_pane` (which had shipped with an inline
+    `pty.write_input` call, reopening this exact bug class) are now ALL
+    routed through the same per-pane `input_tx` channel; there are no
+    remaining direct `pty.write_input` call sites left in the dispatch layer.
+    Originally (Task 4) only the two hottest call sites moved. Contract
     amendments: `2026-07-06-mvp-interfaces.md`'s `## pty` section
     (`Pty::try_clone_writer`/`PtyWriter`) and
     `2026-07-07-server-client-interfaces.md`'s `## server` section
@@ -1987,3 +1992,128 @@ or correctness niceties, not known-active bugs.
     winmux pane on Windows specifically); MEDIUM significance as
     documentation (closes the loop on a recurring "why can't we test this"
     question across several SP4-SP7 tasks).
+
+## New tickets from the SP7 final-gate review round (2026-07-11)
+
+85. **Incoming OSC 52 (application -> winmux clipboard/paste-buffer) is not
+    implemented.** `Grid::osc_dispatch` (`src/grid.rs`) only handles OSC 0/2
+    (window/icon title); every other OSC sequence, including 52
+    (clipboard), is a silent no-op. Real tmux implements OSC 52 in BOTH
+    directions (`docs/tmux-reference/copy-mode-and-buffers.md` §9.7 is
+    explicitly titled "OSC 52 in both directions"): `input_osc_52`
+    (`input.c:3268`) intercepts an OSC 52 an in-pane application emits
+    (e.g. neovim/vim with `clipboard=unnamedplus`), but only when
+    `set-clipboard` is exactly `on` (not `external`) -- the base64 payload
+    is decoded, forwarded to attached client ttys, AND added as a new
+    automatic paste buffer (`paste_add`). winmux only ever implemented the
+    OUTGOING half (winmux -> attached client, on every copy-mode copy
+    action, SP7 Task 13/follow-up #55) -- confirmed against that task's own
+    brief/report, both scoped outgoing-only with no mention of the
+    incoming half. Narrow but real impact: a user running e.g. neovim
+    inside a winmux pane with `set-clipboard on` and clipboard integration
+    configured to emit OSC 52 gets no paste buffer and no clipboard
+    forwarding, silently. Not fixed in the SP7 final-fix wave (out of
+    scope for that wave's mandate); recommend implementing the incoming
+    half (parse OSC 52 in `Grid::osc_dispatch`, gate on `set-clipboard ==
+    "on"`, decode base64, forward to attached clients' tty output, add an
+    automatic paste buffer) as a future task, or explicitly re-scoping it
+    out permanently.
+
+86. **`copy-pipe`/`copy-selection`-family commands don't support tmux's
+    `-C`/`-P`/`[prefix]` grammar.** `docs/tmux-reference/copy-mode-and-
+    buffers.md` (line 353-358's table) gives every `copy-*`/`copy-pipe*`
+    command the grammar `[-CP] [command] [prefix]` (or `[-CP] [prefix]`
+    for the non-pipe forms): `-C` suppresses writing the system clipboard
+    (OSC 52), `-P` suppresses creating a paste buffer, and a trailing
+    `[prefix]` positional names the created buffer (`<prefix><n>`, default
+    prefix `buffer`). winmux's grammar (`src/cmd.rs`) has none of these:
+    `copy-pipe`/`copy-pipe-and-cancel` parse exactly one optional
+    positional (the shell command) and error on more than one arg; every
+    other `copy-*` command takes zero arguments at all. Low impact (no
+    default winmux binding uses these flags, and a user hitting this gets
+    a clean usage error, not silent misbehavior -- `-C somecmd` parses as
+    two positional args and is rejected outright, so `-C` is never
+    mistaken for a shell command). Recommend implementing `-C`/`-P`/
+    `[prefix]` parsing if a future task revisits copy-mode command
+    grammar, otherwise this stays accepted v1 scope debt.
+
+87. **`find-window` from a script/CLI context with no attached client now
+    errors instead of jumping directly (SP7 Task 12 narrowing, not
+    previously ticketed).** At `fd12b26` (pre-SP7), `winmux -L sock
+    find-window foo` with no attached client (e.g. an automation script)
+    headlessly jumped straight to the matching window
+    (`FindWindow { pattern } => self.exec_find_window(pattern, None)`).
+    SP7 Task 12 replaced this with always opening choose-tree (matching
+    real tmux, which always opens choose-tree for `find-window`, even for
+    a single match -- `windows-and-sessions.md:256-275`, and correctly
+    still ticketed/closed as follow-up #46 for the INTERACTIVE `f`
+    prefix-key path). But the no-client dispatch arm
+    (`src/server/dispatch.rs`, the `FindWindow { .. }` arm under
+    `execute_headless`) was changed to a hard `Err("no current client")`
+    rather than a headless equivalent of the tree-jump, since choose-tree
+    is inherently a client-attached overlay. This is a real, one-directional
+    functional narrowing for non-interactive callers: a script that
+    previously got a working (if implicit) window switch now gets a clean
+    error. Not unsafe (the `Err` short-circuits before any overlay state is
+    touched) and arguably correct tmux parity (real tmux has no headless
+    direct-jump form of `find-window` either, since `find-window` IS
+    `choose-tree`-backed in real tmux too) -- filed so the narrowing is
+    recorded rather than silently discovered by a future automation user.
+    No fix planned; document-only.
+
+88. **`list-buffers` CLI text ordering (oldest-first) is inconsistent with
+    `choose-buffer`'s newest-first ordering over the identical buffer
+    store (pre-existing SP4 debt, now visibly inconsistent since SP7).**
+    `src/buffers.rs::Buffers::list()`'s own doc comment says "oldest first
+    ... (`list-buffers` order)", consumed verbatim by
+    `list_buffers_text`/`exec_list_buffers_client`
+    (`src/server/dispatch.rs`) with no re-sort. Real tmux's `list-buffers
+    [-F format] [-f filter] [-O order] [-r]` defaults to newest-first
+    (`docs/tmux-reference/copy-mode-and-buffers.md` §9.5: "sorted (default:
+    creation/time order, newest first)"), with no `-O` order flag
+    implemented on winmux's CLI `list-buffers` at all. `git log
+    fd12b26..f42cd1a -- src/buffers.rs` shows zero commits, so this is
+    pre-existing SP4 debt outside SP7's diff -- but SP7's own Task 14
+    (`choose-buffer`, follow-up #48) implements the SAME underlying data
+    correctly newest-first for the overlay UI, so the two sibling surfaces
+    over the identical buffer store now visibly disagree with each other,
+    where before there was no second surface to compare against. Recommend
+    flipping `list-buffers`' CLI text to newest-first (and/or adding `-O`)
+    in a future pass; not fixed in the SP7 final-fix wave (pre-existing
+    debt, out of that wave's mandate).
+
+89. **Contention-driven test flakiness is a broader class than the
+    previously-documented "known flaky trio," confirmed by the SP7
+    final-gate review round.** CLAUDE.md's testing section previously
+    named three specific flaky tests
+    (`server_proto::stalled_pane_stdin_does_not_block_other_sessions`,
+    `pipe_smoke::two_sequential_clients`,
+    `choose_tree_double_click_commits_switch`) with the general guidance
+    to retry via `cargo test --test server_proto -- --test-threads=4`.
+    The final-gate tests-quality review ran the full `server_proto` suite
+    at default (full) parallelism three times on one machine and observed
+    FIVE distinct tests flake across those runs -- the three documented
+    ones, PLUS `choose_tree_wheel_is_noop_matching_tmux` and
+    `second_attach_no_config_message` (run 1), and separately
+    `choose_tree_click_swallowed_during_pending_kill_confirm` (run 3) --
+    each confirmed to pass reliably in isolation or at `--test-threads=4`.
+    This is independently corroborated by `task-18-report.md`'s own
+    observation of a FOURTH, differently-timed flake (`source_file_
+    runtime`) during ITS verification runs. Root cause in every case is
+    the same: real ConPTY/named-pipe process contention under full
+    default-parallelism `cargo test` scheduling on a loaded machine, not a
+    logic bug in any individual test (every one of the 5+ tests named here
+    has been independently re-verified to pass reliably when run in
+    isolation or under a capped thread count). `stalled_pane_stdin_does_
+    not_block_other_sessions`'s timing margin was widened in the SP7
+    final-fix wave (was the single test with near-zero margin, `< 3s`
+    against an observed 3.045s failure; now `< 6s`, still far below the
+    ~3.8-4s pre-fix/RED baseline it's actually testing against) --
+    `CLAUDE.md`'s testing section's existing flaky-trio note should be
+    broadened to name this as a general contention-flakiness CLASS
+    (any test polling for transient rendered output or comparing narrow
+    wall-clock margins is a candidate under heavy parallel load), not just
+    the original three named tests, so a future contributor seeing a
+    flake outside that specific trio doesn't misread it as a new
+    regression. `CLAUDE.md`'s testing-conventions section has been updated
+    accordingly in the same commit as this ticket.
