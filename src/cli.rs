@@ -205,8 +205,18 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// (#23 fix) Bare `winmux` (no argv at all): defaults across the board,
+    /// including `cols: 0, rows: 0` -- NOT a literal 0x0 terminal request,
+    /// but the "no `-x`/`-y` given" SENTINEL `main.rs` resolves to a real
+    /// size later (console probe or a headless default). Renamed from
+    /// `bare_is_new_session` so that sentinel meaning is obvious from the
+    /// name alone; see `new_session_explicit_zero_size_matches_omitted_sentinel`
+    /// below for the same sentinel reached via an EXPLICIT `-x 0 -y 0`
+    /// instead of omission. Asserts the FULL `Invocation` (#23), not just
+    /// `.cmd`, so a regression in `socket`/`config` extraction would also
+    /// fail this test.
     #[test]
-    fn bare_is_new_session() {
+    fn bare_invocation_is_new_session_with_zero_size_sentinel() {
         let inv = parse(&args(&[])).unwrap();
         assert_eq!(
             inv,
@@ -222,50 +232,103 @@ mod tests {
     fn new_flags() {
         let inv = parse(&args(&["new", "-d", "-s", "x", "-x", "100", "-y", "30"])).unwrap();
         assert_eq!(
-            inv.cmd,
-            Command::NewSession {
-                name: Some("x".to_string()),
-                detached: true,
-                cols: 100,
-                rows: 30,
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::NewSession {
+                    name: Some("x".to_string()),
+                    detached: true,
+                    cols: 100,
+                    rows: 30,
+                },
             }
         );
+    }
+
+    /// (#23) There was previously no test that passed `-x 0`/`-y 0`
+    /// LITERALLY on the command line (every existing zero-cols/rows test
+    /// only ever reached that value by OMITTING `-x`/`-y`) -- this proves
+    /// the parser doesn't special-case an explicit zero differently from the
+    /// default, so both spellings hit the identical downstream "use default
+    /// size" sentinel in `main.rs`.
+    #[test]
+    fn new_session_explicit_zero_size_matches_omitted_sentinel() {
+        let explicit = parse(&args(&["new", "-x", "0", "-y", "0"])).unwrap();
+        let omitted = parse(&args(&["new"])).unwrap();
+        assert_eq!(
+            explicit,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::NewSession { name: None, detached: false, cols: 0, rows: 0 },
+            }
+        );
+        assert_eq!(explicit, omitted, "explicit -x 0 -y 0 must be indistinguishable from omitting both");
     }
 
     #[test]
     fn ls_alias() {
         let inv = parse(&args(&["ls"])).unwrap();
-        assert_eq!(inv.cmd, Command::Control(vec!["ls".to_string()]));
+        assert_eq!(
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::Control(vec!["ls".to_string()]),
+            }
+        );
     }
 
     #[test]
     fn attach_t() {
         let inv = parse(&args(&["attach", "-t", "foo"])).unwrap();
         assert_eq!(
-            inv.cmd,
-            Command::Attach { target: Some("foo".to_string()), detach_others: false }
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::Attach { target: Some("foo".to_string()), detach_others: false },
+            }
         );
     }
 
     #[test]
     fn attach_dashd() {
         let inv = parse(&args(&["attach", "-d"])).unwrap();
-        assert_eq!(inv.cmd, Command::Attach { target: None, detach_others: true });
+        assert_eq!(
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::Attach { target: None, detach_others: true },
+            }
+        );
     }
 
     #[test]
     fn dash_l_socket() {
         let inv = parse(&args(&["-L", "mysock", "ls"])).unwrap();
-        assert_eq!(inv.socket, "mysock");
-        assert_eq!(inv.cmd, Command::Control(vec!["ls".to_string()]));
+        assert_eq!(
+            inv,
+            Invocation {
+                socket: "mysock".to_string(),
+                config: None,
+                cmd: Command::Control(vec!["ls".to_string()]),
+            }
+        );
     }
 
     #[test]
     fn server_role_parse() {
         let inv = parse(&args(&["__server", "--pipe", r"\\.\pipe\winmux-test"])).unwrap();
         assert_eq!(
-            inv.cmd,
-            Command::ServerRole { pipe: r"\\.\pipe\winmux-test".to_string(), config: vec![] }
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::ServerRole { pipe: r"\\.\pipe\winmux-test".to_string(), config: vec![] },
+            }
         );
     }
 
@@ -273,21 +336,32 @@ mod tests {
     fn server_role_config_args() {
         let inv = parse(&args(&["__server", "--pipe", "p", "--config", "a", "--config", "b"])).unwrap();
         assert_eq!(
-            inv.cmd,
-            Command::ServerRole {
-                pipe: "p".to_string(),
-                config: vec!["a".to_string(), "b".to_string()],
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::ServerRole {
+                    pipe: "p".to_string(),
+                    config: vec!["a".to_string(), "b".to_string()],
+                },
             }
         );
     }
 
+    /// `cols: 0, rows: 0` here is the same "no `-x`/`-y` given" sentinel as
+    /// `bare_invocation_is_new_session_with_zero_size_sentinel` (#23),
+    /// incidental to this test's actual point (`-f` extraction), included
+    /// only because the full `Invocation` is now asserted.
     #[test]
     fn dash_f_parses() {
         let inv = parse(&args(&["-f", "x.conf", "new", "-s", "w"])).unwrap();
-        assert_eq!(inv.config, Some("x.conf".to_string()));
         assert_eq!(
-            inv.cmd,
-            Command::NewSession { name: Some("w".to_string()), detached: false, cols: 0, rows: 0 }
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: Some("x.conf".to_string()),
+                cmd: Command::NewSession { name: Some("w".to_string()), detached: false, cols: 0, rows: 0 },
+            }
         );
     }
 
@@ -296,35 +370,74 @@ mod tests {
         // -f is extracted from anywhere in argv, same as -L, not just before
         // the subcommand token.
         let inv = parse(&args(&["ls", "-f", "x.conf"])).unwrap();
-        assert_eq!(inv.config, Some("x.conf".to_string()));
-        assert_eq!(inv.cmd, Command::Control(vec!["ls".to_string()]));
+        assert_eq!(
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: Some("x.conf".to_string()),
+                cmd: Command::Control(vec!["ls".to_string()]),
+            }
+        );
     }
 
     #[test]
     fn dash_f_repeated_last_wins() {
         let inv = parse(&args(&["-f", "a.conf", "-f", "b.conf", "new"])).unwrap();
-        assert_eq!(inv.config, Some("b.conf".to_string()));
+        assert_eq!(
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: Some("b.conf".to_string()),
+                cmd: Command::NewSession { name: None, detached: false, cols: 0, rows: 0 },
+            }
+        );
     }
 
+    /// (#23) Previously only checked `!err.is_empty()`; pins the EXACT text
+    /// instead, so a future accidental edit to `USAGE` is caught here too --
+    /// an unrecognized top-level flag falls through to the same full usage
+    /// string `-h`/`--help` prints on success (`usage_text()`), just
+    /// returned as `Err` instead of an `Ok(Help)`.
     #[test]
     fn unknown_flag_err() {
         let err = parse(&args(&["-z"])).unwrap_err();
-        assert!(!err.is_empty());
+        assert_eq!(
+            err,
+            "usage: winmux [-L socket-name] [-f config-file] [command [args]]\n\
+Supported commands:\n\
+  new-session|new [-d] [-s name] [-x cols] [-y rows]\n\
+  attach-session|attach|a [-d] [-t target]\n\
+  detach-client [-s name]\n\
+  list-sessions|ls\n\
+  list-windows|lsw [-t name]\n\
+  has-session|has [-t name]\n\
+  kill-session [-t name]\n\
+  kill-server\n\
+  rename-session [-t target] new-name\n\
+  rename-window [-t target] new-name\n\
+Global: -L socket-name, -f config-file (server startup only; -f - disables config)\n\
+Bare `winmux` (no command) is `new-session`.\n"
+        );
     }
 
     #[test]
     fn kill_session_passthrough() {
         let inv = parse(&args(&["kill-session", "-t", "foo"])).unwrap();
         assert_eq!(
-            inv.cmd,
-            Command::Control(vec!["kill-session".to_string(), "-t".to_string(), "foo".to_string()])
+            inv,
+            Invocation {
+                socket: "default".to_string(),
+                config: None,
+                cmd: Command::Control(vec!["kill-session".to_string(), "-t".to_string(), "foo".to_string()]),
+            }
         );
     }
 
     #[test]
     fn help_parses() {
-        assert_eq!(parse(&args(&["--help"])).unwrap().cmd, Command::Help);
-        assert_eq!(parse(&args(&["-h"])).unwrap().cmd, Command::Help);
-        assert_eq!(parse(&args(&["help"])).unwrap().cmd, Command::Help);
+        let expect = Invocation { socket: "default".to_string(), config: None, cmd: Command::Help };
+        assert_eq!(parse(&args(&["--help"])).unwrap(), expect);
+        assert_eq!(parse(&args(&["-h"])).unwrap(), expect);
+        assert_eq!(parse(&args(&["help"])).unwrap(), expect);
     }
 }

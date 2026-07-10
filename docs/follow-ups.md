@@ -120,14 +120,31 @@ reviews. None affect the sub-project 2 merge.
     older server, or a corrupted length) decodes successfully today instead
     of erroring. Low risk while client/server ship from the same binary, but
     would matter for any future wire compatibility story.
-11. **Kill-last-pane-of-window-via-`x` cascade in a multi-window session is
-    untested.** `server_proto.rs` covers `kill_only_pane_confirm_destroys_session`
+11. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10). Added
+    `tests/server_proto.rs::kill_last_pane_of_non_last_window_destroys_window_and_refocuses`:
+    a 3-window session, killing the middle (non-last) window's only pane via
+    `Ctrl-b x` confirm, proving the window is destroyed, focus lands on a
+    remaining window (per `Session::kill_window`'s `last`-fallback rule, not
+    just "some window"), and an unrelated third window's content survives
+    untouched.
+    *Original text:* Kill-last-pane-of-window-via-`x` cascade in a
+    multi-window session is
+    untested. `server_proto.rs` covers `kill_only_pane_confirm_destroys_session`
     (single-window session) and window-kill via `&` (`kill_window_confirm_text`),
     but there is no test that kills the last pane of a *non-last* window (via
     `Ctrl-b x` confirm) in a session that has other windows, to confirm the
     window is destroyed and focus/selection lands correctly on a remaining
     window without disturbing the rest of the session.
-12. **`drain_after_exit`'s 10×50 ms poll heuristic** (`tests/common/mod.rs`)
+12. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10).
+    `tests/common/mod.rs::drain_after_exit` is now a bounded
+    condition-predicate loop over the SAME total 500ms budget (still polling
+    in 50ms steps, since ConPTY's trailing bytes can trickle in over the
+    whole window), exiting early once two consecutive polls observe no new
+    bytes instead of always burning the full budget. All e2e suites
+    (`e2e`, `e2e_sessions`, `e2e_config`, `e2e_copy_mouse`) that use this
+    helper re-verified green.
+    *Original text:* `drain_after_exit`'s 10×50 ms poll heuristic
+    (`tests/common/mod.rs`)
     is a fixed-iteration sleep loop rather than a condition-based wait. It
     has been reliable in practice but is inherently a timing guess; a
     genuinely slow CI box could still flake it. Consider a bounded
@@ -273,13 +290,36 @@ merge blockers).
     `finish_attach`
     does a redundant `Renderer::new` immediately followed by a `resize`
     that makes the `new` call's initial size irrelevant.
-22. Untested paths: `rename_session` propagation to OTHER attached clients
+22. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10). All four
+    untested paths now covered in `tests/server_proto.rs`:
+    `rename_session_propagates_to_other_attached_clients` (two clients on
+    one session; A renames, B's status line updates without B doing
+    anything), `switch_client_prev_is_noop_with_single_session` (`prefix-(`
+    with one session is a true no-op, client keeps working normally after),
+    `list_windows_no_target_defaults_to_most_recent_session` (two sessions,
+    no `-t` shows the more recently created one's windows, not the older
+    one's), and `kill_last_pane_of_non_last_window_destroys_window_and_refocuses`
+    (shared with #11's resolution, same test).
+    *Original text:* Untested paths: `rename_session` propagation to OTHER
+    attached clients
     (not just the renaming one); `SwitchClientPrev` as a no-op when only one
     session exists; `list-windows`' default-target-most-recent-session
     behavior with no `-t`; the kill-last-pane-via-`Ctrl-b x` cascade in a
     multi-window session (see also follow-up #11, which is the same gap
     phrased for the `&`/window-kill path).
-23. CLI unit tests assert against the parsed `cmd` field only, not the full
+23. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10). `src/cli.rs`'s
+    test module now asserts the full `Invocation` (socket + config + cmd, not
+    just `.cmd`) in every test that constructs one; `unknown_flag_err` pins
+    the exact `USAGE` text instead of just checking non-emptiness; a new
+    `new_session_explicit_zero_size_matches_omitted_sentinel` test drives a
+    LITERAL `-x 0 -y 0` (previously only ever reached via omission) and
+    proves it's identical to omitting both flags; the bare-invocation
+    sentinel test is renamed
+    `bare_invocation_is_new_session_with_zero_size_sentinel` so the `cols: 0,
+    rows: 0` meaning ("no `-x`/`-y` given", not a literal 0x0 terminal) is
+    obvious from the test name alone.
+    *Original text:* CLI unit tests assert against the parsed `cmd` field
+    only, not the full
     `Invocation`; `unknown_flag_err` only asserts the error string is
     non-empty rather than pinning its exact text; `-x 0`/`-y 0` is treated
     as a "use default size" sentinel rather than a literal zero size, which
@@ -849,8 +889,29 @@ None block the sub-project 4 merge.
 
 ## Test-flakiness follow-up (Task 10 closeout verification, 2026-07-08)
 
-58. **Concurrent-output copy-mode/selection tests in `tests/server_proto.rs`
-    have flaked under full-parallelism `cargo test`.** During Task 10's own
+58. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10). Took the
+    ticket's first candidate fix (widen timing margins, not thread-capping).
+    Root cause: both tests' `recv_output_until` predicate is satisfied by
+    the FIRST `Output` frame where the anchored line has moved/highlighted
+    — but the triggering background `send-keys` (echo+execute+reprompt) can
+    arrive as several separate frames, so that first-true frame isn't
+    reliably the FINAL settled state the tests' subsequent assertions
+    assume, especially under full-parallelism scheduling delay. Fix: a new
+    `recv_output_settled` test helper (`tests/server_proto.rs`) that, after
+    the predicate first holds, keeps draining any further `Output` frames
+    that arrive within a 300ms settle window and re-asserts the SAME
+    predicate still holds on the settled grid — widens the margin against
+    the race without weakening either test's actual assertions (same
+    predicate, just not trusted at the first instant it flips true). Applied
+    to both tests' concurrent-output predicates. Verified: both tests passed
+    6/6 full-default-parallelism `cargo test --test server_proto` runs
+    post-fix (one run in that set had an unrelated `source_file_runtime`
+    timeout, a pre-existing flake outside this ticket's scope, consistent
+    with the project's already-documented general `server_proto` flakiness
+    class).
+    *Original text:* Concurrent-output copy-mode/selection tests in
+    `tests/server_proto.rs`
+    have flaked under full-parallelism `cargo test`. During Task 10's own
     pre-merge verification, `selection_survives_concurrent_output` was
     reported to have flaked twice previously (passing standalone and at
     `--test-threads=4`), and in this task's own repeated `cargo test` runs
@@ -884,7 +945,14 @@ None block the sub-project 4 merge.
     move target, which has no sensible default) rather than a defect.
     Ticketed so the deliberateness is durable and revisitable if the
     inconsistency ever surprises a user.
-60. **`swap-pane -t` first/last wraparound has no dedicated test**
+60. **RESOLVED** (SP7 Task 18, test-debt batch, 2026-07-10). Added
+    `tests/server_proto.rs::swap_pane_wraps_at_ends`: a fresh 3-pane window
+    (`swap-pane -U -t 0`, position 0 wraps to the last pane, position 2) and
+    a second fresh window (`swap-pane -D -t 1.2`, position 2 wraps to
+    position 0), each verified via content markers landing in the expected
+    positions with the untouched middle pane confirmed undisturbed.
+    *Original text:* `swap-pane -t` first/last wraparound has no dedicated
+    test
     (Task 6, layout presets). The wrap arithmetic
     (`src/server/dispatch.rs`, `(pos+n-1)%n` / `(pos+1)%n`) is standard and
     the same pattern is already pretested via `rotate`, but no test

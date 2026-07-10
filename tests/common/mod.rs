@@ -128,9 +128,32 @@ pub fn process_exited(raw: isize) -> bool {
 /// process's own final message is present in `raw` but is no longer
 /// necessarily the last thing in it -- assert with `.contains(...)`, not
 /// `.ends_with(...)`, on any text expected right before process exit.
+///
+/// (#12) Was a fixed 10x50ms sleep loop (always the full 500ms, win or
+/// lose). Now a bounded condition-predicate loop over the SAME total 500ms
+/// budget: it still polls in 50ms steps (`pump_raw` needs repeated chances
+/// for ConPTY's own trailing bytes to trickle in, per the caution above --
+/// a naive "stop as soon as the channel looks empty" check would race that
+/// trickle and exit too early), but now exits as soon as it OBSERVES the
+/// condition "no new bytes arrived for two consecutive polls" (100ms of
+/// quiet) instead of always burning the whole budget regardless. A
+/// genuinely slow CI box still gets the full 500ms if bytes keep trickling
+/// in throughout; a fast/idle box returns in ~100-150ms instead of always
+/// 500ms.
 pub fn drain_after_exit(grid: &mut Grid, rx: &Receiver<Vec<u8>>, raw: &mut Vec<u8>) {
-    for _ in 0..10 {
+    let deadline = Instant::now() + Duration::from_millis(500); // same total bound as the old 10x50ms loop
+    let mut quiet_polls = 0u32;
+    while Instant::now() < deadline {
+        let before = raw.len();
         pump_raw(grid, rx, raw);
+        if raw.len() == before {
+            quiet_polls += 1;
+            if quiet_polls >= 2 {
+                break;
+            }
+        } else {
+            quiet_polls = 0;
+        }
         thread::sleep(Duration::from_millis(50));
     }
 }
