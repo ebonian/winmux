@@ -54,6 +54,26 @@
 //! `#I:#W#{?window_flags,#{window_flags}, }`, whose conditional the engine
 //! evaluates directly, so the width-stable one-space-when-flagless behavior
 //! falls out of the format string itself (closes follow-ups #27/#70).
+//!
+//! **SP7 Task 7 (status-line residuals):** three more gaps closed. (1)
+//! **Window-list overflow scrolling** (closes #69a): when `left` + the
+//! window list + `right` together exceed the terminal width, `status_spans`
+//! now scrolls the list to keep the CURRENT window visible and draws `<`/`>`
+//! markers wherever content still exists off-screen, per
+//! `docs/tmux-reference/status-line-and-messages.md` §1.4 — see the private
+//! `group_runs` helper and the overflow branch inside `status_spans` for the
+//! exact cell-granularity algorithm (a documented simplification from
+//! tmux's own eight-screen `format_draw` model, not a byte-for-byte port).
+//! (2) **Per-window active-pane context** (closes #71): [`WindowEntry`]
+//! gained `pane_index`/`pane_title`, and each tab's `per_window_ctx` now
+//! reads THOSE fields instead of the shared `ctx`'s (which only ever held
+//! the acting client's focused pane in the CURRENT window) — `#P`/`#T`
+//! inside a `window-status(-current)-format` now shows the RIGHT window's
+//! own active pane. (3) **Visible-width `status-left` cap** (closes #69b):
+//! [`truncate_visible`] counts only characters outside a `#[...]` marker
+//! toward `status-left-length`'s budget and never bisects one, bringing
+//! `status-left` in line with `status-right`'s existing
+//! strip-then-cap treatment.
 
 use crate::grid::Style;
 use crate::options::{expand_format, FormatCtx};
@@ -83,6 +103,17 @@ pub struct WindowEntry {
     /// Same idea as `format_override`, for `window-status-style`/
     /// `-current-style`.
     pub style_override: Option<PartialStyle>,
+    /// SP7 Task 7 (closes follow-up #71): THIS window's own active pane's
+    /// `#P`/`pane_index` value (already `pane-base-index`-shifted by the
+    /// caller, same rule `render_one` already applies for the shared `ctx`).
+    /// Every pre-Task-7 caller/test gets `0` here, which is the correct
+    /// value for a lone default pane and keeps every earlier test's expected
+    /// spans unchanged (none of them expand `#P` in a window format).
+    pub pane_index: u32,
+    /// THIS window's own active pane's `#T`/`pane_title` value. Empty string
+    /// for every pre-Task-7 caller/test (same "no earlier test exercises
+    /// `#T`" reasoning as `pane_index`).
+    pub pane_title: String,
 }
 
 /// Flags string for one window: `*` if current, else `-` if last, else empty,
@@ -160,6 +191,47 @@ pub fn strip_style_markers(text: &str) -> String {
     styled_runs(text, Style::default()).into_iter().map(|(t, _)| t).collect()
 }
 
+/// Truncate `text` (already `expand_format`-expanded, so it may still carry
+/// literal `#[...]` inline style markers) to `max` VISIBLE characters --
+/// closes follow-up #69b. Counts only characters OUTSIDE a `#[...]` marker
+/// toward the budget (a marker draws zero columns) and never bisects one: a
+/// marker is emitted whole if the budget isn't exhausted yet when it's
+/// reached, otherwise it (and everything after it) is dropped whole. Used
+/// for `status-left`, which -- unlike `status-right` (`strip_style_markers`
+/// then a plain char-count cap, since `render::StatusRow::right` has only
+/// one style slot to begin with) -- keeps its markers all the way through so
+/// `status_spans`'s `styled_runs` can still split it into differently-styled
+/// runs. Text with no markers at all behaves exactly like a plain
+/// `s.chars().take(max)` cap.
+pub fn truncate_visible(text: &str, max: u16) -> String {
+    let max = max as usize;
+    let mut out = String::new();
+    let mut visible = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' && chars.peek() == Some(&'[') {
+            let mut marker = String::from("#[");
+            chars.next(); // consume '['
+            for c2 in chars.by_ref() {
+                marker.push(c2);
+                if c2 == ']' {
+                    break;
+                }
+            }
+            if visible < max {
+                out.push_str(&marker);
+            }
+            continue;
+        }
+        if visible >= max {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out
+}
+
 /// The window-list group's starting column per `status-justify`'s
 /// positioning rules (`docs/tmux-reference/status-line-and-messages.md`
 /// §1.4; winmux has no `status-format`-configurable centre/after content, so
@@ -228,7 +300,11 @@ pub fn status_spans(
 
     let mut tab_spans: Vec<Vec<(String, Style)>> = Vec::with_capacity(windows.len());
     let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
-    for w in windows {
+    let mut current_idx: Option<usize> = None;
+    for (i, w) in windows.iter().enumerate() {
+        if w.current {
+            current_idx = Some(i);
+        }
         let flags_str = flags(w);
         let fmt = w
             .format_override
@@ -244,15 +320,21 @@ pub fn status_spans(
         // stable across focus changes with no special-casing here (closes
         // follow-ups #27/#70; superseded the SP6 Task 4 padding shim that
         // used to live in this loop).
+        // SP7 Task 7 (closes follow-up #71): `#P`/`#T` inside a per-window
+        // format must show THAT window's own active pane, not the acting
+        // client's focused pane in the CURRENT window (`ctx.pane_index`/
+        // `ctx.pane_title`) -- those two fields are only correct for the
+        // one window that happens to be current, and were wrongly reused
+        // for every OTHER window's tab before this fix.
         let per_window_ctx = FormatCtx {
             session: ctx.session,
             window_index: w.index,
             window_name: &w.name,
             window_flags: &flags_str,
-            pane_index: ctx.pane_index,
+            pane_index: w.pane_index,
             hostname: ctx.hostname,
             now: ctx.now,
-            pane_title: ctx.pane_title,
+            pane_title: &w.pane_title,
         };
         let text = expand_format(fmt, &per_window_ctx);
         let tab_base = match &w.style_override {
@@ -269,22 +351,126 @@ pub fn status_spans(
     let list_width: usize =
         tab_widths.iter().sum::<usize>() + sep_width.saturating_mul(windows.len().saturating_sub(1));
 
-    let offset = list_offset(justify, width as usize, left_width, right_len, list_width);
-    let pad = offset.saturating_sub(left_width);
+    // `list_avail` is the total budget the window-list BLOCK (tabs plus, if
+    // it overflows, its `<`/`>` markers) may occupy: everything between
+    // `left` and `right` (`docs/tmux-reference/status-line-and-messages.md`
+    // §1.4's "what gets cut first" summary -- the list is trimmed before
+    // `left`, after `right`). When the raw list fits, this is unused by the
+    // no-overflow branch below (which keeps the pre-Task-7 `list_offset`
+    // justify math byte-for-byte); it only matters once overflow is
+    // detected.
+    let list_avail = (width as usize).saturating_sub(left_width).saturating_sub(right_len);
 
     let mut spans = Vec::with_capacity(left_spans.len() + tab_spans.len() * 2);
     spans.append(&mut left_spans);
-    if pad > 0 {
-        spans.push((" ".repeat(pad), base));
-    }
-    let last_idx = windows.len().saturating_sub(1);
-    for (i, ts) in tab_spans.into_iter().enumerate() {
-        spans.extend(ts);
-        if i != last_idx {
-            spans.push((separator.to_string(), base));
+
+    if windows.is_empty() || list_width <= list_avail {
+        // Fits (or nothing to show): unchanged pre-Task-7 behavior -- the
+        // justify math decides a start column, realized as literal padding
+        // spaces, no markers.
+        let offset = list_offset(justify, width as usize, left_width, right_len, list_width);
+        let pad = offset.saturating_sub(left_width);
+        if pad > 0 {
+            spans.push((" ".repeat(pad), base));
+        }
+        let last_idx = windows.len().saturating_sub(1);
+        for (i, ts) in tab_spans.into_iter().enumerate() {
+            spans.extend(ts);
+            if i != last_idx {
+                spans.push((separator.to_string(), base));
+            }
+        }
+    } else {
+        // Overflow (SP7 Task 7, closes follow-up #69a): §1.4's
+        // `format_draw_put_list` scrolls the window list at CELL
+        // granularity to keep the CURRENT window's centre visible, drawing
+        // `<`/`>` markers wherever content still exists beyond that edge.
+        // Flatten the full (unclipped) tab+separator sequence into one
+        // per-char `(char, Style)` run so the scroll window can land
+        // mid-tab exactly like real tmux's (a documented simplification
+        // from tmux's own eight-screen model is that winmux scrolls the
+        // WHOLE left/list/right block as a single fixed budget rather than
+        // tmux's justify-specific trim order -- see the status-line report
+        // for the ruling). No padding is ever inserted in this branch: an
+        // overflowing list, by definition, consumes its entire allotted
+        // budget with nothing left over for any justify's gap.
+        let mut flat: Vec<(char, Style)> = Vec::with_capacity(list_width);
+        let mut focus_start = 0usize;
+        let mut focus_end = 0usize;
+        let last_idx = tab_spans.len().saturating_sub(1);
+        for (i, ts) in tab_spans.into_iter().enumerate() {
+            let start_col = flat.len();
+            for (text, style) in &ts {
+                flat.extend(text.chars().map(|c| (c, *style)));
+            }
+            let end_col = flat.len();
+            if current_idx == Some(i) {
+                focus_start = start_col;
+                focus_end = end_col;
+            }
+            if i != last_idx {
+                flat.extend(separator.chars().map(|c| (c, base)));
+            }
+        }
+        let focus_centre = focus_start + (focus_end.saturating_sub(focus_start)) / 2;
+
+        // Fixed-point search for which end marker(s) are actually needed:
+        // reserving a marker's column shrinks the visible content window,
+        // which can flip whether the OTHER end is still off-screen (and
+        // vice versa). Converges quickly in practice; capped at 4 passes as
+        // a documented simplification (four states -- both/left-only/
+        // right-only/neither -- so a fixed point is reached well within
+        // that bound for every case exercised by this task's tests).
+        let mut marker_left = true;
+        let mut marker_right = true;
+        let mut start = 0usize;
+        let mut content_w = 0usize;
+        for _ in 0..4 {
+            let reserved = marker_left as usize + marker_right as usize;
+            content_w = list_avail.saturating_sub(reserved);
+            start = if content_w == 0 {
+                focus_centre.min(list_width)
+            } else {
+                let half = content_w / 2;
+                let raw_start = focus_centre.saturating_sub(half);
+                let max_start = list_width.saturating_sub(content_w);
+                raw_start.min(max_start)
+            };
+            let end = (start + content_w).min(list_width);
+            let new_left = start > 0;
+            let new_right = end < list_width;
+            if new_left == marker_left && new_right == marker_right {
+                break;
+            }
+            marker_left = new_left;
+            marker_right = new_right;
+        }
+        let end = (start + content_w).min(list_width);
+
+        if marker_left {
+            spans.push(("<".to_string(), base));
+        }
+        spans.extend(group_runs(&flat[start..end]));
+        if marker_right {
+            spans.push((">".to_string(), base));
         }
     }
     spans
+}
+
+/// Merge consecutive same-`Style` characters from a per-char slice back into
+/// `(String, Style)` spans -- the inverse of flattening, used by the
+/// window-list overflow branch above after it slices `flat` to the visible
+/// column range.
+fn group_runs(chars: &[(char, Style)]) -> Vec<(String, Style)> {
+    let mut out: Vec<(String, Style)> = Vec::new();
+    for (c, style) in chars {
+        match out.last_mut() {
+            Some((text, last_style)) if last_style == style => text.push(*c),
+            _ => out.push((c.to_string(), *style)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -295,7 +481,17 @@ mod tests {
     use crate::style::parse_style;
 
     fn win(index: u32, name: &str, current: bool, last: bool, zoomed: bool) -> WindowEntry {
-        WindowEntry { index, name: name.to_string(), current, last, zoomed, format_override: None, style_override: None }
+        WindowEntry {
+            index,
+            name: name.to_string(),
+            current,
+            last,
+            zoomed,
+            format_override: None,
+            style_override: None,
+            pane_index: 0,
+            pane_title: String::new(),
+        }
     }
 
     /// tmux default `status-style` resolved: `bg=green,fg=black`.
@@ -629,6 +825,59 @@ mod tests {
         );
     }
 
+    /// Verify-and-mark evidence for follow-up #31 ("inline `#[...]`
+    /// per-segment style overrides are not parsed" in `status-left`/
+    /// `-right`): `status-left`'s OWN text (not just a window format) is
+    /// run through `styled_runs` exactly like every window tab, so a
+    /// literal `#[...]` marker embedded in the ALREADY-EXPANDED `left`
+    /// argument splits it into multiple differently-styled spans, additively
+    /// layered on top of `status-left-style`-over-`base`. `status-right`
+    /// deliberately does NOT do this (`render::StatusRow::right` has only
+    /// one style slot, so `server::render_one` strips its markers via
+    /// `strip_style_markers` before assignment -- a documented, intentional
+    /// single-style-slot constraint, not an unimplemented gap).
+    #[test]
+    fn status_left_inline_style_marker_splits_spans() {
+        // No windows: isolates `left`'s own span-splitting from the window
+        // list entirely (`list_width` = 0, always the "fits" branch, no
+        // padding since `left_width` == the "left" justify offset).
+        let windows: Vec<WindowEntry> = vec![];
+        let base_style = base();
+        // status-left-style = fg=cyan, layered under BOTH inline markers
+        // below (never overridden -- neither marker mentions `fg=cyan`
+        // specifically, but the second marker's `bg=blue` accumulates
+        // ADDITIVELY on top of the first marker's `fg=red`, per
+        // `styled_runs`' doc comment: "a later `#[bg=black]` after an
+        // earlier `#[fg=white]` keeps both").
+        let left_style = parse_style("fg=cyan").unwrap();
+        let spans = status_spans(
+            "#[fg=red]ERR#[bg=blue]ok",
+            &left_style,
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &PartialStyle::default(),
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                // "ERR": fg=red (overriding left_style's fg=cyan) over base
+                // (bg stays base's green -- bg was never mentioned).
+                ("ERR".to_string(), Style { fg: Color::Idx(1), ..base_style }),
+                // "ok": fg=red STILL applies (additive marker state) plus
+                // bg=blue now layered on top.
+                ("ok".to_string(), Style { fg: Color::Idx(1), bg: Color::Idx(4), ..base_style }),
+            ]
+        );
+    }
+
     /// `status-left-style` layers over `status-style` for the left span,
     /// exactly like `window-status(-current)-style` layers over base for
     /// tabs — the two sides never leak into each other (the left's cyan fg
@@ -852,5 +1101,167 @@ mod tests {
                 ("[1:plain]".to_string(), Style { underline: true, ..base_style }),
             ]
         );
+    }
+
+    // ---- window-list overflow scrolling + markers (SP7 Task 7, closes follow-up #69a) ----
+
+    /// List fits (`overflow_markers_absent_when_list_fits`): 3 windows,
+    /// bare `#I` format (each tab 1 char wide), separator " ", left="",
+    /// right_len=0, width=10. list_width = 1+1+1+1+1 = 5 (three tabs + two
+    /// separators) <= list_avail (10-0-0=10) -> the pre-Task-7 fit branch,
+    /// no `<`/`>` anywhere.
+    #[test]
+    fn overflow_markers_absent_when_list_fits() {
+        let windows = vec![
+            win(0, "a", false, false, false),
+            win(1, "b", true, false, false),
+            win(2, "c", false, false, false),
+        ];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            10,
+            0,
+        );
+        let joined: String = spans.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(!joined.contains('<') && !joined.contains('>'), "no overflow markers when the list fits: {joined:?}");
+        assert_eq!(joined, "0 1 2");
+    }
+
+    /// `window_list_scrolls_to_keep_current_visible_with_markers`: 5
+    /// windows, bare `#I` format (index 0-4, one char each), separator " ",
+    /// left="", right_len=0, width=5 (narrow). current = window at array
+    /// position 4 (the LAST window).
+    ///
+    /// Unclipped list (concatenated, one char per column):
+    ///   col: 0123456789
+    ///   text: 0 1 2 3 4
+    /// (9 columns total: 5 tabs + 4 separators.) `list_avail` =
+    /// width(5) - left_width(0) - right_len(0) = 5, and 9 > 5 -> overflow.
+    ///
+    /// Window 4's tab is the single char "4" at column 8 -> focus_start=8,
+    /// focus_end=9, focus_centre = 8 + (9-8)/2 = 8.
+    ///
+    /// Fixed-point marker search (list_avail=5):
+    ///   pass 1 (assume both markers): reserved=2, content_w=3, half=1,
+    ///     raw_start=8-1=7, max_start=9-3=6, start=min(7,6)=6,
+    ///     end=min(9,9)=9 -> new_left=(6>0)=true, new_right=(9<9)=false.
+    ///     Differs from the (true,true) assumption -> iterate again.
+    ///   pass 2 (left only): reserved=1, content_w=4, half=2,
+    ///     raw_start=8-2=6, max_start=9-4=5, start=min(6,5)=5,
+    ///     end=min(9,9)=9 -> new_left=(5>0)=true, new_right=(9<9)=false.
+    ///     Matches (true,false) -> converged: start=5, content_w=4, end=9.
+    ///
+    /// Visible slice = columns [5,9) = " 3 4" (position5=' ' separator,
+    /// 6='3' from the non-current window-3 tab, 7=' ' separator, 8='4' from
+    /// the CURRENT window-4 tab). Adjacent same-style chars merge: the
+    /// separator/'3'/separator run is all plain `base` (win_style is the
+    /// default empty PartialStyle, so non-current == base) -> one span
+    /// " 3 "; '4' is styled with `win_current_style` (underscore) -> its
+    /// own span. `marker_left` is true (`<` prepended); `marker_right` is
+    /// false (nothing appended).
+    #[test]
+    fn window_list_scrolls_to_keep_current_visible_with_markers() {
+        let windows = vec![
+            win(0, "a", false, false, false),
+            win(1, "b", false, false, false),
+            win(2, "c", false, false, false),
+            win(3, "d", false, false, false),
+            win(4, "e", true, false, false),
+        ];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            5,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                ("<".to_string(), base_style),
+                (" 3 ".to_string(), base_style),
+                ("4".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    // ---- per-window active-pane context (SP7 Task 7, closes follow-up #71) ----
+
+    /// Two windows with DISTINCT active-pane titles; format `#T` (pane_title
+    /// alias) must show each tab's OWN window's pane_title, not the shared
+    /// `ctx.pane_title` (which neither window's entry even sets here --
+    /// `ctx0()` leaves it empty -- proving the value really comes from
+    /// `WindowEntry::pane_title`, not the caller's ctx).
+    #[test]
+    fn per_tab_ctx_uses_that_windows_active_pane_title() {
+        let mut w0 = win(0, "a", false, false, false);
+        w0.pane_title = "alpha".to_string();
+        let mut w1 = win(1, "b", true, false, false);
+        w1.pane_title = "beta".to_string();
+        let windows = vec![w0, w1];
+        let (ws, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#T",
+            "#T",
+            base_style,
+            &ws,
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                ("alpha".to_string(), base_style),
+                (" ".to_string(), base_style),
+                ("beta".to_string(), Style { underline: true, ..base_style }),
+            ]
+        );
+    }
+
+    // ---- status-left visible-width length cap (SP7 Task 7, closes follow-up #69b) ----
+
+    /// `#[fg=red]` (9 raw chars) draws zero visible columns; a cap of 3 must
+    /// count only the literal text that follows, and must never split the
+    /// marker itself.
+    #[test]
+    fn status_left_length_cap_ignores_style_marker_bytes() {
+        assert_eq!(truncate_visible("#[fg=red]abcdef", 3), "#[fg=red]abc");
+        // No markers at all: behaves exactly like a plain char-count cap.
+        assert_eq!(truncate_visible("abcdef", 3), "abc");
+        // The whole text fits under the cap already: returned unchanged,
+        // marker included.
+        assert_eq!(truncate_visible("#[fg=red]ab", 5), "#[fg=red]ab");
     }
 }

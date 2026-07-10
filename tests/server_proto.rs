@@ -5573,6 +5573,60 @@ fn mouse_ignored_under_display_panes_overlay() {
     server.join().expect("server exits after last session dies");
 }
 
+/// SP7 Task 7 (closes follow-up #29): `status-interval` must drive a
+/// periodic status re-render on its own configured cadence, independent of
+/// the server's coarse minute-granularity clock change-detector -- a
+/// `status-right` with sub-minute-sensitive content (here, a bare `%S`
+/// wrapped in a unique marker so the exact two digits are easy to locate on
+/// the bottom row) must visibly update well before a full minute elapses.
+/// `status-interval` is shrunk to 1 second (still far above the server's
+/// 50ms `Tick` granularity) so the test doesn't need to wait anywhere near a
+/// real minute boundary; a `%S` value that happens not to change across a
+/// short real-time sleep would be a false negative for the OLD (pre-fix)
+/// behavior too, so this is the same class of small residual timing
+/// sensitivity as the project's other real-clock tests (see
+/// `docs/follow-ups.md` #58's flakiness note) rather than a new risk.
+#[test]
+fn status_interval_refreshes_seconds_format() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-interval".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "SECTAG%SEND".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Wait for the new format to actually render at least once, then read
+    // off its current two-digit seconds value.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("SECTAG")));
+    let read_seconds = |g: &Grid| -> String {
+        screen_text(g)
+            .iter()
+            .find_map(|l| l.find("SECTAG").map(|i| l[i + 6..i + 8].to_string()))
+            .expect("SECTAG marker present")
+    };
+    let first = read_seconds(&grid);
+
+    // Real wall-clock sleep, comfortably longer than one status-interval
+    // tick (1s) but short enough that a minute boundary is very unlikely to
+    // be crossed coincidentally.
+    thread::sleep(Duration::from_millis(1300));
+
+    // Drain whatever Output frames arrived during the sleep (status-interval
+    // ticks, if wired up) until the seconds value visibly differs from the
+    // first read -- pre-fix, nothing re-renders `status-right` on this
+    // cadence at all (only a minute-boundary flip of the coarse `HH:MM`
+    // clock would), so this times out RED against the old behavior.
+    c.recv_output_until(&mut grid, |g| read_seconds(g) != first);
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// Task 9 (sub-project 4): escape-time disambiguation. A lone ESC byte with
 /// nothing following it can never resolve through `KeyDecoder`'s normal
 /// path within one `feed()` call -- only the `Tick`-driven escape-time

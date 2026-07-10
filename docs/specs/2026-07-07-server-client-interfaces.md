@@ -459,7 +459,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4, SP7 Task 7)
 
 ```rust
 // status.rs
@@ -480,6 +480,16 @@ pub struct WindowEntry {
     // `_for` getters already fold in the global fallback).
     pub format_override: Option<String>,
     pub style_override: Option<crate::style::PartialStyle>,
+    // AMENDED (SP7 Task 7, closes follow-up #71): THIS window's own active
+    // pane's `#P`/`pane_index` value, already `pane-base-index`-shifted by
+    // the caller (same rule `render_one` applies for the shared `ctx`
+    // argument to `status_spans` below). Every pre-Task-7 caller/test gets
+    // `0` here (the correct value for a lone default pane), so every
+    // earlier test's expected spans are unchanged.
+    pub pane_index: u32,
+    // THIS window's own active pane's `#T`/`pane_title` value. Empty string
+    // for every pre-Task-7 caller/test.
+    pub pane_title: String,
 }
 
 // SP6 Task 4 signature (status-justify, per-side styles, per-window
@@ -507,6 +517,18 @@ pub fn status_spans(
 /// multiple inline-styled sub-runs the way `status_spans`'s returned `Vec`
 /// has for `left`/the window list).
 pub fn strip_style_markers(text: &str) -> String;
+
+/// NEW (SP7 Task 7, closes follow-up #69b). Truncate `text` (already
+/// `expand_format`-expanded, so it may still carry literal `#[...]` markers)
+/// to `max` VISIBLE characters: markers themselves count as zero width and
+/// are never bisected (emitted whole if the visible budget isn't exhausted
+/// yet when reached, otherwise dropped whole along with everything after).
+/// Used for `status-left` (which — unlike `status-right` — keeps its
+/// markers all the way through so `status_spans`'s `styled_runs` can still
+/// split it into differently-styled runs); `status-right` keeps its
+/// existing `strip_style_markers`-then-plain-char-count-cap treatment
+/// unchanged (no markers survive to bisect by the time it's capped).
+pub fn truncate_visible(text: &str, max: u16) -> String;
 ```
 
 **AMENDMENT (SP3 Task 8, historical):** the original Task 5 signature was
@@ -525,10 +547,15 @@ still pure (no I/O), `expand_format` is pure too.
 - **Per-window format expansion:** for each window, `window_current_format`
   (if `current`) else `window_format` is expanded via `options::
   expand_format` against a `FormatCtx` built from `ctx`'s
-  session/pane_index/hostname/now/pane_title fields, with `window_index`/
-  `window_name`/`window_flags` overridden to that window's own values
-  (`window_flags` uses the SAME flags-string rule as before — see below,
-  now fed through `#F` rather than hardcoded string concatenation).
+  session/hostname/now fields, with `window_index`/`window_name`/
+  `window_flags` overridden to that window's own values (`window_flags`
+  uses the SAME flags-string rule as before — see below, now fed through
+  `#F` rather than hardcoded string concatenation) and, as of **SP7 Task 7**
+  (closes follow-up #71), `pane_index`/`pane_title` ALSO overridden to that
+  window's own `WindowEntry::pane_index`/`pane_title` rather than `ctx`'s
+  (which only ever carried the acting client's focused pane in the CURRENT
+  window — reused for every other window's tab before this fix, so `#P`/`#T`
+  in a per-window format used to misrender for every non-focused window).
 - **Inline `#[...]` style markers:** `expand_format` (SP6 Task 4 addition,
   see the command-config contract amendment) passes `#[...]` blocks through
   VERBATIM rather than interpreting them. `status.rs`'s private
@@ -540,21 +567,40 @@ still pure (no I/O), `expand_format` is pure too.
   yields exactly one span, byte-identical to the pre-Task-4 output. A
   malformed marker (no closing `]`, or content `parse_style` rejects) is a
   no-op/literal-text fallback, never a panic.
-- **`status-justify` positioning:** the window-list group's start column is
-  computed by a private `list_offset` helper per
-  `docs/tmux-reference/status-line-and-messages.md` §1.4's closed-form
-  offsets (winmux has no user-configurable centre/after content, so the
-  general 8-screen trim-order engine collapses to `left`/`centre`/`right`/
-  `absolute-centre` formulas keyed off `left`'s width, `right_len`, and the
-  list's own total width). The gap between `left` and the list start is
-  realized as a literal run of `base`-styled padding spaces inserted into
+- **`status-justify` positioning (fits case):** when the window list fits
+  its allotted budget (`list_width <= width - left_width - right_len`), the
+  window-list group's start column is computed by a private `list_offset`
+  helper per `docs/tmux-reference/status-line-and-messages.md` §1.4's
+  closed-form offsets (winmux has no user-configurable centre/after content,
+  so the general 8-screen trim-order engine collapses to `left`/`centre`/
+  `right`/`absolute-centre` formulas keyed off `left`'s width, `right_len`,
+  and the list's own total width). The gap between `left` and the list start
+  is realized as a literal run of `base`-styled padding spaces inserted into
   the returned `Vec` — `render::compose_back` is UNCHANGED, it still just
   draws spans sequentially from column 0 (see `## render-styles`); this is
-  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task. An
-  offset that would require NEGATIVE padding (overflow: `left` + list +
-  `right` wider than the terminal) clamps to zero pad rather than
-  overlapping — a documented simplification vs. tmux's `<`/`>` scroll
-  markers (out of scope).
+  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task.
+- **Window-list overflow scrolling (SP7 Task 7, closes follow-up #69a):**
+  when the list does NOT fit (`list_width > list_avail`, where `list_avail =
+  width - left_width - right_len`), `status_spans` no longer clamps to
+  zero pad and overlaps/overruns. Instead it flattens the full unclipped
+  tab+separator sequence to one `(char, Style)` per column, locates the
+  CURRENT window's column range (`focus_start`/`focus_end`) within it,
+  computes `focus_centre = focus_start + (focus_end - focus_start) / 2`, and
+  scrolls a `content_w`-wide window (`content_w = list_avail` minus 1 column
+  per marker actually needed) centered on `focus_centre`, clamped so it
+  never runs past either end of the full list. Whether the left/right marker
+  is needed is resolved by a capped (4-pass) fixed-point search — reserving
+  a marker shrinks `content_w`, which can flip whether the OTHER end is
+  still off-screen. `<` is prepended when content is scrolled off the left
+  (`start > 0`); `>` is appended when content remains beyond the right
+  (`start + content_w < list_width`); both markers are drawn in the row's
+  plain `base` style. This is a documented simplification of tmux's own
+  eight-screen `format_draw` model (winmux scrolls the whole
+  left/list/right block as one fixed budget rather than reproducing every
+  justify mode's own trim order for the overflow case specifically) — see
+  the SP7 Task 7 report for the exact ruling. No padding is ever inserted in
+  this branch: an overflowing list, by definition, consumes its entire
+  allotted budget.
 - **`window-status-separator`** replaces the old hardcoded `" "` between
   tabs (still omitted after the last one).
 - **`status-right`'s style** is resolved by the SERVER directly
@@ -563,6 +609,16 @@ still pure (no I/O), `expand_format` is pure too.
   any `#[...]` markers `expand_format` leaves in the expanded `status-right`
   text are removed via `strip_style_markers` before length-capping and
   assignment, rather than leaking literal `#[...]` bytes onto the screen.
+- **`status-left`'s length cap (SP7 Task 7, closes follow-up #69b):**
+  `server::render_one` caps `status-left` with the NEW `status::
+  truncate_visible` instead of a plain char-count `truncate_chars` — it
+  counts only characters outside a `#[...]` marker toward
+  `status-left-length`'s budget and never bisects a marker (whole-marker
+  in-or-out, never partial), so `status-left` (which keeps its markers,
+  unlike `status-right`) can't have its visible-width budget miscounted by
+  bytes that draw zero columns. `status-right` is unaffected — it strips
+  markers BEFORE capping, so there's nothing left to bisect by the time its
+  existing `truncate_chars` cap runs.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
 between "else a literal space" and "else empty" phrasings that circulated
@@ -601,7 +657,18 @@ span vectors (mirrors `render.rs`'s exact-VT-bytes test style), including
 expands_per_tab`/`window_status_current_format_used_for_current` (per-window
 expansion + format selection), `side_styles_layer_over_status_style`,
 `window_status_separator_respected`, and `inline_style_marker_in_window_
-format` (SP6 Task 4).
+format` (SP6 Task 4). **SP7 Task 7** adds
+`window_list_scrolls_to_keep_current_visible_with_markers`/
+`overflow_markers_absent_when_list_fits` (window-list overflow, closes
+#69a), `per_tab_ctx_uses_that_windows_active_pane_title` (per-window pane
+context, closes #71), `status_left_length_cap_ignores_style_marker_bytes`
+(`truncate_visible`, closes #69b), and
+`status_left_inline_style_marker_splits_spans` (verify-and-mark evidence for
+follow-up #31 — `status-left`'s own text, not just a window tab's, really
+does split into multiple styled spans on an inline `#[...]` marker).
+`tests/server_proto.rs::status_interval_refreshes_seconds_format` is the
+end-to-end proof for `status-interval`-driven refresh (closes #29, in
+`## server` below).
 
 ## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 
@@ -634,6 +701,26 @@ various free helper functions) is private to the module.
   rendering once (follow-up #4's coalescing). Every attached client is
   re-rendered on any dirty turn (see "Design choices" below) — not a
   per-session dirty set.
+- **`status-interval`-driven status refresh (SP7 Task 7, closes follow-up
+  #29):** `Server` gained a `last_status_render: Instant` field (init
+  `Instant::now()`). On every `Tick`, in addition to the pre-existing
+  minute-granularity `clock`-changed check, `handle_event` now ALSO checks
+  `options.status_interval() > Duration::ZERO && deadline.duration_since
+  (last_status_render) >= options.status_interval()`; if true, it sets
+  `last_status_render = deadline` and `dirty = true`. This is a periodic
+  refresh independent of whether the status TEXT actually changed —
+  matching real tmux's own per-client status timer
+  (`docs/tmux-reference/status-line-and-messages.md` §8), so a custom
+  `status-right` with sub-minute-sensitive content (`%S`, a fast-changing
+  pane title, etc.) now re-renders on the configured cadence rather than
+  only when the coarse `HH:MM` clock string happens to flip. One
+  server-global timer, not per-session/per-client (`status-interval` has no
+  `_for` scope-resolving getter yet, consistent with several other
+  session-scoped options that stayed global-only through SP7 Task 6 — see
+  follow-up #75/#76's framing). `status_interval() == 0` means "never
+  re-arm" (tmux's documented "0 = no periodic refresh"), so it never sets
+  `dirty` on its own in that case. Test:
+  `tests/server_proto.rs::status_interval_refreshes_seconds_format`.
 - **Startup config loading (Task 7, SP3 config loading):** after binding the
   pipe and spawning the accept thread, but BEFORE entering the event loop
   (so no attach is ever served against an unconfigured `Options`/`Bindings`),

@@ -51,7 +51,7 @@ use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
 use crate::render::{CopyView, ListOverlay, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell};
-use crate::status::{status_spans, strip_style_markers, WindowEntry};
+use crate::status::{status_spans, strip_style_markers, truncate_visible, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -853,16 +853,35 @@ struct Server {
     /// cleanup exactly).
     pane_activity: HashMap<PaneId, u64>,
     next_active_point: u64,
+    /// `status-interval`-driven periodic status refresh (SP7 Task 7, closes
+    /// follow-up #29): the last `Tick` at which the interval was deemed to
+    /// have elapsed, checked against `options.status_interval()` on every
+    /// `Tick` (`now - last_status_render >= status_interval`). This is
+    /// SEPARATE from `clock`'s minute-granularity change-detector above --
+    /// that one only forces a redraw when the default `%H:%M`-shaped
+    /// `status-right` would visibly change; `status-interval` forces one on
+    /// its own configured cadence regardless of what `status-right`
+    /// contains, matching real tmux's per-client status timer
+    /// (`docs/tmux-reference/status-line-and-messages.md` §8, "Timer").
+    /// One server-global timer rather than per-session/per-client (a
+    /// documented narrowing, consistent with `status-interval` otherwise
+    /// having no `_for` scope-resolving getter yet -- see the task report).
+    /// `status_interval() == 0` means "never re-arm" (tmux's own "0 = no
+    /// periodic refresh" rule), so a zero interval never sets `dirty`.
+    last_status_render: Instant,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
 /// from `app.rs` (which dies in Task 8) rather than shared. Since SP3 Task 8
 /// the status bar's right side is rendered via `expand_format` instead, but
-/// this string is still the `Tick` handler's change detector: a re-render is
-/// triggered whenever it changes (minute granularity — matching the default
-/// `status-right`; a custom `%S`-bearing format only refreshes when the
-/// minute flips, documented SP4 refinement alongside the stored-but-unused
-/// `status-interval`).
+/// this string is still ONE of the `Tick` handler's change detectors: a
+/// re-render is triggered whenever it changes (minute granularity — matching
+/// the default `status-right`). SP7 Task 7 (closes follow-up #29) adds the
+/// SECOND, independent detector: `Server::last_status_render` vs.
+/// `options.status_interval()`, so a custom `%S`-bearing (or otherwise
+/// sub-minute-sensitive) `status-right` now also refreshes on the configured
+/// `status-interval` cadence, not only when this minute-granularity string
+/// happens to change.
 fn local_clock() -> String {
     // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
     let st = unsafe { GetLocalTime() };
@@ -1246,6 +1265,7 @@ impl Server {
             buffers: Buffers::new(),
             pane_activity: HashMap::new(),
             next_active_point: 1,
+            last_status_render: Instant::now(),
         }
     }
 
@@ -1383,6 +1403,19 @@ impl Server {
                     false
                 };
                 let deadline = Instant::now();
+                // status-interval (closes follow-up #29): a periodic
+                // refresh independent of whether `clock`'s minute string
+                // actually changed -- a custom `status-right` with
+                // sub-minute-sensitive content (e.g. `%S`, or a pane-title
+                // format that ticks faster than once a minute) needs
+                // `render_all` to re-run and recompute fresh content on
+                // this cadence too, not just when the coarse minute clock
+                // flips.
+                let interval = self.options.status_interval();
+                if interval > Duration::ZERO && deadline.duration_since(self.last_status_render) >= interval {
+                    self.last_status_render = deadline;
+                    dirty = true;
+                }
                 // escape-time (Task 9, sub-project 4): collected during the
                 // borrow-checked `iter_mut` pass below (can't remove a
                 // client from `self.clients` mid-iteration) and processed
@@ -2852,7 +2885,11 @@ fn render_one(
         // `#[...]`-styled sub-runs the way the left/window-list spans have),
         // so any markers are dropped to plain text rather than leaking their
         // literal `#[...]` bytes onto the screen (SP6 Task 4).
-        let left = truncate_chars(
+        // status-left keeps its `#[...]` markers (unlike status-right, which
+        // strips them since `StatusRow::right` has only one style slot) --
+        // the length cap counts only VISIBLE characters and never bisects a
+        // marker (`truncate_visible`, closes follow-up #69b).
+        let left = truncate_visible(
             &expand_format(options.status_left_for(&session.session_options), &fctx),
             options.status_left_length_for(&session.session_options),
         );
@@ -2882,6 +2919,17 @@ fn render_one(
                 } else {
                     options.window_status_style_for(&w.window_options)
                 };
+                // SP7 Task 7 (closes follow-up #71): THIS window's own
+                // active pane, not the acting client's focused pane in the
+                // CURRENT window -- `w.layout` is per-window, so a
+                // background window's `#P`/`#T` must reflect ITS OWN
+                // active pane, exactly mirroring the `fctx` computation
+                // above for the current window (same pane-base-index shift
+                // via `Options::pane_base_index_for`).
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + options.pane_base_index_for(&w.window_options);
+                let w_pane_title = panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
                 WindowEntry {
                     index: w.index,
                     name: w.name.clone(),
@@ -2890,6 +2938,8 @@ fn render_one(
                     zoomed: w.layout.is_zoomed(),
                     format_override: Some(fmt.to_string()),
                     style_override: Some(*style),
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
                 }
             })
             .collect();

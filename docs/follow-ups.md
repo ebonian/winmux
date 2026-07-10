@@ -347,7 +347,23 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     OSC 0), not the foreground process, and `allow-rename`/ESC k remains
     deferred (item still tracked implicitly via the design spec's
     "Documented deferrals" list, not separately itemized here).
-29. **`status-interval` is stored but unused for a general refresh timer.**
+29. **RESOLVED** (SP7 Task 7, 2026-07-10). `Server` gained a
+    `last_status_render: Instant` field; the `Tick` handler now ALSO checks
+    `options.status_interval() > Duration::ZERO && now.duration_since
+    (last_status_render) >= status_interval`, independent of the
+    pre-existing minute-granularity `clock`-changed check, and sets `dirty`
+    on its own cadence (0 = never re-arm, matching tmux). Now that SP7
+    Task 1's general format engine (closes #27) makes sub-minute-sensitive
+    `status-right` content (`%S`, fast-changing pane titles via
+    `#{=N:pane_title}`, etc.) actually expressible, this refresh timer makes
+    it actually refresh on schedule too. Test:
+    `tests/server_proto.rs::status_interval_refreshes_seconds_format` (RED
+    confirmed against the pre-fix Tick handler — timed out waiting for the
+    seconds digits to change within ~1.5s real time — GREEN after). Contract
+    amended: `docs/specs/2026-07-07-server-client-interfaces.md`'s
+    `## server` section.
+    *Original text:* `status-interval` is stored but unused for a general
+    refresh timer.
     The status-right clock still only re-renders on a minute-granularity
     change-detector (`server.rs`'s `local_clock`/Tick handling, inherited
     from SP2), not on the configured interval — a custom `status-right`
@@ -394,8 +410,29 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     contract updated: `docs/specs/2026-07-07-command-config-interfaces.md`'s
     `## input-v2` "Root-table throughput simplification" bullet, which
     previously documented this as an open deviation.
-31. **`status-right`'s inline `#[...]` per-segment style overrides are not
-    parsed.** Real tmux lets `status-right`/`status-left` embed
+31. **VERIFIED-RESOLVED** (SP7 Task 7, 2026-07-10, verify-and-mark). SP6
+    Task 4 shipped the general `#[...]` inline-style-marker parsing
+    machinery (`status::styled_runs`) that this ticket's title describes as
+    missing; confirmed with a NEW test,
+    `status::tests::status_left_inline_style_marker_splits_spans`
+    (`src/status.rs`), proving `status-left`'s own text (not just a window
+    tab's) really does split into multiple additively-styled spans on an
+    inline `#[fg=...]`/`#[bg=...]` marker. **Nuance kept honest, not
+    glossed over:** `status-right` specifically does NOT do this — it never
+    did and still doesn't, by design, not by omission. `render::
+    StatusRow::right` has exactly one style slot (no room for multiple
+    styled sub-runs the way `status_spans`'s returned `Vec` has for `left`),
+    so `server::render_one` deliberately strips any `#[...]` markers via
+    `strip_style_markers` before assigning `right`/`right_style` — already
+    documented in this file's `## status` contract section and unchanged by
+    this task. So: the GENERAL capability the ticket's title names ("inline
+    `#[...]` per-segment style overrides are not parsed") is resolved for
+    `status-left`; `status-right`'s single-style-slot limitation is a
+    separate, already-documented architectural constraint, not the
+    open gap this ticket originally described.
+    *Original text:* `status-right`'s inline `#[...]` per-segment style
+    overrides are not
+    parsed. Real tmux lets `status-right`/`status-left` embed
     `#[fg=red,bold]`-style directives mid-string to change color partway
     through the line; SP3 renders the whole right side in one style
     (`options.status_style()`, per `render_one`'s `right_style: base`) — see
@@ -486,8 +523,21 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     need per-pane mouse-mode tracking (has THIS pane's own app requested
     `?1000h`/etc. via its own output stream?) plus a policy for which takes
     priority when both winmux and the inner app want the same click.
-36. **Drag-to-select only starts inside a pane already in THAT client's copy
-    mode** (Task 5, mouse). Real tmux implicitly enters copy mode on a
+36. **RESOLVED** (SP6 parity wave 2, Task 6; VERIFIED SP7 Task 7,
+    2026-07-10, verify-and-mark). A click-drag on a LIVE (non-copy-mode)
+    pane now auto-enters copy mode on the first `Drag` event and starts a
+    selection there too, matching real tmux's implicit `Drag1`-enters-copy-
+    mode behavior this ticket describes as missing. Confirmed still true and
+    end-to-end by the existing
+    `tests/e2e_copy_mouse.rs::mouse_drag_select_copies_release_text` (a real
+    SGR press-drag-release across known text on a live pane, proving the
+    drag auto-enters copy mode, the release copies against the release-time
+    pane, and the exact dragged text pastes back) plus
+    `tests/server_proto.rs::drag_on_live_pane_enters_copy_mode_selecting`
+    (both still green as of this task's full-suite run).
+    *Original text:* Drag-to-select only starts inside a pane already in
+    THAT client's copy
+    mode (Task 5, mouse). Real tmux implicitly enters copy mode on a
     `Drag1` over a LIVE (non-copy-mode) pane; winmux's `mouse_down` only arms
     a selection drag when the click lands inside the pane already bound to
     the client's `ClientMode::Copy` — a plain click-drag on a live pane just
@@ -495,7 +545,23 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     own bulleted overview, which scopes "Drag1 = selection" under "In copy
     mode:" specifically; documented as a deliberate v1 scope decision, not
     an oversight.
-37. **`word-separators` is a hardcoded constant, not a real tmux option**
+37. **RESOLVED** (SP6 parity wave 2, Task 7; VERIFIED SP7 Task 7,
+    2026-07-10, verify-and-mark). `word-separators` is now a real tmux
+    option: `src/options.rs`'s `SPECS` table has a `word-separators` entry
+    (`Kind::Str`, default `!"#$%&'()*+,-./:;<=>?@[\]^\`{|}~`, tmux's real
+    default — not the `" -_@"` shim this ticket originally described), with
+    a session-scoped `Options::word_separators`/`word_separators_for`
+    getter pair. `src/server/dispatch.rs`'s word-boundary logic
+    (`char_class(c, seps: &str)`, `word_separators_for_session`) reads the
+    LIVE option value at every double-click/drag-extend call site instead
+    of a hardcoded constant — confirmed by direct inspection (no
+    `WORD_SEPARATORS` constant remains) rather than a dedicated behavioral
+    test exercising a non-default `set -g word-separators` value end to end
+    (a genuine residual coverage gap, noted honestly: the OPTION and its
+    live wiring are real and confirmed, but no test proves changing it away
+    from the default actually moves a word boundary).
+    *Original text:* `word-separators` is a hardcoded constant, not a real
+    tmux option
     (Task 5, mouse). Double-click word selection (`select_word_at` in
     `src/server/dispatch.rs`) uses tmux's DEFAULT `word-separators` value
     (`" -_@"`) as a private `const WORD_SEPARATORS`, matching the task
@@ -1083,8 +1149,25 @@ None block the sub-project 4 merge.
     silently succeeds; scoped reads per #26's resolution above). Proven end
     to end by `tests/server_proto.rs::show_gqv_user_option_prints_value_only`.
 
-69. **`status-justify` has no overflow/scroll behavior, and `status-left`'s
-    length cap counts `#[...]` marker bytes as visible width** (SP6 Task 4,
+69. **RESOLVED** (SP7 Task 7, 2026-07-10). (a) Window-list overflow
+    scrolling: when `left` + the window list + `right` together exceed the
+    terminal width, `status::status_spans` now scrolls the list around the
+    CURRENT window (cell-granularity, per §1.4) and draws `<`/`>` markers
+    wherever content still exists off-screen, instead of saturating padding
+    to zero and letting the row overlap/overrun. Tests:
+    `window_list_scrolls_to_keep_current_visible_with_markers`,
+    `overflow_markers_absent_when_list_fits`. (b) `status-left`'s length cap
+    now counts only VISIBLE characters (`status::truncate_visible`, wired
+    into `server::render_one` in place of the plain `truncate_chars`):
+    `#[...]` markers count as zero width and are never bisected. Test:
+    `status_left_length_cap_ignores_style_marker_bytes`. Full details
+    (exact scroll/marker algorithm, the fixed-point marker-reservation
+    search, the visible-width cap's marker-whole-or-nothing rule) in
+    `docs/specs/2026-07-07-server-client-interfaces.md`'s `## status`
+    section and the SP7 Task 7 report.
+    *Original text:* `status-justify` has no overflow/scroll behavior, and
+    `status-left`'s
+    length cap counts `#[...]` marker bytes as visible width (SP6 Task 4,
     2026-07-10, `status::list_offset`/`status_spans`). When `left` + the
     window list + `right` together exceed the terminal width under
     `centre`/`right`/`absolute-centre` justify, real tmux scrolls the window
@@ -1126,8 +1209,19 @@ None block the sub-project 4 merge.
     fixture config (its custom formats use only `#I`/`#W`/`#F`/`#[...]`).
     MEDIUM (a format engine). LOW.
 
-71. **Per-window `FormatCtx` reuses the FOCUSED pane's `pane_index`/
-    `pane_title` for every window's tab expansion** (SP6 Task 4 review
+71. **RESOLVED** (SP7 Task 7, 2026-07-10). `status::WindowEntry` gained
+    `pane_index`/`pane_title` fields (THAT window's own active pane,
+    computed by `server::render_one` from `w.layout.focused()` the same way
+    the shared `ctx`'s fields are computed for the current window, including
+    the same `pane-base-index` shift); `status_spans`'s per-window
+    `per_window_ctx` now reads `w.pane_index`/`w.pane_title` instead of the
+    shared `ctx`'s. Test: `per_tab_ctx_uses_that_windows_active_pane_title`
+    (two windows, distinct pane titles, `#T` shows each tab's own). Contract
+    amended: `docs/specs/2026-07-07-server-client-interfaces.md`'s
+    `## status` `WindowEntry`/per-window-format-expansion sections.
+    *Original text:* Per-window `FormatCtx` reuses the FOCUSED pane's
+    `pane_index`/
+    `pane_title` for every window's tab expansion (SP6 Task 4 review
     Minor, 2026-07-10, `status::status_spans`). Each tab's
     `window-status(-current)-format` expansion overrides
     `window_index`/`window_name`/`window_flags` per window but carries the
