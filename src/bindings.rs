@@ -290,6 +290,10 @@ impl Default for Bindings {
         b(char_key('w'), vec![cmd1("choose-tree", &["-w"])], false);
         b(char_key('s'), vec![cmd1("choose-tree", &["-s"])], false);
         b(char_key('q'), vec![cmd1("display-panes", &[])], false);
+        // SP7 Task 14 (closes #48/#49): `=` choose-buffer, `D` choose-client
+        // -- real tmux's own defaults (`key-bindings.c:412,414`).
+        b(char_key('='), vec![cmd1("choose-buffer", &[])], false);
+        b(char_key('D'), vec![cmd1("choose-client", &[])], false);
 
         // Clock mode (Task 10, sub-project 6 wave 2): `t`, matching real
         // tmux's default `prefix t` (`key-bindings.c:433`).
@@ -621,6 +625,8 @@ mod tests {
             ("'", "select-window", &[], false),
             ("w", "choose-tree", &["-w"], false),
             ("s", "choose-tree", &["-s"], false),
+            ("=", "choose-buffer", &[], false),
+            ("D", "choose-client", &[], false),
             ("q", "display-panes", &[], false),
             ("t", "clock-mode", &[], false),
         ];

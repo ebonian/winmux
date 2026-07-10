@@ -2351,19 +2351,26 @@ phrasing, in favor of the doc's more rigorously researched ruling.
 ```rust
 // server::dispatch (new, private methods)
 fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize>;
-fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+// `acting_id` threaded from `dispatch_mouse` (Wave-4 merge: Task 14's `exec_tree_commit`
+// gained it for choose-client self-detach; `dispatch_mouse` itself gained the same
+// parameter, passed from `handle_stdin`'s per-client `id`).
+fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome;
 ```
 
 `choose_tree_row_at` maps a click's screen row `y` to an index into a
-freshly-rebuilt `rows` (`build_tree_rows`), mirroring `server::render_one`'s
-`RenderOverlay::Tree` → `render::ListOverlay` layout exactly: choose-tree's
-`ListOverlay::title` is ALWAYS empty (no header-row offset to account for),
-and `list_height`/`preview`-shown/`msg_reserved`/`top`/the visible `[start,
+freshly-rebuilt `rows` (`build_choose_rows` — the sorted/filtered seam, so
+hit-testing always sees exactly what the renderer drew), mirroring
+`server::render_one`'s `RenderOverlay::Tree` → `render::ListOverlay` layout
+exactly: `list_height`/`preview`-shown (via `choose_tree_preview_paintable`,
+the Task-15 #73 split)/`msg_reserved`/`title_reserved` (the Task-15 sort/
+filter title row always occupies the panel's first row, so list rows start
+at screen row 1 and a click on row 0 is a miss)/`top`/the visible `[start,
 end)` window are recomputed the SAME way `render_one`'s own `RenderOverlay::
 Tree` arm does (same `choose_tree_list_height` call, same
 `pending_kill.is_some() || client.message.is_some()` message-reservation
 rule). `None` (no row) on a click outside the list — an empty list, the
-preview box, a reserved kill-confirm row, or past the last row.
+title row, the preview box, a reserved kill-confirm row, or past the last
+row.
 
 `dispatch_choose_tree_mouse` is called from `dispatch_mouse`'s
 `ChooseTree` guard branch ONLY for `Down(1)` with no kill-confirm pending
@@ -2657,11 +2664,15 @@ full-clear already put there (blank) when smaller. The server builds
 `content` at exactly the inset interior size (`build_render_overlay` passes
 `w - 4` x `sy - list_height - 2` to `build_tree_preview`); no extra
 "inset shrank the blit below 1x1" drop rule is needed —
-`choose_tree_list_height`'s box-size guard (`sy-h <= 4 || w <= 4` drops
-the preview) already guarantees the interior is >= 1x3 whenever a preview
-is emitted. That guard folds tmux's paint-time "skip the box" check into
-the height function itself — a degenerate-only divergence, ticketed
-`docs/follow-ups.md` #73.
+`choose_tree_preview_paintable`'s box-size guard (`sy-h <= 4 || w <= 4`
+drops the preview) already guarantees the interior is >= 1x3 whenever a
+preview is emitted. **RESOLVED by SP7 Task 15** (was: this guard used to be
+folded into `choose_tree_list_height` itself, collapsing the row list to
+the FULL panel height whenever the guard failed — a real divergence,
+ticketed `docs/follow-ups.md` #73; see the SP7 Tasks 14/15 amendment below
+for the fix, which splits sizing (`choose_tree_list_height`) from
+paintability (`choose_tree_preview_paintable`) so a degenerate pane's list
+keeps its own small height instead of expanding).
 
 ### TDD evidence (this task)
 
@@ -2684,54 +2695,269 @@ task report for the specific before/after reasoning per test.
 
 ### **AMENDMENT (SP7 Task 12 — `find-window` routes into a FILTERED choose-tree):**
 
-`ChooseTreeState` gains one field, and `build_tree_rows` one parameter:
-
-```rust
-struct ChooseTreeState {
-    view: ChooseTreeView,
-    sel: usize,
-    selected: Option<TreeTarget>,
-    pending_kill: Option<(TreeTarget, String)>,
-    expanded: std::collections::HashSet<String>,
-    preview: PreviewMode,
-    /// NEW: `Some(matches)` for a tree opened by `find-window` (the exact
-    /// `WindowId`s the pattern matched, snapshotted ONCE at open time --
-    /// deliberately not live-refiltered while the tree stays open, a
-    /// documented simplification); `None` for a plain `choose-tree`/`w`/`s`
-    /// open (no filtering).
-    filter: Option<std::collections::HashSet<WindowId>>,
-}
-```
-
-`build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded:
-&HashSet<String>, filter: Option<&HashSet<WindowId>>) -> Vec<TreeRow>`: in
-the `Windows` view, a window row is only emitted when `filter` is `None` or
-contains that window's id (the session HEADER row is always emitted
-regardless, for context); the `Sessions` view ignores `filter` entirely
-(`find-window` never opens that view). All three existing call sites
-(`build_render_overlay`, `dispatch_choose_tree_key`, and the opening logic
-below) thread `state.filter.as_ref()` / the caller's filter through.
+`ChooseTreeState` gains one field — `win_filter: Option<HashSet<WindowId>>`
+(shown in the merged struct in the Tasks 14/15 amendment just below; named
+`win_filter`, not `filter`, because Task 15's interactive text filter owns
+the plain name) — `Some(matches)` for a tree opened by `find-window` (the
+exact `WindowId`s the pattern matched, snapshotted ONCE at open time,
+deliberately not live-refiltered while the tree stays open, a documented
+simplification), `None` for a plain `choose-tree`/`w`/`s` open.
+`build_tree_rows` gains the matching `win_filter: Option<&HashSet<WindowId>>`
+parameter (full merged signature below): in the `Windows` view, a window
+row is only emitted when `win_filter` is `None` or contains that window's
+id (the session HEADER row is always emitted regardless, for context); the
+`Sessions` view ignores `win_filter` entirely (`find-window` never opens
+that view). The window filter composes with Task 15's sort/text filter:
+win-filter first (inside `build_tree_rows`), sort with it, text filter on
+top (`build_choose_rows`).
 
 Opening a tree is refactored into one shared helper both `choose-tree` and
-`find-window` call:
+`find-window` call (itself a thin default-selection layer over Task 14's
+even more general `open_choose_mode`, below):
 
 ```rust
 impl Server {
-    /// `filter: None` = plain `choose-tree` (`exec_choose_tree_client` is
-    /// now a thin `sessions`-to-`view` wrapper around this). `filter:
-    /// Some(_)` = `find-window`'s filtered open: default selection is the
-    /// FIRST matching window row (not necessarily the session's current
-    /// window, which may not even be in the match set) instead of the
-    /// session's current-window default a plain `choose-tree -w` open uses.
+    /// `win_filter: None` = plain `choose-tree` (`exec_choose_tree_client`
+    /// is now a thin `sessions`-to-`view` wrapper around this).
+    /// `win_filter: Some(_)` = `find-window`'s filtered open: default
+    /// selection is the FIRST matching window row (not necessarily the
+    /// session's current window, which may not even be in the match set)
+    /// instead of the session's current-window default a plain
+    /// `choose-tree -w` open uses.
     fn open_choose_tree(
         &mut self,
         view: ChooseTreeView,
-        filter: Option<std::collections::HashSet<WindowId>>,
+        win_filter: Option<std::collections::HashSet<WindowId>>,
         client: &mut ClientState,
         session_name: &str,
     ) -> ExecOutcome;
 }
 ```
+
+### **AMENDMENT (SP7 Tasks 14/15): choose-buffer/choose-client overlays + tagging/sort/filter + tiny-pane guard parity (closes #48, #49, #50, #73)**
+
+Task 14 generalizes the choose-tree overlay machinery to two new flat (no
+tree structure) views instead of duplicating it; Task 15 adds tagging, a
+sort-field cycle, a substring filter, and the tag marker/title-line render
+work to the SAME machinery (applying "for free" to all four views), plus a
+correctness fix to `choose_tree_list_height`'s tiny-pane guard (#73). Both
+tasks touch the same types, documented together.
+
+**`server` (`ChooseTreeView`, `TreeTarget`, `ChooseTreeState`, `SortKey`,
+`ClientState`):**
+
+```rust
+enum ChooseTreeView { Windows, Sessions, Buffers, Clients }   // Buffers/Clients new (Task 14)
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]                  // Hash new (Task 15, keys `tagged`)
+enum TreeTarget {
+    Session(String),
+    Window(String, WindowId),
+    Buffer(String),      // new (Task 14): buffer name, `buffers::Buffers`'s own stable identity
+    Client(ClientId),    // new (Task 14): winmux has no tty path, the id IS the identity
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]                   // new (Task 15)
+enum SortKey { Index, Name, Size, Creation }
+
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    sel: usize,
+    selected: Option<TreeTarget>,
+    pending_kill: Option<(Vec<TreeTarget>, String)>,   // CHANGED (Task 15): Vec, was a single TreeTarget
+    expanded: HashSet<String>,
+    preview: PreviewMode,
+    win_filter: Option<HashSet<WindowId>>,   // new (Task 12): find-window's match set, see amendment above
+    tagged: HashSet<TreeTarget>,      // new (Task 15)
+    sort: SortKey,                    // new (Task 15)
+    reversed: bool,                   // new (Task 15)
+    filter: Option<String>,           // new (Task 15): committed filter
+    filter_edit: Option<String>,      // new (Task 15): in-progress `f`-prompt edit buffer
+}
+```
+
+`pending_kill`'s `Vec<TreeTarget>` only ever holds `Session`/`Window`
+targets — `Buffers`/`Clients` kills/detaches never confirm at all (`## 9`/
+`## 10`: "No confirm prompts"), bypassing `pending_kill` entirely. Multiple
+targets = the tagged set at `x`-press time (empty tagged set falls back to
+just the current row, the pre-Task-15 shape). `cancel_stale_choose_trees`
+now `retain`s only the still-alive targets inside the vec instead of nulling
+the whole confirm, so one concurrently-killed tagged target doesn't cancel
+confirmation for the rest.
+
+`ClientState` gains `attached_at: Instant` (set once in `finish_attach`) —
+choose-client's "attach time" row column and its `Creation` sort key both
+read it; only meaningful relative to another client's `attached_at`.
+
+**`server::dispatch` (row building, sort/filter, title, preview, key
+routing, exec helpers):**
+
+```rust
+// SIGNATURE CHANGED (Task 12: gained `win_filter`; Task 15: gained `sort: SortKey, reversed: bool`);
+// new Buffers/Clients arms (Task 14).
+pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>, win_filter: Option<&HashSet<WindowId>>, sort: SortKey, reversed: bool) -> Vec<TreeRow>;
+
+// new (Task 15): substring/case-insensitive filter over `TreeRow::text`, with the
+// "depth-0 row also kept if any depth-1 child matches" rule for the two-level tree.
+fn apply_choose_filter(rows: Vec<TreeRow>, filter: &str) -> Vec<TreeRow>;
+
+// new (Task 15): the ONE seam both `build_render_overlay` and `dispatch_choose_tree_key`
+// use to get sorted+filtered rows; `(rows, filter_no_matches)` -- an over-narrow filter
+// falls back to the UNFILTERED list with `filter_no_matches: true` (mirrors mode-tree's
+// own "ignore a filter that matches nothing" rule, `## 2.2` point 4).
+pub(super) fn build_choose_rows(&self, session_name: &str, state: &ChooseTreeState) -> (Vec<TreeRow>, bool);
+
+// new (Task 15): the `" <item> (sort: <field>[, reversed])[ (filter: active|no matches)]"`
+// title string (`## 3.2`), now ALWAYS non-empty -- see the `render`/title-row-reservation
+// note below for the render-side consequence.
+pub(super) fn build_choose_title(&self, rows: &[TreeRow], sel: usize, state: &ChooseTreeState, filter_no_matches: bool) -> String;
+
+fn item_display_name(&self, target: &TreeTarget) -> String;   // new (Task 15) helper for the title
+fn client_label(id: ClientId) -> String;                       // new (Task 14): "client-<id>"
+fn sort_seq(view: ChooseTreeView) -> &'static [SortKey];       // new (Task 15): per-view `O`-cycle sequence
+fn next_sort(view: ChooseTreeView, cur: SortKey) -> SortKey;   // new (Task 15)
+fn sort_key_name(k: SortKey) -> &'static str;                  // new (Task 15)
+
+// SIGNATURE CHANGED (#73 fix, Task 15): DROPPED the `w: u16` parameter -- the paint-time
+// box-size guard (which used `w`) is no longer folded into this function at all (see below).
+pub(super) fn choose_tree_list_height(sy: u16, line_size: usize, mode: PreviewMode) -> u16;
+
+// new (#73 fix, Task 15): `mode_tree_draw`'s SEPARATE paint-time guard (mode-tree.c:980-981),
+// checked independently of `choose_tree_list_height`'s own sizing formula -- `false` means
+// "no preview box," and the caller must keep using the SAME (possibly tiny) list height
+// rather than falling back to a full-height list (the bug #73 tracked).
+pub(super) fn choose_tree_preview_paintable(sy: u16, h: u16, w: u16) -> bool;
+
+// SIGNATURE CHANGED (Task 14): gained `acting_id: ClientId` (needed for choose-client
+// self-detach vs. detaching another client).
+pub(super) fn dispatch_choose_tree_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> Option<ExecOutcome>;
+
+fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str, acting_id: ClientId) -> ExecOutcome;      // gained acting_id
+fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> ExecOutcome;  // gained acting_id
+fn exec_client_detach(&mut self, id: ClientId, acting_id: ClientId) -> ExecOutcome;   // new (Task 14)
+fn tree_kill_prompt_many(&self, targets: &[TreeTarget]) -> String;                     // new (Task 15): single -> `tree_kill_prompt`, N>1 -> "kill N tagged? (y/n)"
+
+fn exec_choose_buffer_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome;   // new (Task 14)
+fn exec_choose_client_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome;   // new (Task 14)
+fn open_choose_mode(&mut self, view: ChooseTreeView, default_target: Option<TreeTarget>, win_filter: Option<HashSet<WindowId>>, session_name: &str, client: &mut ClientState) -> ExecOutcome; // new (Task 14): shared opener, `open_choose_tree` (and thus `exec_choose_tree_client`/`find-window`) delegates to it; `win_filter` threaded from Task 12
+
+fn feed_choose_filter_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>);  // new (Task 15), same shape as `feed_copy_search_byte`
+```
+
+`ChooseTreeAction` (the hardcoded key enum) gains, ALL Task 15: `ToggleTag`
+(`t`), `UntagAll` (`T`), `TagAll` (`C-t`), `SortNext` (`O`), `SortReverse`
+(`r`), `FilterOpen` (`f`), `FilterClear` (`c`) — `resolve_choose_tree_key`
+maps them; `C-t` is special-cased above the blanket `ctrl||meta => None`
+guard, same pattern as `C-c`. `dispatch_choose_tree_key`'s `Kill` arm now
+collects targets from the tagged set (falling back to the current row when
+empty) and branches on `view`: `Sessions`/`Windows` still arm
+`pending_kill` (confirm, `y`/`Y`/Enter); `Buffers`/`Clients` act
+IMMEDIATELY via `exec_tree_kill` in a loop, no confirm. `feed_mode_byte`
+gains a peek for `ClientMode::ChooseTree(state) if state.filter_edit.
+is_some()` (mirrors the pre-existing `CopyState::search_prompt` peek),
+routing to `feed_choose_filter_byte`.
+
+`build_tree_rows`'s `Buffers`/`Clients` arms produce FLAT rows (`depth: 0`,
+`marker: None`): buffer text is `"<name>: <size> bytes: \"<sample>\""`
+(reusing `list-buffers`' own format), sorted by `Buffers::list()`'s
+insertion order (`Creation`, reversed for newest-first default), name, or
+byte size; client text is `"<client_label>: session <name> (attached
+<secs>s)"`, sorted by `client_label`, `cols*rows`, or `attached_at`. Default
+sort per view (`sort_seq(view)[0]`): `Index` (tree), `Creation` (buffer,
+newest-first), `Name` (client) — matching `## 4.1`/`## 9`/`## 10`'s
+documented defaults, restricted to a 2-3-entry sequence per view (no
+`activity`/`z` — not modeled, a documented divergence).
+
+**`cmd` (`ParsedCmd`):**
+
+```rust
+ChooseBuffer,   // new (Task 14): `choose-buffer|chooseb`, no flags modeled
+ChooseClient,   // new (Task 14): `choose-client`, no flags modeled
+```
+
+Usage strings: `usage: choose-buffer`, `usage: choose-client`. Headless
+dispatch: `Err("no current client")` for both (same as `ChooseTree`).
+Client dispatch: `ChooseBuffer => exec_choose_buffer_client(...)`,
+`ChooseClient => exec_choose_client_client(...)`.
+
+**`bindings`:** two new default prefix bindings (Task 14, real tmux's own
+defaults, `key-bindings.c:412,414`): `=` -> `choose-buffer`, `D` ->
+`choose-client`.
+
+**`render` (`TreeRowCell`, `ListOverlay`, paint code):**
+
+```rust
+struct TreeRowCell {
+    text: String,
+    depth: u8,
+    marker: Option<char>,
+    selected: bool,
+    tagged: bool,   // new (Task 15)
+}
+
+struct ListOverlay {
+    title: String,   // now ALWAYS non-empty in practice (see below) -- was always `String::new()` pre-Task-15
+    rows: Vec<TreeRowCell>,
+    top: usize,
+    preview: Option<PreviewBlock>,
+    list_height: u16,   // new (#73 fix, Task 15) -- see below
+}
+```
+
+Row painting inserts a fixed 2-column "tag slot" (`"* "` tagged / `"  "`
+untagged) between the marker slot and the row's text (`## 3.3`).
+
+**#73 fix — `ListOverlay::list_height` and the `list_cap` computation:**
+pre-Task-15, a `None` preview meant "the list gets the WHOLE panel," which
+was correct for the legitimate cases (`PreviewMode::Off`, or a list too
+short for the 2/3 rule) but WRONG for the genuinely-degenerate case (a pane
+too small for `mode_tree_draw`'s own paint-time box guard) — that case used
+to be folded into `choose_tree_list_height` itself, collapsing `h` to the
+full panel height and silently EXPANDING the row list into the space a tiny
+preview box would have occupied. The fix splits sizing from paintability
+(`choose_tree_list_height` no longer contains the paint-time guard at all;
+`choose_tree_preview_paintable` checks it separately) and adds
+`ListOverlay::list_height`, which `render`'s `list_cap` now uses
+UNCONDITIONALLY (`list.list_height.min(rows)`) instead of matching on
+`preview.is_some()` — so a degenerate pane's row list stays capped at its
+own small `list_height` and the freed rows stay blank, matching real tmux.
+
+**Title row + scroll-math reservation:** `build_choose_title` now returns a
+non-empty string for every choose overlay open (previously `ListOverlay.
+title` was wired up but always fed `String::new()`, so the render code's
+existing "paint title row 0, list starts at row 1" logic went entirely
+unused pre-Task-15). Since the title now always consumes the panel's own
+first row, `Server`'s `top` (scroll-into-view) computation in the
+`RenderOverlay::Tree` match arm reserves 1 row for it (`title_reserved`,
+alongside the pre-existing `msg_reserved`) — omitting this reservation
+regressed `choose_tree_scrolls_long_list_with_confirm_message_shown`
+(caught during this task's own verification pass, not a pre-existing gap).
+
+**`server` (`RenderOverlay::Tree`):**
+
+```rust
+Tree {
+    rows: Vec<(String, u8, Option<char>, bool)>,   // 4th element `tagged: bool`, new (Task 15)
+    sel: usize,
+    list_height: u16,
+    preview: Option<TreePreviewData>,
+    title: String,   // new (Task 15)
+}
+```
+
+### TDD evidence (SP7 Tasks 14/15)
+
+`tests/server_proto.rs`: `choose_buffer_lists_buffers_enter_pastes`,
+`choose_buffer_x_deletes_selected`, `choose_client_lists_attached_clients`,
+`choose_client_x_detaches_selected` (Task 14); `choose_tree_t_tags_row_and_
+x_kills_all_tagged`, `choose_tree_o_cycles_sort_r_reverses`, `choose_tree_
+filter_narrows_rows`, `choose_tree_tiny_pane_keeps_short_list_blank_
+remainder` (Task 15, #73). `render::tests`: `overlay_tagged_row_shows_
+asterisk_marker` (new); `overlay_list_paints_rows_and_selection`, `overlay_
+tree_rows_indent_children`, `overlay_list_shrinks_to_two_thirds_when_
+preview_on` amended in place for the new `tagged`/`list_height` fields (2
+extra columns per row; exact expected strings recomputed in each test's own
+comment).
 
 ## `clock-mode` — clock-mode overlay (sub-project 6 wave 2, Task 10)
 

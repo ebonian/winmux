@@ -46,8 +46,8 @@ use super::{
     advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
     send_msg, spawn_pane, system_time_parts, truncate_chars, AutoscrollState, ChooseTreeState, ChooseTreeView,
     ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag,
-    PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
-    MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
+    PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, SortKey, TreeTarget,
+    MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::{Cell, Grid, MouseProto, Style};
 use std::time::Duration;
@@ -2637,7 +2637,7 @@ impl Server {
     /// right-click (context menu) and drag are out of scope (winmux has no
     /// context-menu system, and `mouse.md` §2.5's drag-selection semantics
     /// don't apply to a list overlay).
-    pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+    pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome {
         // `mouse` is session-scoped (#26).
         let mouse_on = match self.acting_session_overlay(Some(session_name)) {
             Ok(ov) => self.options.mouse_for(ov),
@@ -2676,7 +2676,7 @@ impl Server {
                 end_drag(client);
             }
             if no_pending_kill && matches!(ev.kind, MouseKind::Down(1)) {
-                return self.dispatch_choose_tree_mouse(ev, client, session_name);
+                return self.dispatch_choose_tree_mouse(ev, client, session_name, acting_id);
             }
             return ExecOutcome::Ok(String::new());
         }
@@ -4340,6 +4340,8 @@ impl Server {
             // path (that was the parity deviation being fixed).
             FindWindow { .. } => Err("no current client".to_string()),
             ChooseTree { .. } => Err("no current client".to_string()),
+            ChooseBuffer => Err("no current client".to_string()),
+            ChooseClient => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
             ClockMode => Err("no current client".to_string()),
         }
@@ -4533,6 +4535,8 @@ impl Server {
                 self.exec_find_window_client(pattern, by_content, by_name, by_title, regex, ignore_case, client, session_name.as_str())
             }
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
+            ChooseBuffer => self.exec_choose_buffer_client(client, session_name.as_str()),
+            ChooseClient => self.exec_choose_client_client(client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
             ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
         }
@@ -4572,19 +4576,60 @@ impl Server {
                 return self.feed_copy_search_byte(client, b);
             }
         }
+        // SP7 Task 15 (closes #50's remainder): a choose overlay with an
+        // OPEN filter edit (`f` was pressed, `ChooseTreeState::filter_edit`)
+        // arms capture the same way, staying in `ClientMode::ChooseTree`
+        // for the exact same reason `CopyState::search_prompt` stays in
+        // `ClientMode::Copy` — see that field's own doc comment.
+        if let ClientMode::ChooseTree(state) = &client.mode {
+            if state.filter_edit.is_some() {
+                return self.feed_choose_filter_byte(client, b);
+            }
+        }
         match client.mode {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
             // Copy mode (Task 2) without an open search prompt, and
-            // choose-tree/display-panes/clock-mode (Tasks 8, 10), never arm
-            // raw capture (`set_capture`) — their keys flow through the
-            // normal `KeyInputEvent::Key`/`Forward` path with a table
-            // override (see `handle_stdin`), not `Captured` bytes. This arm
-            // exists only for match-exhaustiveness.
+            // choose-tree (without an open filter edit)/display-panes/
+            // clock-mode (Tasks 8, 10), never arm raw capture
+            // (`set_capture`) — their keys flow through the normal
+            // `KeyInputEvent::Key`/`Forward` path with a table override
+            // (see `handle_stdin`), not `Captured` bytes. This arm exists
+            // only for match-exhaustiveness.
             ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => {
                 (true, None)
             }
         }
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): route one byte of the `f`
+    /// filter prompt's line edit — same commit/cancel/printable/backspace
+    /// rules as `feed_prompt_byte`/`feed_copy_search_byte`, via the shared
+    /// `edit_line_buf` helper. Commit sets the ACTIVE `filter` (empty commit
+    /// clears it, mirroring `## 7.1`'s "empty input clears it"); cancel
+    /// (Esc/`C-c`/`C-g`) leaves the previously-active filter untouched.
+    fn feed_choose_filter_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>) {
+        let mut scratch = String::new();
+        let buf = match &mut client.mode {
+            ClientMode::ChooseTree(state) => state.filter_edit.as_mut().unwrap_or(&mut scratch),
+            _ => &mut scratch,
+        };
+        let edit = edit_line_buf(buf, b);
+        if matches!(edit, LineEdit::Editing) {
+            return (false, None);
+        }
+        client.key_machine.set_capture(false);
+        let ClientMode::ChooseTree(state) = &mut client.mode else {
+            return (true, None);
+        };
+        let Some(edited) = state.filter_edit.take() else {
+            return (true, None);
+        };
+        if matches!(edit, LineEdit::Cancel) {
+            return (true, None);
+        }
+        state.filter = if edited.is_empty() { None } else { Some(edited) };
+        (true, None)
     }
 
     /// Route one byte of a copy-mode search prompt's (Task 4) line edit:
@@ -4812,11 +4857,35 @@ enum ChooseTreeAction {
     Expand,
     Collapse,
     TogglePreview,
+    /// SP7 Task 15 (closes #50's remainder): `t` toggle-tag current row.
+    ToggleTag,
+    /// `T` untag every row.
+    UntagAll,
+    /// `C-t` tag every currently-visible ROOT row (`## 7.1`: "all root
+    /// items" — depth-0 rows here, i.e. every currently-listed session
+    /// (`Sessions`) or the header row (`Windows`, a no-op target in
+    /// practice — its `x`/tag flow never targets it), or every buffer/
+    /// client row (`Buffers`/`Clients`, which are ENTIRELY root rows)).
+    TagAll,
+    /// `O` cycle to the next sort field in the view's sequence.
+    SortNext,
+    /// `r` flip the reverse flag.
+    SortReverse,
+    /// `f` open the filter edit prompt.
+    FilterOpen,
+    /// `c` clear the active filter.
+    FilterClear,
 }
 
 fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
     if key.ctrl && matches!(key.code, KeyCode::Char('c')) {
         return Some(ChooseTreeAction::Cancel);
+    }
+    // SP7 Task 15: `C-t` (tag all) is the one other ctrl-modified key this
+    // overlay recognizes -- checked before the blanket `key.ctrl ||
+    // key.meta => None` guard below, same pattern as `C-c` above.
+    if key.ctrl && matches!(key.code, KeyCode::Char('t')) {
+        return Some(ChooseTreeAction::TagAll);
     }
     if key.ctrl || key.meta {
         return None;
@@ -4837,7 +4906,48 @@ fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
         KeyCode::Char('h') => Some(ChooseTreeAction::Collapse),
         KeyCode::Char('-') => Some(ChooseTreeAction::Collapse),
         KeyCode::Char('v') => Some(ChooseTreeAction::TogglePreview),
+        KeyCode::Char('t') => Some(ChooseTreeAction::ToggleTag),
+        KeyCode::Char('T') => Some(ChooseTreeAction::UntagAll),
+        KeyCode::Char('O') => Some(ChooseTreeAction::SortNext),
+        KeyCode::Char('r') => Some(ChooseTreeAction::SortReverse),
+        KeyCode::Char('f') => Some(ChooseTreeAction::FilterOpen),
+        KeyCode::Char('c') => Some(ChooseTreeAction::FilterClear),
         _ => None,
+    }
+}
+
+/// SP7 Task 14 (#48/#49): the display identity for an attached client --
+/// winmux has no tty path, so the `ClientId` itself stands in for tmux's
+/// client name (`## 9`). Shared by row-building and title-building so they
+/// never disagree.
+fn client_label(id: ClientId) -> String {
+    format!("client-{id}")
+}
+
+/// SP7 Task 15 (closes #50's remainder): each view's `O`-cycle sequence,
+/// restricted vs. tmux's own (see [`SortKey`]'s doc comment for what's not
+/// modeled and why). The sequence's FIRST entry is also the view's default
+/// sort at overlay-open time (`Server::exec_choose_tree_client` et al.).
+fn sort_seq(view: ChooseTreeView) -> &'static [SortKey] {
+    match view {
+        ChooseTreeView::Windows | ChooseTreeView::Sessions => &[SortKey::Index, SortKey::Name],
+        ChooseTreeView::Buffers => &[SortKey::Creation, SortKey::Name, SortKey::Size],
+        ChooseTreeView::Clients => &[SortKey::Name, SortKey::Size, SortKey::Creation],
+    }
+}
+
+fn next_sort(view: ChooseTreeView, cur: SortKey) -> SortKey {
+    let seq = sort_seq(view);
+    let i = seq.iter().position(|k| *k == cur).unwrap_or(0);
+    seq[(i + 1) % seq.len()]
+}
+
+fn sort_key_name(k: SortKey) -> &'static str {
+    match k {
+        SortKey::Index => "index",
+        SortKey::Name => "name",
+        SortKey::Size => "size",
+        SortKey::Creation => "creation",
     }
 }
 
@@ -4864,12 +4974,32 @@ impl Server {
     /// deliberately leaves unchanged (real tmux's `-w` shows the whole
     /// multi-session tree; see `ChooseTreeView`'s doc comment).
     ///
-    /// `filter` (SP7 Task 12, closes follow-ups #46/#54): `Some(ids)`
+    /// `win_filter` (SP7 Task 12, closes follow-ups #46/#54): `Some(ids)`
     /// restricts the `Windows` view's window rows to `ids` (the session
     /// HEADER row is always emitted regardless, for context); `None` shows
-    /// every window, unchanged. `Sessions` ignores `filter` entirely --
+    /// every window, unchanged. `Sessions` ignores `win_filter` entirely --
     /// `find-window` never opens that view.
-    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>, filter: Option<&HashSet<WindowId>>) -> Vec<TreeRow> {
+    ///
+    /// SP7 Task 14/15: `Buffers`/`Clients` are FLAT (`depth: 0`, `marker:
+    /// None` on every row -- `## 9`/`## 10`); `sort`/`reversed` (Task 15)
+    /// order every view's rows per [`sort_seq`]'s restricted sequence --
+    /// sessions/windows are sorted by NAME when `sort == Name` (`Index`
+    /// keeps the registry's natural creation/index order, already correct
+    /// with no work: `Registry::sessions()` is creation order and
+    /// `Session::windows` is kept index-sorted); buffers default to
+    /// NEWEST-first (`Buffers::list()` is oldest-first, so `Creation`
+    /// reverses it, matching `## 10`'s documented default direction) and
+    /// otherwise sort by name/byte-size; clients sort by their synthetic
+    /// [`client_label`] name, `cols*rows` area, or `attached_at`.
+    pub(super) fn build_tree_rows(
+        &self,
+        session_name: &str,
+        view: ChooseTreeView,
+        expanded: &HashSet<String>,
+        win_filter: Option<&HashSet<WindowId>>,
+        sort: SortKey,
+        reversed: bool,
+    ) -> Vec<TreeRow> {
         let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
         let session_text = |s: &Session| format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" });
         let window_row = |session: &Session, w: &Window| {
@@ -4887,10 +5017,27 @@ impl Server {
                 marker: None,
             }
         };
+        fn sorted_windows(session: &Session, sort: SortKey, reversed: bool) -> Vec<&Window> {
+            let mut ws: Vec<&Window> = session.windows.iter().collect();
+            if sort == SortKey::Name {
+                ws.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            if reversed {
+                ws.reverse();
+            }
+            ws
+        }
         match view {
             ChooseTreeView::Sessions => {
+                let mut sessions: Vec<&Session> = self.registry.sessions().iter().collect();
+                if sort == SortKey::Name {
+                    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                if reversed {
+                    sessions.reverse();
+                }
                 let mut rows = Vec::new();
-                for s in self.registry.sessions() {
+                for s in sessions {
                     let is_expanded = expanded.contains(&s.name);
                     rows.push(TreeRow {
                         text: session_text(s),
@@ -4899,7 +5046,7 @@ impl Server {
                         marker: Some(if is_expanded { '-' } else { '+' }),
                     });
                     if is_expanded {
-                        rows.extend(s.windows.iter().map(|w| window_row(s, w)));
+                        rows.extend(sorted_windows(s, sort, reversed).into_iter().map(|w| window_row(s, w)));
                     }
                 }
                 rows
@@ -4914,22 +5061,194 @@ impl Server {
                     depth: 0,
                     marker: Some('-'),
                 }];
-                rows.extend(session.windows.iter().filter(|w| filter.is_none_or(|f| f.contains(&w.id))).map(|w| window_row(session, w)));
+                // Task 12's find-window match set narrows the leaf rows
+                // FIRST; Task 15's sort/reverse then orders what survived.
+                rows.extend(
+                    sorted_windows(session, sort, reversed)
+                        .into_iter()
+                        .filter(|w| win_filter.is_none_or(|f| f.contains(&w.id)))
+                        .map(|w| window_row(session, w)),
+                );
                 rows
+            }
+            ChooseTreeView::Buffers => {
+                let mut list = self.buffers.list(); // oldest-first
+                match sort {
+                    SortKey::Creation => list.reverse(), // default: newest-first
+                    SortKey::Name => list.sort_by(|a, b| a.0.cmp(&b.0)),
+                    SortKey::Size => list.sort_by_key(|(_, size, _)| *size),
+                    SortKey::Index => {}
+                }
+                if reversed {
+                    list.reverse();
+                }
+                list.into_iter()
+                    .map(|(name, size, sample)| TreeRow {
+                        text: format!("{name}: {size} bytes: \"{sample}\""),
+                        target: TreeTarget::Buffer(name),
+                        depth: 0,
+                        marker: None,
+                    })
+                    .collect()
+            }
+            ChooseTreeView::Clients => {
+                let mut entries: Vec<(ClientId, &ClientState)> = self.clients.iter().map(|(id, c)| (*id, c)).collect();
+                match sort {
+                    SortKey::Name => entries.sort_by_key(|(id, _)| client_label(*id)),
+                    SortKey::Size => entries.sort_by_key(|(_, c)| c.cols as u32 * c.rows as u32),
+                    SortKey::Creation => entries.sort_by_key(|(_, c)| c.attached_at),
+                    SortKey::Index => entries.sort_by_key(|(id, _)| *id),
+                }
+                if reversed {
+                    entries.reverse();
+                }
+                entries
+                    .into_iter()
+                    .map(|(id, c)| TreeRow {
+                        text: format!(
+                            "{}: session {} (attached {}s)",
+                            client_label(id),
+                            c.session.as_deref().unwrap_or(""),
+                            c.attached_at.elapsed().as_secs()
+                        ),
+                        target: TreeTarget::Client(id),
+                        depth: 0,
+                        marker: None,
+                    })
+                    .collect()
             }
         }
     }
 
+    /// SP7 Task 15 (closes #50's remainder; `docs/tmux-reference/
+    /// choose-tree.md` `## 7.1`/`## 2.2`): a substring, case-insensitive
+    /// filter over a row's already-formatted `text` -- a documented
+    /// simplification of tmux's real per-pane FORMAT filter. A depth-0 row
+    /// is ALSO kept when any of its immediately-following depth-1 children
+    /// matches (mirroring "rows whose whole subtree fails the filter
+    /// disappear" for this project's two-level tree); `Buffers`/`Clients`
+    /// rows are all depth-0 with no children, so only their own text match
+    /// applies. Returns the SUBSET that matched (possibly empty — callers
+    /// decide what "matched nothing" means, see [`Server::build_choose_rows`]).
+    fn apply_choose_filter(rows: Vec<TreeRow>, filter: &str) -> Vec<TreeRow> {
+        if filter.is_empty() {
+            return rows;
+        }
+        let needle = filter.to_lowercase();
+        let mut keep = vec![false; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            if r.text.to_lowercase().contains(&needle) {
+                keep[i] = true;
+            }
+        }
+        let mut i = 0;
+        while i < rows.len() {
+            if rows[i].depth == 0 {
+                let mut j = i + 1;
+                let mut any_child = false;
+                while j < rows.len() && rows[j].depth > 0 {
+                    if keep[j] {
+                        any_child = true;
+                    }
+                    j += 1;
+                }
+                if any_child {
+                    keep[i] = true;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        rows.into_iter().zip(keep).filter_map(|(r, k)| k.then_some(r)).collect()
+    }
+
+    /// SP7 Task 15: the one seam both `Server::build_render_overlay` and
+    /// `dispatch_choose_tree_key` go through to get this client's CURRENT
+    /// row list -- sort applied inside `build_tree_rows`, then the active
+    /// filter (if any) on top. Returns `(rows, filter_no_matches)`:
+    /// `filter_no_matches` is `true` when a non-empty filter is active but
+    /// matched nothing, in which case `rows` is the UNFILTERED list (`##
+    /// 2.2` point 4's "ignore an over-narrow filter" rule) — the title
+    /// (`build_choose_title`) is what actually tells the user their filter
+    /// matched nothing.
+    pub(super) fn build_choose_rows(&self, session_name: &str, state: &ChooseTreeState) -> (Vec<TreeRow>, bool) {
+        let rows = self.build_tree_rows(session_name, state.view, &state.expanded, state.win_filter.as_ref(), state.sort, state.reversed);
+        match state.filter.as_deref() {
+            Some(f) if !f.is_empty() => {
+                let filtered = Server::apply_choose_filter(rows, f);
+                if filtered.is_empty() {
+                    (self.build_tree_rows(session_name, state.view, &state.expanded, state.win_filter.as_ref(), state.sort, state.reversed), true)
+                } else {
+                    (filtered, false)
+                }
+            }
+            _ => (rows, false),
+        }
+    }
+
+    /// SP7 Task 15 (`## 3.2`): the box-title-shaped string painted on the
+    /// overlay's own first row — `" <item> (sort: <field>[, reversed])[
+    /// (filter: active|no matches)]"`. `<item>` is the CURRENTLY SELECTED
+    /// row's own display name (session name / `idx:name` / buffer name /
+    /// [`client_label`]), matching tmux's own title (its preview box's
+    /// title happens to be the same string, `## 3.2` — winmux paints this
+    /// version even when the preview itself is off/too small to show, a
+    /// harmless superset).
+    pub(super) fn build_choose_title(&self, rows: &[TreeRow], sel: usize, state: &ChooseTreeState, filter_no_matches: bool) -> String {
+        let item = match rows.get(sel) {
+            Some(r) => self.item_display_name(&r.target),
+            None => String::new(),
+        };
+        let mut title = format!(" {} (sort: {}{})", item, sort_key_name(state.sort), if state.reversed { ", reversed" } else { "" });
+        if filter_no_matches {
+            title.push_str(" (filter: no matches)");
+        } else if state.filter.as_deref().is_some_and(|f| !f.is_empty()) {
+            title.push_str(" (filter: active)");
+        }
+        title
+    }
+
+    fn item_display_name(&self, target: &TreeTarget) -> String {
+        match target {
+            TreeTarget::Session(n) => n.clone(),
+            TreeTarget::Window(sn, wid) => self
+                .registry
+                .sessions()
+                .iter()
+                .find(|s| s.name == *sn)
+                .and_then(|s| s.windows.iter().find(|w| w.id == *wid))
+                .map(|w| format!("{}:{}", w.index, w.name))
+                .unwrap_or_default(),
+            TreeTarget::Buffer(n) => n.clone(),
+            TreeTarget::Client(id) => client_label(*id),
+        }
+    }
+
     /// choose-tree preview sizing (SP6 wave 2, Task 8;
-    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`
-    /// plus `mode_tree_draw`'s own box-size guard): the ROW LIST's height in
-    /// panel rows -- the preview (if any) occupies every row below it, i.e.
-    /// `sy - h`. Returns `sy` itself (no preview at all) whenever the mode
-    /// is `Off`, the computed split would leave the list under 10 rows
-    /// (NORMAL) / the preview under 2 rows total (BIG, or the final `sy - h
-    /// < 2` guard), or the panel is too small in either axis for a sensible
-    /// box (`sy <= 4 || h < 2 || sy - h <= 4 || w <= 4`).
-    pub(super) fn choose_tree_list_height(sy: u16, w: u16, line_size: usize, mode: PreviewMode) -> u16 {
+    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`):
+    /// the ROW LIST's height in panel rows -- the preview (if any) occupies
+    /// every row below it, i.e. `sy - h`. Returns `sy` itself (no preview at
+    /// all, list gets the WHOLE panel) whenever the mode is `Off`, the
+    /// computed split would leave the list under 10 rows (NORMAL), or the
+    /// preview under 2 rows total (BIG, or the final `sy - h < 2` guard) --
+    /// these three collapses are `mode_tree_set_height`'s OWN formula
+    /// (mode-tree.c:626-654), reproduced verbatim.
+    ///
+    /// SP7 Task 15 fix (closes #73, mode-tree.c:980-981's box-size guard):
+    /// this function used to ALSO collapse `h` to `sy` whenever `mode_tree_
+    /// draw`'s SEPARATE paint-time guard (`sy <= 4 || h < 2 || sy - h <= 4 ||
+    /// w <= 4`) would fail -- conflating "the sizing formula legitimately
+    /// wants the list full-height" with "the box happens to be too small to
+    /// paint," which silently EXPANDED the row list into space a tiny
+    /// preview box would have occupied. Real tmux keeps the two concerns
+    /// separate: `h` is whatever the sizing formula above computed,
+    /// unconditionally; a genuinely-too-small preview just doesn't get
+    /// painted, and the leftover rows stay BLANK (see
+    /// [`Server::choose_tree_preview_paintable`], the paint-time guard now
+    /// checked independently by the caller). This function no longer
+    /// contains that guard at all.
+    pub(super) fn choose_tree_list_height(sy: u16, line_size: usize, mode: PreviewMode) -> u16 {
         let sy_i = sy as i32;
         let ls = line_size as i32;
         let mut h = match mode {
@@ -4958,15 +5277,12 @@ impl Server {
         if sy_i - h < 2 {
             h = sy_i; // preview must be >= 2 rows
         }
-        if sy_i <= 4 || h < 2 || sy_i - h <= 4 || w <= 4 {
-            h = sy_i; // mode_tree_draw's own box-size guard
-        }
         h.clamp(0, sy_i.max(0)) as u16
     }
 
     /// Map a choose-tree overlay click's screen row `y` to an index into
     /// `rows` (already rebuilt fresh by the caller from LIVE registry
-    /// state, `build_tree_rows`), mirroring `server::render_one`'s
+    /// state, `build_choose_rows`), mirroring `server::render_one`'s
     /// `RenderOverlay::Tree` -> `render::ListOverlay` layout EXACTLY (SP7
     /// Task 10, closes follow-up #61) so a click always resolves to the row
     /// actually drawn there: choose-tree's `ListOverlay::title` is ALWAYS
@@ -4982,22 +5298,32 @@ impl Server {
         }
         let ClientMode::ChooseTree(state) = &client.mode else { return None };
         let sel = resolve_tree_sel(rows, &state.selected, state.sel);
-        let list_height = Server::choose_tree_list_height(client.rows, client.cols, rows.len(), state.preview);
-        let preview_shown = list_height < client.rows;
+        let list_height = Server::choose_tree_list_height(client.rows, rows.len(), state.preview);
+        // SP7 Task 15 (#73) split sizing from paintability -- `list_height
+        // < client.rows` alone is no longer a reliable "is there a preview"
+        // test (a degenerate geometry can size a preview region that then
+        // fails the paint-time guard), so mirror `build_render_overlay`'s
+        // own `choose_tree_preview_paintable` check exactly.
+        let preview_shown = Server::choose_tree_preview_paintable(client.rows, list_height, client.cols);
         // Mirrors `render_one`'s own `message` resolution for `ClientMode::
         // ChooseTree`: the pending kill-confirm prompt takes priority over
         // an ordinary transient `client.message`, but either one reserves
         // the panel's last row exactly when no preview is showing.
         let has_message = state.pending_kill.is_some() || client.message.is_some();
         let msg_reserved: usize = if has_message && !preview_shown { 1 } else { 0 };
-        let visible = (list_height as usize).saturating_sub(msg_reserved);
-        if visible == 0 {
+        // SP7 Task 15: the sort/filter title row (always non-empty since
+        // `build_choose_title`) takes the panel's FIRST row before any list
+        // rows are painted -- same `title_reserved` `render_one`'s Tree arm
+        // applies, and clicks on the title row itself are a miss.
+        let title_reserved = 1usize;
+        let visible = (list_height as usize).saturating_sub(msg_reserved).saturating_sub(title_reserved);
+        if visible == 0 || (y as usize) < title_reserved {
             return None;
         }
         let top = sel.saturating_sub(visible.saturating_sub(1));
         let start = top.min(rows.len());
         let end = (start + visible).min(rows.len());
-        let idx = start + y as usize;
+        let idx = start + (y as usize) - title_reserved;
         if idx < end {
             Some(idx)
         } else {
@@ -5022,15 +5348,15 @@ impl Server {
     /// reserved message row) is a no-op -- no selection change, matching
     /// real tmux's `mode_tree_key` returning early when the click doesn't
     /// land in the list rect at all.
-    fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        let (view, expanded, filter) = match &client.mode {
-            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone(), state.filter.clone()),
+    fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome {
+        // Same row set the renderer draws — `build_choose_rows` applies
+        // Task 12's find-window `win_filter`, Task 15's sort/reverse, AND
+        // Task 15's text filter, so hit-testing here can never click a row
+        // the client isn't currently seeing.
+        let rows = match &client.mode {
+            ClientMode::ChooseTree(state) => self.build_choose_rows(session_name, state).0,
             _ => return ExecOutcome::Ok(String::new()),
         };
-        // Same filtered row set the renderer draws (SP7 Task 12's
-        // find-window filter) — hit-testing an unfiltered list here would
-        // click the wrong row inside a filtered tree.
-        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
         let Some(row_idx) = self.choose_tree_row_at(client, &rows, ev.y) else {
             return ExecOutcome::Ok(String::new());
         };
@@ -5058,7 +5384,21 @@ impl Server {
         // path here.
         client.mode = ClientMode::Normal;
         let mut sn = session_name.to_string();
-        self.exec_tree_commit(target, client, &mut sn)
+        self.exec_tree_commit(target, client, &mut sn, acting_id)
+    }
+
+    /// `mode_tree_draw`'s SEPARATE paint-time box-size guard (SP7 Task 15,
+    /// closes #73; mode-tree.c:980-981): whether the preview BOX can be
+    /// painted at all, given the ALREADY-COMPUTED list height `h` from
+    /// [`Server::choose_tree_list_height`] -- independent of that function's
+    /// own sizing formula (see its doc comment for why the two were split
+    /// apart). `false` means "no box" — the caller must still use the SAME
+    /// (possibly tiny) `h` for the row list's visible height; it must NOT
+    /// fall back to a full-height list, or the #73 fix regresses.
+    pub(super) fn choose_tree_preview_paintable(sy: u16, h: u16, w: u16) -> bool {
+        let sy_i = sy as i32;
+        let h_i = h as i32;
+        !(sy_i <= 4 || h_i < 2 || sy_i - h_i <= 4 || w <= 4)
     }
 
     /// The selected tree row's live preview content (SP6 wave 2, Task 8;
@@ -5104,6 +5444,40 @@ impl Server {
                 let panes = window.layout.panes();
                 let slots = panes.iter().enumerate().map(|(idx, pid)| (*pid, format!("{idx}"))).collect();
                 (title, slots)
+            }
+            // SP7 Task 14 (#49): choose-client's preview is "what that
+            // client currently sees" (`## 9`) -- simplified here to that
+            // client's current window's ACTIVE pane content, one slot
+            // filling the whole interior (the existing single-slot path
+            // below already does that with no divider needed) -- no status-
+            // line-screen strip underneath (documented simplification vs.
+            // tmux's `window_client_draw`, `## 9`).
+            TreeTarget::Client(id) => {
+                let Some(c) = self.clients.get(id) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let Some(session) = c.session.as_deref().and_then(|n| self.registry.sessions().iter().find(|s| s.name == n)) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {} (sort: index)", client_label(*id));
+                (title, vec![(session.current_window().layout.focused(), String::new())])
+            }
+            // SP7 Task 14 (#48): choose-buffer's preview is the buffer's
+            // raw text content, clipped to the interior, control characters
+            // made visible as `?` (`## 10`; a documented simplification of
+            // tmux's `utf8_strvis` visible-escaping).
+            TreeTarget::Buffer(name) => {
+                let Some(data) = self.buffers.get(name) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {name} (sort: index)");
+                for (row, line) in data.lines().take(interior_h as usize).enumerate() {
+                    for (col, ch) in line.chars().take(interior_w as usize).enumerate() {
+                        let ch = if ch.is_control() { '?' } else { ch };
+                        content[row * interior_w as usize + col] = Cell { ch, style: Style::default() };
+                    }
+                }
+                return (title, interior_w, interior_h, content);
             }
         };
         let n = slots.len();
@@ -5171,6 +5545,24 @@ impl Server {
                     .unwrap_or_default();
                 format!("kill-window {name}? (y/n)")
             }
+            // Unreachable in practice — `Buffers`/`Clients` kills never go
+            // through the confirm flow (`## ChooseTreeState::pending_kill`
+            // doc comment) — kept for match exhaustiveness.
+            TreeTarget::Buffer(_) | TreeTarget::Client(_) => String::new(),
+        }
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): the `x` confirm prompt for a
+    /// (possibly tagged, `Sessions`/`Windows`-only) multi-target kill --
+    /// `"kill-session <name>? (y/n)"`/`"kill-window <name>? (y/n)"` for a
+    /// single target (delegates to [`Server::tree_kill_prompt`]), or `"kill
+    /// <N> tagged? (y/n)"` for more than one, per `## 7.2`'s `X` prompt
+    /// shape (winmux collapses `x`/`X` into one binding, see the task
+    /// brief).
+    fn tree_kill_prompt_many(&self, targets: &[TreeTarget]) -> String {
+        match targets {
+            [one] => self.tree_kill_prompt(one),
+            many => format!("kill {} tagged? (y/n)", many.len()),
         }
     }
 
@@ -5184,7 +5576,7 @@ impl Server {
     /// `exec_kill_window_client`/`exec_kill_pane_client`) — the overlay
     /// simply closes along with the rest of that client's exit, matching a
     /// normal kill-your-own-session flow.
-    fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str) -> ExecOutcome {
+    fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str, acting_id: ClientId) -> ExecOutcome {
         match target {
             TreeTarget::Session(name) => {
                 if self.registry.session_mut(&name).is_none() {
@@ -5209,7 +5601,41 @@ impl Server {
                     Err(e) => ExecOutcome::Err(e),
                 }
             }
+            // SP7 Task 14/15: never actually reached via the confirm flow
+            // (`Buffers`/`Clients` kills bypass `pending_kill` entirely, see
+            // `dispatch_choose_tree_key`'s `Kill` arm) — implemented for
+            // real anyway rather than left as a defensive no-op, so this
+            // stays correct if a future caller ever DOES route one through
+            // here.
+            TreeTarget::Buffer(name) => wrap(self.exec_delete_buffer(Some(name))),
+            TreeTarget::Client(id) => self.exec_client_detach(id, acting_id),
         }
+    }
+
+    /// SP7 Task 14 (#49): detach ONE specific client by identity (not by
+    /// session, unlike `exec_detach_client_client`'s `-s` — see that
+    /// function's own doc comment for why this is a separate helper).
+    /// `acting_id == id` (the acting client detaching itself via choose-
+    /// client) returns `ExecOutcome::Detach` WITHOUT touching `self.clients`
+    /// — the acting client was already removed from the map for the
+    /// duration of dispatch (see `handle_stdin`'s doc comment), so there is
+    /// nothing to remove here; the caller's `detach` flag does the rest.
+    /// Detaching any OTHER client removes it directly and messages it,
+    /// mirroring `exec_detach_client_client`'s own removal loop.
+    fn exec_client_detach(&mut self, id: ClientId, acting_id: ClientId) -> ExecOutcome {
+        if id == acting_id {
+            return ExecOutcome::Detach;
+        }
+        let Some(c) = self.clients.remove(&id) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let name = c.session.clone().unwrap_or_default();
+        send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: format!("[detached (from session {name})]") });
+        if !name.is_empty() {
+            self.recompute_session_size(&name);
+            self.apply_layout_for_session(&name);
+        }
+        ExecOutcome::Ok(String::new())
     }
 
     /// Commit choose-tree's selection (Task 8, Enter): re-validates the
@@ -5218,7 +5644,7 @@ impl Server {
     /// id) then switches this client to the session, or selects the window
     /// within its (always-current, per the `Windows` view's own scope) session
     /// — same underlying mutation as `switch-client -p/-n`/`select-window`.
-    fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+    fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> ExecOutcome {
         match target {
             TreeTarget::Session(name) => {
                 if self.registry.session_mut(&name).is_none() || name == *session_name {
@@ -5244,6 +5670,18 @@ impl Server {
                 self.apply_layout_for_session(&sname);
                 ExecOutcome::Ok(String::new())
             }
+            // SP7 Task 14 (#48): choose-buffer's default template is
+            // `paste-buffer -p -b '%%'` (`## 10`) — paste into the acting
+            // client's focused pane and exit (the caller already sets
+            // `client.mode = Normal` before calling this, matching
+            // `Session`/`Window`'s own "commit switches, then the caller
+            // closes the overlay" shape).
+            TreeTarget::Buffer(name) => wrap(self.exec_paste_buffer(Some(name), None, false, false, Some(session_name.as_str()))),
+            // SP7 Task 14 (#49): choose-client's default template is
+            // `detach-client -t '%%'` (`## 9`) — Enter DETACHES the
+            // selected client, same as its `x`/`d` extra key (`## 9`'s
+            // "Extra keys: d/x detach current").
+            TreeTarget::Client(id) => self.exec_client_detach(id, acting_id),
         }
     }
 
@@ -5251,7 +5689,13 @@ impl Server {
     /// (Task 8). `None` = the key was swallowed (unbound, or a navigation
     /// key while `pending_kill` absorbed it) with NO dispatch to report;
     /// `handle_stdin` only calls `route_outcome` on `Some`.
-    pub(super) fn dispatch_choose_tree_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> Option<ExecOutcome> {
+    pub(super) fn dispatch_choose_tree_key(
+        &mut self,
+        key: &Key,
+        client: &mut ClientState,
+        session_name: &mut String,
+        acting_id: ClientId,
+    ) -> Option<ExecOutcome> {
         // A pending kill-confirm (`x` was already pressed) absorbs the VERY
         // NEXT key as its y/n answer, taking priority over ordinary
         // navigation -- same y/Y/Enter-confirms, anything-else-cancels rule
@@ -5260,17 +5704,51 @@ impl Server {
             ClientMode::ChooseTree(state) => state.pending_kill.take(),
             _ => return None,
         };
-        if let Some((target, _prompt)) = pending {
+        if let Some((targets, _prompt)) = pending {
             let confirmed = matches!(key.code, KeyCode::Enter) || matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-            return Some(if confirmed { self.exec_tree_kill(target, session_name) } else { ExecOutcome::Ok(String::new()) });
+            if let ClientMode::ChooseTree(state) = &mut client.mode {
+                state.tagged.clear();
+            }
+            if !confirmed {
+                return Some(ExecOutcome::Ok(String::new()));
+            }
+            // SP7 Task 15: kill every confirmed target; if one destroys the
+            // acting client's own session, stop there (that client is about
+            // to be dropped) rather than acting on the rest.
+            let mut outcome = ExecOutcome::Ok(String::new());
+            for t in targets {
+                outcome = self.exec_tree_kill(t, session_name, acting_id);
+                if matches!(outcome, ExecOutcome::Destroy) {
+                    break;
+                }
+            }
+            return Some(outcome);
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let (view, expanded, filter) = match &client.mode {
-            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone(), state.filter.clone()),
+        let (view, expanded, tagged, sort, reversed, filter, win_filter) = match &client.mode {
+            ClientMode::ChooseTree(state) => {
+                (state.view, state.expanded.clone(), state.tagged.clone(), state.sort, state.reversed, state.filter.clone(), state.win_filter.clone())
+            }
             _ => return None,
         };
-        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
+        let unfiltered = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, reversed);
+        // SP7 Task 15: apply the active filter the SAME way
+        // `build_choose_rows` (the render path) does, so navigation/commit/
+        // kill never act on a row the client can't currently see -- see
+        // that function's doc comment for the "no matches -> fall back to
+        // unfiltered" rule.
+        let rows = match filter.as_deref() {
+            Some(f) if !f.is_empty() => {
+                let filtered = Server::apply_choose_filter(unfiltered, f);
+                if filtered.is_empty() {
+                    self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, reversed)
+                } else {
+                    filtered
+                }
+            }
+            _ => unfiltered,
+        };
 
         // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
         // IDENTITY against this freshly rebuilt `rows`, rather than trusting
@@ -5307,19 +5785,53 @@ impl Server {
                 client.mode = ClientMode::Normal;
                 Some(ExecOutcome::Ok(String::new()))
             }
+            // SP7 Task 15 (closes #50's remainder / brief's "kill applies
+            // to tagged when tags exist" rule): tagged targets (if any)
+            // instead of just the current row. `Sessions`/`Windows` still
+            // go through the `pending_kill` y/n confirm exactly as before
+            // (`## 7.2`'s `x`/`X` kill prompts); `Buffers`/`Clients` never
+            // confirm at all (`## 9`/`## 10`) -- deleted/detached
+            // immediately, since a `ChooseTreeState` is scoped to exactly
+            // one view, tagged targets are always homogeneous, so branching
+            // on `view` alone is sufficient (no need to inspect each
+            // target's own variant).
             ChooseTreeAction::Kill => {
-                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
-                let prompt = self.tree_kill_prompt(&row.target);
-                if let ClientMode::ChooseTree(state) = &mut client.mode {
-                    state.pending_kill = Some((row.target.clone(), prompt));
+                let targets: Vec<TreeTarget> = if !tagged.is_empty() {
+                    rows.iter().filter(|r| tagged.contains(&r.target)).map(|r| r.target.clone()).collect()
+                } else {
+                    rows.get(sel).map(|r| vec![r.target.clone()]).unwrap_or_default()
+                };
+                if targets.is_empty() {
+                    return Some(ExecOutcome::Ok(String::new()));
                 }
-                Some(ExecOutcome::Ok(String::new()))
+                match view {
+                    ChooseTreeView::Sessions | ChooseTreeView::Windows => {
+                        let prompt = self.tree_kill_prompt_many(&targets);
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.pending_kill = Some((targets, prompt));
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    ChooseTreeView::Buffers | ChooseTreeView::Clients => {
+                        let mut outcome = ExecOutcome::Ok(String::new());
+                        for t in targets {
+                            outcome = self.exec_tree_kill(t, session_name, acting_id);
+                            if matches!(outcome, ExecOutcome::Detach | ExecOutcome::Destroy) {
+                                break;
+                            }
+                        }
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.tagged.clear();
+                        }
+                        Some(outcome)
+                    }
+                }
             }
             ChooseTreeAction::Commit => {
                 let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
                 let target = row.target.clone();
                 client.mode = ClientMode::Normal;
-                Some(self.exec_tree_commit(target, client, session_name))
+                Some(self.exec_tree_commit(target, client, session_name, acting_id))
             }
             // SP6 wave 2, Task 8 (`docs/tmux-reference/choose-tree.md`
             // `## 5.1`/`## 7.1`): only session (depth-0) rows carry an
@@ -5348,6 +5860,9 @@ impl Server {
                         }
                         Some(ExecOutcome::Ok(String::new()))
                     }
+                    // `Buffers`/`Clients` rows are flat -- no expand/collapse
+                    // affordance (SP7 Task 14).
+                    TreeTarget::Buffer(_) | TreeTarget::Client(_) => Some(ExecOutcome::Ok(String::new())),
                 }
             }
             ChooseTreeAction::Expand => {
@@ -5360,7 +5875,7 @@ impl Server {
                         }
                         Some(ExecOutcome::Ok(String::new()))
                     }
-                    TreeTarget::Window(..) => {
+                    TreeTarget::Window(..) | TreeTarget::Buffer(_) | TreeTarget::Client(_) => {
                         let new_sel = (sel + 1).min(rows.len().saturating_sub(1));
                         if let ClientMode::ChooseTree(state) = &mut client.mode {
                             state.sel = new_sel;
@@ -5373,6 +5888,56 @@ impl Server {
             ChooseTreeAction::TogglePreview => {
                 if let ClientMode::ChooseTree(state) = &mut client.mode {
                     state.preview = state.preview.cycle();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            // ---- SP7 Task 15 (closes #50's remainder): tag/sort/filter ----
+            ChooseTreeAction::ToggleTag => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                let target = row.target.clone();
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    if !state.tagged.remove(&target) {
+                        state.tagged.insert(target);
+                    }
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::UntagAll => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.tagged.clear();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::TagAll => {
+                let roots: Vec<TreeTarget> = rows.iter().filter(|r| r.depth == 0).map(|r| r.target.clone()).collect();
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.tagged.extend(roots);
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::SortNext => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.sort = next_sort(state.view, state.sort);
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::SortReverse => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.reversed = !state.reversed;
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::FilterOpen => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.filter_edit = Some(state.filter.clone().unwrap_or_default());
+                }
+                client.key_machine.set_capture(true);
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::FilterClear => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.filter = None;
+                    state.filter_edit = None;
                 }
                 Some(ExecOutcome::Ok(String::new()))
             }
@@ -5434,23 +5999,26 @@ impl Server {
 
     /// Shared choose-tree-opening logic (SP7 Task 12, extracted from the
     /// pre-Task-12 `exec_choose_tree_client` so `find-window` can reuse it
-    /// with a filter -- closes follow-ups #46/#54): seeds `selected` with an
-    /// IDENTITY (not just an index) so the very first Up/Down/Commit/Kill
-    /// has one to re-resolve (Task 8 review fix, Critical #1).
+    /// with a window filter -- closes follow-ups #46/#54); since SP7 Task
+    /// 14 it is itself a thin default-selection layer over the even more
+    /// general [`Self::open_choose_mode`] (which `choose-buffer`/
+    /// `choose-client` call directly).
     ///
-    /// Default selection: with `filter: Some(_)` (a `find-window` open), the
-    /// FIRST matching window row wins -- the session's CURRENT window may
-    /// not even be in the match set, so that default (used below for a
-    /// plain, unfiltered open) would be meaningless here. With `filter:
-    /// None`, the SP6 wave 2 "current-item default" rule applies:
-    /// `Sessions` defaults to the acting client's own current session's row
-    /// (always present); `Windows` defaults to that session's CURRENT
-    /// window's row (also always present). `rows.first()` is only a
-    /// fallback for the structurally-unreachable case that lookup fails.
-    fn open_choose_tree(&mut self, view: ChooseTreeView, filter: Option<HashSet<WindowId>>, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        let expanded = HashSet::new();
-        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
-        let default_target = if filter.is_some() {
+    /// Default selection: with `win_filter: Some(_)` (a `find-window`
+    /// open), the FIRST matching window row wins -- the session's CURRENT
+    /// window may not even be in the match set, so that default (used below
+    /// for a plain, unfiltered open) would be meaningless here. With
+    /// `win_filter: None`, the SP6 wave 2 "current-item default" rule
+    /// applies (mode-tree's "current-item" default start,
+    /// `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions` defaults
+    /// to the acting client's own current session's row (always present);
+    /// `Windows` defaults to that session's CURRENT window's row (also
+    /// always present). `open_choose_mode`'s row-0 fallback covers the
+    /// structurally-unreachable case that lookup fails.
+    fn open_choose_tree(&mut self, view: ChooseTreeView, win_filter: Option<HashSet<WindowId>>, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let default_target = if win_filter.is_some() {
+            let expanded = HashSet::new();
+            let rows = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort_seq(view)[0], false);
             rows.iter().find(|r| matches!(r.target, TreeTarget::Window(..))).map(|r| r.target.clone())
         } else {
             match view {
@@ -5461,13 +6029,64 @@ impl Server {
                     .iter()
                     .find(|s| s.name == session_name)
                     .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+                ChooseTreeView::Buffers | ChooseTreeView::Clients => None,
             }
         };
+        self.open_choose_mode(view, default_target, win_filter, session_name, client)
+    }
+
+    /// `choose-buffer` (SP7 Task 14, closes #48): opens the same overlay
+    /// machinery scoped to `Buffers`. `cmd-choose-tree.c:122-125`: silently
+    /// does nothing if there are no buffers at all (`paste_is_empty()`).
+    fn exec_choose_buffer_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if self.buffers.list().is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        self.open_choose_mode(ChooseTreeView::Buffers, None, None, session_name, client)
+    }
+
+    /// `choose-client` (SP7 Task 14, closes #49): opens the same overlay
+    /// machinery scoped to `Clients`. `cmd-choose-tree.c:126-129`: silently
+    /// does nothing with no attached clients -- structurally unreachable
+    /// here (the client running this command IS attached), kept only for
+    /// parity/documentation. No special default selection is documented for
+    /// choose-client (`## 9`, unlike choose-tree's own `## 1.1` "current
+    /// item" rule) -- `open_choose_mode`'s row-0 fallback applies.
+    fn exec_choose_client_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if self.clients.is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        self.open_choose_mode(ChooseTreeView::Clients, None, None, session_name, client)
+    }
+
+    /// Shared choose-overlay opener (SP7 Task 14): seeds `selected`/`sel`
+    /// from `default_target` (falling back to row 0 -- Task 8 review fix,
+    /// Critical #1: an IDENTITY, not a raw index, so the very first
+    /// Up/Down/Commit/Kill has one to re-resolve, same as every subsequent
+    /// keypress), and the view's default sort (`sort_seq(view)[0]`, SP7
+    /// Task 15).
+    fn open_choose_mode(&mut self, view: ChooseTreeView, default_target: Option<TreeTarget>, win_filter: Option<HashSet<WindowId>>, session_name: &str, client: &mut ClientState) -> ExecOutcome {
+        let expanded = HashSet::new();
+        let sort = sort_seq(view)[0];
+        let rows = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, false);
         let selected = default_target
             .filter(|t| rows.iter().any(|r| &r.target == t))
             .or_else(|| rows.first().map(|r| r.target.clone()));
         let sel = selected.as_ref().and_then(|t| rows.iter().position(|r| &r.target == t)).unwrap_or(0);
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal, filter });
+        client.mode = ClientMode::ChooseTree(ChooseTreeState {
+            view,
+            sel,
+            selected,
+            pending_kill: None,
+            expanded,
+            preview: PreviewMode::Normal,
+            win_filter,
+            tagged: HashSet::new(),
+            sort,
+            reversed: false,
+            filter: None,
+            filter_edit: None,
+        });
         ExecOutcome::Ok(String::new())
     }
 
@@ -5605,6 +6224,7 @@ mod mouse_dispatch_tests {
             message: None,
             tx,
             mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
         }
     }
 
@@ -5714,7 +6334,7 @@ mod mouse_dispatch_tests {
         let (mut server, session_name, _pane_id) = test_server_with_pane(true);
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             matches!(client.mode, ClientMode::Normal),
@@ -5739,7 +6359,7 @@ mod mouse_dispatch_tests {
         let (mut server, session_name, _pane_id) = test_server_with_pane(false);
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(matches!(client.mode, ClientMode::Copy(_)), "wheel over a LIVE pane must enter copy mode");
     }
@@ -5814,7 +6434,7 @@ mod mouse_dispatch_tests {
         assert!(matches!(client.mode, ClientMode::DisplayPanes(_)), "test setup: overlay must be open");
 
         let up = MouseEvent { kind: MouseKind::Up(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
-        let outcome = server.dispatch_mouse(up, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(up, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             client.mouse.drag == super::super::MouseDrag::None,
@@ -5893,7 +6513,7 @@ mod mouse_dispatch_tests {
         let (_, left_rect) = *rects.iter().find(|(id, _)| *id == left_id).expect("left pane must have a rect");
         let click = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: left_rect.x + 1, y: left_rect.y + 1 };
 
-        let outcome = server.dispatch_mouse(click, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(click, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert_eq!(
             focused(&server),
@@ -5911,11 +6531,11 @@ mod mouse_dispatch_tests {
         let mut client = test_client(20, 10);
 
         let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
-        let outcome = server.dispatch_mouse(down, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
         let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: 6, y: 3 };
-        let outcome = server.dispatch_mouse(drag, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
         assert!(
@@ -5941,7 +6561,7 @@ mod mouse_dispatch_tests {
         let (mut server, session_name, _pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             matches!(client.mode, ClientMode::Normal),
@@ -5966,7 +6586,7 @@ mod mouse_dispatch_tests {
         let border_x = left_rect_before.x + left_rect_before.w;
 
         let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: border_x, y: 3 };
-        let outcome = server.dispatch_mouse(down, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             client.mouse.drag == super::super::MouseDrag::Border { pane: left_id, vertical: true },
@@ -5974,7 +6594,7 @@ mod mouse_dispatch_tests {
         );
 
         let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: border_x + 2, y: 3 };
-        let outcome = server.dispatch_mouse(drag, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
         let (_area, rects_after) = server.mouse_pane_rects(&session_name).unwrap();
@@ -5994,7 +6614,7 @@ mod mouse_dispatch_tests {
         let (mut server, session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(matches!(client.mode, ClientMode::Normal), "test setup: pane must own the mouse before DECRST");
 
@@ -6002,7 +6622,7 @@ mod mouse_dispatch_tests {
             pane.grid.feed(b"\x1b[?1000l");
         }
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             matches!(client.mode, ClientMode::Copy(_)),
@@ -6034,6 +6654,7 @@ mod choose_tree_dispatch_tests {
             message: None,
             tx,
             mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
         }
     }
 
@@ -6104,7 +6725,7 @@ mod choose_tree_dispatch_tests {
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
         // Down: A's row (the default selection) -> B's row.
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname, 0).expect("Down dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
                 assert_eq!(state.selected, Some(TreeTarget::Window(session_name.clone(), b_id)), "test setup: selection must be window B before the concurrent kill")
@@ -6115,7 +6736,7 @@ mod choose_tree_dispatch_tests {
         // Same-batch concurrent kill of window A (bypasses dispatch/render).
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");
 
-        let outcome = server.dispatch_choose_tree_key(&key(KeyCode::Enter), &mut client, &mut sname).expect("Enter dispatches");
+        let outcome = server.dispatch_choose_tree_key(&key(KeyCode::Enter), &mut client, &mut sname, 0).expect("Enter dispatches");
         assert!(matches!(outcome, ExecOutcome::Ok(_)), "commit to a same-session window is a plain Ok, not SwitchedSession");
         let current = server.registry.session_mut(&session_name).unwrap().current;
         assert_eq!(
@@ -6135,17 +6756,17 @@ mod choose_tree_dispatch_tests {
         let mut sname = session_name.clone();
 
         server.exec_choose_tree_client(false, &mut client, &sname);
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname, 0).expect("Down dispatches");
 
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");
 
-        server.dispatch_choose_tree_key(&key(KeyCode::Char('x')), &mut client, &mut sname).expect("x dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Char('x')), &mut client, &mut sname, 0).expect("x dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let (target, _) = state.pending_kill.as_ref().expect("x must arm a pending kill");
+                let (targets, _) = state.pending_kill.as_ref().expect("x must arm a pending kill");
                 assert_eq!(
-                    target,
-                    &TreeTarget::Window(session_name.clone(), b_id),
+                    targets.as_slice(),
+                    &[TreeTarget::Window(session_name.clone(), b_id)],
                     "x must arm the kill-confirm on what the user actually selected (window B), not the stale index"
                 );
             }

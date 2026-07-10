@@ -202,7 +202,8 @@ enum ClientMode {
     Clock(ClockState),
 }
 
-/// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
+/// The choose overlay's four view kinds (Task 8; `Buffers`/`Clients` added
+/// SP7 Task 14, closes #48/#49). `Sessions` (`-s`) lists every session as
 /// a real tree row (SP6 wave 2, Task 8: a `+`/`-` expand marker, collapsed by
 /// default per `docs/tmux-reference/choose-tree.md` `## 1.1` -- "sessions
 /// start collapsed"; `Right`/`+` reveals its windows as indented children);
@@ -211,11 +212,16 @@ enum ClientMode {
 /// -- see the design spec's `## 7. Overlays` section for the documented
 /// "windows of the current session only" scope simplification, which this
 /// task does not change: real tmux's `-w` shows the whole multi-session
-/// tree).
+/// tree). `Buffers` (`choose-buffer`, `## 10`) and `Clients` (`choose-
+/// client`, `## 9`) are FLAT (`depth: 0` on every row, no expand affordance)
+/// -- see `dispatch::Server::build_tree_rows`'s doc comment for their row
+/// format and `dispatch::sort_seq` for their (restricted) sort sequences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChooseTreeView {
     Windows,
     Sessions,
+    Buffers,
+    Clients,
 }
 
 /// choose-tree's live preview mode (SP6 wave 2, Task 8;
@@ -240,6 +246,27 @@ impl PreviewMode {
             PreviewMode::Normal => PreviewMode::Off,
         }
     }
+}
+
+/// The choose overlay's sort FIELD (SP7 Task 15, closes #50's remainder;
+/// `docs/tmux-reference/choose-tree.md` `## 4`/`## 9`/`## 10`), cycled by
+/// `O` and flipped by `r` (`ChooseTreeState::sort`/`reversed`). Each view
+/// only cycles through a RESTRICTED sequence (`dispatch::sort_seq`) — a
+/// documented simplification of tmux's per-mode sequences: `activity`/`z`
+/// (choose-tree) and `activity` (choose-client) aren't modeled (winmux
+/// tracks no per-window "z" order and no per-client activity clock), so
+/// `Index`/`Name` is choose-tree's whole sequence, `Creation`/`Name`/`Size`
+/// is choose-buffer's, and `Name`/`Size`/`Creation` is choose-client's.
+/// `Index` for buffers/clients
+/// is unreachable via `O` (never in either view's sequence) but kept as a
+/// variant for a uniform type; `sort_rows`/`build_tree_rows` treat it as a
+/// no-op ("natural"/insertion order) if ever passed directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKey {
+    Index,
+    Name,
+    Size,
+    Creation,
 }
 
 /// choose-tree's per-client state (Task 8; review fix, Critical #1).
@@ -280,7 +307,16 @@ struct ChooseTreeState {
     view: ChooseTreeView,
     sel: usize,
     selected: Option<TreeTarget>,
-    pending_kill: Option<(TreeTarget, String)>,
+    /// `Some((targets, prompt))` between `x` and the y/n answer — `targets`
+    /// is EVERY target the confirm applies to: the tagged set (SP7 Task 15)
+    /// when non-empty at `x`-press time, else just the current row (the
+    /// pre-Task-15 shape, now wrapped in a length-1 `Vec`). Only ever
+    /// populated for `Sessions`/`Windows` views (`## 7.2`'s `x`/`X` kill
+    /// confirms) — `Buffers`/`Clients` targets are removed IMMEDIATELY on
+    /// `x` with no confirm (`## 9`/`## 10`: "No confirm prompts" for
+    /// choose-client; choose-buffer's `d`/`D` likewise never confirm), so
+    /// this field is simply never set for those two views.
+    pending_kill: Option<(Vec<TreeTarget>, String)>,
     expanded: HashSet<String>,
     preview: PreviewMode,
     /// SP7 Task 12 (closes follow-ups #46/#54): `Some(matches)` for a tree
@@ -289,9 +325,46 @@ struct ChooseTreeState {
     /// while the tree stays open -- a documented simplification, see
     /// `dispatch::Server::exec_find_window_client`'s doc comment). `None`
     /// for a plain `choose-tree`/`w`/`s` open (no filtering). Only the
-    /// `Windows` view ever has a filter -- `find-window` never opens
-    /// `Sessions`.
-    filter: Option<HashSet<WindowId>>,
+    /// `Windows` view ever has a window filter -- `find-window` never opens
+    /// `Sessions`. Named `win_filter` (not `filter`) because SP7 Task 15's
+    /// interactive `f` TEXT filter below owns the plain name; the two
+    /// filters are independent and compose (win-filter first, inside
+    /// `build_tree_rows`; text filter on top, in `build_choose_rows`).
+    win_filter: Option<HashSet<WindowId>>,
+    /// SP7 Task 15 (closes #50's remainder): the tagged set, keyed by the
+    /// SAME stable identity `selected` uses — `t` toggles membership, `T`
+    /// clears it, `C-t` tags every currently-visible root row. When
+    /// non-empty, `x` (Kill) applies to every tagged target instead of just
+    /// the current row (`## 7.1`'s `t`/`T`/`C-t`, collapsed with `x`/`X`
+    /// per the task brief's "kill applies to tagged when tags exist" rule).
+    /// Cleared after every kill/detach/delete that consumes it.
+    tagged: HashSet<TreeTarget>,
+    /// SP7 Task 15: the active sort field, `O`-cycled through
+    /// `dispatch::sort_seq(view)`; seeded to that sequence's first entry
+    /// (the view's tmux-documented default) at overlay-open time.
+    sort: SortKey,
+    /// SP7 Task 15: `r`-flipped reverse flag, ANDed onto every comparison
+    /// `sort` makes (mirrors tmux's `sort_criteria.reversed` negating the
+    /// comparator's final result, `## 4.2`).
+    reversed: bool,
+    /// SP7 Task 15: the COMMITTED filter string (substring, case-
+    /// insensitive over a row's rendered `text` — a documented
+    /// simplification of tmux's real per-pane FORMAT filter, `## 7.1`).
+    /// `None`/empty = no filter. A filter that would match nothing is
+    /// IGNORED (the unfiltered row list is used, with the title showing
+    /// `(filter: no matches)` instead of narrowing to zero rows) —
+    /// `dispatch::Server::build_choose_rows` implements this exactly like
+    /// `mode_tree_build`'s own fallback (`## 2.2` point 4).
+    filter: Option<String>,
+    /// SP7 Task 15: `Some(buf)` while the `f` filter prompt is being
+    /// edited — kept INSIDE `ChooseTreeState` rather than switching
+    /// `client.mode` away to `ClientMode::Prompt`, the exact same reason
+    /// `CopyState::search_prompt` does (see its doc comment): switching
+    /// modes while typing would hide the row list/preview mid-edit.
+    /// Editing uses the same byte-capture machinery as every other status-
+    /// line-shaped prompt (`client.key_machine.set_capture(true)`,
+    /// `edit_line_buf`) via `dispatch::Server::feed_choose_filter_byte`.
+    filter_edit: Option<String>,
 }
 
 /// Re-resolve choose-tree's selection identity to a display INDEX into a
@@ -320,10 +393,12 @@ fn resolve_tree_sel(rows: &[dispatch::TreeRow], selected: &Option<TreeTarget>, f
     }
 }
 
-/// A choose-tree row's underlying identity (Task 8): resolved fresh from the
-/// registry at both render time and commit/kill time, never cached across a
-/// render -- see `ClientMode::ChooseTree`'s doc comment.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A choose overlay row's underlying identity (Task 8; `Buffer`/`Client`
+/// added SP7 Task 14, closes #48/#49): resolved fresh from live state at
+/// both render time and commit/kill time, never cached across a render --
+/// see `ClientMode::ChooseTree`'s doc comment. `Hash` (SP7 Task 15) lets it
+/// key `ChooseTreeState::tagged`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TreeTarget {
     Session(String),
     /// Session name + window id (the session is always the acting client's
@@ -331,6 +406,15 @@ enum TreeTarget {
     /// carried explicitly rather than assumed, for clarity at the exec
     /// sites).
     Window(String, WindowId),
+    /// A paste buffer, keyed by NAME (`buffers::Buffers`'s own stable
+    /// identity — `buffer<N>` names are never reused, `set_named`
+    /// overwrites in place, so a name is exactly as stable as tmux's
+    /// creation-order counter, `## 10`).
+    Buffer(String),
+    /// An attached client, keyed by its `ClientId` (winmux has no tty-path
+    /// client name; the identity IS the id -- `dispatch::client_label`
+    /// derives the display name from it, `## 9`).
+    Client(ClientId),
 }
 
 /// display-panes' per-client state (Task 8): just the auto-dismiss deadline
@@ -414,20 +498,24 @@ fn pane_digit_entries(window: &crate::model::Window, options: &Options) -> Vec<(
 /// clients`, neither of which the per-client `render_one` (called while
 /// `self.clients` is already mutably borrowed) can see directly.
 enum RenderOverlay {
-    /// Already-formatted row text (+ tree depth/expand-marker) in order,
-    /// plus which index is selected; `render_one` turns this into a
-    /// `render::Overlay::List` (padding/scrolling is a rendering concern,
+    /// Already-formatted row text (+ tree depth/expand-marker/tagged flag)
+    /// in order, plus which index is selected; `render_one` turns this into
+    /// a `render::Overlay::List` (padding/scrolling is a rendering concern,
     /// computed there with the client's own `rows`/`cols` in hand).
     /// `list_height` is the pre-sized row-list height (`Server::
     /// choose_tree_list_height`, SP6 wave 2 Task 8) -- equal to the full
     /// scene height whenever `preview` is `None` (preview OFF, or the panel
     /// too small per the sizing rule), reproducing the pre-Task-8-wave-2
-    /// full-height list exactly in that case.
+    /// full-height list exactly in that case. `title` (SP7 Task 15) is the
+    /// box-title-shaped `" <item> (sort: <field>[, reversed])[ (filter:
+    /// active|no matches)]"` string (`## 3.2`) painted on the panel's own
+    /// first row (`render::ListOverlay::title`).
     Tree {
-        rows: Vec<(String, u8, Option<char>)>,
+        rows: Vec<(String, u8, Option<char>, bool)>,
         sel: usize,
         list_height: u16,
         preview: Option<TreePreviewData>,
+        title: String,
     },
     /// The digit-to-pane mapping for the client's current window (see
     /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
@@ -679,6 +767,12 @@ struct ClientState {
     /// triple-click detection and in-progress border-resize/selection
     /// dragging. See [`MouseClientState`].
     mouse: MouseClientState,
+    /// SP7 Task 15 (#48/#49/#50): when this client attached — choose-
+    /// client's "attach time" row column and its `Creation` sort key
+    /// (`docs/tmux-reference/choose-tree.md` `## 9`) both read this. Only
+    /// meaningful relative to another client's `attached_at` (an `Instant`
+    /// has no absolute wall-clock meaning); set once in `finish_attach`.
+    attached_at: Instant,
 }
 
 /// SGR mouse-mode enable sequence (normal tracking `?1000h` + button-event
@@ -2032,6 +2126,7 @@ impl Server {
             message,
             tx,
             mouse: MouseClientState::default(),
+            attached_at: Instant::now(),
         };
         self.clients.insert(id, client);
         self.had_session = true;
@@ -2242,25 +2337,34 @@ impl Server {
     }
 
     /// Cancel any attached client's choose-tree (Task 8) `pending_kill`
-    /// confirm whose snapshotted target no longer exists (killed by another
-    /// client, or by this same client's own dispatch, while the `x` (y/n)
-    /// prompt was up). Navigation/commit never go stale (see
+    /// confirm whose snapshotted target(s) no longer exist (killed by
+    /// another client, or by this same client's own dispatch, while the `x`
+    /// (y/n) prompt was up). Navigation/commit never go stale (see
     /// `ClientMode::ChooseTree`'s doc comment for why) — `pending_kill` is
     /// the one piece of state this mode carries across renders, so it is the
     /// only thing this sweep needs to re-validate. Called from the same two
     /// sites as `cancel_stale_confirms`/`cancel_stale_copy_modes`.
+    ///
+    /// SP7 Task 15: `pending_kill` now carries a `Vec` (the tagged-kill
+    /// case) — a DEAD target is dropped from the vec (not the whole
+    /// confirm), so a tagged multi-kill where only ONE tagged item died
+    /// concurrently still confirms the rest; the confirm is cancelled only
+    /// once every target has died. `pending_kill` is only ever populated for
+    /// `Sessions`/`Window` targets (`## ChooseTreeState` doc comment), so no
+    /// `Buffer`/`Client` liveness check is needed here.
     fn cancel_stale_choose_trees(&mut self) {
         let live_sessions: HashSet<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
         let live_windows: HashSet<(String, WindowId)> =
             self.registry.sessions().iter().flat_map(|s| s.windows.iter().map(move |w| (s.name.clone(), w.id))).collect();
         for client in self.clients.values_mut() {
             if let ClientMode::ChooseTree(state) = &mut client.mode {
-                if let Some((target, _)) = &state.pending_kill {
-                    let alive = match target {
+                if let Some((targets, _)) = &mut state.pending_kill {
+                    targets.retain(|target| match target {
                         TreeTarget::Session(n) => live_sessions.contains(n),
                         TreeTarget::Window(sn, wid) => live_windows.contains(&(sn.clone(), *wid)),
-                    };
-                    if !alive {
+                        TreeTarget::Buffer(_) | TreeTarget::Client(_) => true,
+                    });
+                    if targets.is_empty() {
                         state.pending_kill = None;
                     }
                 }
@@ -2566,7 +2670,7 @@ impl Server {
                         decoded.extend(dec.flush());
                         for item in decoded {
                             let crate::keys::DecodedInput::Key(dk) = item else { continue };
-                            if let Some(outcome) = self.dispatch_choose_tree_key(&dk.key, &mut client, &mut session_name) {
+                            if let Some(outcome) = self.dispatch_choose_tree_key(&dk.key, &mut client, &mut session_name, id) {
                                 dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                                 if detach || destroy {
                                     break 'events;
@@ -2685,7 +2789,7 @@ impl Server {
                     // ignored (overlay stays open either way), never as the
                     // prefix-bound command.
                     if matches!(client.mode, ClientMode::ChooseTree(_)) {
-                        if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name) {
+                        if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name, id) {
                             dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                             if detach || destroy {
                                 break 'events;
@@ -2804,7 +2908,7 @@ impl Server {
                     // Task 5 (mouse): routed entirely outside the prefix/
                     // binding-table machinery — see `dispatch::dispatch_mouse`
                     // and the design spec's `## 4. Mouse` section.
-                    let outcome = self.dispatch_mouse(event, &mut client, &session_name);
+                    let outcome = self.dispatch_mouse(event, &mut client, &session_name, id);
                     dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                     if detach || destroy {
                         break 'events;
@@ -2887,7 +2991,13 @@ impl Server {
         let session_name = client.session.as_deref()?;
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let rows = self.build_tree_rows(session_name, state.view, &state.expanded, state.filter.as_ref());
+                // SP7 Task 15: `build_choose_rows` applies the active
+                // sort/filter on top of `build_tree_rows`'s live rebuild --
+                // see its doc comment for the "filter matches nothing ->
+                // fall back to unfiltered" rule. (It also passes through
+                // Task 12's `win_filter`, so a `find-window` tree renders
+                // its match set here too.)
+                let (rows, filter_no_matches) = self.build_choose_rows(session_name, state);
                 // Task 8 review fix, Critical #1: resolve by IDENTITY, not
                 // a raw clamped index -- see `resolve_tree_sel`'s doc
                 // comment. `build_render_overlay` runs with `&self` only
@@ -2895,6 +3005,7 @@ impl Server {
                 // is a read-only re-derivation, same as every other render
                 // pass; the persisted `ChooseTreeState` is not mutated here.
                 let sel = resolve_tree_sel(&rows, &state.selected, state.sel);
+                let title = self.build_choose_title(&rows, sel, state, filter_no_matches);
                 // SP6 wave 2, Task 8: sizing (`## 3.1`) + the selected row's
                 // live preview content, built here (not `render_one`) for the
                 // same reason the rows themselves are -- this is the one pass
@@ -2902,18 +3013,28 @@ impl Server {
                 // hand before `render_all`'s mutable per-client loop begins.
                 let sy = client.rows;
                 let w = client.cols;
-                let list_height = Server::choose_tree_list_height(sy, w, rows.len(), state.preview);
-                let preview = if list_height < sy {
+                let list_height = Server::choose_tree_list_height(sy, rows.len(), state.preview);
+                // SP7 Task 15 fix (closes #73): the paint-time box-size
+                // guard is now CHECKED SEPARATELY from `list_height`'s own
+                // sizing formula (`choose_tree_preview_paintable`'s doc
+                // comment) -- a degenerate geometry no longer implies
+                // `list_height == sy`, so `list_height < sy` alone is no
+                // longer a reliable "is there a preview" test; the
+                // `RenderOverlay::Tree` -> `ListOverlay` conversion below
+                // still caps the row list to `list_height` (via its own new
+                // `list_height` field) EVEN when no preview is painted, so a
+                // degenerate pane leaves the leftover rows blank rather than
+                // expanding the list into them.
+                let preview = if Server::choose_tree_preview_paintable(sy, list_height, w) {
                     // Fix round 1 (`## 3.2`): the interior is inset inside
                     // the full 4-sided box -- 2 cells horizontal each side
                     // (`w - 4`), 1 row vertical each (top + bottom border:
-                    // `(sy - list_height) - 2`). `choose_tree_list_height`'s
-                    // box-size guard (`sy-h <= 4 || w <= 4` drops the
-                    // preview) guarantees both are >= 1 whenever this branch
-                    // is reached (region >= 5 rows -> interior >= 3 rows;
-                    // panel >= 5 cols -> interior >= 1 col), so no extra
-                    // "inset shrank the blit area below 1x1" drop rule is
-                    // needed here.
+                    // `(sy - list_height) - 2`). `choose_tree_preview_paintable`
+                    // guarantees both are >= 1 whenever this branch is
+                    // reached (region >= 5 rows -> interior >= 3 rows; panel
+                    // >= 5 cols -> interior >= 1 col), so no extra "inset
+                    // shrank the blit area below 1x1" drop rule is needed
+                    // here.
                     let interior_h = sy.saturating_sub(list_height).saturating_sub(2);
                     let interior_w = w.saturating_sub(4);
                     rows.get(sel).map(|r| {
@@ -2924,10 +3045,11 @@ impl Server {
                     None
                 };
                 Some(RenderOverlay::Tree {
-                    rows: rows.into_iter().map(|r| (r.text, r.depth, r.marker)).collect(),
+                    rows: rows.into_iter().map(|r| { let tagged = state.tagged.contains(&r.target); (r.text, r.depth, r.marker, tagged) }).collect(),
                     sel,
                     list_height,
                     preview,
+                    title,
                 })
             }
             ClientMode::DisplayPanes(_) => {
@@ -3304,7 +3426,7 @@ fn render_one(
     };
 
     let overlay = overlay_data.map(|ov| match ov {
-        RenderOverlay::Tree { rows, sel, list_height, preview } => {
+        RenderOverlay::Tree { rows, sel, list_height, preview, title } => {
             // Task 8 review fix, Important #3: `compose_back`'s actual paint
             // pass reserves the panel's OWN last row for `scene.message`
             // (choose-tree's `x` kill-confirm prompt) whenever it's `Some`
@@ -3321,7 +3443,15 @@ fn render_one(
             // `*list_height == scene_size.1` in every other case, so this
             // subsumes the pre-Task-8-wave-2 math exactly.
             let msg_reserved = if message.is_some() && preview.is_none() { 1 } else { 0 };
-            let visible = (*list_height as usize).saturating_sub(msg_reserved);
+            // SP7 Task 15: the title row (`## 3.2`'s sort/filter indicator,
+            // now always non-empty) takes the panel's own FIRST row before
+            // any list rows are painted (`compose_back`'s `y += 1` when
+            // `!list.title.is_empty()`) -- reserved here too, same reason
+            // `msg_reserved` already is, so `top`'s "keep `sel` on screen"
+            // math never assumes one more paintable row than `compose_back`
+            // will actually use.
+            let title_reserved = 1usize; // title is always non-empty (see `Server::build_choose_title`)
+            let visible = (*list_height as usize).saturating_sub(msg_reserved).saturating_sub(title_reserved);
             let top = sel.saturating_sub(visible.saturating_sub(1));
             let preview_block = preview.as_ref().map(|p| PreviewBlock {
                 rect: Rect { x: 0, y: *list_height, w: scene_size.0, h: scene_size.1.saturating_sub(*list_height) },
@@ -3331,14 +3461,21 @@ fn render_one(
                 content: p.content.clone(),
             });
             Overlay::List(ListOverlay {
-                title: String::new(),
+                title: title.clone(),
                 rows: rows
                     .iter()
                     .enumerate()
-                    .map(|(i, (text, depth, marker))| TreeRowCell { text: text.clone(), depth: *depth, marker: *marker, selected: i == *sel })
+                    .map(|(i, (text, depth, marker, tagged))| TreeRowCell {
+                        text: text.clone(),
+                        depth: *depth,
+                        marker: *marker,
+                        selected: i == *sel,
+                        tagged: *tagged,
+                    })
                     .collect(),
                 top,
                 preview: preview_block,
+                list_height: *list_height,
             })
         }
         RenderOverlay::Digits(entries) => {

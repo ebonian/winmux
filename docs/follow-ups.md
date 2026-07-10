@@ -811,34 +811,61 @@ None block the sub-project 4 merge.
     on resize ... documented winmux divergence, ticket"). A resize mid-copy-
     mode-scroll can therefore show ragged/truncated historical lines that
     don't match what a reflowing terminal would show.
-48. **`choose-buffer` (`=`) is not implemented** (Task 3, paste buffers). The
-    design spec explicitly deferred a picker UI for selecting among multiple
-    named/automatic paste buffers; `paste-buffer`/`delete-buffer` always
-    default to the newest buffer (or an explicit `-b name`) with no
-    interactive chooser.
-49. **`D` (choose-client) is not implemented** (Task 7, window ops; design
-    spec `## 6. Window ops`: "`D` choose-client: DEFERRED"). There is
-    no way to list and switch/detach OTHER attached clients from within a
-    session; only `switch-client`'s session-level `(`/`)` and the CLI's
-    `detach-client` exist.
-50. **`choose-tree` has no preview, tagging, filtering, or sort options**
+48. **RESOLVED (SP7 Task 14, 2026-07-10).** `choose-buffer` (`=`) is now
+    implemented: reuses the choose-tree overlay machinery, generalized
+    (`ChooseTreeView::Buffers`, `TreeTarget::Buffer`) rather than
+    duplicated. Rows are `"<name>: <size> bytes: \"<sample>\""`, default
+    sort NEWEST-first (`docs/tmux-reference/choose-tree.md` `## 10`); Enter
+    runs the default `paste-buffer -p -b '%%'` template and exits; `x`
+    deletes the selected buffer immediately (no confirm, matching real
+    tmux). *Original text:* **`choose-buffer` (`=`) is not implemented**
+    (Task 3, paste buffers). The design spec explicitly deferred a picker
+    UI for selecting among multiple named/automatic paste buffers;
+    `paste-buffer`/`delete-buffer` always default to the newest buffer (or
+    an explicit `-b name`) with no interactive chooser.
+49. **RESOLVED (SP7 Task 14, 2026-07-10).** `D` (choose-client) is now
+    implemented on the same generalized machinery (`ChooseTreeView::
+    Clients`, `TreeTarget::Client(ClientId)` — winmux has no tty path, so
+    the client id itself is the row identity, displayed as a synthetic
+    `client-<id>` label). Rows list every attached client and the session
+    it's on; Enter and `x` both detach the selected client immediately (no
+    confirm, `## 9`: "No confirm prompts") — detaching another client sends
+    it the same `[detached (from session ...)]` exit the CLI's
+    `detach-client` does; detaching yourself exits this client the same way
+    `d`/`detach-client` (bare) does. *Original text:* **`D` (choose-client)
+    is not implemented** (Task 7, window ops; design spec `## 6. Window
+    ops`: "`D` choose-client: DEFERRED"). There is no way to list and
+    switch/detach OTHER attached clients from within a session; only
+    `switch-client`'s session-level `(`/`)` and the CLI's `detach-client`
+    exist.
+50. **RESOLVED (SP7 Task 15, 2026-07-10) — the remainder closed.**
+    Tagging/sort/filter are now implemented on the SAME generalized choose
+    overlay machinery (so they apply to `choose-buffer`/`choose-client` too,
+    "for free"): `t` toggles a tag (drawn as a leading `*` marker), `T`
+    untags everything, `C-t` tags every visible root row; `x` applies to
+    every TAGGED row when any exist, collapsing tmux's separate `x`/`X`
+    into one binding (a single `"kill N tagged?"` confirm for
+    `Sessions`/`Windows`, immediate for `Buffers`/`Clients`); `O` cycles a
+    per-view sort field (`Index`/`Name` for choose-tree, `Creation`/`Name`/
+    `Size` for choose-buffer, `Name`/`Size`/`Creation` for choose-client —
+    a documented RESTRICTED subset of tmux's own sequences, since winmux
+    tracks no per-window "z" order or per-client activity clock) and `r`
+    reverses it; `f` opens a filter prompt (substring, case-insensitive
+    over a row's rendered text — a documented simplification of tmux's real
+    per-pane FORMAT filter) and `c` clears it; the panel's own first row
+    now shows a `" <item> (sort: <field>[, reversed])[ (filter: active|no
+    matches)]"` title line. See `docs/specs/2026-07-07-parity-polish-
+    interfaces.md`'s "SP7 Tasks 14/15" amendment for the full type/
+    signature diff. *Original text (SP6 wave 2 narrowing, 2026-07-10):*
+    **`choose-tree` has no preview, tagging, filtering, or sort options**
     (Task 8, overlays). The design spec's `## 7. Overlays` section is
     explicit ("No preview, no tagging (documented)"); winmux's `w`/`s`
     overlay is a flat, unfilterable, untaggable list with plain up/down
     navigation and no session/window content preview pane, unlike real
-    tmux's `choose-tree`.
-
-    **NARROWED (SP6 parity wave 2, Task 8, 2026-07-10).** The tree-shape and
-    preview halves of this gap are now closed: `choose-tree` is a real
-    session/window tree with `Left`/`Right` expand/collapse (sessions
-    collapsed by default in `s`-view), the default selection lands on the
-    CURRENT item (not always the first row), and `v` cycles a live preview
-    box through off → BIG → normal with tmux's own sizing and full 4-sided
-    box chrome. What remains open from the original text: **tagging** (no
-    way to mark multiple rows for a bulk action) and **sort options** (real
-    tmux's `O`/`r` cycle the sort key and reverse it; winmux has no sort
-    concept at all, rows are always in registry-insertion order) — filtering
-    (`/`-style incremental search within the list) is also still absent.
+    tmux's `choose-tree`. The tree-shape and preview halves of this gap
+    were closed by SP6 wave 2 Task 8 (real tree, current-item default
+    selection, live preview box) — what remained open (tagging, sort, and
+    filtering) is what this SP7 Task 15 entry closes.
 51. **No right-click context menus** (mouse, Task 5). Real tmux (recent
     versions) can show a right-click menu over a pane/status-line/border;
     winmux's mouse routing has no menu concept at all — every mouse event
@@ -1539,18 +1566,34 @@ None block the sub-project 4 merge.
     dispatch, and gate copy-mode-entry/wheel translation on the pane's mouse mode.
     MEDIUM effort. Interacts with #67(b) table-driven mouse bindings.
 
-73. **choose-tree degenerate tiny-pane guard reverts to a full-height list where
-    tmux would draw a short list + blank remainder** (SP6 wave 2 Task 8 review,
-    self-found, 2026-07-10, `dispatch::Server::choose_tree_list_height`). winmux
-    folds tmux's mode_tree_draw paint-time guard (`sy <= 4 || h < 2 ||
-    sy - h <= 4 || w <= 4`, mode-tree.c:980-981 — "don't draw the box") into the
-    HEIGHT function by setting `h = sy` (list takes the whole panel). Real tmux
-    keeps the computed `h` and simply skips painting the preview box, leaving rows
-    `h..sy-1` blank — so in a degenerate-size pane (e.g. BIG preview mode in a
-    panel 5-6 rows tall) tmux shows a short list over blank rows where winmux
-    shows a full-height list. Defensible (winmux's behavior is arguably more
-    useful — no dead rows) and reachable only in degenerate geometries; ticketed
-    for the record. TINY. LOW.
+73. **RESOLVED (SP7 Task 15, 2026-07-10).** `choose_tree_list_height` no
+    longer folds `mode_tree_draw`'s paint-time box-size guard
+    (`sy <= 4 || h < 2 || sy - h <= 4 || w <= 4`, mode-tree.c:980-981) into
+    its own sizing formula at all — that check moved to a SEPARATE new
+    function, `choose_tree_preview_paintable`, consulted independently by
+    `Server::build_render_overlay`. `render::ListOverlay` gained a
+    `list_height: u16` field that the paint code now uses UNCONDITIONALLY
+    to cap the row list (`list.list_height.min(rows)`), instead of the old
+    "no preview -> list gets the whole panel" inference. A degenerate pane
+    (e.g. BIG preview mode, `sy - h <= 4`) now shows its own small
+    `list_height` worth of rows with the freed rows left BLANK, matching
+    real tmux exactly — `choose_tree_tiny_pane_keeps_short_list_blank_
+    remainder` (`tests/server_proto.rs`) proves it directly (an 80x6 client,
+    4 windows, BIG preview: only 1 row of list content shown, rows 2-5 all
+    blank, no border glyphs anywhere). *Original text:* **choose-tree
+    degenerate tiny-pane guard reverts to a full-height list where tmux
+    would draw a short list + blank remainder** (SP6 wave 2 Task 8 review,
+    self-found, 2026-07-10, `dispatch::Server::choose_tree_list_height`).
+    winmux folds tmux's mode_tree_draw paint-time guard (`sy <= 4 || h < 2
+    || sy - h <= 4 || w <= 4`, mode-tree.c:980-981 — "don't draw the box")
+    into the HEIGHT function by setting `h = sy` (list takes the whole
+    panel). Real tmux keeps the computed `h` and simply skips painting the
+    preview box, leaving rows `h..sy-1` blank — so in a degenerate-size
+    pane (e.g. BIG preview mode in a panel 5-6 rows tall) tmux shows a
+    short list over blank rows where winmux shows a full-height list.
+    Defensible (winmux's behavior is arguably more useful — no dead rows)
+    and reachable only in degenerate geometries; ticketed for the record.
+    TINY. LOW.
 
 ## Follow-ups from Task 9 (SP6 parity wave 2 closeout, 2026-07-10)
 

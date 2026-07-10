@@ -348,6 +348,16 @@ pub enum ParsedCmd {
     /// and the documented "windows of the current session only" scope
     /// simplification. `-s`/`-w` together is a usage error.
     ChooseTree { sessions: bool },
+    /// `choose-buffer|chooseb` (SP7 Task 14, closes #48): open the choose-
+    /// buffer overlay on the acting client (paste buffers, `docs/tmux-
+    /// reference/choose-tree.md` `## 10`). No flags modeled (real tmux's
+    /// `-F`/`-f`/`-K`/`-N`/`-O`/`-r`/`-t`/`-y`/`-Z` are out of scope, same
+    /// precedent as `ChooseTree` above not modeling most of its own flags).
+    ChooseBuffer,
+    /// `choose-client` (SP7 Task 14, closes #49): open the choose-client
+    /// overlay on the acting client (attached clients, `## 9`). Same "no
+    /// flags modeled" precedent as `ChooseBuffer`.
+    ChooseClient,
     /// `display-panes|displayp [-d ms]` (Task 8): show a per-pane digit
     /// overlay on the acting client's current window; `ms: None` uses the
     /// `display-panes-time` option's current value (resolved at dispatch
@@ -684,6 +694,8 @@ fn canonical(name: &str) -> Option<&'static str> {
         "swap-window" | "swapw" => "swap-window",
         "find-window" | "findw" => "find-window",
         "choose-tree" | "choosetree" => "choose-tree",
+        "choose-buffer" | "chooseb" => "choose-buffer",
+        "choose-client" => "choose-client",
         "display-panes" | "displayp" => "display-panes",
         "clock-mode" => "clock-mode",
         _ => return None,
@@ -762,6 +774,8 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "swap-window" => "usage: swap-window [-d] [-s src] -t dst",
         "find-window" => "usage: find-window [-CNTirZ] pattern",
         "choose-tree" => "usage: choose-tree [-s] [-w]",
+        "choose-buffer" => "usage: choose-buffer",
+        "choose-client" => "usage: choose-client",
         "display-panes" => "usage: display-panes [-d ms]",
         "clock-mode" => "usage: clock-mode",
         _ => unreachable!("canonical() and usage() command lists diverged"),
@@ -1414,6 +1428,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             }
             Ok(ParsedCmd::ChooseTree { sessions: has(&b, "-s") })
         }
+        "choose-buffer" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseBuffer)
+        }
+        "choose-client" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseClient)
+        }
         "display-panes" => {
             let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-d"]) else { return Err(bad()) };
             if !p.is_empty() {
@@ -1913,6 +1941,15 @@ mod tests {
         assert_eq!(resolve(&raw("choosetree", &["-s"])).unwrap(), ParsedCmd::ChooseTree { sessions: true });
         assert_eq!(resolve(&raw("choose-tree", &["-s", "-w"])).unwrap_err(), usage("choose-tree").unwrap());
         assert_eq!(resolve(&raw("choose-tree", &["extra"])).unwrap_err(), usage("choose-tree").unwrap());
+    }
+
+    #[test]
+    fn choose_buffer_and_choose_client() {
+        assert_eq!(resolve(&raw("choose-buffer", &[])).unwrap(), ParsedCmd::ChooseBuffer);
+        assert_eq!(resolve(&raw("chooseb", &[])).unwrap(), ParsedCmd::ChooseBuffer);
+        assert_eq!(resolve(&raw("choose-buffer", &["extra"])).unwrap_err(), usage("choose-buffer").unwrap());
+        assert_eq!(resolve(&raw("choose-client", &[])).unwrap(), ParsedCmd::ChooseClient);
+        assert_eq!(resolve(&raw("choose-client", &["extra"])).unwrap_err(), usage("choose-client").unwrap());
     }
 
     #[test]
