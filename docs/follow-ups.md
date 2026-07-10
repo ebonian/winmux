@@ -880,9 +880,27 @@ None block the sub-project 4 merge.
     `Write-Host` statement and relies on a SEPARATE statement's own,
     unrelated real escape sequence (verified to survive ConPTY intact) to
     supply the commit.
-53. **`paste-buffer -p`'s bracketed-paste flag is accepted but has no
-    effect** (Task 3, paste buffers). Real tmux's `-p` wraps the pasted
-    bytes in `ESC[200~`/`ESC[201~` bracketed-paste markers so a
+53. **RESOLVED** (SP7 Task 13, 2026-07-10). `paste-buffer -p` now really
+    wraps the write in `ESC[200~`/`ESC[201~` -- but ONLY when the TARGET
+    pane's grid currently has bracketed-paste mode set (`Grid::
+    bracketed_paste`, tracking DECSET/DECRST 2004, `src/grid.rs`); otherwise
+    `-p` stays a silent no-op wrapper, matching real tmux
+    (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5). Wiring:
+    `src/server/dispatch.rs`'s `maybe_bracket_paste` (pure helper, unit
+    tested) plus `Grid::bracketed_paste()`. The "pane DID request it"
+    positive case is proven at the unit level only (`grid::tests::
+    decset_2004_tracks_bracketed_paste`, `server::dispatch::clipboard_tests::
+    bracket_wraps_only_when_both_flag_and_pane_true`) — see that test
+    module's doc comment for why a real-ConPTY end-to-end proof of the
+    positive case was found to be fundamentally unprovable black-box (both a
+    ConPTY VT-relay reliability concern for the injected DECSET, AND a
+    paste-aware reader being EXPECTED to consume/strip the markers on
+    success, making a successful wrap indistinguishable on-screen from a
+    no-op skip). The negative case (`tests/server_proto.rs::
+    paste_p_plain_when_not_requested`) is a real end-to-end test.
+    *Original text:* `paste-buffer -p`'s bracketed-paste flag is accepted
+    but has no effect (Task 3, paste buffers). Real tmux's `-p` wraps the
+    pasted bytes in `ESC[200~`/`ESC[201~` bracketed-paste markers so a
     bracketed-paste-aware application (e.g. a shell with `bracketed-paste`
     support) can distinguish pasted text from typed keystrokes; winmux's
     `-p` is parsed and accepted but the write is always a plain byte dump
@@ -893,18 +911,51 @@ None block the sub-project 4 merge.
     regex"). A pattern like `^foo` or `bar$` is matched LITERALLY (including
     the `^`/`$` characters) rather than as an anchor, unlike real tmux's
     `-r`-capable regex matching.
-55. **No `copy-pipe`/OSC 52 clipboard integration in copy mode** (Tasks 2-4,
-    copy mode). Copying in copy mode only ever writes to winmux's own
-    internal paste-buffer store; there is no way to pipe a copy-mode
-    selection to an external command (tmux's `copy-pipe`/`copy-pipe-and-cancel`)
-    or to emit an OSC 52 sequence so the selection also lands on the REAL
-    system clipboard (some tmux configs wire this up for clipboard
-    integration over SSH).
-56. **Emacs copy-mode table omits `C-k` (copy-to-end-of-line-and-cancel) and
-    `M-m` (back-to-indentation)** (Task 2, copy mode; design spec `## 2. Copy
-    mode`: "`C-k` copy to end of line and cancel (defer, not in v1 tables)").
-    Both are real tmux emacs-table bindings; winmux's emacs copy-mode table
-    covers the more commonly used subset only.
+55. **RESOLVED** (SP7 Task 13, 2026-07-10). `copy-pipe`/`copy-pipe-and-cancel
+    [command]` are now real commands (`CopyAction::CopyPipe`/
+    `CopyPipeAndCancel`, `src/cmd.rs`): copy destinations are the SAME as
+    `copy-selection-and-cancel` (automatic buffer + OSC 52 when
+    `set-clipboard` emits) PLUS, if `command` is given, it's spawned via
+    `cmd.exe /C` (`CREATE_NO_WINDOW`, detached, not waited on) with the
+    copied text on its stdin (`spawn_copy_pipe`, `src/server/dispatch.rs`).
+    OSC 52 (`\x1b]52;c;<base64>\x07`, hand-rolled base64 per plan decision)
+    is emitted to the attached client on EVERY copy destination (not just
+    copy-pipe), gated only on the new `set-clipboard` option (`on`/
+    `external` emit, `off` doesn't -- `Options::set_clipboard_emits`; no
+    ConPTY `Ms`-capability probe exists, so per-value gating is the accepted
+    substitute, per the reference doc's Windows-notes section). Real tmux's
+    `copy-command` server-option fallback (when `command` is empty) is NOT
+    modeled (documented narrowing -- an absent command is simply "no pipe"
+    here). See `tests/server_proto.rs::copy_pipe_runs_command_with_selection_stdin`
+    (real subprocess, real scratch-file write) and `::
+    osc52_emitted_to_client_on_copy`.
+    *Original text:* No `copy-pipe`/OSC 52 clipboard integration in copy
+    mode (Tasks 2-4, copy mode). Copying in copy mode only ever writes to
+    winmux's own internal paste-buffer store; there is no way to pipe a
+    copy-mode selection to an external command (tmux's `copy-pipe`/
+    `copy-pipe-and-cancel`) or to emit an OSC 52 sequence so the selection
+    also lands on the REAL system clipboard (some tmux configs wire this up
+    for clipboard integration over SSH).
+56. **RESOLVED** (SP7 Task 13, 2026-07-10). Added `C-k` and `M-m` to the
+    emacs copy-mode default table (`src/bindings.rs`). `C-k` is
+    `copy-end-of-line-and-cancel` (`CopyAction::EndOfLineAndCancel`): copies
+    cursor-to-end-of-line into a new automatic buffer (+ OSC 52 if
+    `set-clipboard` emits), then exits copy mode -- winmux's OWN naming
+    choice, NOT tmux MASTER branch's pipe-always
+    `copy-pipe-end-of-line-and-cancel` default (classic tmux <=3.5 bound
+    plain `copy-end-of-line`, no pipe, no cancel; see `CopyAction::
+    EndOfLineAndCancel`'s doc comment in `src/cmd.rs` for the full
+    reasoning). `M-m` is `back-to-indentation` (`CopyAction::
+    BackToIndentation`): first non-blank column of the current view row (v1
+    scope: no wrapped-line crossing, same simplification `NextWord`/
+    `PreviousWord` already document). See `tests/server_proto.rs::
+    emacs_c_k_copies_to_eol_and_cancels` / `::emacs_m_m_moves_to_first_nonblank`.
+    *Original text:* Emacs copy-mode table omits `C-k`
+    (copy-to-end-of-line-and-cancel) and `M-m` (back-to-indentation) (Task
+    2, copy mode; design spec `## 2. Copy mode`: "`C-k` copy to end of line
+    and cancel (defer, not in v1 tables)"). Both are real tmux emacs-table
+    bindings; winmux's emacs copy-mode table covers the more commonly used
+    subset only.
 57. **RESOLVED** (SP7 Task 8, 2026-07-10). Was: mouse bindings had no
     bindable NAMES in `bind-key`. `keys::KeyCode` gained a
     `MouseKey(MouseKeyKind, u8, MouseKeyLoc)` variant with full

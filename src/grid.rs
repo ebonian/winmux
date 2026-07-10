@@ -226,6 +226,14 @@ struct TermState {
     /// `Grid::take_bell` (SP7 Task 3; `Task 17` consumes this for bell
     /// alerts).
     bell: bool,
+    /// DECSET/DECRST 2004 (bracketed paste): `true` once the pane app has
+    /// requested bracketed-paste mode, `false` initially/after a DECRST
+    /// (SP7 Task 13, closes follow-up #55). Read via `Grid::bracketed_paste`
+    /// -- `paste-buffer -p` only wraps in `ESC[200~`/`ESC[201~` when this is
+    /// set on the TARGET pane (`docs/tmux-reference/copy-mode-and-buffers.md`
+    /// §9.4 point 5: "only if the target pane's screen has MODE_BRACKETPASTE
+    /// set... otherwise -p is a silent no-op wrapper").
+    bracketed_paste: bool,
 }
 
 impl TermState {
@@ -258,6 +266,7 @@ impl TermState {
             mouse_utf8: false,
             mouse_sgr: false,
             bell: false,
+            bracketed_paste: false,
         }
     }
 
@@ -1085,6 +1094,14 @@ impl Perform for TermState {
                         // the protocol mode above.
                         Some(1005) => self.mouse_utf8 = set,
                         Some(1006) => self.mouse_sgr = set,
+                        // Bracketed paste (SP7 Task 13): tracked purely so
+                        // `paste-buffer -p` knows whether to wrap the write
+                        // in ESC[200~/ESC[201~ -- winmux never emits the
+                        // input-side ESC[200~...ESC[201~ framing itself
+                        // (that's real terminal-side paste detection, out of
+                        // scope; here we're the "terminal" from the pane
+                        // app's point of view).
+                        Some(2004) => self.bracketed_paste = set,
                         _ => {}
                     }
                 }
@@ -1392,6 +1409,14 @@ impl Grid {
         let bell = self.state.bell;
         self.state.bell = false;
         bell
+    }
+
+    /// `true` once the pane app has requested bracketed-paste mode (DECSET
+    /// 2004), `false` after a matching DECRST or if it was never requested
+    /// (SP7 Task 13, closes follow-up #55). NOT edge-triggered -- reflects
+    /// current mode, same shape as `mouse_proto`/`alt_screen`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.state.bracketed_paste
     }
 
     /// Resize the grid, preserving the overlapping region. Dimensions are
@@ -1969,6 +1994,21 @@ mod tests {
         assert_eq!(g.mouse_encoding(), MouseEncoding::Sgr);
         // Setting the encoding mode must not disturb the protocol mode.
         assert_eq!(g.mouse_proto(), MouseProto::Normal);
+    }
+
+    #[test]
+    fn decset_2004_tracks_bracketed_paste() {
+        let mut g = Grid::new(10, 2, 0);
+        assert!(!g.bracketed_paste());
+        g.feed(b"\x1b[?2004h");
+        assert!(g.bracketed_paste());
+        g.feed(b"\x1b[?2004l");
+        assert!(!g.bracketed_paste());
+        // Independent of mouse mode tracking -- setting/resetting 2004 must
+        // not disturb an unrelated DECSET/DECRST bit.
+        g.feed(b"\x1b[?1000h\x1b[?2004h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        assert!(g.bracketed_paste());
     }
 
     #[test]

@@ -226,14 +226,18 @@ pub enum ParsedCmd {
     /// reachable via tmux's `send-keys -X <name>` spelling (`resolve`'s
     /// `send-keys` arm maps the `-X` name to this).
     CopyCmd(CopyAction),
-    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3):
-    /// write a buffer's contents to a pane's pty. `name: None` = the newest
-    /// buffer. `no_replace` (`-r`, tmux "do not replace LF with CR") default
-    /// `false` -- the DEFAULT behavior replaces every `\n` in the buffer with
-    /// `\r` before writing (tmux's own default; shells expect `\r` to submit
-    /// a line). `-p` (bracketed-paste passthrough) is accepted and IGNORED
-    /// (v1 simplification, documented in the design spec's deferrals list).
-    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3;
+    /// `-p` wired up SP7 Task 13, closes follow-up #55): write a buffer's
+    /// contents to a pane's pty. `name: None` = the newest buffer.
+    /// `no_replace` (`-r`, tmux "do not replace LF with CR") default `false`
+    /// -- the DEFAULT behavior replaces every `\n` in the buffer with `\r`
+    /// before writing (tmux's own default; shells expect `\r` to submit a
+    /// line). `bracket` (`-p`): wrap the whole write in `ESC[200~`/`ESC[201~`
+    /// -- but ONLY if the TARGET pane's grid currently has bracketed-paste
+    /// mode set (DECSET 2004, `Grid::bracketed_paste`); otherwise `-p` stays
+    /// a silent no-op wrapper, exactly like real tmux
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5).
+    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
     /// `list-buffers|lsb` (Task 3): `<name>: <size> bytes: "<sample>"` lines,
     /// oldest first. Full multi-line text via the CLI/headless path;
     /// dispatched from a CLIENT (a key binding, or the `:` prompt) instead
@@ -356,7 +360,11 @@ pub enum ParsedCmd {
 /// `send-keys -X` command set. See the design spec's `## 2. Copy mode`
 /// section and the `## copy-mode` contract section for the exact per-name
 /// mapping (`copy_action_name`/`copy_action_from_x_name` below).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// NOT `Copy` (SP7 Task 13): `CopyPipe`/`CopyPipeAndCancel` carry an
+/// optional shell-command argument (`Option<String>`), so every other
+/// (still data-free) variant rides along as `Clone` instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyAction {
     CursorLeft,
     CursorRight,
@@ -412,11 +420,54 @@ pub enum CopyAction {
     /// (`N`). A no-op if no search has ever been committed in this copy-mode
     /// session.
     SearchReverse,
+    /// SP7 Task 13 (closes follow-up #56): first non-blank column of the
+    /// current (view) line -- emacs `M-m`. v1 simplification consistent with
+    /// `NextWord`/`PreviousWord`'s doc comment: operates on the current view
+    /// ROW only, no wrapped-line crossing.
+    BackToIndentation,
+    /// SP7 Task 13 (closes follow-up #56): copy cursor-to-end-of-line into a
+    /// new automatic buffer (+ OSC 52 if `set-clipboard` emits), then cancel
+    /// -- emacs `C-k`. This is winmux's OWN naming choice (documented
+    /// deviation): real tmux's *master*-branch default for `C-k` is
+    /// `copy-pipe-end-of-line-and-cancel` (always pipes to `copy-command`),
+    /// but classic tmux (<=3.5) bound `C-k` to plain `copy-end-of-line` (no
+    /// pipe, stays in copy mode) -- see `docs/tmux-reference/
+    /// copy-mode-and-buffers.md` §3.1's note. winmux's task brief calls for
+    /// a `-and-cancel` variant with NO pipe, splitting the difference: like
+    /// `copy-selection-and-cancel` (Task 3) but the extraction is
+    /// cursor-to-EOL instead of the active selection, and there is no
+    /// `command` argument (use `copy-pipe-and-cancel` -- below -- if a piped
+    /// EOL copy is ever wanted). tmux's own X-name for the real
+    /// `copy-end-of-line-and-cancel` command already carries the `copy-`
+    /// prefix as part of its own name (same precedent as
+    /// `SelectionAndCancel`'s `copy-selection-and-cancel`), so the canonical
+    /// AND -X spellings are identical here too.
+    EndOfLineAndCancel,
+    /// `copy-pipe [command]` (SP7 Task 13, closes follow-ups #53/#56): copy
+    /// the active selection (nothing, if none -- same "no selection -> no-op"
+    /// rule as `SelectionAndCancel`) into a new automatic buffer (+ OSC 52 if
+    /// `set-clipboard` emits) AND, if `command` is `Some`, spawn it (detached,
+    /// no console window) with the copied text on its stdin. Stays in copy
+    /// mode (`copy-pipe-and-cancel`, below, additionally exits). `command:
+    /// None` (bare `copy-pipe`/no positional arg) still creates the buffer
+    /// and emits OSC 52 as normal, it just never spawns anything -- real
+    /// tmux would fall back to the `copy-command` server option in that case
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §5.4 point 3); winmux
+    /// has no `copy-command` option (out of this task's scope, documented
+    /// narrowing), so an absent `command` here is simply "no pipe".
+    CopyPipe(Option<String>),
+    /// `copy-pipe-and-cancel [command]` (SP7 Task 13): same as [`CopyAction::
+    /// CopyPipe`], then exits copy mode. The default binding for emacs
+    /// `C-w`/`M-w` stays on `copy-selection-and-cancel` (unchanged --
+    /// behaviorally identical to this command with `command: None`, per the
+    /// reference doc's own note that the historic and pipe variants "behave
+    /// identically when copy-command is empty").
+    CopyPipeAndCancel(Option<String>),
 }
 
 /// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
 /// table storage, `list-keys` output).
-fn copy_action_name(a: CopyAction) -> &'static str {
+fn copy_action_name(a: &CopyAction) -> &'static str {
     match a {
         CopyAction::CursorLeft => "copy-cursor-left",
         CopyAction::CursorRight => "copy-cursor-right",
@@ -448,6 +499,12 @@ fn copy_action_name(a: CopyAction) -> &'static str {
         CopyAction::SearchBackward => "copy-search-backward",
         CopyAction::SearchAgain => "copy-search-again",
         CopyAction::SearchReverse => "copy-search-reverse",
+        CopyAction::BackToIndentation => "copy-back-to-indentation",
+        // Real tmux's own command name already carries the "copy-" prefix
+        // (same precedent as `SelectionAndCancel`, see its doc comment).
+        CopyAction::EndOfLineAndCancel => "copy-end-of-line-and-cancel",
+        CopyAction::CopyPipe(_) => "copy-pipe",
+        CopyAction::CopyPipeAndCancel(_) => "copy-pipe-and-cancel",
     }
 }
 
@@ -484,10 +541,19 @@ const COPY_ACTIONS: &[CopyAction] = &[
     CopyAction::SearchBackward,
     CopyAction::SearchAgain,
     CopyAction::SearchReverse,
+    CopyAction::BackToIndentation,
+    CopyAction::EndOfLineAndCancel,
+    // `None` command here is fine: this table is only used for NAME
+    // recognition (`copy_action_from_canonical`) -- the real command
+    // argument (if any) is parsed separately by `resolve`'s dedicated
+    // `copy-pipe`/`copy-pipe-and-cancel` arm below, never read off this
+    // const.
+    CopyAction::CopyPipe(None),
+    CopyAction::CopyPipeAndCancel(None),
 ];
 
 fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
-    COPY_ACTIONS.iter().copied().find(|a| copy_action_name(*a) == name)
+    COPY_ACTIONS.iter().find(|a| copy_action_name(a) == name).cloned()
 }
 
 /// `send-keys -X <name>` spelling -> [`CopyAction`] (tmux's copy-mode
@@ -527,6 +593,14 @@ fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
         "search-backward" => CopyAction::SearchBackward,
         "search-again" => CopyAction::SearchAgain,
         "search-reverse" => CopyAction::SearchReverse,
+        "back-to-indentation" => CopyAction::BackToIndentation,
+        // Same "-X name keeps the copy- prefix" precedent as
+        // `copy-selection-and-cancel` above. `command` is `None` here --
+        // `resolve`'s `send-keys -X` arm fills it in from the next
+        // positional token, if any (see the dedicated handling there).
+        "copy-end-of-line-and-cancel" => CopyAction::EndOfLineAndCancel,
+        "copy-pipe" => CopyAction::CopyPipe(None),
+        "copy-pipe-and-cancel" => CopyAction::CopyPipeAndCancel(None),
         _ => return None,
     })
 }
@@ -540,7 +614,7 @@ fn canonical(name: &str) -> Option<&'static str> {
     // Internal copy-* commands: bindable and resolvable but their canonical
     // name IS the alias (no separate short form).
     if let Some(a) = copy_action_from_canonical(name) {
-        return Some(copy_action_name(a));
+        return Some(copy_action_name(&a));
     }
     Some(match name {
         "split-window" | "splitw" => "split-window",
@@ -618,6 +692,16 @@ pub fn usage(name: &str) -> Option<&'static str> {
     let canon = canonical(name)?;
     if canon == "copy-mode" {
         return Some("usage: copy-mode [-u] [-e]");
+    }
+    // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13) take an OPTIONAL
+    // positional shell-command argument -- must be checked before the
+    // generic "copy-<action> (no arguments)" fallback below, which is only
+    // true for every OTHER `copy-*` action.
+    if canon == "copy-pipe" {
+        return Some("usage: copy-pipe [command]");
+    }
+    if canon == "copy-pipe-and-cancel" {
+        return Some("usage: copy-pipe-and-cancel [command]");
     }
     if copy_action_from_canonical(canon).is_some() {
         return Some("usage: copy-<action> (no arguments)");
@@ -775,6 +859,19 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
         }
         return Ok(ParsedCmd::CopyMode { page_up: has(&b, "-u"), mouse: has(&b, "-e") });
     }
+    // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13): a single OPTIONAL
+    // positional shell-command token -- must run before the generic
+    // zero-args `copy_action_from_canonical` arm below, which would
+    // otherwise reject any argument at all.
+    if canon == "copy-pipe" || canon == "copy-pipe-and-cancel" {
+        if raw.args.len() > 1 {
+            return Err(bad());
+        }
+        let command = raw.args.first().cloned();
+        let action =
+            if canon == "copy-pipe" { CopyAction::CopyPipe(command) } else { CopyAction::CopyPipeAndCancel(command) };
+        return Ok(ParsedCmd::CopyCmd(action));
+    }
     if let Some(action) = copy_action_from_canonical(canon) {
         if !raw.args.is_empty() {
             return Err(bad());
@@ -899,6 +996,17 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 let Some(xname) = p.first() else { return Err(bad()) };
                 let Some(action) = copy_action_from_x_name(xname) else {
                     return Err(format!("unknown -X command: {xname}"));
+                };
+                // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13) take the
+                // NEXT positional token as their optional command argument
+                // (`copy_action_from_x_name` always returns `None`'s worth
+                // of command for these two names -- fill it in here from
+                // `p[1]`, if present). Every other action ignores any extra
+                // positional tokens, same as before this task.
+                let action = match action {
+                    CopyAction::CopyPipe(_) => CopyAction::CopyPipe(p.get(1).cloned()),
+                    CopyAction::CopyPipeAndCancel(_) => CopyAction::CopyPipeAndCancel(p.get(1).cloned()),
+                    other => other,
                 };
                 return Ok(ParsedCmd::CopyCmd(action));
             }
@@ -1185,7 +1293,12 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             if !p.is_empty() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::PasteBuffer { name: value_of(&v, "-b"), target: value_of(&v, "-t"), no_replace: has(&b, "-r") })
+            Ok(ParsedCmd::PasteBuffer {
+                name: value_of(&v, "-b"),
+                target: value_of(&v, "-t"),
+                no_replace: has(&b, "-r"),
+                bracket: has(&b, "-p"),
+            })
         }
         "list-buffers" => {
             if !raw.args.is_empty() {
@@ -1987,19 +2100,92 @@ mod tests {
         );
     }
 
+    // ---- clipboard: copy-pipe / bracketed paste / emacs C-k, M-m
+    // (SP7 Task 13, closes follow-ups #53/#55/#56) ----
+
+    #[test]
+    fn back_to_indentation_and_end_of_line_and_cancel_resolve() {
+        assert_eq!(
+            resolve(&raw("copy-back-to-indentation", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BackToIndentation)
+        );
+        assert_eq!(
+            resolve(&raw("copy-end-of-line-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::EndOfLineAndCancel)
+        );
+        // No arguments accepted (same rule as every other zero-arg copy-*
+        // command).
+        assert_eq!(
+            resolve(&raw("copy-back-to-indentation", &["x"])).unwrap_err(),
+            usage("copy-back-to-indentation").unwrap()
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "back-to-indentation"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BackToIndentation)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-end-of-line-and-cancel"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::EndOfLineAndCancel)
+        );
+    }
+
+    #[test]
+    fn copy_pipe_resolves_with_and_without_command() {
+        assert_eq!(resolve(&raw("copy-pipe", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::CopyPipe(None)));
+        assert_eq!(
+            resolve(&raw("copy-pipe", &["clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(Some("clip.exe".to_string())))
+        );
+        assert_eq!(
+            resolve(&raw("copy-pipe-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(None))
+        );
+        assert_eq!(
+            resolve(&raw("copy-pipe-and-cancel", &["clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(Some("clip.exe".to_string())))
+        );
+        // Too many positional args -> usage error.
+        assert_eq!(
+            resolve(&raw("copy-pipe", &["a", "b"])).unwrap_err(),
+            usage("copy-pipe").unwrap()
+        );
+    }
+
+    #[test]
+    fn send_keys_dash_x_copy_pipe_captures_command_arg() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe", "clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(Some("clip.exe".to_string())))
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe-and-cancel", "clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(Some("clip.exe".to_string())))
+        );
+        // No trailing token -> command is `None`.
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(None))
+        );
+    }
+
     #[test]
     fn paste_buffer_flags() {
         assert_eq!(
             resolve(&raw("paste-buffer", &[])).unwrap(),
-            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false }
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false, bracket: false }
         );
         assert_eq!(
             resolve(&raw("pasteb", &["-p", "-b", "foo", "-t", "work"])).unwrap(),
-            ParsedCmd::PasteBuffer { name: Some("foo".to_string()), target: Some("work".to_string()), no_replace: false }
+            ParsedCmd::PasteBuffer {
+                name: Some("foo".to_string()),
+                target: Some("work".to_string()),
+                no_replace: false,
+                bracket: true,
+            }
         );
         assert_eq!(
             resolve(&raw("paste-buffer", &["-r"])).unwrap(),
-            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true }
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true, bracket: false }
         );
         assert_eq!(resolve(&raw("paste-buffer", &["bogus"])).unwrap_err(), usage("paste-buffer").unwrap());
     }

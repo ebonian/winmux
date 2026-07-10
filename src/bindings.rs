@@ -346,6 +346,14 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(named("C-g"), "copy-clear-selection", &[]);
     b(char_key('o'), "copy-other-end", &[]);
 
+    // SP7 Task 13 (closes follow-up #56): `C-k` copy-end-of-line-and-cancel,
+    // `M-m` back-to-indentation. See `CopyAction::EndOfLineAndCancel`'s doc
+    // comment (`src/cmd.rs`) for why `C-k` is winmux's own
+    // `copy-end-of-line-and-cancel` rather than the tmux master branch's
+    // pipe-always `copy-pipe-end-of-line-and-cancel`.
+    b(named("C-k"), "copy-end-of-line-and-cancel", &[]);
+    b(named("M-m"), "copy-back-to-indentation", &[]);
+
     // Search (Task 4, sub-project 4).
     b(named("C-s"), "copy-search-forward", &[]);
     b(named("C-r"), "copy-search-backward", &[]);
@@ -814,6 +822,9 @@ mod tests {
             ("C-r", "copy-search-backward", &[]),
             ("n", "copy-search-again", &[]),
             ("N", "copy-search-reverse", &[]),
+            // SP7 Task 13, closes follow-up #56.
+            ("C-k", "copy-end-of-line-and-cancel", &[]),
+            ("M-m", "copy-back-to-indentation", &[]),
         ];
         for (k, name, args) in expected {
             let binding = b

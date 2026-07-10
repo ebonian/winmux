@@ -197,6 +197,15 @@ const SPECS: &[Spec] = &[
     Spec { name: "monitor-bell", kind: Kind::Flag, choices: &[] },
     Spec { name: "monitor-silence", kind: Kind::Number, choices: &[] },
     Spec { name: "window-status-activity-style", kind: Kind::Style, choices: &[] },
+    // Clipboard (SP7 Task 13, closes follow-up #53): OSC 52 emission gate.
+    // Real tmux default is `external` (options-table.c:513); scope is
+    // `server` there (single global value, matching winmux's own
+    // single-global-table model -- see `scope()` below). Per the plan
+    // review (`.superpowers/sdd/task-13-brief.md`): ConPTY has no `Ms`-
+    // capability probe, so winmux gates OSC 52 emission ONLY on this
+    // option's value (`on`/`external` emit, `off` doesn't) -- see
+    // `Options::set_clipboard_emits`.
+    Spec { name: "set-clipboard", kind: Kind::Choice, choices: &["on", "external", "off"] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -243,7 +252,7 @@ pub enum Scope {
 pub fn scope(name: &str) -> Option<Scope> {
     find_spec(name)?;
     Some(match name {
-        "escape-time" | "default-terminal" | "exit-empty" | "buffer-limit" => Scope::Server,
+        "escape-time" | "default-terminal" | "exit-empty" | "buffer-limit" | "set-clipboard" => Scope::Server,
         "pane-base-index"
         | "window-status-style"
         | "window-status-current-style"
@@ -440,6 +449,7 @@ fn default_value(name: &str) -> Value {
             let s = "reverse";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
+        "set-clipboard" => Value::Choice("external"),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -783,6 +793,23 @@ impl Options {
     /// manual (`set-buffer -b`) buffers are exempt. tmux default 50.
     pub fn buffer_limit(&self) -> u32 {
         self.number("buffer-limit")
+    }
+
+    /// `set-clipboard` (SP7 Task 13, closes follow-up #53): `on`/`external`/
+    /// `off`. tmux default `external`.
+    pub fn set_clipboard(&self) -> &'static str {
+        self.choice("set-clipboard")
+    }
+
+    /// Whether a copy in copy mode should emit OSC 52
+    /// (`\x1b]52;c;<base64>\x07`) to the acting client. Per the plan review
+    /// (`.superpowers/sdd/task-13-brief.md`, decision (a)): winmux has no
+    /// ConPTY `Ms`-capability probe, so this is gated ONLY on the option
+    /// value -- `on`/`external` emit, `off` does not (matches real tmux's
+    /// own outgoing-OSC-52 gate, `!= 0`, `docs/tmux-reference/
+    /// copy-mode-and-buffers.md` §9.7 "Outgoing").
+    pub fn set_clipboard_emits(&self) -> bool {
+        self.set_clipboard() != "off"
     }
 
     /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4): the
@@ -2103,5 +2130,28 @@ mod tests {
         assert_eq!(expand_format("%Y-%m-%d %a %I:%M%p", &c), "2026-07-07 Tue 02:05PM");
         assert_eq!(expand_format("%%", &c), "%");
         assert_eq!(expand_format("%x stays", &c), "%x stays");
+    }
+
+    /// `set-clipboard` (SP7 Task 13, closes follow-up #53): default
+    /// `external`, all three choices settable, and `set_clipboard_emits`'s
+    /// on/external-emit, off-does-not rule.
+    #[test]
+    fn set_clipboard_getter_and_emits_rule() {
+        let mut o = Options::new();
+        assert_eq!(o.set_clipboard(), "external");
+        assert!(o.set_clipboard_emits());
+
+        o.set("set-clipboard", Some("on"), false, false).unwrap();
+        assert_eq!(o.set_clipboard(), "on");
+        assert!(o.set_clipboard_emits());
+
+        o.set("set-clipboard", Some("off"), false, false).unwrap();
+        assert_eq!(o.set_clipboard(), "off");
+        assert!(!o.set_clipboard_emits());
+
+        assert_eq!(
+            o.set("set-clipboard", Some("bogus"), false, false),
+            Err("bad value: bogus".to_string())
+        );
     }
 }
