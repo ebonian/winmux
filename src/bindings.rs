@@ -227,13 +227,8 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(named("C-v"), "copy-page-down", &[]);
     b(named("PPage"), "copy-page-up", &[]);
     b(named("NPage"), "copy-page-down", &[]);
-    // Bound under the literal space CHARACTER, not `named("Space")` (Task 3
-    // review fix): a real spacebar press decodes as `Key{Char(' ')}` -- the
-    // decoder only ever produces `KeyCode::Space` for `Ctrl-Space` (byte
-    // 0x00), so Task 2's original `named("Space")` registration was
-    // unreachable by an actual keypress. Same rule as the vi table's
-    // `Space -> copy-begin-selection`; decoder-level `Char(' ')`/`Space`
-    // normalization stays follow-up #34.
+    // Bound under the literal space CHARACTER, not `named("Space")` -- follows
+    // up #34, now resolved via Bindings-layer `canonical_key` normalization.
     b(char_key(' '), "copy-page-down", &[]);
 
     b(char_key('q'), "copy-cancel", &[]);
@@ -566,6 +561,37 @@ mod tests {
             .lookup(WhichTable::Root, &key("Space"))
             .expect("Char(' ')-registered binding must be reachable via named(\"Space\") lookup");
         assert_eq!(found2.cmds, vec![cmd1("select-pane", &["-U"])]);
+    }
+
+    /// Cross-notation unbind: when a binding is stored under one Space
+    /// notation (named or Char), unbind must work with the other notation too.
+    /// Direction 1: bind via `named("Space")`, unbind via `Char(' ')`.
+    /// Direction 2: bind via `Char(' ')`, unbind via `named("Space")`.
+    #[test]
+    fn unbind_space_across_notations_removes_binding() {
+        // Direction 1: bind under named("Space"), unbind using Char(' ')
+        let mut b = Bindings::default();
+        b.bind(
+            WhichTable::Root,
+            key("Space"),
+            Binding { cmds: vec![cmd1("next-layout", &[])], repeat: false },
+        );
+        assert!(b.lookup(WhichTable::Root, &key("Space")).is_some());
+        // Now unbind using the Char(' ') form
+        assert!(b.unbind(WhichTable::Root, &char_key(' ')));
+        assert!(b.lookup(WhichTable::Root, &key("Space")).is_none());
+
+        // Direction 2: bind under Char(' '), unbind via named("Space")
+        let mut b2 = Bindings::default();
+        b2.bind(
+            WhichTable::Root,
+            char_key(' '),
+            Binding { cmds: vec![cmd1("select-pane", &["-U"])], repeat: false },
+        );
+        assert!(b2.lookup(WhichTable::Root, &char_key(' ')).is_some());
+        // Now unbind using the named("Space") form
+        assert!(b2.unbind(WhichTable::Root, &key("Space")));
+        assert!(b2.lookup(WhichTable::Root, &char_key(' ')).is_none());
     }
 
     /// A real Ctrl-Space keypress decodes as `Key{code: Space, ctrl: true}`
