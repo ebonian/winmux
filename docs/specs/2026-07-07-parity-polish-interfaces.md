@@ -78,12 +78,44 @@ impl Grid {
     /// Convenience: collect a whole view row into a `String` (e.g. for
     /// copy-mode search).
     pub fn view_row_text(&self, scroll_back: u32, row: u16) -> String;
-    /// The pane's title as last captured via OSC 0/2, if any has ever been set.
+    /// The pane's title as last captured via OSC 0/2, if any has ever been
+    /// set. **AMENDED (SP7, Task 3 — closes follow-up #52):** ALSO captures
+    /// the historical `ESC k <name> ESC \` rename escape into this same
+    /// slot — see `title_from_esc_k` below for how a consumer tells the two
+    /// sources apart.
     pub fn title(&self) -> Option<&str>;
     /// Edge-triggered: true the first time this is called after the title
     /// has changed, then false until it changes again. Intended to be
-    /// polled by the server after each `feed`.
+    /// polled by the server after each `feed`. Fires for either title
+    /// source (SP7, Task 3).
     pub fn take_title_changed(&mut self) -> bool;
+    /// **NEW (SP7, Task 3 — closes follow-up #52):** `true` if the CURRENT
+    /// `title()` was last set by `ESC k` rather than OSC 0/2. Not
+    /// edge-triggered — reflects the source of whatever `title()` currently
+    /// holds. `ESC k` is pre-scanned and stripped out of the raw byte
+    /// stream inside `feed`, BEFORE `vte::Parser::advance` ever sees those
+    /// bytes (the `vte` crate has no string-capturing path for `ESC k`: in
+    /// its `Escape` state, `k` falls in the generic `0x60..=0x7e ->
+    /// (Ground, EscDispatch)` bucket, so every subsequent title byte would
+    /// otherwise `Print`-leak into the pane's visible cells). The pre-scan
+    /// persists across `feed` calls (a sequence split across chunk
+    /// boundaries, including a lone trailing `ESC`, is still captured
+    /// correctly) and, verified against tmux's real `input.c` state
+    /// machine (`input_state_rename_string_table`/`input_exit_rename`):
+    /// commits the title the instant a bare `ESC` is seen after the opening
+    /// `ESC k` (tmux's `rename_string` state's `exit` callback fires on
+    /// ANY state change away from it, before the following byte — the
+    /// expected `\` — is even read), and treats `BEL` inside the title as a
+    /// silent no-op, NOT a terminator (unlike OSC 0/2, whose terminator IS
+    /// BEL-or-ST) — `input_state_rename_string_table` has no `BEL` arm,
+    /// unlike OSC's dedicated one. The server decides whether an
+    /// `ESC k`-sourced title participates in automatic-rename, gated by the
+    /// `allow-rename` option (`options::Options::allow_rename`, default off
+    /// — see the `## options` amendment in
+    /// `2026-07-07-command-config-interfaces.md`); the OSC 0/2 path is
+    /// unconditional, matching real tmux (`allow-rename` gates ONLY
+    /// `ESC k`).
+    pub fn title_from_esc_k(&self) -> bool;
     /// Task 5 (mouse) addition: `true` while the pane is showing the
     /// alternate screen (`CSI ?1049h` seen more recently than a matching
     /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide
@@ -93,7 +125,53 @@ impl Grid {
     /// translation, since alt-screen apps like `less`/vim have their own
     /// paging, not winmux's). See the `## mouse` section below.
     pub fn alt_screen(&self) -> bool;
+
+    /// **NEW (SP7, Task 3 — closes follow-up #52; prerequisite for Task 9's
+    /// mouse re-encoding/forwarding):** the pane app's requested mouse
+    /// REPORTING protocol, tracked from DECSET/DECRST 9 (X10) / 1000
+    /// (VT200 "normal"/click-only) / 1002 ("button-event"/drag) / 1003
+    /// ("any-event"/all motion) in `csi_dispatch`'s existing `?`-private
+    /// mode match. Verified against tmux's own pane-mode tracking
+    /// (`input_csi_dispatch_sm_private`/`_rm_private`, tmux `input.c`):
+    /// these 4 mode numbers are MUTUALLY EXCLUSIVE — SET of any one first
+    /// clears every other mouse-mode bit before setting its own (so the
+    /// LAST one set simply wins outright, not a priority order), and RESET
+    /// of ANY of the four unconditionally clears to `Off`, regardless of
+    /// which specific mode number is named in the reset or which one was
+    /// actually active. Modern tmux has no `MODE_MOUSE_X10` bit at all
+    /// (mode 9 is pane-side-unimplemented legacy in current tmux), but
+    /// winmux tracks it with the identical mutual-exclusion rule since
+    /// Task 9's interface promise requires the `X10` variant to exist. This
+    /// task only TRACKS the mode; forwarding/re-encoding mouse events to
+    /// the pane app based on it is Task 9's job.
+    pub fn mouse_proto(&self) -> MouseProto;
+    /// **NEW (SP7, Task 3):** the pane app's requested mouse COORDINATE
+    /// ENCODING, tracked from DECSET/DECRST 1005 (UTF-8) / 1006 (SGR) —
+    /// independent bits (`MODE_MOUSE_UTF8`/`MODE_MOUSE_SGR` in real tmux),
+    /// not mutually exclusive with each other or with `mouse_proto`. SGR
+    /// wins if both are set, else UTF-8, else the legacy default — matching
+    /// tmux's own forwarding precedence (`input-keys.c`
+    /// `input_key_get_mouse`).
+    pub fn mouse_encoding(&self) -> MouseEncoding;
+    /// **NEW (SP7, Task 3; prerequisite for a later alerts task, follow-up
+    /// #74/Task 17):** edge-triggered — true the first time this is called
+    /// after a BEL (`\x07`) byte has been fed via `execute`, then false
+    /// until another BEL arrives. BEL never prints as a visible character
+    /// and does not affect cursor/wrap state.
+    pub fn take_bell(&mut self) -> bool;
 }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse REPORTING
+/// protocol — see `Grid::mouse_proto`'s doc comment for the tmux-verified
+/// mutual-exclusion semantics among the 4 variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProto { #[default] Off, X10, Normal, Button, Any }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse COORDINATE
+/// ENCODING — see `Grid::mouse_encoding`'s doc comment for the resolution
+/// precedence when multiple encoding bits are set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding { #[default] Default, Utf8, Sgr }
 ```
 
 **Scrollback capture rules:**

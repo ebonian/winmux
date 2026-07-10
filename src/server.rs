@@ -1291,14 +1291,23 @@ impl Server {
             ServerEvent::Output(id, bytes) => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.grid.feed(&bytes);
-                    // automatic-rename (Task 9, sub-project 4): OSC 0/2
-                    // titles are edge-triggered (`take_title_changed`) --
-                    // refresh the cached `#T` value and, if this pane is the
-                    // ACTIVE pane of some window, consider renaming it.
+                    // automatic-rename (Task 9, sub-project 4): OSC 0/2 and
+                    // ESC-k (SP7 Task 3, closes follow-up #52) titles are
+                    // both edge-triggered (`take_title_changed`) -- refresh
+                    // the cached `#T` value unconditionally (the grid always
+                    // captures both sources into the same slot), but only
+                    // feed an ESC-k-sourced title into automatic-rename when
+                    // `allow-rename` is on -- real tmux's `allow-rename`
+                    // gates ONLY the `ESC k` escape, never OSC 0/2 (see
+                    // `docs/tmux-reference/windows-and-sessions.md`
+                    // "allow-rename -- what it actually gates").
                     if p.grid.take_title_changed() {
+                        let from_esc_k = p.grid.title_from_esc_k();
                         let title = p.grid.title().unwrap_or("").to_string();
                         p.title = title.clone();
-                        self.maybe_auto_rename(id, &title);
+                        if !from_esc_k || self.options.allow_rename() {
+                            self.maybe_auto_rename(id, &title);
+                        }
                     }
                 }
                 true

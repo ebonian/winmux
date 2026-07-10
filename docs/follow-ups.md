@@ -495,6 +495,47 @@ None block the sub-project 4 merge.
     permanently for that window); there is no per-pane-application escape
     sequence to toggle it transiently the way real tmux's `allow-rename`
     plus `ESC k` support.
+
+    **RESOLVED** (SP7 parity wave 3, Task 3). `ESC k <name> ESC \` is now
+    pre-scanned/stripped out of a pane's raw byte stream in `Grid::feed`
+    (`src/grid.rs`) BEFORE `vte::Parser::advance` ever sees it — `vte` has
+    no string-capturing path for this legacy escape, so without the
+    pre-scan every title byte after the first would `Print`-leak into the
+    pane's visible cells. The pre-scan persists across `feed` calls (a
+    sequence split mid-title, or right at the terminating `ESC`, across
+    chunk boundaries is still captured correctly) and, verified against
+    tmux's real `input.c` state machine, commits the title the instant a
+    bare `ESC` is seen after the opener (matching `input_exit_rename`
+    firing as `rename_string`'s `exit` callback the moment the state
+    changes away, before the following byte is even read) — `BEL` inside
+    the title is a silent no-op, not a terminator, unlike OSC 0/2. The
+    captured title lands in the SAME slot `osc_dispatch` writes
+    (`Grid::title`/`take_title_changed`), with `Grid::title_from_esc_k`
+    added so the server can tell the two sources apart: an `ESC k`-sourced
+    title only participates in `automatic-rename` when the (now-live)
+    `allow-rename` option is on (default off, corrected from an unverified
+    `on` — verified against tmux 2.6+'s real default); the OSC 0/2 path
+    stays unconditional, matching real tmux (`allow-rename` gates ONLY
+    `ESC k`). `Grid` also gained `mouse_proto`/`mouse_encoding` (DECSET/
+    DECRST 9/1000/1002/1003/1005/1006 pane mouse-mode/encoding tracking —
+    prerequisite for a later mouse-forwarding task, tracking only, no
+    forwarding/re-encoding yet) and `take_bell` (edge-triggered BEL
+    surfacing — prerequisite for a later alerts task, no bell subsystem
+    yet). **Windows/ConPTY note found while building the e2e coverage:**
+    real Windows conhost implements its OWN legacy `ESC k`/ST title-escape
+    interpretation on a child process's output and silently drops the
+    literal 2-byte `ESC \` terminator before it ever reaches a pty
+    client's `ReadFile` (verified with a standalone `Pty`-level probe,
+    independent of any winmux grid/server code) — so a single PowerShell
+    statement that emits `ESC k <name> ESC \` in one shot never arrives
+    with a terminator at all on this platform. Not a winmux bug (matches
+    tmux's own tolerance of an unterminated title staying open), but it
+    means the `tests/server_proto.rs` e2e coverage
+    (`allow_rename_off_ignores_esc_k_title_rename` /
+    `allow_rename_on_esc_k_renames_window`) emits the ESC-k opener from one
+    `Write-Host` statement and relies on a SEPARATE statement's own,
+    unrelated real escape sequence (verified to survive ConPTY intact) to
+    supply the commit.
 53. **`paste-buffer -p`'s bracketed-paste flag is accepted but has no
     effect** (Task 3, paste buffers). Real tmux's `-p` wraps the pasted
     bytes in `ESC[200~`/`ESC[201~` bracketed-paste markers so a

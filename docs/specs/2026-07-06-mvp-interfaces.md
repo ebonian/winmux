@@ -326,6 +326,17 @@ superseded section — is the contract's actual current authority on `resize`
 and `view_cell`'s history semantics, and leaving its "no reflow" claim
 uncorrected there would misdocument the real behavior).
 
+**FURTHER SUPERSEDED (SP7, Task 3 — closes follow-up #52):** `Grid` gains
+`title_from_esc_k`, `mouse_proto`, `mouse_encoding`, and `take_bell` — pane
+mouse-mode/encoding tracking (DECSET/DECRST 9/1000/1002/1003/1005/1006), BEL
+surfacing, and `ESC k` title capture (pre-scanned/stripped out of the raw
+byte stream inside `feed`, before `vte::Parser::advance` sees it, since `vte`
+has no string-capturing path for `ESC k`). See
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section
+(amended in the same commit) for the full signatures and tmux-verified
+semantics — again the contract's actual current authority, for the same
+reason as the Task 2 note above.
+
 **Caveat (SP7 review fix):** `history_total()`'s "difference between two
 readings = view rows shifted" invariant (see its own doc comment) holds only
 for mutations that do NOT change the grid's width — `reflow_to_width` does

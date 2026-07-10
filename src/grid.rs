@@ -47,6 +47,91 @@ impl Default for Cell {
     }
 }
 
+/// A pane application's requested mouse REPORTING protocol, tracked from
+/// DECSET/DECRST 9 (X10 compatibility) / 1000 (VT200 "normal"/click-only) /
+/// 1002 ("button-event"/drag) / 1003 ("any-event"/all motion) (SP7 Task 3;
+/// `Task 9` consumes this to decide what to forward/re-encode to the pane
+/// app). Verified against tmux's own pane-mode tracking
+/// (`input_csi_dispatch_sm_private`/`_rm_private`, tmux `input.c`): SET of
+/// ANY of 1000/1002/1003 first clears every other mouse-mode bit
+/// (`ALL_MOUSE_MODES`) before setting its own, i.e. these modes are
+/// mutually exclusive and the LAST one SET simply wins outright (not a
+/// priority order among simultaneously-set bits — only one is ever set at
+/// a time); RESET of any of them clears unconditionally to `Off`,
+/// regardless of which mode number is named in the reset or which one was
+/// actually active. Modern tmux has no `MODE_MOUSE_X10` bit at all (mode 9
+/// is legacy/unimplemented pane-side in current tmux), but winmux tracks it
+/// with the same mutual-exclusion rule as 1000/1002/1003 since a later
+/// task's interface promise requires the `X10` variant to exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProto {
+    #[default]
+    Off,
+    X10,
+    Normal,
+    Button,
+    Any,
+}
+
+/// A pane application's requested mouse COORDINATE ENCODING, tracked from
+/// DECSET/DECRST 1005 (UTF-8) / 1006 (SGR) -- independent bits in real tmux
+/// (`MODE_MOUSE_UTF8`/`MODE_MOUSE_SGR`, tmux.h), not mutually exclusive with
+/// each other or with [`MouseProto`]. [`Grid::mouse_encoding`] resolves both
+/// bits to tmux's own forwarding precedence (`input-keys.c`
+/// `input_key_get_mouse`): SGR wins if both are set, else UTF-8, else the
+/// legacy X10-style default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+/// Which escape sequence last set [`TermState::title`] -- OSC 0/2 (always
+/// participates in automatic-rename) or the historical `ESC k <name> ESC \`
+/// rename escape (participates only when `allow-rename` is on; see
+/// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what it
+/// actually gates"). Read via [`Grid::title_from_esc_k`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TitleSource {
+    Osc,
+    EscK,
+}
+
+/// Pre-scan state for the historical `ESC k <name> (ESC \ | ESC)` rename
+/// escape (SP7 Task 3). The `vte` crate has no string-capturing path for
+/// `ESC k` -- in its `Escape` state, byte `k` falls in the generic
+/// `0x60..=0x7e -> (Ground, EscDispatch)` bucket, so `esc_dispatch` fires
+/// once and every subsequent title byte would `Print`-leak into the pane's
+/// visible cells. `Grid::feed` therefore strips this sequence out of the
+/// raw byte stream BEFORE it ever reaches `vte::Parser::advance`, committing
+/// the captured title into the same slot `osc_dispatch` writes. This state
+/// persists on `Grid` (not `TermState`) across `feed` calls so a sequence
+/// split across chunk boundaries -- including a lone trailing `ESC` -- is
+/// still captured correctly.
+///
+/// Verified against tmux's real state machine (`input.c`
+/// `input_state_rename_string_table` reached via the `esc_enter` table's
+/// `{0x6b,0x6b,NULL,&input_state_rename_string}` transition): the rename is
+/// actually committed by `input_exit_rename`, the STATE's `exit` callback,
+/// which `input_set_state` invokes the INSTANT the state changes away from
+/// `rename_string` -- i.e. on the bare `ESC` byte itself, before the
+/// following byte (the expected `\`) is even read. `PostTitle` below
+/// reproduces this: the title is committed when `ESC` is seen, and the
+/// following byte is only checked to decide whether to swallow it as the
+/// completing `\` of the ST or replay it (plus the ESC) as ordinary input.
+/// Also per that same table: `BEL` (0x07) inside the title is mapped to a
+/// no-op (0x00-0x17 -> `NULL,NULL`), unlike OSC's dedicated
+/// `{0x07,0x07,input_end_bel,&input_state_ground}` arm -- so BEL is
+/// dropped, never accumulated and never a terminator, while inside a title.
+enum EscKScan {
+    Idle,
+    Esc,
+    Title(Vec<u8>),
+    PostTitle,
+}
+
 #[derive(Clone, Copy)]
 struct SavedCursor {
     col: u16,
@@ -114,11 +199,29 @@ struct TermState {
     /// shifted between two moments, because chunked eviction lowers it
     /// without moving any surviving line's view position.
     history_total: u64,
-    /// Pane title captured from OSC 0/2, if any has ever been set.
+    /// Pane title captured from OSC 0/2 or `ESC k` (see [`TitleSource`]), if
+    /// any has ever been set.
     title: Option<String>,
     /// Edge-triggered flag: set whenever `title` changes, cleared by
     /// `Grid::take_title_changed`.
     title_changed: bool,
+    /// Which escape sequence last set `title` -- read via
+    /// `Grid::title_from_esc_k` (SP7 Task 3).
+    title_source: TitleSource,
+    /// Mouse reporting protocol requested by the pane app via DECSET/DECRST
+    /// 9/1000/1002/1003 (SP7 Task 3; `MouseProto` doc comment has the tmux
+    /// mutual-exclusion ruling).
+    mouse_proto: MouseProto,
+    /// DECSET/DECRST 1005 (UTF-8 mouse coordinate encoding) -- independent
+    /// of `mouse_sgr` and `mouse_proto` (SP7 Task 3).
+    mouse_utf8: bool,
+    /// DECSET/DECRST 1006 (SGR mouse coordinate encoding) -- independent of
+    /// `mouse_utf8` and `mouse_proto` (SP7 Task 3).
+    mouse_sgr: bool,
+    /// Edge-triggered: set by a BEL (`\x07`) byte in `execute`, cleared by
+    /// `Grid::take_bell` (SP7 Task 3; `Task 17` consumes this for bell
+    /// alerts).
+    bell: bool,
 }
 
 impl TermState {
@@ -146,7 +249,24 @@ impl TermState {
             history_total: 0,
             title: None,
             title_changed: false,
+            title_source: TitleSource::Osc,
+            mouse_proto: MouseProto::Off,
+            mouse_utf8: false,
+            mouse_sgr: false,
+            bell: false,
         }
+    }
+
+    /// Commit a captured `ESC k <name>` rename-escape title into the same
+    /// slot `osc_dispatch` writes (SP7 Task 3). Cleaning matches
+    /// `osc_dispatch` exactly: UTF-8 (lossy), control characters stripped,
+    /// capped at 256 chars. Always marks `title_changed`, same as OSC (the
+    /// gate on whether this actually renames anything is the server's job,
+    /// keyed off `title_source`).
+    fn set_title_from_esc_k(&mut self, raw: &[u8]) {
+        self.title = Some(clean_title(raw));
+        self.title_source = TitleSource::EscK;
+        self.title_changed = true;
     }
 
     fn idx(&self, col: u16, row: u16) -> usize {
@@ -771,6 +891,13 @@ fn trimmed_len(row: &[Cell]) -> usize {
     n
 }
 
+/// Shared title-cleaning rule for both the OSC 0/2 and `ESC k` capture
+/// paths: UTF-8 (lossy), control characters stripped, capped at 256 chars.
+fn clean_title(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.chars().filter(|c| !c.is_control()).take(256).collect()
+}
+
 /// Read subparameter 0 of CSI param `idx`, or `default` if absent/empty.
 /// Does NOT map an explicit 0 to the default — callers apply `.max(1)`
 /// for movement commands.
@@ -831,7 +958,13 @@ impl Perform for TermState {
                 self.wrap_pending = false;
                 self.cursor_col = 0;
             }
-            // BEL (0x07) and all other C0 are ignored.
+            0x07 => {
+                // BEL: never printed -- just an edge-triggered flag (SP7
+                // Task 3) surfaced via `Grid::take_bell` for a later alerts
+                // task. Does not affect cursor/wrap state.
+                self.bell = true;
+            }
+            // All other C0 are ignored.
             _ => {}
         }
     }
@@ -856,9 +989,8 @@ impl Perform for TermState {
             return;
         }
         let joined: Vec<u8> = params[1..].join(&b';');
-        let raw = String::from_utf8_lossy(&joined);
-        let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(256).collect();
-        self.title = Some(cleaned);
+        self.title = Some(clean_title(&joined));
+        self.title_source = TitleSource::Osc;
         self.title_changed = true;
     }
 
@@ -924,6 +1056,31 @@ impl Perform for TermState {
                                 self.wrap_pending = false;
                             }
                         }
+                        // Mouse reporting protocol (SP7 Task 3): 9/1000/
+                        // 1002/1003 are mutually exclusive in real tmux --
+                        // SET unconditionally overwrites to the new mode,
+                        // RESET of any of the four unconditionally clears
+                        // to `Off` (see `MouseProto`'s doc comment for the
+                        // `input.c` source citation).
+                        Some(9) => {
+                            self.mouse_proto = if set { MouseProto::X10 } else { MouseProto::Off };
+                        }
+                        Some(1000) => {
+                            self.mouse_proto =
+                                if set { MouseProto::Normal } else { MouseProto::Off };
+                        }
+                        Some(1002) => {
+                            self.mouse_proto =
+                                if set { MouseProto::Button } else { MouseProto::Off };
+                        }
+                        Some(1003) => {
+                            self.mouse_proto = if set { MouseProto::Any } else { MouseProto::Off };
+                        }
+                        // Mouse coordinate encoding (SP7 Task 3): 1005/1006
+                        // are independent bits, both of each other and of
+                        // the protocol mode above.
+                        Some(1005) => self.mouse_utf8 = set,
+                        Some(1006) => self.mouse_sgr = set,
                         _ => {}
                     }
                 }
@@ -1023,6 +1180,9 @@ impl Perform for TermState {
 pub struct Grid {
     parser: Parser,
     state: TermState,
+    /// Cross-`feed`-call pre-scan state for the `ESC k` rename escape (SP7
+    /// Task 3) -- see [`EscKScan`]'s doc comment.
+    esck_scan: EscKScan,
 }
 
 impl Grid {
@@ -1030,13 +1190,88 @@ impl Grid {
     /// never zero-sized. `history_limit` caps the scrollback line count;
     /// 0 disables scrollback entirely (nothing is ever captured).
     pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self {
-        Grid { parser: Parser::new(), state: TermState::new(cols, rows, history_limit) }
+        Grid {
+            parser: Parser::new(),
+            state: TermState::new(cols, rows, history_limit),
+            esck_scan: EscKScan::Idle,
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        let filtered = self.strip_esc_k(bytes);
+        for b in filtered {
             self.parser.advance(&mut self.state, b);
         }
+    }
+
+    /// Pre-scan `bytes` for the historical `ESC k <name> (ESC \ | ESC)`
+    /// rename escape and strip it out, returning everything else unchanged
+    /// (byte-for-byte, in order) for `vte::Parser::advance`. See
+    /// [`EscKScan`]'s doc comment for why this must happen before `vte` ever
+    /// sees these bytes, and for the exact tmux-verified terminator rules
+    /// this reproduces (title commits on the bare `ESC`; `BEL` is dropped,
+    /// not a terminator, while inside a title).
+    fn strip_esc_k(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            match std::mem::replace(&mut self.esck_scan, EscKScan::Idle) {
+                EscKScan::Idle => {
+                    if b == 0x1b {
+                        self.esck_scan = EscKScan::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                EscKScan::Esc => {
+                    if b == b'k' {
+                        self.esck_scan = EscKScan::Title(Vec::new());
+                    } else {
+                        // Not `ESC k` -- replay both bytes untouched; state
+                        // is already back to `Idle` via the `mem::replace`
+                        // default above.
+                        out.push(0x1b);
+                        out.push(b);
+                    }
+                }
+                EscKScan::Title(mut buf) => {
+                    if b == 0x1b {
+                        // Commit NOW, on the bare ESC -- matches tmux's
+                        // `input_exit_rename` firing as the `rename_string`
+                        // state's `exit` callback the instant the state
+                        // changes away, before the following byte (the
+                        // expected `\`) is even read.
+                        self.state.set_title_from_esc_k(&buf);
+                        self.esck_scan = EscKScan::PostTitle;
+                    } else if b == 0x07 {
+                        // BEL inside a title: dropped, not accumulated, not
+                        // a terminator (tmux's rename_string state table has
+                        // no BEL arm, unlike OSC's).
+                        self.esck_scan = EscKScan::Title(buf);
+                    } else {
+                        buf.push(b);
+                        self.esck_scan = EscKScan::Title(buf);
+                    }
+                }
+                EscKScan::PostTitle => {
+                    if b == b'\\' {
+                        // ST fully consumed; the title already committed.
+                        self.esck_scan = EscKScan::Idle;
+                    } else if b == 0x1b {
+                        // Another bare ESC instead of the expected `\` --
+                        // keep waiting rather than replaying (the title is
+                        // already committed either way; this only affects
+                        // whether a stray non-`\` byte here leaks through).
+                        self.esck_scan = EscKScan::PostTitle;
+                    } else {
+                        // Not `ESC \` after all -- replay the consumed ESC
+                        // plus this byte as ordinary input.
+                        out.push(0x1b);
+                        out.push(b);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Number of scrollback lines currently captured (<= the `history_limit`
@@ -1100,6 +1335,50 @@ impl Grid {
         let changed = self.state.title_changed;
         self.state.title_changed = false;
         changed
+    }
+
+    /// `true` if the pane's CURRENT `title()` was last set by the historical
+    /// `ESC k <name> ESC \` rename escape rather than OSC 0/2 (SP7 Task 3).
+    /// Not edge-triggered -- reflects the source of whatever `title()`
+    /// currently holds. Lets the server gate ESC-k-sourced automatic-rename
+    /// behind the `allow-rename` option while leaving the OSC 0/2 path
+    /// unconditional, matching real tmux (`allow-rename` gates ONLY
+    /// `ESC k` -- see `docs/tmux-reference/windows-and-sessions.md`
+    /// "allow-rename -- what it actually gates").
+    pub fn title_from_esc_k(&self) -> bool {
+        matches!(self.state.title_source, TitleSource::EscK)
+    }
+
+    /// The pane app's requested mouse reporting protocol (SP7 Task 3), or
+    /// `MouseProto::Off` if it has never sent a mouse-mode DECSET. See
+    /// [`MouseProto`]'s doc comment for the tmux-verified mutual-exclusion
+    /// rule among 9/1000/1002/1003.
+    pub fn mouse_proto(&self) -> MouseProto {
+        self.state.mouse_proto
+    }
+
+    /// The pane app's requested mouse coordinate encoding (SP7 Task 3):
+    /// SGR (1006) wins if both SGR and UTF-8 (1005) are set, else UTF-8,
+    /// else the legacy default -- matching tmux's own forwarding precedence
+    /// (`input-keys.c` `input_key_get_mouse`; see [`MouseEncoding`]'s doc
+    /// comment).
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        if self.state.mouse_sgr {
+            MouseEncoding::Sgr
+        } else if self.state.mouse_utf8 {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Default
+        }
+    }
+
+    /// Edge-triggered: true the first time this is called after a BEL
+    /// (`\x07`) byte has been fed, then false until another BEL arrives
+    /// (SP7 Task 3; a later alerts task consumes this).
+    pub fn take_bell(&mut self) -> bool {
+        let bell = self.state.bell;
+        self.state.bell = false;
+        bell
     }
 
     /// Resize the grid, preserving the overlapping region. Dimensions are
@@ -1664,6 +1943,112 @@ mod tests {
         g.feed(b"\x1b[99;99Z"); // unknown CSI final byte -> ignored
         assert_eq!(g.cell(0, 0).ch, 'A');
         assert_eq!(g.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn decset_1000_sets_normal_mouse_1006_sets_sgr_encoding() {
+        let mut g = Grid::new(10, 2, 0);
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Default);
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        g.feed(b"\x1b[?1006h");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Sgr);
+        // Setting the encoding mode must not disturb the protocol mode.
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+    }
+
+    #[test]
+    fn decrst_clears_mouse_mode() {
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"\x1b[?1002h");
+        assert_eq!(g.mouse_proto(), MouseProto::Button);
+        g.feed(b"\x1b[?1002l");
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+
+        // A DECRST of any of the 4 protocol mode numbers clears unconditionally
+        // to Off, even naming a DIFFERENT mode from the one actually active --
+        // matches tmux's `input_csi_dispatch_rm_private` (case 1000/1002/1003
+        // all clear ALL_MOUSE_MODES regardless of which is set).
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(g.mouse_proto(), MouseProto::Any);
+        g.feed(b"\x1b[?1000l");
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+
+        g.feed(b"\x1b[?1005h");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Utf8);
+        g.feed(b"\x1b[?1005l");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mode_1003_any_motion_wins_over_1000() {
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(g.mouse_proto(), MouseProto::Any);
+        // And the reverse also holds: these 4 modes are mutually exclusive
+        // (last SET wins outright), not priority-ordered -- a later 1000
+        // supersedes an active 1003 too.
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+    }
+
+    #[test]
+    fn bel_byte_sets_bell_flag_take_bell_clears() {
+        let mut g = Grid::new(10, 2, 0);
+        assert!(!g.take_bell());
+        g.feed(b"abc\x07def");
+        assert!(g.take_bell());
+        assert!(!g.take_bell()); // edge-triggered: cleared on read
+        // BEL must never print as a visible character.
+        assert_eq!(row_str(&g, 0), "abcdef    ");
+    }
+
+    #[test]
+    fn esc_k_sets_title() {
+        let mut g = Grid::new(20, 1, 0);
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1bkmy-title\x1b\\");
+        assert_eq!(g.title(), Some("my-title"));
+        assert!(g.take_title_changed());
+        assert!(g.title_from_esc_k());
+    }
+
+    #[test]
+    fn esc_k_title_bytes_do_not_leak_into_cells() {
+        // The `vte` crate has no string-capturing path for `ESC k` -- without
+        // the `Grid::feed` pre-scan/strip, every title byte after the first
+        // would `Print`-leak into the pane's visible cells. Prove it doesn't.
+        let mut g = Grid::new(20, 2, 0);
+        g.feed(b"\x1bkfoo\x1b\\");
+        g.feed(b"bar");
+        assert_eq!(row_str(&g, 0).trim_end(), "bar");
+        assert_eq!(g.title(), Some("foo"));
+    }
+
+    #[test]
+    fn esc_k_split_across_feed_chunks() {
+        // The sequence -- including the ESC/backslash terminator itself --
+        // arrives split over several `feed` calls; the pre-scan state must
+        // persist on `Grid` across calls, and (verified against tmux's
+        // `input_exit_rename` firing as the `rename_string` state's `exit`
+        // callback) the title commits on the bare ESC, one call before the
+        // completing backslash even arrives.
+        let mut g = Grid::new(20, 2, 0);
+        g.feed(b"\x1bkhel");
+        assert_eq!(g.title(), None);
+        g.feed(b"lo");
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1b");
+        assert_eq!(g.title(), Some("hello"));
+        assert!(g.take_title_changed());
+        g.feed(b"\\");
+        assert_eq!(g.title(), Some("hello")); // ST consumed; no further change
+        assert!(!g.take_title_changed());
+        // No title bytes leaked into the visible grid at any point.
+        assert_eq!(row_str(&g, 0).trim_end(), "");
     }
 
     #[test]

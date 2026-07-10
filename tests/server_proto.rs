@@ -6130,3 +6130,87 @@ fn copy_mode_selection_clears_on_width_resize() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+/// `allow-rename` (SP7 Task 3, closes follow-up #52): default is OFF (tmux
+/// since 2.6), and it gates ONLY the historical `ESC k <name> ESC \` rename
+/// escape -- the OSC 0/2 path (`pane_title_updates_window_name`, above)
+/// stays unconditional. With the default `allow-rename off`, the window
+/// must stay named "powershell" (its startup default) -- NOT "esckname".
+///
+/// **Command shape -- verified against real ConPTY, not just guessed:** a
+/// standalone `Pty`-level probe (bypassing grid/server entirely) proved
+/// Windows conhost's OWN legacy title-escape support silently drops the
+/// literal 2-byte `ESC \` (ST) terminator from a child process's `ESC k
+/// ... ESC \` output before it ever reaches the pty client's `ReadFile` --
+/// conhost recognizes and consumes the ST for its OWN internal
+/// `SetConsoleTitle`-equivalent handling but does not relay it, so a
+/// single statement that emits `ESC k <name> ESC \` arrives at winmux's
+/// grid missing its terminator and (correctly, matching tmux parity --
+/// `EscKScan`'s doc comment: BEL never terminates a title either) never
+/// commits. The same probe proved an *unrelated* real escape sequence
+/// emitted by a SEPARATE, later statement (e.g. `Write-Host
+/// -ForegroundColor`'s own SGR `ESC[...m`) DOES survive intact and lands
+/// right after the ESC-k content -- so two separate `Write-Host` calls
+/// (title escape, then ANY statement that emits its own real escape) is
+/// what reliably round-trips a committed ESC-k title through a live pane
+/// on this platform; PowerShell has no purpose-built cmdlet for the
+/// escape itself, hence the raw `[char]27` construction.
+#[test]
+fn allow_rename_off_ignores_esc_k_title_rename() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-esck-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:powershell*")),
+        "allow-rename off must ignore an ESC-k rename escape; screen:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "the ESC-k title must not have renamed the window; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Mirror of `allow_rename_off_ignores_esc_k_title_rename` with `allow-rename`
+/// turned on: the SAME `ESC k` escape now DOES rename the window (through
+/// the same `maybe_auto_rename`/`derive_auto_name` pipeline the OSC 0/2 path
+/// uses -- winmux's simplified model feeds an allowed ESC-k title into the
+/// same slot/pipeline as an OSC title, rather than tmux's literal direct
+/// `window_set_name` call). `allow-rename on` is loaded from a STARTUP
+/// config file (rather than a live `set` command after attaching) purely to
+/// keep the test shape minimal; see the sibling test's doc comment for the
+/// verified reason behind the two-statement command shape.
+#[test]
+fn allow_rename_on_esc_k_renames_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
