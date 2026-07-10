@@ -2156,9 +2156,6 @@ impl Options {
     // two levels; an empty overlay is byte-identical to the zero-arg
     // getter — the default-behavior regression bar). Session-scoped:
     pub fn prefix_for(&self, session: &Overlay) -> crate::keys::Key;
-    pub fn base_index_for(&self, session: &Overlay) -> u32;
-    pub fn status_on_for(&self, session: &Overlay) -> bool;
-    pub fn status_position_top_for(&self, session: &Overlay) -> bool;
     pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
     pub fn status_right_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
     pub fn status_left_length_for(&self, session: &Overlay) -> u16;
@@ -2168,7 +2165,6 @@ impl Options {
     pub fn status_right_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
     pub fn status_justify_for(&self, session: &Overlay) -> &'static str;
     pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
-    pub fn repeat_time_for(&self, session: &Overlay) -> std::time::Duration;
     pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
     pub fn renumber_windows_for(&self, session: &Overlay) -> bool;
     pub fn mouse_for(&self, session: &Overlay) -> bool;

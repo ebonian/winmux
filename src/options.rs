@@ -1025,18 +1025,6 @@ impl Options {
         }
     }
 
-    pub fn base_index_for(&self, session: &Overlay) -> u32 {
-        as_number(self.resolve_session("base-index", session))
-    }
-
-    pub fn status_on_for(&self, session: &Overlay) -> bool {
-        as_flag(self.resolve_session("status", session))
-    }
-
-    pub fn status_position_top_for(&self, session: &Overlay) -> bool {
-        matches!(self.resolve_session("status-position", session), Value::Choice("top"))
-    }
-
     pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
         as_str(self.resolve_session("status-left", session))
     }
@@ -1074,10 +1062,6 @@ impl Options {
 
     pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
         as_style(self.resolve_session("message-style", session))
-    }
-
-    pub fn repeat_time_for(&self, session: &Overlay) -> Duration {
-        Duration::from_millis(as_number(self.resolve_session("repeat-time", session)) as u64)
     }
 
     pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
