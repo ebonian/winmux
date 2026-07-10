@@ -1915,7 +1915,9 @@ see the Task 11 report for the sanctioned inversion).
 
 **New module**, `src/format.rs`, replacing the fixed `#`/`%` subset that
 used to live inline in `src/options.rs`. Pure: no I/O, `std` only, no
-dependency on any other winmux module.
+dependency on any other winmux module in non-test code (the `#[cfg(test)]`
+module reads `crate::options::DEFAULT_WINDOW_STATUS_FORMAT` as a fixture
+constant for one acceptance test).
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2013,6 +2015,12 @@ output for every case the shim covered.
   change was explicitly named).
 - `%`-strftime passthrough: unchanged from the pre-SP7 subset (`%H %M %S
   %d %m %Y %y %b %a %p %I %%`, any other `%<c>` literal passthrough).
+- Recursion/loop limit: expansion is capped at `FORMAT_LOOP_LIMIT` (100, the
+  real tmux `format.c` constant, §5.1) levels of recursion; past that depth
+  `expand` stops and returns the remaining input literally instead of
+  recursing further, so a pathologically/adversarially nested format string
+  degrades safely (partially-unexpanded output) rather than overflowing the
+  stack.
 
 ### Documented non-supported remainder (§5.3's modifier table)
 

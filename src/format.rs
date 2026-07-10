@@ -1,7 +1,11 @@
 //! The general tmux format-expansion engine (SP7 Task 1, closes follow-ups
 //! #27 and #70).
 //!
-//! Pure module: no I/O, `std` only. Replaces the fixed subset that used to
+//! Pure module: no I/O, `std` only, and no dependency on any other winmux
+//! module in non-test code (the `#[cfg(test)]` module below reads
+//! `crate::options::DEFAULT_WINDOW_STATUS_FORMAT` as a fixture constant for
+//! one acceptance test — that's the only place this crate's other modules
+//! are referenced). Replaces the fixed subset that used to
 //! live in `src/options.rs` (`#S`/`#I`/three long-form variables/strftime
 //! only, no conditionals or modifiers) with a recursive-descent expander
 //! that implements the *documented core* of real tmux's format grammar —
@@ -58,6 +62,14 @@
 //!   DEFAULT_WINDOW_STATUS_FORMAT`, which is now the literal tmux string).
 //! - `%`-strftime passthrough, unchanged from the SP3 engine: `%H %M %S %d
 //!   %m %Y %y %b %a %p %I %%`; any other `%<c>` is literal passthrough.
+//! - Recursion/loop limit (§5.1's `FORMAT_LOOP_LIMIT` = 100, reference doc
+//!   line ~332): expansion is capped at 100 levels of recursion (conditional
+//!   nesting, `#{...}`-in-`#{...}` fallback expansion, and `eval_truth`'s
+//!   own re-expand all count); past that depth, [`expand`] stops expanding
+//!   and returns the remaining input text literally instead of recursing
+//!   further, so a pathological/malicious format string degrades safely
+//!   (truncated/partially-unexpanded output) instead of overflowing the
+//!   stack.
 //!
 //! ## Documented non-supported remainder (§5.3's modifier table)
 //!
@@ -170,11 +182,14 @@ fn truthy(s: &str) -> bool {
 /// changed nothing (an unrecognized bare word expands to itself unchanged,
 /// since `expand` only transforms `#`/`%` sequences), treat it as false —
 /// otherwise apply `format_true` to the expanded result.
-fn eval_truth(text: &str, ctx: &FormatCtx) -> bool {
+///
+/// `depth` is the current recursion depth (see [`expand_depth`]'s doc for
+/// the `FORMAT_LOOP_LIMIT` cap); the re-expand below goes one level deeper.
+fn eval_truth(text: &str, ctx: &FormatCtx, depth: u32) -> bool {
     if let Some(v) = lookup_variable(text, ctx) {
         return truthy(&v);
     }
-    let expanded = expand(text, ctx);
+    let expanded = expand_depth(text, ctx, depth + 1);
     if expanded == text {
         false
     } else {
@@ -264,18 +279,19 @@ fn split_top_commas(s: &str) -> Vec<String> {
 /// stripped. Evaluated pairwise: the first cond that's truthy short-circuits
 /// to its (recursively expanded) value; an unpaired trailing part is the
 /// else-value (also expanded); no match and no trailing part -> empty
-/// (§5.2).
-fn resolve_conditional(rest: &str, ctx: &FormatCtx) -> String {
+/// (§5.2). `depth` threads through to [`eval_truth`]/[`expand_depth`] for
+/// the `FORMAT_LOOP_LIMIT` cap (see [`expand_depth`]).
+fn resolve_conditional(rest: &str, ctx: &FormatCtx, depth: u32) -> String {
     let parts = split_top_commas(rest);
     let mut idx = 0;
     while idx + 1 < parts.len() {
-        if eval_truth(&parts[idx], ctx) {
-            return expand(&parts[idx + 1], ctx);
+        if eval_truth(&parts[idx], ctx, depth + 1) {
+            return expand_depth(&parts[idx + 1], ctx, depth + 1);
         }
         idx += 2;
     }
     if idx < parts.len() {
-        expand(&parts[idx], ctx)
+        expand_depth(&parts[idx], ctx, depth + 1)
     } else {
         String::new()
     }
@@ -348,9 +364,18 @@ const COMPARISON_PREFIXES: &[(&str, CmpFn)] = &[
 /// -> `=N:`/`=-N:` length-limit -> plain variable lookup (falling back to a
 /// full recursive [`expand`] if the name itself contains further `#{`
 /// structure, else empty — §5.3).
-fn resolve_braced(content: &str, ctx: &FormatCtx) -> String {
+///
+/// `depth` is the current recursion depth; past `FORMAT_LOOP_LIMIT` (100,
+/// see [`expand_depth`]'s doc) this returns `content` literally instead of
+/// recursing further — this function is itself a recursion site (the
+/// `=N:`/`=-N:` branch below calls back into itself) independent of
+/// [`expand_depth`]'s own guard, so it needs the same check at entry.
+fn resolve_braced(content: &str, ctx: &FormatCtx, depth: u32) -> String {
+    if depth > FORMAT_LOOP_LIMIT {
+        return content.to_string();
+    }
     if let Some(rest) = content.strip_prefix('?') {
-        return resolve_conditional(rest, ctx);
+        return resolve_conditional(rest, ctx, depth);
     }
     for (prefix, op) in COMPARISON_PREFIXES {
         if let Some(rest) = content.strip_prefix(prefix) {
@@ -358,40 +383,62 @@ fn resolve_braced(content: &str, ctx: &FormatCtx) -> String {
             if parts.len() != 2 {
                 return String::new(); // malformed -- no real config produces this
             }
-            let a = expand(&parts[0], ctx);
-            let b = expand(&parts[1], ctx);
+            let a = expand_depth(&parts[0], ctx, depth + 1);
+            let b = expand_depth(&parts[1], ctx, depth + 1);
             return if op(&a, &b) { "1" } else { "0" }.to_string();
         }
     }
     if let Some(rest) = content.strip_prefix("&&:") {
         let parts = split_top_commas(rest);
-        let result = !parts.is_empty() && parts.iter().all(|p| eval_truth(p, ctx));
+        let result = !parts.is_empty() && parts.iter().all(|p| eval_truth(p, ctx, depth + 1));
         return if result { "1" } else { "0" }.to_string();
     }
     if let Some(rest) = content.strip_prefix("||:") {
         let parts = split_top_commas(rest);
-        let result = parts.iter().any(|p| eval_truth(p, ctx));
+        let result = parts.iter().any(|p| eval_truth(p, ctx, depth + 1));
         return if result { "1" } else { "0" }.to_string();
     }
     if let Some((n, remainder)) = parse_truncate(content) {
-        let base = resolve_braced(remainder, ctx);
+        let base = resolve_braced(remainder, ctx, depth + 1);
         return truncate_n(&base, n);
     }
     if let Some(v) = lookup_variable(content, ctx) {
         return v;
     }
     if content.contains("#{") {
-        return expand(content, ctx);
+        return expand_depth(content, ctx, depth + 1);
     }
     String::new() // unknown plain name -> empty (§5.3)
 }
+
+/// `FORMAT_LOOP_LIMIT` (real tmux's `format.c` constant, §5.1 of the
+/// reference doc, line ~332): the maximum recursion depth [`expand_depth`]
+/// (and its mutually-recursive helpers `resolve_braced`/`resolve_conditional`/
+/// `eval_truth`) will descend before giving up and returning the remaining
+/// input literally rather than recursing further.
+const FORMAT_LOOP_LIMIT: u32 = 100;
 
 /// Expand a tmux format string against `ctx`. See the module docs for the
 /// full grammar this implements. Never panics, never returns an error —
 /// every unrecognized/malformed construct degrades to empty text or a
 /// literal passthrough, matching tmux's own "anything else renders empty"
-/// posture.
+/// posture. Delegates to [`expand_depth`] at depth 0.
 pub fn expand(fmt: &str, ctx: &FormatCtx) -> String {
+    expand_depth(fmt, ctx, 0)
+}
+
+/// The actual expansion loop behind [`expand`], with an explicit recursion
+/// `depth` threaded through every mutually-recursive helper (`resolve_braced`,
+/// `resolve_conditional`, `eval_truth`) so nesting driven entirely by
+/// (possibly adversarial) input text can't stack-overflow the process: once
+/// `depth` exceeds [`FORMAT_LOOP_LIMIT`] (tmux's own `FORMAT_LOOP_LIMIT` =
+/// 100, §5.1), expansion stops and `fmt` is returned unexpanded/literal —
+/// safe degradation (truncated output), never a panic or an abort. Every
+/// recursive call site below passes `depth + 1`.
+fn expand_depth(fmt: &str, ctx: &FormatCtx, depth: u32) -> String {
+    if depth > FORMAT_LOOP_LIMIT {
+        return fmt.to_string();
+    }
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::with_capacity(fmt.len());
     let mut i = 0;
@@ -436,7 +483,7 @@ pub fn expand(fmt: &str, ctx: &FormatCtx) -> String {
                 '{' => match find_close(&chars, i + 2) {
                     Some(close) => {
                         let content: String = chars[i + 2..close].iter().collect();
-                        out.push_str(&resolve_braced(&content, ctx));
+                        out.push_str(&resolve_braced(&content, ctx, depth + 1));
                         i = close + 1;
                     }
                     None => {
@@ -660,5 +707,92 @@ mod tests {
         assert_eq!(expand("%Y-%m-%d %a %I:%M%p", &c), "2026-07-07 Tue 02:05PM");
         assert_eq!(expand("%%", &c), "%");
         assert_eq!(expand("%x stays", &c), "%x stays");
+    }
+
+    /// Malformed input regression (code-review Important #2): an unterminated
+    /// `#{` finds no matching close ([`find_close`] returns `None`), so
+    /// [`expand_depth`] consumes to end-of-string producing nothing further
+    /// (see its `'{' => match find_close(...) { None => ... }` arm) -- "a"
+    /// (pushed before the `#{` was hit) is all that survives. Asserts this
+    /// documented current behavior and, implicitly, that it doesn't panic.
+    #[test]
+    fn unclosed_brace_consumes_to_end_without_panic() {
+        let c = ctx("s", "", "", "H");
+        assert_eq!(expand("a#{session_name", &c), "a");
+    }
+
+    /// Malformed input regression (code-review Important #2): `#{}` -- empty
+    /// braced content. `find_close` matches the `}` immediately (content =
+    /// ""); `resolve_braced("")` fails every prefix check, `lookup_variable("")`
+    /// is `None`, `"".contains("#{")` is false, so it falls through to the
+    /// final `String::new()` arm (empty). "x" and "y" survive from outside
+    /// the braces -> "xy".
+    #[test]
+    fn empty_braces_expand_empty() {
+        let c = ctx("s", "", "", "H");
+        assert_eq!(expand("x#{}y", &c), "xy");
+    }
+
+    /// FORMAT_LOOP_LIMIT regression (code-review Important #1): a
+    /// pathologically deep nest must terminate (not stack-overflow the
+    /// process) once recursion passes depth 100, per `docs/tmux-reference/
+    /// commands-config-options-formats.md` §5.1's `FORMAT_LOOP_LIMIT` (100).
+    ///
+    /// `layers[k]` is built programmatically so the expected output can be
+    /// sliced out exactly rather than hand-typed (a 500-deep string is not
+    /// something anyone should hand-compute): `layers[0]` = "session_name"
+    /// (the leaf, no `#` in it at all); `layers[k]` = `#{` + `layers[k-1]` +
+    /// `}` (one more wrap). `layers[500]` is fed to `expand`.
+    ///
+    /// Tracing `expand_depth`/`resolve_braced`'s mutual recursion on
+    /// `layers[500]`: `expand_depth(layers[500-k], depth=2k)` always calls
+    /// `resolve_braced(layers[500-k-1], depth=2k+1)` (one `resolve_braced`
+    /// call per unwrapped layer, `depth` climbing by 2 per layer: +1 for the
+    /// `expand_depth -> resolve_braced` call, +1 for `resolve_braced`'s own
+    /// `content.contains("#{") -> expand_depth` fallback call on the next
+    /// layer down). The n-th `resolve_braced` call (1-indexed) runs at
+    /// `depth = 2n-1` and processes `layers[500-n]`. The guard is `depth >
+    /// FORMAT_LOOP_LIMIT` (100); the first odd depth exceeding 100 is 101,
+    /// at `n = 51`, processing `layers[500-51] = layers[449]` -- that call's
+    /// guard fires immediately and returns `layers[449]` back UNCHANGED
+    /// (literal, still `#{`-wrapped, not further expanded), and every
+    /// enclosing frame passes that same string straight back up (each
+    /// wrapping layer's `fmt` is *exactly* one `#{...}` occupying the whole
+    /// string, so there is no surrounding literal text to prepend/append at
+    /// any level) -- so `expand(layers[500], ..)` returns `layers[449]`
+    /// exactly: 51 layers were unwrapped (500 -> 449) before the cap bit,
+    /// leaving the remaining 449-deep nest around `session_name` as
+    /// unexpanded literal text.
+    #[test]
+    fn deep_nesting_hits_depth_limit_without_overflow() {
+        let mut layers = vec!["session_name".to_string()];
+        for _ in 0..500 {
+            let prev = layers.last().unwrap();
+            layers.push(format!("#{{{}}}", prev));
+        }
+        let c = ctx("s", "", "", "H");
+        let result = expand(layers.last().unwrap(), &c);
+        // Termination without a stack overflow/process abort IS the main
+        // assertion here (a pre-fix build of this code would abort the test
+        // process on this call rather than returning at all).
+        assert_eq!(result, layers[449]);
+        // Sanity: NOT the fully-expanded leaf value ("s") -- proves
+        // expansion really did stop early rather than coincidentally
+        // finishing at the same answer.
+        assert_ne!(result, "s");
+        assert!(result.contains("#{"), "expected an unexpanded literal tail, got: {result}");
+    }
+
+    /// Malformed/edge-case regression (code-review Important #2): a nested
+    /// braced variable inside a length-limit modifier, `#{=5:#{session_name}}`
+    /// -- proves `resolve_braced`'s `=N:` branch recurses into the inner
+    /// `#{session_name}` (via its own `content.contains("#{") -> expand_depth`
+    /// fallback) BEFORE truncating, not after truncating literal `"#{session_name}"`
+    /// text. A 20-char session name truncated to the left 5 chars is
+    /// "super".
+    #[test]
+    fn length_limit_wraps_nested_braced_variable() {
+        let c = ctx("superlongsessionname", "", "", "H"); // 20 chars
+        assert_eq!(expand("#{=5:#{session_name}}", &c), "super");
     }
 }
