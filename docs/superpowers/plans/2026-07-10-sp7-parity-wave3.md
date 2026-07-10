@@ -36,11 +36,11 @@
 | Track | Tasks | Primary files | Branch |
 |---|---|---|---|
 | A | 1 | NEW `src/format.rs`, `src/options.rs` (expand_format delegation), `src/status.rs` (callers) | `sp7/track-a` |
-| B | 2, 3 (serial within track) | `src/grid.rs` | `sp7/track-b` |
+| B | 2, 3 (serial within track) | `src/grid.rs`, `src/options.rs` (Task 3's `allow-rename` SPECS entry — **overlaps Track A's file**) | `sp7/track-b` |
 | C | 4 | `src/pty.rs`, `src/pipe.rs`, `src/protocol.rs`, `src/client.rs`, `src/main.rs`, `src/render.rs` (one dead field), `src/server.rs` (writer threads, eviction msg) | `sp7/track-c` |
 | D | 5 | `src/keys.rs`, `src/input.rs`, `src/bindings.rs` | `sp7/track-d` |
 
-Merge order after Wave 1: C → D → B → A (smallest blast radius first; A last because its status.rs callers may touch what B/C leave alone anyway). Full `cargo test` + clippy after each merge.
+Merge order after Wave 1: C → D → B → A (smallest blast radius first; A merges LAST deliberately because Tracks A and B both edit `src/options.rs` — B's `allow-rename` SPECS/getter entry lands first, and A's merge must be conflict-checked against it by the controller as a REAL textual merge, not just a test-suite re-run). All tracks also append tests to `tests/server_proto.rs` (append-only conflicts, controller-resolved). Full `cargo test` + clippy after each merge.
 
 **Waves 2-7 — serial on the integration branch** (every task touches `src/cmd.rs` / `src/server/dispatch.rs` / `src/options.rs`, the shared choke-point files):
 
@@ -111,9 +111,11 @@ Spec: `docs/tmux-reference/panes-and-layout.md` (resize/reflow section — tmux 
 
 Spec: `docs/tmux-reference/mouse.md` (pane mouse-mode flags: which DECSET numbers map to which MOUSE_* flags, and the SGR/UTF8 encoding toggles) and `docs/tmux-reference/commands-config-options-formats.md` (`allow-rename`, default off in modern tmux — verify). ESC k `<title>` ESC \ is the historical tmux title escape.
 
-- [ ] **Step 1: RED —** grid unit tests: `decset_1000_sets_normal_mouse_1006_sets_sgr_encoding`, `decrst_clears_mouse_mode`, `mode_1003_any_motion_wins_over_1000`, `bel_byte_sets_bell_flag_take_bell_clears`, `esc_k_sets_title`. server_proto: `allow_rename_off_ignores_esc_k_title_rename` + `allow_rename_on_esc_k_renames_window` (mirror the existing automatic-rename OSC tests).
+**ESC k implementation constraint (plan-review ruling, verified against vte 0.13's state table):** the vte crate has NO string-capturing path for `ESC k` — in the `Escape` state, byte `k` falls in the generic `0x60..=0x7e → (Ground, EscDispatch)` bucket, so `esc_dispatch` fires once and every subsequent title byte would be dispatched as `Print` (leaking the title text into the pane's visible cells). Do NOT try to hook `esc_dispatch`/OSC for this. Instead, pre-scan the raw byte stream in `Grid::feed` for `\x1bk … \x1b\\` (or BEL-terminated per tmux's tolerance — verify terminator rules in the tmux source if the doc is silent), strip the sequence out before handing bytes to `vte::Parser::advance`, and capture the title into the existing OSC-title slot. The pre-scan must handle the sequence split across `feed` chunk boundaries (keep a small pending-state, same class of problem as the input decoder's escape buffering).
+
+- [ ] **Step 1: RED —** grid unit tests: `decset_1000_sets_normal_mouse_1006_sets_sgr_encoding`, `decrst_clears_mouse_mode`, `mode_1003_any_motion_wins_over_1000`, `bel_byte_sets_bell_flag_take_bell_clears`, `esc_k_sets_title`, `esc_k_title_bytes_do_not_leak_into_cells` (feed `\x1bkfoo\x1b\\` then `bar`; assert cells contain only `bar`), `esc_k_split_across_feed_chunks` (sequence split mid-title over two `feed` calls; title still captured, no leak). server_proto: `allow_rename_off_ignores_esc_k_title_rename` + `allow_rename_on_esc_k_renames_window` (mirror the existing automatic-rename OSC tests).
 - [ ] **Step 2: Run, record RED.**
-- [ ] **Step 3: GREEN —** vte CSI `?`-private set/reset arms for the mode numbers; BEL in the execute hook; ESC k via the vte OSC/ESC-string path. Option + server gate: ESC k-sourced titles participate in automatic-rename only when `allow-rename` is on (OSC 0/2 path unchanged).
+- [ ] **Step 3: GREEN —** DECSET/DECRST arms for the mode numbers in `csi_dispatch`'s existing `?`-intermediate match (modes 7/25/1049 already live there); BEL in the vte `execute` hook; ESC k via the pre-scan/strip in `Grid::feed` described above (NOT a vte hook). Option + server gate: ESC k-sourced titles participate in automatic-rename only when `allow-rename` is on (OSC 0/2 path unchanged).
 - [ ] **Step 4: Full verification + clippy.**
 - [ ] **Step 5: Amend contracts; mark #52 resolved in follow-ups. Commit** `feat(grid): pane mouse-mode/encoding tracking, BEL surfacing, ESC k title + allow-rename (closes follow-up #52)`.
 
@@ -264,9 +266,9 @@ Spec: `docs/tmux-reference/panes-and-layout.md` (swap-pane full semantics incl. 
 
 **Interfaces:** layout may gain an absolute-size annotation (contract-documented).
 
-Spec: `docs/tmux-reference/windows-and-sessions.md` (find-window: `-C`/`-N`/`-T` content/name/title match targets, fnmatch vs `-r` regex — implement per doc; multiple matches open a choose-tree of matches) and `docs/tmux-reference/panes-and-layout.md` (main-pane-width/height are ABSOLUTE cell counts re-applied on every resize).
+Spec: `docs/tmux-reference/windows-and-sessions.md` §find-window (lines ~256-275): find-window is sugar that opens **choose-tree (window-tree) mode filtered to the matches** — it is NOT a direct jump, **even for a single match** (plan-review ruling: winmux's current single-match direct jump is a parity deviation and must be REPLACED, not preserved; selecting the entry in the tree performs the jump). `-C`/`-N`/`-T` content/name/title match targets, fnmatch by default, `-r` regex — implement per doc. Also `docs/tmux-reference/panes-and-layout.md` (main-pane-width/height are ABSOLUTE cell counts re-applied on every resize).
 
-- [ ] **Step 1: RED —** server_proto: `find_window_multi_match_opens_choose_list`, `find_window_regex_flag_matches_anchor` (`-r '^foo'`), `find_window_single_match_jumps` (existing behavior preserved). layout/server_proto: `main_pane_width_survives_window_resize` (apply main-vertical with `main-pane-width 20`, resize the terminal, assert the main pane is STILL exactly 20 cols, not proportionally scaled).
+- [ ] **Step 1: RED —** server_proto: `find_window_multi_match_opens_choose_list`, `find_window_single_match_opens_choose_list_too` (tmux parity: one match still opens the filtered tree; Enter then jumps — the OLD direct-jump test, if one exists, is sanctioned to invert with a computed comment), `find_window_regex_flag_matches_anchor` (`-r '^foo'`). layout/server_proto: `main_pane_width_survives_window_resize` (apply main-vertical with `main-pane-width 20`, resize the terminal, assert the main pane is STILL exactly 20 cols, not proportionally scaled).
 - [ ] **Step 2: Run, record RED.**
 - [ ] **Step 3: GREEN** per docs.
 - [ ] **Step 4: Full verification + clippy.**
@@ -282,6 +284,8 @@ Spec: `docs/tmux-reference/windows-and-sessions.md` (find-window: `-C`/`-N`/`-T`
 **Interfaces:** grid gains `bracketed_paste(&self) -> bool` if not present (contract note).
 
 Spec: `docs/tmux-reference/copy-mode-and-buffers.md` (copy-pipe semantics: selection piped to the shell command AND still stored in a buffer; set-clipboard/OSC 52 rules — which value emits to clients; paste-buffer -p bracket rule) — verify each detail there.
+
+Two plan-review decisions, made here so the implementer doesn't have to: (a) **OSC 52 capability gating** — ConPTY has no `Ms`-capability probe (per the doc's Windows notes), so winmux gates emission ONLY on the `set-clipboard` option value (`on`/`external` emit, `off` doesn't; per-value semantics per the doc); the "terminal may ignore or mangle it" risk is accepted and documented in the contract amendment (modern Windows Terminal supports OSC 52). (b) **base64**: hand-roll the encoder (~15 lines) in a private helper — do NOT add a dependency for it.
 
 - [ ] **Step 1: RED —** server_proto: `copy_pipe_runs_command_with_selection_stdin` (pipe to `findstr`/`powershell -c "Set-Content"`-class command writing a scratch file; assert file contents == selection), `osc52_emitted_to_client_on_copy` (attached client's byte stream contains the base64 of the copied text), `paste_p_brackets_when_pane_requested_2004` + `paste_p_plain_when_not_requested`, `emacs_C_k_copies_to_eol_and_cancels`, `emacs_M_m_moves_to_first_nonblank`.
 - [ ] **Step 2: Run, record RED.**
@@ -300,7 +304,7 @@ Spec: `docs/tmux-reference/copy-mode-and-buffers.md` (copy-pipe semantics: selec
 
 Spec: `docs/tmux-reference/choose-tree.md` (choose-buffer and choose-client are mode-tree siblings; row columns, default sort, Enter/x/tag behaviors per the doc — implement Enter + x + navigation; tagging arrives in Task 15 and should apply to these lists too if the shared machinery makes it free, else note).
 
-- [ ] **Step 1: RED —** server_proto: `choose_buffer_lists_buffers_enter_pastes`, `choose_buffer_x_deletes_selected`, `choose_client_lists_attached_clients`, `choose_client_x_detaches_selected` (two attached clients over the pipe — harness supports multi-client already, see rename-propagation tests).
+- [ ] **Step 1: RED —** server_proto: `choose_buffer_lists_buffers_enter_pastes`, `choose_buffer_x_deletes_selected`, `choose_client_lists_attached_clients`, `choose_client_x_detaches_selected` (two attached clients over the pipe — the existing multi-client harness precedent is `two_clients_smallest_size_wins` in tests/server_proto.rs, ~line 443; follow its two-connection setup).
 - [ ] **Step 2: Run, record RED.**
 - [ ] **Step 3: GREEN** reusing the ChooseTree overlay state machine (generalize its row model rather than duplicating it — the SP6 tree already carries typed targets).
 - [ ] **Step 4: Full verification + clippy.**
@@ -332,7 +336,7 @@ Spec: `docs/tmux-reference/choose-tree.md` — tagging keys/markers, sort keys f
 
 **Interfaces:** ParsedCmd::DisplayMenu (contract).
 
-Spec: `docs/tmux-reference/status-line-and-messages.md` and/or `docs/tmux-reference/mouse.md` — wherever display-menu + default right-click menus are documented (locate the section; if the reference docs do NOT cover menus, verify against tmux C source `menu.c` + default bindings in `key-bindings.c`, record the ruling in the ledger, and implement that).
+Spec (plan-review ruling — the reference docs do NOT fully cover menus): `docs/tmux-reference/mouse.md` §7.1 documents the default right-click menu CONTENTS, and `docs/tmux-reference/commands-config-options-formats.md` Appendix A has only the raw args template (`display-menu | menu | b:c:C:H:s:S:MOt:T:x:y: | 1 | −1` — flags, no grammar prose). The PRIMARY spec source for the `name key command ...` triple-list grammar, flag semantics, and navigation behavior is therefore the tmux C source itself: clone tmux (master db115c6) to the scratchpad, read `menu.c` + `cmd-display-menu.c` + the default menu definitions, record the rulings in the ledger, and implement those.
 
 - [ ] **Step 1: RED —** cmd unit: `display_menu_parses_name_key_command_triples`. server_proto: `display_menu_opens_and_enter_runs_selected` (menu whose item runs `select-window -t 1`; navigate + Enter; assert window switched), `right_click_on_pane_opens_default_menu` (SGR button-3 press; assert menu box rendered), `menu_click_outside_closes_without_action`, `menu_escape_closes`.
 - [ ] **Step 2: Run, record RED.**
@@ -388,7 +392,8 @@ Spec: `docs/tmux-reference/status-line-and-messages.md` (alerts section: flag ch
 ## Self-review notes
 
 - **Coverage:** every open follow-up ticket maps to a task: #7-#10/#14-#21/#24/#62/#63→T4; #11/#12/#22/#23/#58/#60→T18; #26/#32/#68→T6; #27/#70→T1; #29/#69/#71 (+#31/#36/#37 verify-mark)→T7; #30/#34→T5; #35/#72→T9; #39/#61→T10; #41/#42/#44/#45→T11; #43/#46/#54→T12; #47→T2; #48/#49→T14; #50/#73→T15; #51→T16; #52→T3; #53/#55/#56→T13; #57/#67→T8; #74→T17. Accepted set (#2, #4, #13, #33, #40, #59) documented in T19. TPM/SP5 explicitly out of scope with prerequisites delivered (T1, T6).
-- **Order/deps validated:** T7 after T1+T6; T9 after T3+T8; T16 after T8; T17 after T3+T6. Wave 1's four tracks touch disjoint primary files; server_proto.rs append conflicts are controller-resolved at merge.
+- **Order/deps validated:** T7 after T1+T6; T9 after T3+T8; T16 after T8; T17 after T3+T6. Wave 1's tracks are disjoint EXCEPT Tracks A and B both edit `src/options.rs` (B merges before A; controller conflict-checks A's merge as a real textual merge); server_proto.rs append conflicts are controller-resolved at merge.
+- **Plan-review gate (2026-07-10, Sonnet, adversarial): APPROVE-WITH-FIXES — all 3 blocking fixes applied (Task 3 ESC k pre-scan ruling, Task 12 find-window always-opens-tree parity, Wave-1 options.rs overlap) plus 4 advisories (Task 14 test citation, Task 16 menu.c-as-primary-spec, Task 13 OSC 52 gating decision + hand-rolled base64).
 - **Contract discipline:** T1 (new module section), T2/T3/T4(#63)/T11 (mvp/grid/layout), T4/T7/T11 (server-client), T3/T6/T8/T13/T14/T16/T17 (command-config) — each amends in-commit.
 - **Sanctioned existing-test edits:** T1 removes the #70 shim tests (replaced by real-engine tests); T8 may need mechanical updates where mouse tests assert internal dispatch details (behavior must stay identical); everything else adds tests.
 - **Known risk concentrations** (flagged for reviewers): T8's dispatch refactor (largest regression surface — the entire mouse suite is the net); T2's reflow (copy-mode view math interacts with scrollback indices); T6's scope threading (every option read site). These three get the strictest review gates.
