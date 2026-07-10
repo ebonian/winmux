@@ -108,13 +108,16 @@ impl Grid {
     /// expected `\` — is even read), and treats `BEL` inside the title as a
     /// silent no-op, NOT a terminator (unlike OSC 0/2, whose terminator IS
     /// BEL-or-ST) — `input_state_rename_string_table` has no `BEL` arm,
-    /// unlike OSC's dedicated one. The server decides whether an
-    /// `ESC k`-sourced title participates in automatic-rename, gated by the
-    /// `allow-rename` option (`options::Options::allow_rename`, default off
-    /// — see the `## options` amendment in
-    /// `2026-07-07-command-config-interfaces.md`); the OSC 0/2 path is
-    /// unconditional, matching real tmux (`allow-rename` gates ONLY
-    /// `ESC k`).
+    /// unlike OSC's dedicated one. The server handles `ESC k`-sourced titles
+    /// according to the `allow-rename` option (`options::Options::allow_rename`,
+    /// default off — see the `## options` amendment in
+    /// `2026-07-07-command-config-interfaces.md`): when `allow-rename` is on,
+    /// an ESC k title renames the window directly (independent of
+    /// `automatic-rename` and of any prior manual rename), then clears that
+    /// window's `auto_rename` flag — matching tmux's `input_exit_rename` per
+    /// `docs/tmux-reference/windows-and-sessions.md:358-374`. When `allow-rename`
+    /// is off, ESC k titles are captured by the grid but cause no rename. The
+    /// OSC 0/2 path is unconditional, matching real tmux.
     pub fn title_from_esc_k(&self) -> bool;
     /// Task 5 (mouse) addition: `true` while the pane is showing the
     /// alternate screen (`CSI ?1049h` seen more recently than a matching
