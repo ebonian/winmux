@@ -9,7 +9,13 @@ None ever blocked a merge.
    until closed. Fixed: the server drops `Pty` at `Event::Exited`
    (`PaneRuntime.pty = None`), and a natural pane exit now auto-removes the
    pane entirely (tmux `remain-on-exit off` default, wired up in Task 7).
-2. **STILL OPEN** — deliberate choice. Confirm race when `Ctrl-b x y` arrive
+2. **ACCEPTED DEBT — deliberate choice, re-affirmed (SP7 Task 19 closeout
+   sweep, 2026-07-11).** Not implemented in SP7 per the SP7 plan's explicit
+   accepted-debt list; kept "open" rather than "resolved" on purpose (see
+   below) because closing it for real would mean eliminating the underlying
+   race class in the abstract, not just changing the mechanism that
+   currently mitigates it — no SP7 task touched this. Confirm race when
+   `Ctrl-b x y` arrive
    in one stdin read: without care the `y` could be forwarded to the shell
    before confirm mode arms. The server/client design fixes this
    *structurally* rather than closing the race in the MVP's single-batch
@@ -33,12 +39,17 @@ None ever blocked a merge.
    had a partial-failure gap: code pages/stdout mode were mutated before the
    `RESTORE` snapshot was published. Fixed by publishing `RESTORE` before the
    first mutation.
-4. **PARTIALLY RESOLVED** (sub-project 2, Task 6). Unbounded event-channel
-   growth under pane output flood: events are now drained and coalesced once
-   per main-loop turn before a single render, instead of one render per 4 KB
-   `Output` chunk. The underlying `mpsc` channel itself is still unbounded —
-   a sufficiently fast, never-drained producer can still grow the queue
-   without limit. Residual risk, not eliminated.
+4. **PARTIALLY RESOLVED; residual ACCEPTED DEBT, re-affirmed (SP7 Task 19
+   closeout sweep, 2026-07-11)** (sub-project 2, Task 6). Unbounded
+   event-channel growth under pane output flood: events are now drained and
+   coalesced once per main-loop turn before a single render, instead of one
+   render per 4 KB `Output` chunk. The underlying `mpsc` channel itself is
+   still unbounded — a sufficiently fast, never-drained producer can still
+   grow the queue without limit. Residual risk, not eliminated. Per the SP7
+   plan's explicit accepted-debt list (grouped with #13 below as the same
+   unbounded-channel tradeoff), SP7 deliberately did not implement bounding
+   here — the design tradeoff (never block the main loop / a writer thread
+   over blocking on backpressure) is judged still correct, not revisited.
 5. **RESOLVED** (sub-project 2, Task 10). `layout`'s Right/Down adjacency
    checks in `focus_dir` computed `f.x + f.w + 1` / `f.y + f.h + 1` with
    plain `+`, which is a theoretical `u16` overflow (debug-mode panic) for
@@ -149,7 +160,11 @@ reviews. None affect the sub-project 2 merge.
     has been reliable in practice but is inherently a timing guess; a
     genuinely slow CI box could still flake it. Consider a bounded
     `wait_until`-style predicate loop instead if it ever becomes flaky.
-13. **Unbounded per-client writer channel.** Per the server/client design
+13. **ACCEPTED DEBT, re-affirmed (SP7 Task 19 closeout sweep, 2026-07-11) —
+    NOT implemented in SP7**, per the plan's explicit accepted-debt list
+    (grouped with #4 above as the same design tradeoff — see that entry).
+    **Unbounded per-client writer channel.** Per the server/client design
+
     (`docs/specs/2026-07-07-server-client-design.md`, "Server architecture"),
     each client's writer thread drains an unbounded `mpsc<Vec<u8>>` by
     design, so a slow/stalled client can never block the main loop — but the
@@ -366,12 +381,41 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     #75/#76 below): no `-t` targeting for set/show, no per-PANE option
     tree, live `set` side effects fire on global writes only, and
     `status`/`status-position` GEOMETRY stays global-only.
-27. **Format engine covers a fixed subset of `#`-codes, not the general
-    tmux format language.** `expand_format` (`src/options.rs`) supports
-    `#S`/`#W`/`#I`/`#P`/`#F`/`#H`/strftime-style `%H:%M`-class codes and
-    nothing else — no `#{...}` braced expressions, no conditionals
-    (`#{?...}`), no arithmetic/string format functions. `status-right`'s
-    real tmux default (`#{=21:pane_title}`-bearing) is out of reach for this
+27. **RESOLVED** (SP7 Task 1, 2026-07-10; closes together with #70 below —
+    same fix). `src/format.rs` is a new, pure recursive-descent format
+    engine that `options::expand_format` now delegates to: `#{variable}`
+    braced long-form vars, `#{?cond,a,b}` conditionals (incl. chained
+    `#{?c1,v1,c2,v2,fallback}` and nested expansion), the six `#{OP:a,b}`
+    string comparisons (`==`/`!=`/`<`/`>`/`<=`/`>=`), N-ary `#{&&:...}`/
+    `#{||:...}`, the `#{=N:x}`/`#{=-N:x}` length-limit modifier, `#,`/`#}`
+    literal escapes (needed so a conditional arm can embed a literal comma/
+    close-brace), and a `FORMAT_LOOP_LIMIT`=100 recursion cap (tmux parity,
+    prevents pathological input from overflowing the stack). `status-right`'s
+    real tmux default (`#{=21:pane_title}`-bearing) and `window-status-format`'s
+    real tmux default (`#I:#W#{?window_flags,#{window_flags}, }`) both now
+    expand correctly for the first time — see `options::
+    DEFAULT_WINDOW_STATUS_FORMAT`, now the literal tmux string. Documented
+    non-supported remainder (matches real tmux's own much larger unsupported
+    surface, not a gap specific to winmux): `b:`/`d:`/`t:`/`p`/`pN:`/`l:`/
+    `E:`/`T:`/`S:`/`W:`/`P:`/`L:`/`O:`/`V:`/`N:`/`C:`/`s/.../.../`/`m/.../...`/
+    `q:`/`n:`/`w:`/`a:`/`c:`/`I/...`/`R:`/arithmetic/`!:`/`!!:` modifiers,
+    `#(command)` shell jobs (no shell-job subsystem exists at all), and
+    `client_*`/loop-injected/copy-mode/mouse/buffer format variables
+    (`FormatCtx` carries none of that data yet — plumbing it needs new fields
+    threaded through `server/dispatch.rs`'s `FormatCtx` construction sites,
+    out of Task 1's file-scope restriction; carried forward, not picked up by
+    a later SP7 wave — a real, still-open residual gap, but a narrow one: no
+    current winmux default format or the fixture config uses a `client_*`
+    variable). See `src/format.rs`'s module doc comment for the full
+    supported/unsupported grammar table cited against
+    `docs/tmux-reference/commands-config-options-formats.md`'s `## 5. Formats
+    (format.c)` section.
+    *Original text:* **Format engine covers a fixed subset of `#`-codes, not
+    the general tmux format language.** `expand_format` (`src/options.rs`)
+    supported `#S`/`#W`/`#I`/`#P`/`#F`/`#H`/strftime-style `%H:%M`-class
+    codes and nothing else — no `#{...}` braced expressions, no conditionals
+    (`#{?...}`), no arithmetic/string format functions. `status-right`'s real
+    tmux default (`#{=21:pane_title}`-bearing) was out of reach for this
     reason (documented deviation in `src/options.rs`'s `default_value`).
 28. **RESOLVED** (sub-project 4, Task 9). `automatic-rename` is inert. The
     option is registered with tmux's default (`on`) and round-trips through
@@ -491,8 +535,11 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     user-visible index, so under `pane-base-index 1` `.1` is the first
     pane and `.0` errors). Proven end to end by `tests/server_proto.rs::
     pane_base_index_shifts_display_panes_digits_and_hash_p`.
-33. **Config errors surface via `server.log` + a first-attach transient
-    message, not tmux's interactive error view.** Real tmux reports a
+33. **ACCEPTED DEBT, re-affirmed (SP7 Task 19 closeout sweep, 2026-07-11) —
+    NOT implemented in SP7**, per the plan's explicit accepted-debt list:
+    this is a documented design-spec deviation, not an oversight, and SP7
+    left it as-is. **Config errors surface via `server.log` + a first-attach
+    transient message, not tmux's interactive error view.** Real tmux reports a
     `.tmux.conf` parse/apply error interactively (an in-place message in the
     client that loaded it, with `set -g @tmux_error` style follow-up
     tooling in some configs); winmux instead logs the error to
@@ -626,8 +673,10 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     option already exists"). A `set -g word-separators <chars>` line is
     accepted/stored nowhere and has no effect — no `word-separators` entry
     exists in `src/options.rs`'s `SPECS` table at all.
-38. **Mouse-during-prompt/confirm/choose-tree/display-panes is swallowed
-    entirely, not forwarded to the overlay** (Task 5, mouse; scope widened
+38. **PARTIALLY RESOLVED (SP7 Tasks 10 and 16); `ConfirmCmd`/`Prompt`/
+    `DisplayPanes` remain fully swallowed, by design.** *Original title:*
+    Mouse-during-prompt/confirm/choose-tree/display-panes is swallowed
+    entirely, not forwarded to the overlay (Task 5, mouse; scope widened
     in the final SP4 review's merge-gate fix round). `dispatch_mouse` drops
     (silent no-op) any mouse event while the acting client's `ClientMode` is
     `ConfirmCmd`, `Prompt`, `ChooseTree`, or `DisplayPanes`, rather than
@@ -642,6 +691,25 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     documented deviation, fixed in the same review round; see
     `docs/follow-ups.md` #61 for the follow-on "real tmux-style mouse
     routing into choose-tree" ticket this fix deferred.
+    **Update (SP7 Task 10, closes #61):** `ChooseTree` now gets its OWN
+    guard, routing a `Down(1)` press into the tree's row list
+    (`dispatch_choose_tree_mouse`) instead of swallowing it outright — still
+    swallows everything (including `Down(1)`) while a kill-confirm prompt is
+    pending on it, matching `ConfirmCmd`/`Prompt`.
+    **Update (SP7 Task 16, closes #51):** `Menu` (a mode that didn't exist
+    when this ticket was filed) gets an analogous guard — any press is
+    routed into the menu's own click-inside-commits/click-outside-cancels
+    handling, same shape as choose-tree's.
+    **Still true, unchanged, by design (verified in code as of this
+    closeout sweep):** `ConfirmCmd`, `Prompt`, and `DisplayPanes` still
+    swallow every mouse event unconditionally (`src/server/dispatch.rs`'s
+    `dispatch_mouse`, the guard immediately after the `Menu` arm) — no SP7
+    task touched this, and the original reasoning (never let a stray click
+    race a confirm's y/n capture, or hit-test against geometry an overlay is
+    hiding) still applies to all three. This ticket's TITLE is now
+    inaccurate for `choose-tree`/`display-menu` specifically; kept open
+    (not closed outright) because the `ConfirmCmd`/`Prompt`/`DisplayPanes`
+    portion of the original observation is still exactly true.
 39. **VERIFIED-RESOLVED** (SP7 Task 10, 2026-07-10, verify-and-mark). Task
     7's `status::status_tab_columns` fix (see follow-up #69a's entry) made
     `mouse_status_click` build `left`/`right_len`/`width` via the EXACT same
@@ -673,7 +741,11 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     (`status-left-length`/`status-right-length` already cap the common case;
     this only matters on terminals narrower than those caps plus every
     window tab combined).
-40. **Corner-cell border hit-testing tie-break is arbitrary** (Task 5,
+40. **ACCEPTED DEBT, re-affirmed (SP7 Task 19 closeout sweep, 2026-07-11) —
+    NOT implemented in SP7**, per the plan's explicit accepted-debt list:
+    real tmux has the same class of ambiguity and doesn't resolve it either,
+    so there is no tmux behavior to match here — kept as documented, not a
+    bug. **Corner-cell border hit-testing tie-break is arbitrary** (Task 5,
     mouse). `server::dispatch::hit_test` checks vertical-border positions
     before horizontal-border positions, so the single cell at a 4-way "+"
     junction between four panes always resolves to a vertical-border drag,
@@ -804,13 +876,38 @@ duplicates (mouse-forwarding-to-pane-apps is already #35; automatic-rename's
 "not separately itemized" there, so it gets its own ticket here as promised).
 None block the sub-project 4 merge.
 
-47. **Scrollback does not reflow on terminal resize** (Task 1, grid v2). Real
-    tmux (≥1.9) reflows scrollback content to the new width on resize;
-    winmux's `VecDeque<Vec<Cell>>` scrollback lines are clipped/padded to the
-    new width lazily on READ instead (design spec `## 1. Grid`: "NO reflow
-    on resize ... documented winmux divergence, ticket"). A resize mid-copy-
-    mode-scroll can therefore show ragged/truncated historical lines that
-    don't match what a reflowing terminal would show.
+47. **RESOLVED** (SP7 Task 2, 2026-07-10). `Grid::reflow_to_width`
+    (`src/grid.rs`) now reflows scrollback + the live screen to a new column
+    width on resize, tmux (`grid_reflow`) style: physical rows are grouped
+    into logical lines by following `row_wrapped`/`HistLine::wrapped` chains,
+    then each logical line is re-split at the new width
+    (`ceil(len / new_cols)` rows), with cursor mapping following tmux's
+    `grid_wrap_position`/`grid_unwrap_position` rules. Row COUNT is a
+    separate axis, unaffected by this function. Tests: `grid.rs`'s reflow
+    unit-test module (narrowing/widening across wrapped chains, cursor
+    remap, empty-line edge). A resize while a client is in copy mode also now
+    clears that client's selection unconditionally on ANY actual pane
+    width-or-height change — this matches real tmux's
+    `window_pane_resize` → `window_copy_size_changed` →
+    `window_copy_clear_selection` chain (`window.c:1362-1388`,
+    `window-copy.c:1174-1193,5914-5929`), verified against the C source
+    (SEMANTICS RULING recorded in `.superpowers/sdd/progress.md`), rather
+    than attempting to repair a stored `(anchor_scroll, anchor_y,
+    anchor_total)` selection anchor across a non-uniform reflow (there is no
+    single "shift count" that could do that correctly). See `docs/follow-ups.md`
+    #80/#81/#82 below for three small residual edges self-found while
+    building this: a position-only rect change over-clears the selection
+    where tmux would early-return, a combined width+height resize pads
+    instead of pulling rows back from history, and `trimmed_len` loses
+    genuine trailing spaces across a reflow.
+    *Original text:* **Scrollback does not reflow on terminal resize** (Task
+    1, grid v2). Real tmux (≥1.9) reflows scrollback content to the new
+    width on resize; winmux's `VecDeque<Vec<Cell>>` scrollback lines were
+    clipped/padded to the new width lazily on READ instead (design spec
+    `## 1. Grid`: "NO reflow on resize ... documented winmux divergence,
+    ticket"). A resize mid-copy-mode-scroll could therefore show
+    ragged/truncated historical lines that didn't match what a reflowing
+    terminal would show.
 48. **RESOLVED (SP7 Task 14, 2026-07-10).** `choose-buffer` (`=`) is now
     implemented: reuses the choose-tree overlay machinery, generalized
     (`ChooseTreeView::Buffers`, `TreeTarget::Buffer`) rather than
@@ -1143,7 +1240,11 @@ None block the sub-project 4 merge.
 
 ## Follow-ups from the final whole-branch review (sub-project 4, 2026-07-08)
 
-59. **`'` index-prompt empty-commit is a silent no-op; `MoveWindow`/
+59. **ACCEPTED DEBT, re-affirmed (SP7 Task 19 closeout sweep, 2026-07-11) —
+    NOT implemented in SP7**, per the plan's explicit accepted-debt list:
+    the inconsistency was already adjudicated a reasoned judgment call
+    rather than a defect (see below), and SP7 left the behavior unchanged.
+    **`'` index-prompt empty-commit is a silent no-op; `MoveWindow`/
     `RenameWindow`/`RenameSession` siblings all error on empty instead**
     (Task 7/8, prompt commit handling). `PromptKind::Index`'s empty-buffer
     commit is a deliberate, comment-documented silent no-op
@@ -1507,26 +1608,34 @@ None block the sub-project 4 merge.
     implementing tmux's degenerate-width scrolling" bucket as follow-up #46
     (`find-window`) and #50 (`choose-tree` overflow). SMALL/MEDIUM. LOW.
 
-70. **Custom `window-status-format` values containing `#{?cond,a,b}` expand
-    the conditional to empty** (SP6 Task 4 + fix round 1, 2026-07-10). What
-    remains of the Task 4 default-format deviation after the fix-round-1
-    width-stability shim: winmux's stored DEFAULT is
+70. **RESOLVED** (SP7 Task 1, 2026-07-10; same fix as #27 above — see that
+    entry for the full engine writeup). `src/format.rs`'s general recursive-
+    descent engine evaluates `#{?cond,a,b}` for real now, so a USER-set
+    `window-status-format`/`window-status-current-format` (or any other
+    format-bearing option) that uses a conditional is no longer forced to
+    the width-stability shim from SP6 Task 4's fix round — the shim's default
+    string, `options::DEFAULT_WINDOW_STATUS_FORMAT`, is now updated to be the
+    LITERAL real tmux default (`#I:#W#{?window_flags,#{window_flags}, }`)
+    and expands correctly through the real engine, rather than needing the
+    special-cased empty-flags padding as a workaround. `e2e_config.rs`'s
+    closeout addition (`config_conditional_format_and_setw_take_effect`)
+    exercises a genuinely custom `#{?...}` format end to end via `-f`, not
+    just the shipped default. Residual: `client_*` format variables are
+    still unsupported (see #27's resolution note); no current config depends
+    on them.
+    *Original text:* **Custom `window-status-format` values containing
+    `#{?cond,a,b}` expand the conditional to empty** (SP6 Task 4 + fix round
+    1, 2026-07-10). What remained of the Task 4 default-format deviation
+    after the fix-round-1 width-stability shim: winmux's stored DEFAULT was
     `options::DEFAULT_WINDOW_STATUS_FORMAT` (`#I:#W#F`) plus a
     default-path-only pad of an empty flags string to one space in
     `status::status_spans` — together byte-identical to tmux's real default
     `#I:#W#{?window_flags,#{window_flags}, }` for flagged AND flagless
     windows, width-stable across focus changes. But a USER-set format that
-    itself uses `#{?...}` (or any other conditional/modifier outside the
-    `expand_format` subset) still renders that token as empty — the general
-    tmux format-expression engine is deliberately deferred to the TPM plan
-    (`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`). The three
-    doc sites describing the deviation: `src/options.rs`
-    (`DEFAULT_WINDOW_STATUS_FORMAT` + the `default_value` arm's note),
-    `docs/specs/2026-07-07-command-config-interfaces.md` (options SPECS
-    amendment), `docs/specs/2026-07-07-server-client-interfaces.md`
-    (`## status` flags-string/padding-shim rule). Not exercised by the
-    fixture config (its custom formats use only `#I`/`#W`/`#F`/`#[...]`).
-    MEDIUM (a format engine). LOW.
+    itself used `#{?...}` (or any other conditional/modifier outside the
+    `expand_format` subset) still rendered that token as empty — the general
+    tmux format-expression engine was, at the time, deliberately deferred to
+    the TPM plan (`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`).
 
 71. **RESOLVED** (SP7 Task 7, 2026-07-10). `status::WindowEntry` gained
     `pane_index`/`pane_title` fields (THAT window's own active pane,
@@ -1761,3 +1870,120 @@ None block the sub-project 4 merge.
     committed pane on Enter" and `exec_tree_commit` to act on it). LOW
     priority — no test or real workflow depends on it, and `find-window`'s
     own target pane is rarely already zoomed at search time.
+
+## Follow-ups from SP7 Task 19 (closeout sweep, 2026-07-11)
+
+Four small self-found notes carried forward from earlier SP7 Wave reviews
+(Task 2's reflow and the #30 fix round) that were flagged for "Task 19
+closeout ticket sweep" but had not yet been given their own ticket numbers.
+None block the SP7 merge; all are TINY/SMALL-effort, LOW-priority coverage
+or correctness niceties, not known-active bugs.
+
+80. **A position-only `Rect` change (no width/height change) over-clears a
+    copy-mode selection, where real tmux would early-return.**
+    `Server::apply_layout_for_session` (`src/server.rs`) clears
+    `cs.sel = None` for every pane `layout::apply_layout` reports as
+    `resized`, but `apply_layout`'s `resized` set is keyed on the pane's
+    `Rect` changing AT ALL (position OR size) — a same-size `swap-pane`
+    that relocates a pane's rect without changing its width/height also
+    trips this clear. Real tmux's actual trigger
+    (`window_pane_resize`/`window_copy_size_changed`, cited in follow-up
+    #47's resolution above) fires only on an actual width/height change,
+    not a same-size reposition, and would leave the selection alone in this
+    case. Self-found and self-disclosed by the SP7 Task 2 implementer (see
+    `.superpowers/sdd/progress.md`'s Task 2 completion entry, "safe-direction
+    over-clear"); the chosen behavior (clear more often than tmux would)
+    was judged the safer direction to ship, not deferred pending investigation.
+81. **A combined width+height resize pads the live screen from blank rows
+    instead of pulling rows back from history, unlike a real reflowing
+    terminal.** `Grid::resize` (`src/grid.rs`) calls `reflow_to_width` first
+    (which reflows content at the OLD row count) then, if the row count also
+    changed, calls `resize_cells`/`resize_row_flags` to grow/shrink the row
+    dimension — `resize_cells` on a GROW pads with new blank rows rather
+    than pulling additional content back up from `self.history` the way a
+    tmux-style combined resize effectively does (tmux resizes width and
+    height as two logically separate axis operations against the same
+    unified grid, so a height grow after a width reflow naturally exposes
+    more of what's already in the scrollback region). Practical effect:
+    simultaneously widening AND growing the terminal (a single ConPTY resize
+    event with both deltas, e.g. maximizing a window) can show extra blank
+    rows at the bottom of a pane where a reflowing terminal would show more
+    of that pane's actual recent history. Self-found by the SP7 Task 2
+    implementer (`.superpowers/sdd/progress.md` Task 2 completion entry).
+82. **`trimmed_len`-based reflow loses genuine trailing spaces on a
+    terminal-row's content.** `Grid::reflow_to_width` (`src/grid.rs`)
+    determines a wrapped-chain's final row's real content length via
+    `trimmed_len` (drops trailing never-written cells) — this is correct for
+    the common case (a row's tail was never written and only holds default
+    blank cells), but cannot distinguish that from a row whose tail cells
+    were explicitly written AS spaces (e.g. a shell prompt padded with real
+    trailing space characters, or a TUI app that clears a line by writing
+    spaces). Both cases produce a Cell that looks like a blank cell by the
+    time `trimmed_len` inspects it, so a reflow can silently drop
+    intentional trailing whitespace from historical content. Low practical
+    impact (trailing whitespace is rarely visually significant, and this
+    only matters across an actual width-changing resize while that content
+    is in scrollback). Self-found by the SP7 Task 2 implementer
+    (`.superpowers/sdd/progress.md` Task 2 completion entry).
+83. **RESOLVED (comment fixed in place, SP7 Task 19).** `input::
+    is_plain_forwardable`'s doc comment (`src/input.rs`) said `bind -n` on a
+    bare unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key "is accepted by
+    `cmd`/`bindings` but never fires" — true when written (pre-#30 fix), now
+    STALE: follow-up #30's resolution (SP7 Wave 2 opener) made exactly this
+    case fire, by having `server.rs`'s `Forward`-blob consumption re-decode
+    and look up every key against the live root table before forwarding.
+    The comment is corrected in place to describe the CURRENT split of
+    responsibility: `is_plain_forwardable` still only decides the
+    input-machine-level coalescing shape (whether a key becomes part of one
+    batched `Forward` blob or its own `Key` event) — it is no longer, and
+    after #30 never was, the last word on whether a plain key can be bound;
+    that now happens one layer up, in `server.rs`'s post-decode root-table
+    lookup. Self-found by the `#30` fix implementer
+    (`.superpowers/sdd/progress.md`'s "#30 fix: complete" entry's minors).
+
+84. **NEW FINDING, confirmed and pinned (SP7 Task 19 closeout, 2026-07-11):
+    Windows ConPTY does not relay a hosted process's mouse-mode DECSET
+    (`CSI ?1000h`-class) private-mode sequence through to the reader of the
+    pseudoconsole's output pipe at all.** Discovered investigating this
+    closeout's application-mouse-passthrough e2e attempt (follow-ups
+    #35/#72): a real `powershell.exe` pane emitting `ESC[?1000h` via
+    `Write-Host` or `[Console]::Out.Write` (both tried, identical result)
+    never produces that byte sequence anywhere in `Pty`'s raw output --- not
+    garbled, not delayed, entirely absent --- while an ordinary SGR sequence
+    (`CSI 31 m`) sent the SAME way survives byte-for-byte in the SAME
+    capture (ruling out "the reader/harness doesn't work" as an
+    alternative explanation). Pinned as a permanent regression test,
+    `tests/pty_smoke.rs::mouse_decset_private_mode_is_not_relayed_by_conpty`
+    (SGR-survives control + DECSET-absent assertion, both against the SAME
+    captured byte buffer), so a future ConPTY/Windows update that changes
+    this behavior is caught rather than silently assumed to still hold; see
+    that test's doc comment for the full writeup. One-line summary also
+    added to `CLAUDE.md`'s "Hard-won platform gotchas" section.
+    **Consequence:** `Grid::mouse_proto` (which parses exactly this
+    sequence, `src/grid.rs`, prerequisite work for follow-ups #35/#72) can
+    never observe a real hosted Windows-console app's mouse-mode request
+    over ConPTY on this platform --- the forwarding feature itself
+    (`forward_mouse_to_pane`/`mouse_forward_eligible`,
+    `src/server/dispatch.rs`) is correctly implemented and unit-tested
+    (synthetic `Grid` byte-feed for DECSET parsing, a dedicated gating-table
+    test, a dedicated re-encode-and-write test), but a REAL pane app hosted
+    by winmux on Windows would need to request mouse mode through some OTHER
+    channel than the standard VT DECSET sequence for winmux to ever notice
+    (out of scope to investigate further here --- no such alternate channel
+    is modeled anywhere in winmux today). **Retroactively explains three
+    previously-separate "investigated and gave up" notes already in this
+    file**, now understood to be the SAME root cause rather than three
+    unrelated obstacles: the SP4 abandonment of `alt_screen_wheel_
+    sends_arrows` (a synthetic `?1049h` alt-screen CSI, same DECSET-`h`
+    private-mode-sequence class); follow-up #35/#72's own "no live-process
+    byte-receipt e2e proof was attempted"; and follow-up #53's
+    bracketed-paste (`?2004h`) positive path being "found to be
+    fundamentally unprovable black-box". No code change is prescribed by
+    this finding (it's a platform ceiling, not a winmux defect) --- filed so
+    the reasoning is durable and any future investigation starts from a
+    confirmed mechanism instead of re-discovering it. LOW priority for
+    further action (no realistic winmux user workflow depends on a
+    console-hosted app's OWN VT mouse-mode request working through a
+    winmux pane on Windows specifically); MEDIUM significance as
+    documentation (closes the loop on a recurring "why can't we test this"
+    question across several SP4-SP7 tasks).
