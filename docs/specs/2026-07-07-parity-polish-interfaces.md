@@ -3492,3 +3492,194 @@ original test) is rewritten to open the tree and commit with `Enter` for
 both the name-match and content-match cases, keeping its no-match assertion
 unchanged (see `exec_find_window_client`'s doc comment above for why the
 zero-match message path is preserved).
+
+## `display-menu` — display-menu overlay + right-click default menus (SP7 Task 16, closes #51)
+
+The `cmd`/`bindings` side of this task (`ParsedCmd::DisplayMenu`/`MenuPos`/
+`MenuEntry`, the three `mouse_default_menu_*` sentinel defaults) is
+documented in `docs/specs/2026-07-07-command-config-interfaces.md`'s sibling
+`## display-menu` section — this section covers the NEW overlay itself:
+`server::ClientMode::Menu`, `render::Overlay::Menu`, and every new
+`server::dispatch` function. Parity authority: the cloned tmux C source's
+`menu.c`/`cmd-display-menu.c` (see the sibling section's citation) — the
+reference docs under `docs/tmux-reference/` do not fully cover menus.
+
+### `server` (`src/server.rs`)
+
+```rust
+enum ClientMode {
+    // ...
+    Menu(MenuState),
+}
+
+struct MenuState {
+    rect: Rect,
+    title: String,
+    rows: Vec<MenuRow>,
+    /// `-1` = no row highlighted yet (tmux's `md->choice == -1`).
+    sel: i32,
+}
+
+struct MenuRow {
+    /// Fully pre-formatted display text (name, right-padded, then a
+    /// `" (key)"` hint if the item has one) — `render` blits it verbatim.
+    text: String,
+    /// Parsed once at open time from the item's key-notation string.
+    key: Option<Key>,
+    /// `None` = separator row.
+    command: Option<String>,
+}
+```
+
+Unlike `ChooseTreeState` (which is deliberately snapshot-FREE, rebuilding
+its row list from live registry state on every render/key), `MenuState` IS
+a stable snapshot taken once at open time — this matches real tmux exactly
+(`menu.c`'s `struct menu` is built once by `cmd_display_menu_exec`/the
+default-menu builders and never rebuilt while showing). `rect` is likewise
+resolved once at open time and never repositioned on a later client resize
+— a documented narrowing vs. tmux's `menu_resize_cb`.
+
+`render_one` reads `ClientMode::Menu` DIRECTLY (not through the
+`RenderOverlay` two-phase indirection every other overlay uses) — `MenuState`
+needs no `&self` server context beyond what's already snapshotted in it, so
+there is nothing for that indirection (which exists specifically for
+overlays needing `&self` before `render_all`'s mutable per-client loop
+begins) to buy here. `build_render_overlay` therefore has NO `ClientMode::
+Menu` arm (falls through its existing `_ => None`). The message/cursor
+`match &client.mode` sites gain `ClientMode::Menu(_)` arms: `too_small`
+still shows "terminal too small" (no overlay painted); otherwise any
+transient `client.message` passes through UNCHANGED underneath the menu
+(unlike `ChooseTree`/`DisplayPanes`, which take over the message row — the
+menu is a small floating box, not a full-panel overlay, so there's no
+reason to hide an unrelated message); cursor is hidden (tmux: `MODE_CURSOR`
+cleared). `handle_stdin`'s `Forward`-blob and `Key{table,key,raw}` branches
+each gain a `ClientMode::Menu` arm mirroring `ChooseTree`'s (unconditional
+interception, including a completed prefix sequence), routing to
+`dispatch_menu_key`.
+
+`switch_client_session_to` (new free fn, mirrors the pre-existing `switch_
+client_session`'s `-p`/`-n` shape): switches directly to a NAMED session for
+`ParsedCmd::SwitchClientTo`. `None` (silent no-op, same convention as the
+`-p`/`-n` sibling) for both an unknown name and "already there".
+
+### `render` (`src/render.rs`)
+
+```rust
+pub struct MenuRowCell {
+    pub text: String,
+    pub separator: bool,
+    pub selected: bool,
+}
+
+pub struct MenuOverlay {
+    pub rect: Rect,
+    pub title: String,
+    pub rows: Vec<MenuRowCell>,
+}
+
+pub enum Overlay {
+    // ...
+    Menu(MenuOverlay),
+}
+```
+
+`Renderer::paint_menu` (new private method, called from `compose_back`'s
+overlay match): UNLIKE `Overlay::List`'s full-client-area clear, this paints
+ONLY inside `rect` — every cell outside it (other panes, borders, the
+status row) is left exactly as already composed, matching real tmux's own
+floating-menu behavior. Draws a single-line box (`┌─┐│└┘`, `scene.border`
+style — the same glyph set `Overlay::List`'s preview box uses), the title
+CENTERED over the top border (a documented simplification: winmux's
+`display-menu` doesn't parse `#[align=...]` inside `-T`, so every title
+centers unconditionally — which is what every one of winmux's own default
+menus' titles would render as anyway, since real tmux's own default menus
+all pass `#[align=centre]`), then each row: a separator fills the interior
+with `─`; a real item fills the interior with `scene.mode_style` (selected)
+or the default style, then draws `row.text` starting one column in from the
+left border. Zero/degenerate rects (`w < 2 || h < 2`) paint nothing (no
+panic on the underflowing box-corner math).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+```rust
+// Generic display-menu execution (CLI/config/`:` prompt).
+fn exec_display_menu_client(&mut self, x: cmd::MenuPos, y: cmd::MenuPos, title: Option<String>, items: Vec<cmd::MenuEntry>, client: &mut ClientState) -> ExecOutcome;
+fn open_menu(&mut self, client: &mut ClientState, title: String, entries: Vec<(String, Option<String>, Option<String>)>, x: cmd::MenuPos, y: cmd::MenuPos, trigger: Option<(u16, u16)>) -> ExecOutcome;
+
+// Default menu builders (built directly in Rust from live state, not a
+// tmux-style conditional format-string template).
+fn open_pane_menu(&mut self, pane_id: PaneId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn open_window_menu(&mut self, wid: WindowId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn open_session_menu(&mut self, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+
+// Key/mouse routing while ClientMode::Menu is active.
+pub(super) fn dispatch_menu_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn dispatch_menu_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn menu_move(&mut self, client: &mut ClientState, down: bool);
+fn menu_choose(&mut self, idx: usize, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn exec_menu_command(&mut self, command: &str, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+
+// Root-table MouseDown3* triage (unbound/override/default sentinel).
+fn mouse_down_pane_button3(&mut self, pane_id: PaneId, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn mouse_status_button3(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn status_hit_at(&self, session_name: &str, x: u16) -> StatusHit; // Left | Window(WindowId) | Other
+```
+
+- **`dispatch_mouse`** gains a `ClientMode::Menu` guard (same shape as the
+  pre-existing `ChooseTree` guard): a `Down` event routes to `dispatch_menu_
+  mouse`; every other kind (Drag/Up/Wheel) no-ops after `end_drag` hygiene.
+- **`mouse_down`**'s `MouseHit::Pane` arm gains a `btn == 3` branch (checked
+  before the existing generic `btn != 1` early-return) calling `mouse_down_
+  pane_button3` — table-driven exactly like every other Task-8 mouse
+  default: unbound no-ops, a user override runs generically via `dispatch_
+  mouse_cmds`, the default sentinel calls `open_pane_menu`. The pane is
+  focused (`mouse_focus_pane`) BEFORE this branch runs, same as every other
+  button — a documented substitution for tmux's own `MouseDown3Pane`, which
+  only focuses on its "relay to app" branch, not when opening the menu;
+  winmux's default pane-menu item commands (`split-window -h`, `kill-pane`,
+  ...) rely on this focus, since they use the ordinary "no `-t` = current
+  pane" default rather than an explicit target.
+- **`dispatch_mouse_status`** gains a `MouseKind::Down(3)` arm calling
+  `mouse_status_button3`, which discriminates `MouseDown3StatusLeft` vs.
+  `MouseDown3Status` via `status_hit_at` (mirrors `mouse_status_click`'s own
+  `left`/`status::status_tab_columns` construction EXACTLY — duplicated
+  rather than shared, since `mouse_status_click` also SELECTS the window as
+  a side effect a hit-test-only caller must not have), then the same
+  unbound/override/default-sentinel triage as `mouse_down_pane_button3`.
+- **`open_pane_menu`/`open_window_menu`/`open_session_menu`** build a
+  `MenuBuilder` (private helper reproducing `menu_add_item`'s separator
+  de-dup rule: a `sep()` call is dropped if the list is empty or the
+  previous entry was already a separator) directly from live state, then
+  call `open_menu` with `x`/`y` both `MenuPos::Mouse` and `trigger =
+  Some((mx, my))` — the pointer position that triggered the click. See the
+  sibling command-config-interfaces amendment's "Documented narrowings" for
+  every content substitution versus tmux's `DEFAULT_PANE_MENU`/
+  `DEFAULT_WINDOW_MENU`/`DEFAULT_SESSION_MENU`.
+- **`build_menu_rows`**/**`resolve_menu_axis`** (private free functions):
+  finalize a `(name, key, command)` tuple list into display-ready `MenuRow`s
+  plus the box's content width (mirrors `menu_add_item`'s own `menu->width`
+  tracking, minus tmux's overflow-truncation machinery — not needed, since
+  every entry list here is short and fixed); resolve one axis of the box's
+  top-left corner from a `MenuPos`, mirroring `menu_prepare`'s own centering
+  formula and on-screen clamp.
+- **`menu_move`** mirrors `menu.c`'s `KEYC_UP`/`KEYC_DOWN` cases exactly:
+  wrapping, separator-skipping navigation that is a no-op if every OTHER
+  row is a separator (the skip loop wraps back to the untouched original
+  selection). **`menu_choose`** resets `client.mode` to `Normal` BEFORE
+  running the chosen row's command (mirrors `menu.c`'s `chosen:` label),
+  so an item that itself opens another overlay is never fighting the menu
+  it was chosen from. **`dispatch_menu_key`** checks every row's OWN
+  shortcut key FIRST (mirrors `menu_key_cb`'s per-item loop, which runs
+  before its `switch` on navigation keys) — a shortcut match runs
+  immediately regardless of the current selection.
+- **`execute_headless`**/**`execute_for_client`** gain `DisplayMenu`/
+  `SwitchClientTo` arms: `DisplayMenu` is client-only (`Err("no current
+  client")` headless, same rule as `ChooseTree`/`ClockMode`); `SwitchClientTo`
+  is likewise client-only, mapping to `ExecOutcome::SwitchedSession`/`Ok`
+  exactly like the pre-existing `SwitchClient` arm.
+
+### Tests
+
+See the sibling command-config-interfaces amendment's Tests list (covers
+both files' additions together, since the behavior is one feature split
+across two contract documents purely by module-ownership convention).

@@ -2656,3 +2656,178 @@ renumbers src only, never dst).
   primitive with NO current `dispatch.rs` caller (see its doc comment and
   the `## layout` amendment above) — reserved for a future
   `join-pane`/`move-pane` implementation.
+
+## `display-menu` — display-menu command + right-click default menus (SP7 Task 16, closes #51)
+
+Parity authority: the tmux reference docs do NOT fully cover menus
+(`docs/tmux-reference/mouse.md` §7.1 documents only the default menus'
+CONTENTS, abridged, and `commands-config-options-formats.md` Appendix A has
+only the raw `display-menu` flags template) — the PRIMARY spec source is
+tmux's own C source, cloned to a scratch checkout (master, commit
+`db115c6`/`ec31f45`): `menu.c` (the overlay's key/mouse state machine,
+`menu_add_item`'s separator de-dup + layout rules, `menu_key_cb`'s
+navigation/selection semantics) and `cmd-display-menu.c`
+(`cmd_display_menu_args_parse`'s NAME/KEY/COMMAND triple grammar,
+`cmd_display_menu_exec`'s flag handling). Every citation below is to those
+two files.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    DisplayMenu {
+        target: Option<String>,
+        x: MenuPos,
+        y: MenuPos,
+        title: Option<String>,
+        stay_open: bool,
+        items: Vec<MenuEntry>,
+    },
+    /// `switch-client -t target-session` — a THIRD, separate form from the
+    /// pre-existing `SwitchClient { next: bool }` (`-p`/`-n`); combining
+    /// `-t` with either is a usage error. Added because the default SESSION
+    /// menu's "Switch To <name>" items need it and nothing else in the
+    /// table could express a direct-by-name session switch.
+    SwitchClientTo { target: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPos { Literal(i32), Centre, Mouse }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuEntry {
+    Separator,
+    Item { name: String, key: Option<String>, command: String },
+}
+```
+
+- `canonical()`: `"display-menu" | "menu" => "display-menu"`.
+- `usage("display-menu")`: `"usage: display-menu [-O] [-T title] [-t target] [-x pos] [-y pos] name [key command] ..."`.
+- `resolve`: a manual flag loop (not `scan_flags` — the positional item list
+  can legitimately start with a token that looks like a flag), then a
+  triple-parsing loop reproducing `cmd_display_menu_args_parse`'s STRING/
+  STRING/COMMANDS_OR_STRING cycle: an empty-string token alone is a
+  separator (`menu.c:74`, `*name == '\0'`); otherwise the next TWO tokens
+  are consumed as `key`/`command` (`key`: empty string -> `None`, tmux's
+  `KEYC_NONE`). `command` is stored as RAW TEXT, never parsed by `resolve`
+  itself — it is only tokenized+resolved when the item is actually chosen
+  (`menu.c:509`'s `cmd_parse_and_append`), matching real tmux's late-
+  binding exactly (same precedent as `bind-key`'s own `tail: Vec<RawCmd>`,
+  except here even the FIRST parse is deferred, since a menu item's command
+  is one string, not pre-tokenized argv). `-t`/`-O`/`-M` are accepted and
+  stored/no-op (see the variant's own doc comment for why `target`/
+  `stay_open` have no live effect). `-x`/`-y` (`parse_menu_pos`): `C`
+  (centre) or `M` (mouse) or a bare integer; anything else is a parse
+  error. Tests: `display_menu_parses_name_key_command_triples`,
+  `display_menu_empty_name_is_separator`, `display_menu_empty_key_is_no_shortcut`,
+  `display_menu_flags_and_title`, `display_menu_requires_at_least_one_item_and_full_triples`.
+- `"switch-client"`'s resolve arm grew a `-t` value flag: given (and
+  `-p`/`-n` absent), returns `SwitchClientTo`; given together with `-p`/
+  `-n`, a usage error; absent, the pre-existing `-p`/`-n`-exactly-one-of
+  behavior is untouched. Test: `switch_client_to_named_session`.
+
+### `bindings` (`src/bindings.rs`)
+
+Three new root-table mouse-key sentinel defaults, following the Task 8
+sentinel pattern exactly (`mouse-menu-pane`/`mouse-menu-status`/`mouse-menu-
+status-left`, compared by VALUE in `server::dispatch` to distinguish
+"default" from "user override"):
+
+```rust
+pub(crate) fn mouse_default_menu_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_menu_status() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_menu_status_left() -> Vec<RawCmd>;
+```
+
+Registered in `root_mouse_defaults()` for `(Down, 3, Pane)` /
+`(Down, 3, Status)` / `(Down, 3, StatusLeft)` — `MouseDown3Pane`/
+`MouseDown3Status`/`MouseDown3StatusLeft`, `mouse.md` §7.1. The `M-`
+modifier variants and `-O`'s "stay open if the app owns the mouse" guard
+(tmux's `MouseDown3Pane`'s real `if -Ft=` wrapper) are NOT modeled — a
+documented narrowing, see the task report. Root table size grows from 6 to
+9 (`default_root_table_contains_mouse_bindings`, `defaults_cover_current_
+behavior` updated accordingly).
+
+### `server::dispatch` (`src/server/dispatch.rs`) and `server`/`render` overlay wiring
+
+See the sibling `docs/specs/2026-07-07-parity-polish-interfaces.md`
+amendment (`## display-menu`) for `ClientMode::Menu`/`MenuState`/`MenuRow`,
+`render::Overlay::Menu`/`MenuOverlay`/`MenuRowCell`, and every new
+`dispatch` function (`open_menu`, `open_pane_menu`/`open_window_menu`/
+`open_session_menu`, `dispatch_menu_key`/`dispatch_menu_mouse`,
+`status_hit_at`) — kept in that file since it's the one that already owns
+every other overlay's (`ChooseTree`/`DisplayPanes`/`Clock`) `server`+
+`render` contract.
+
+### Tests
+
+`src/cmd.rs`: see above. `src/bindings.rs`: `default_root_table_contains_
+mouse_bindings` (updated). `src/render.rs`:
+`overlay_menu_draws_box_title_rows_and_selection`,
+`overlay_menu_degenerate_rect_paints_nothing`. `tests/server_proto.rs`:
+`display_menu_opens_and_enter_runs_selected`,
+`right_click_on_pane_opens_default_menu`,
+`menu_click_outside_closes_without_action`, `menu_escape_closes`,
+`menu_shortcut_key_runs_item_immediately`,
+`right_click_on_window_tab_opens_menu_and_kills_that_window`,
+`right_click_on_status_left_opens_session_menu`,
+`mouse_down3_pane_user_override_runs_generically`.
+
+### Documented narrowings
+
+- **No format expansion inside item command text.** Real tmux's default
+  menus lean heavily on `#{...}`/`-t=` ("current target") format tokens
+  inside stored item commands, expanded at CHOICE time. winmux's `display-
+  menu` does none of that — every item command must name any target
+  explicitly. winmux's own default menus work around this by building
+  CONCRETE target strings (`-t :3`, `switch-client -t work`) directly in
+  Rust at menu-open time, using the live registry state already in hand —
+  see `open_pane_menu`/`open_window_menu`/`open_session_menu`'s doc
+  comments.
+- **No conditional/disabled items.** Real tmux draws a conditionally-
+  unavailable item disabled (a `-`-prefixed name, unselectable but still
+  visible, `menu.c`'s `*name == '-'` checks). winmux's default-menu
+  builders simply OMIT such an item instead — see `MenuEntry`'s doc
+  comment.
+- **No `#{S/t:...}` format-loop support.** The session menu's "Switch To
+  <name>" entries (tmux: ONE templated item that a format LOOP function
+  expands into several) are instead built by iterating live sessions
+  directly in Rust, capped at 5 like tmux's own template — see
+  `open_session_menu`'s doc comment.
+- **`MENU_STAYOPEN` (`-O`) is accepted but inert** — there are no disabled
+  items for it to matter for (see above), and separators are never
+  independently selectable.
+- **`-x`/`-y` only support `C`/`M`/a literal integer** — tmux's `R`/`P`/`W`/
+  `L` relative-position letters need a position-computing format engine
+  winmux doesn't have. winmux's own default menus use `M` (mouse position)
+  uniformly for all three (pane/window/session), a documented substitution
+  for tmux's own `-xW -yW` on the latter two — see `ParsedCmd::DisplayMenu`'s
+  doc comment.
+- **Winmux implements neither `respawn-pane`/`respawn-window` nor a
+  marked-pane concept** — the default pane/window menus omit tmux's
+  Respawn/Mark(-Unmark)/Swap-Marked items entirely.
+- **No floating panes** — the default pane menu omits tmux's Move/Move &
+  Resize/Tile/Float items entirely.
+- **No hyperlink tracking (`mouse_hyperlink`)** — the default pane menu
+  omits tmux's Type/Copy-hyperlink items entirely.
+- **`new-window` has no `-a` (insert-after) flag** — the default window
+  menu offers a single "New Window" item instead of tmux's separate "New
+  After"/"New At End".
+- **No `move-window -r` (renumber-all) equivalent** — the default window
+  and session menus omit tmux's "Renumber" item.
+- **The window menu's "Rename" item has a documented side effect**: it
+  first runs `select-window -t :<idx>` (switching the acting client's
+  CURRENT window to the one that was right-clicked) before the bare
+  `rename-window` that opens the interactive prompt — because that prompt
+  only ever operates on the CURRENT window, and there is no non-
+  interactive "set this OTHER window's name" one-shot command to use
+  instead. Real tmux's own Rename item has no such side effect.
+- **Menu clicks commit on PRESS, not RELEASE-with-no-button-held** (real
+  tmux's own rule, with hover-highlight tracked in between) — winmux has no
+  hover/click-run tracking machinery for a floating overlay. Drag/Up/Wheel
+  events over an open menu are all no-ops.
+- **`switch-client -t` targeting an unknown or already-current session is
+  a silent no-op**, not an error — matches the pre-existing `-p`/-n`'s own
+  "already there" convention rather than introducing a second error-
+  reporting shape for this one extra case.

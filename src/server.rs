@@ -44,13 +44,16 @@ use crate::cmd::RawCmd;
 use crate::geom::Rect;
 use crate::grid::{Cell, Grid, Style};
 use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
+use crate::keys::Key;
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
 use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{CopyView, ListOverlay, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell};
+use crate::render::{
+    CopyView, ListOverlay, MenuOverlay, MenuRowCell, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell,
+};
 use crate::status::{status_spans, strip_style_markers, truncate_visible, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
@@ -200,6 +203,13 @@ enum ClientMode {
     /// tmux's "any key exits" (`window_clock_key`/`window_pane_reset_mode`)
     /// is the only way out (see `dispatch::Server::dispatch_clock_key`).
     Clock(ClockState),
+    /// display-menu overlay (SP7 Task 16, closes #51; `display-menu`/`menu`,
+    /// plus the default `MouseDown3Pane`/`MouseDown3Status`/
+    /// `MouseDown3StatusLeft` right-click context menus). Per-CLIENT, a
+    /// momentary modal overlay like `DisplayPanes`/`Clock` — see
+    /// `MenuState`'s own doc comment for why it's a stable snapshot rather
+    /// than `ChooseTree`'s live rebuild.
+    Menu(MenuState),
 }
 
 /// The choose overlay's four view kinds (Task 8; `Buffers`/`Clients` added
@@ -441,6 +451,39 @@ struct DisplayPanesState {
 struct ClockState {
     pane: PaneId,
     text: String,
+}
+
+/// display-menu's per-client state (SP7 Task 16, closes #51). Unlike
+/// `ChooseTreeState`, `rows` IS a stable SNAPSHOT, taken once at open time —
+/// this matches real tmux exactly: `menu.c`'s `struct menu` is built once by
+/// `cmd_display_menu_exec`/`open_pane_menu`-and-friends and never rebuilt
+/// while the overlay is showing (contrast `docs/tmux-reference/choose-
+/// tree.md`'s live-rebuild-every-render rule, which is a `ChooseTreeView`-
+/// specific design, not a general overlay rule). `rect` is likewise resolved
+/// once at open time from the requested [`crate::cmd::MenuPos`] `x`/`y` and
+/// the client's THEN-current size, clamped to fit — a documented narrowing
+/// vs. real tmux's `menu_resize_cb`, which re-clamps a showing menu against
+/// a live client resize; winmux does not reposition an already-open menu.
+struct MenuState {
+    rect: Rect,
+    title: String,
+    rows: Vec<MenuRow>,
+    /// `-1` = no row highlighted (tmux's `md->choice == -1`, the initial
+    /// state before any Up/Down/mouse-hover/key-shortcut selects one).
+    sel: i32,
+}
+
+/// One row of an open [`MenuState`] — a snapshot of one [`crate::cmd::
+/// MenuEntry`], pre-formatted for display and with its shortcut key (if any)
+/// already parsed once at open time rather than on every keypress.
+/// `command: None` marks a separator (mirrors `MenuEntry::Separator`); `text`
+/// is the SAME field for both, but only meaningful (non-empty) for a real
+/// item — a separator's row is drawn as a plain horizontal rule regardless of
+/// `text`'s content (see `render::MenuRowCell::separator`).
+struct MenuRow {
+    text: String,
+    key: Option<Key>,
+    command: Option<String>,
 }
 
 /// Format the clock-mode display string per `clock-mode-style`
@@ -1301,6 +1344,24 @@ fn switch_client_session(
     client.session = Some(neighbor.clone());
     client.renderer.resize(client.cols.max(1), client.rows.max(1));
     Some((old, neighbor))
+}
+
+/// `switch-client -t target-session` (SP7 Task 16, closes #51): switch
+/// directly to a NAMED session rather than a relative neighbor. `None` (no
+/// switch performed, caller treats it as a silent success — matching
+/// [`switch_client_session`]'s own "already there" convention) for BOTH an
+/// unknown session name and "already on it" — a documented narrowing vs.
+/// real tmux, which errors on an unknown target; kept uniform with the
+/// `-p`/`-n` sibling above rather than introducing a second error-reporting
+/// convention for this one extra case.
+fn switch_client_session_to(registry: &mut Registry, client: &mut ClientState, session_name: &mut String, target: &str) -> Option<(String, String)> {
+    if target == session_name.as_str() || !registry.sessions().iter().any(|s| s.name == target) {
+        return None;
+    }
+    let old = std::mem::replace(session_name, target.to_string());
+    client.session = Some(target.to_string());
+    client.renderer.resize(client.cols.max(1), client.rows.max(1));
+    Some((old, target.to_string()))
 }
 
 /// One config file to attempt loading at server startup (Task 7):
@@ -2703,6 +2764,26 @@ impl Server {
                         if detach || destroy {
                             break 'events;
                         }
+                    } else if matches!(client.mode, ClientMode::Menu(_)) {
+                        // display-menu (SP7 Task 16): same Forward-blob
+                        // re-decode as choose-tree above -- shortcut keys
+                        // (letters like `X`/`p`/`h`) and navigation
+                        // (`j`/`k`/`q`) are all plain-forwardable, so every
+                        // decoded key is resolved against the menu's OWN
+                        // per-row shortcut table / hardcoded nav keys
+                        // (`dispatch_menu_key`), never forwarded to the pane
+                        // underneath.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        for item in decoded {
+                            let crate::keys::DecodedInput::Key(dk) = item else { continue };
+                            let outcome = self.dispatch_menu_key(&dk.key, &mut client, &mut session_name);
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
+                            }
+                        }
                     } else {
                         // Follow-up #30: a coalesced Forward blob (built from
                         // ANY run of plain-forwardable keys, per
@@ -2819,6 +2900,19 @@ impl Server {
                     // command underneath it.
                     if matches!(client.mode, ClientMode::Clock(_)) {
                         let outcome = self.dispatch_clock_key(&mut client);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
+                        continue;
+                    }
+                    // display-menu (SP7 Task 16): same unconditional
+                    // interception as choose-tree above -- a completed
+                    // prefix sequence is either reinterpreted as a menu
+                    // action (a shortcut key match, if any) or silently
+                    // swallowed, never the prefix-bound command.
+                    if matches!(client.mode, ClientMode::Menu(_)) {
+                        let outcome = self.dispatch_menu_key(&key, &mut client, &mut session_name);
                         dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                         if detach || destroy {
                             break 'events;
@@ -3148,6 +3242,7 @@ fn render_one(
         ClientMode::ChooseTree(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::DisplayPanes(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::Clock(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::Menu(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::ChooseTree(state) => match &state.pending_kill {
             Some((_, prompt)) => Some(prompt.clone()),
             None => client.message.as_ref().map(|(msg, _)| msg.clone()),
@@ -3156,6 +3251,12 @@ fn render_one(
         // clock-mode (Task 10): no message of its own -- the time is drawn
         // directly on the pane, same as display-panes' digits.
         ClientMode::Clock(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // display-menu (SP7 Task 16): no message of its own -- any
+        // transient status message underneath still shows (the menu is a
+        // small floating box, not a full-panel overlay, so there's no
+        // reason to hide it, unlike the other three overlays' own
+        // messages above).
+        ClientMode::Menu(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
@@ -3414,7 +3515,9 @@ fn render_one(
         // OTHER overlay/message case above).
         // clock-mode (Task 10): "Cursor is hidden" (`s->mode &= ~MODE_CURSOR`
         // in `window-clock.c`) -- same treatment as the other two overlays.
-        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => (None, false),
+        // display-menu (SP7 Task 16): tmux's own menu screen also has
+        // `MODE_CURSOR` cleared (`menu_prepare`: `md->s.mode &= ~MODE_CURSOR`).
+        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) | ClientMode::Menu(_) => (None, false),
         _ => match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
             (Some(r), Some(p)) => {
                 let (cx, cy) = p.grid.cursor();
@@ -3425,7 +3528,27 @@ fn render_one(
         },
     };
 
-    let overlay = overlay_data.map(|ov| match ov {
+    // display-menu (SP7 Task 16): unlike every other overlay, this reads
+    // straight off `client.mode` rather than through `build_render_overlay`/
+    // `overlay_data` -- `MenuState` needs no `&self` context at all beyond
+    // what's already snapshotted in it at open time (no live registry
+    // rebuild, see `MenuState`'s doc comment), so there's nothing for the
+    // two-phase `RenderOverlay` indirection (which exists specifically for
+    // overlays that need `&self` before `render_all`'s mutable per-client
+    // loop begins) to buy here.
+    let overlay = if let ClientMode::Menu(state) = &client.mode {
+        Some(Overlay::Menu(MenuOverlay {
+            rect: state.rect,
+            title: state.title.clone(),
+            rows: state
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| MenuRowCell { text: r.text.clone(), separator: r.command.is_none(), selected: state.sel == i as i32 })
+                .collect(),
+        }))
+    } else {
+        overlay_data.map(|ov| match ov {
         RenderOverlay::Tree { rows, sel, list_height, preview, title } => {
             // Task 8 review fix, Important #3: `compose_back`'s actual paint
             // pass reserves the panel's OWN last row for `scene.message`
@@ -3501,7 +3624,8 @@ fn render_one(
             // above).
             Overlay::Clock(rect, text.clone(), options.clock_mode_colour_for(&window.window_options))
         }
-    });
+        })
+    };
 
     let scene = Scene {
         size: scene_size,

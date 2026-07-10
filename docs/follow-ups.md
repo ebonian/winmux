@@ -871,6 +871,30 @@ None block the sub-project 4 merge.
     winmux's mouse routing has no menu concept at all — every mouse event
     resolves to a direct action (focus/resize/select/scroll) or is dropped,
     never a menu.
+
+    **RESOLVED** (SP7 parity wave 5, Task 16). `display-menu`/`menu` is now
+    a real command (`ParsedCmd::DisplayMenu`, `src/cmd.rs`) opening a
+    `ClientMode::Menu` overlay (`src/server.rs`) rendered as a small
+    floating bordered box (`render::Overlay::Menu`, `src/render.rs`) — Up/
+    Down/`j`/`k` navigate (wrapping, skipping separators), a per-item
+    shortcut key jumps directly, Enter chooses, Escape/`q`/`C-c`/`C-g`
+    cancels; a mouse press inside runs that row, a press outside (or on any
+    other overlay-swallowed event) cancels. `MouseDown3Pane`/
+    `MouseDown3Status`/`MouseDown3StatusLeft` (right-click on a pane/window
+    tab/the session-name segment) now open winmux's own default PANE/
+    WINDOW/SESSION context menus (`server::dispatch::open_pane_menu`/
+    `open_window_menu`/`open_session_menu`), table-driven exactly like every
+    other Task-8 mouse default (rebindable/unbindable). Spec authority was
+    the cloned tmux C source (`menu.c`/`cmd-display-menu.c`), since the
+    reference docs under `docs/tmux-reference/` only cover the default
+    menus' item CONTENTS, not the grammar or C mechanics — see
+    `docs/specs/2026-07-07-command-config-interfaces.md` and
+    `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## display-menu`
+    sections for the full amendment, including every documented content
+    substitution vs. tmux's own default menus (no floating-pane/Respawn/
+    Mark/hyperlink items, no format-loop-generated "Switch To" entries, no
+    `#{...}` expansion inside item command text, menu clicks commit on
+    press not release, and more).
 52. **`allow-rename` (`ESC k` / the `#{automatic-rename}` toggle escape) is
     not implemented** (Task 9, automatic-rename; see also follow-up #28,
     which noted this gap inline but deferred the formal ticket to this
