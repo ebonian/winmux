@@ -203,6 +203,38 @@ impl Client {
     }
 }
 
+/// Like [`Client::recv_output_until`], but widens the margin against a real
+/// race in `selection_survives_concurrent_output`/
+/// `other_end_survives_concurrent_output` (#58, task-10-closeout
+/// flakiness): a background `send-keys` triggers a multi-line shell
+/// echo+execute+reprompt that can arrive as SEVERAL separate `Output`
+/// frames, so the FIRST frame where `pred` happens to hold (e.g. the moment
+/// the anchored line has scrolled up by exactly one row, or the highlight's
+/// leftmost column has repainted) is not necessarily the FINAL settled
+/// state the rest of the test's assertions assume — under full-parallelism
+/// `cargo test` scheduling delay, more output/redraw frames can still be
+/// in flight when `pred` first flips true. This keeps draining any further
+/// `Output` frames that arrive within a short settle window after `pred`
+/// first holds, then re-asserts `pred` still holds on the settled grid —
+/// closing that race without weakening what either test actually checks
+/// (the settled grid still has to satisfy the exact same predicate; this
+/// only refuses to trust the FIRST instant it does).
+fn recv_output_settled(client: &Client, grid: &mut Grid, pred: impl Fn(&Grid) -> bool) {
+    client.recv_output_until(grid, &pred);
+    let settle_deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        let remaining = settle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match client.rx.recv_timeout(remaining) {
+            Ok(ServerMsg::Output(bytes)) => grid.feed(&bytes),
+            Ok(_) | Err(_) => break,
+        }
+    }
+    assert!(pred(grid), "predicate held transiently but not after settling; screen:\n{}", screen_text(grid).join("\n"));
+}
+
 fn attach(client: &mut Client, mode: AttachMode, name: &str, cols: u16, rows: u16) {
     client.send(&ClientMsg::Attach {
         mode,
@@ -2777,9 +2809,14 @@ fn selection_survives_concurrent_output() {
     // (a) The highlight must FOLLOW the anchored content to its new view
     // row: the row that now holds "anchor777" is highlighted from col 0
     // (it's the selection's first row), and it moved up from target_row.
+    // (#58 fix) `recv_output_settled`, not a plain `recv_output_until`: the
+    // background echo+execute+reprompt can arrive as several `Output`
+    // frames, and the FIRST one where this predicate flips true isn't
+    // necessarily the settled final state the column loop below assumes —
+    // see the helper's doc comment for the full race description.
     let find_anchor_row =
         |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
-    c.recv_output_until(&mut grid, |g| {
+    recv_output_settled(&c, &mut grid, |g| {
         screen_text(g).iter().any(|l| l.contains("extra999"))
             && match find_anchor_row(g) {
                 Some(r) => r < target_row && g.cell(0, r).style.bg == Color::Idx(3),
@@ -2846,9 +2883,13 @@ fn other_end_survives_concurrent_output() {
     let mut cli2 = cli_client(&name);
     cli2.send(&ClientMsg::Cli(vec!["send-keys".into(), "echo extra888".into(), "Enter".into()]));
     expect_cli_done(&cli2, 0);
+    // (#58 fix) `recv_output_settled`, same reasoning as
+    // `selection_survives_concurrent_output` above: don't trust the FIRST
+    // frame where the anchor row has moved, in case more scroll/redraw
+    // frames from the same background command are still in flight.
     let find_anchor_row =
         |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
-    c.recv_output_until(&mut grid, |g| {
+    recv_output_settled(&c, &mut grid, |g| {
         screen_text(g).iter().any(|l| l.contains("extra888")) && find_anchor_row(g).is_some_and(|r| r < target_row)
     });
     let new_row = find_anchor_row(&grid).unwrap();
@@ -7103,5 +7144,261 @@ fn pane_base_index_shifts_display_panes_digits_and_hash_p() {
     let mut cli_k = cli_client(&name);
     cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- SP7 Task 18: test-debt batch (closes #11, #12, #22, #23, #58, #60) ---
+
+/// #11/#22: kill the last pane of a NON-last window (via `Ctrl-b x`
+/// confirm) in a session that has OTHER windows besides it, distinct from
+/// the two pre-existing cases (`kill_only_pane_confirm_destroys_session`:
+/// the only window in the only session; `kill_window_confirm_text`: `&`
+/// window-kill, not the pane-kill cascade). Three windows (0, 1, 2); window
+/// 1 (neither first nor last) is killed. Asserts: the window is destroyed,
+/// focus lands on a REMAINING window (2, per `Session::kill_window`'s
+/// `last`-fallback rule -- window 2 was `current` right before the client
+/// stepped back to window 1, so it's `last` at the moment window 1 dies),
+/// and window 0 -- entirely unrelated to the kill -- is undisturbed.
+#[test]
+fn kill_last_pane_of_non_last_window_destroys_window_and_refocuses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 0: mark it so we can prove it's undisturbed later.
+    c.send(&ClientMsg::Stdin(b"echo win0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+
+    // prefix-c twice builds windows 1 and 2 (creation order 0, 1, 2); window
+    // 2 ends up current, window 1 "last" (it was current right before
+    // window 2 was created).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo win2mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win2mark").is_some());
+
+    // prefix-p (previous-window) steps back to window 1 -- the NON-last
+    // window here: both window 0 and window 2 remain alive when it dies.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'p']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+
+    // Kill window 1's only pane via Ctrl-b x confirm.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-pane 0? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+
+    // Window 1 is destroyed; focus falls back to window 2 (NOT window 0),
+    // and window 2's content survives untouched (no reset/re-render of its
+    // pane's grid).
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("2:powershell*")) && !lines.iter().any(|l| l.contains("1:powershell"))
+    });
+    assert!(marker_col(&grid, "win2mark").is_some(), "window 2's content must survive the kill undisturbed");
+
+    // Window 0 -- entirely unrelated to the kill -- is still there with its
+    // own content intact.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:powershell*")));
+    assert!(marker_col(&grid, "win0mark").is_some(), "window 0's content must be undisturbed by window 1's death");
+
+    // Clean up: exit window 0's shell (window 2 still alive -> just
+    // destroys window 0, focus falls to window 2), then exit window 2's
+    // shell (now the only window -> destroys the session).
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("2:powershell*")) && !lines.iter().any(|l| l.contains("0:powershell"))
+    });
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `rename-session` must propagate to OTHER attached clients, not
+/// just the one that issued it. Two clients attached to the same session;
+/// client A renames it via the `prefix-$` prompt, and client B -- which
+/// never touched the rename -- must independently see its own status-left
+/// `[name]` update.
+#[test]
+fn rename_session_propagates_to_other_attached_clients() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "orig", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::Existing, "orig", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // A renames the session via prefix-$; "orig" is 4 chars, wipe then type.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'$']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("(rename-session) orig")));
+    a.send(&ClientMsg::Stdin(vec![0x7f, 0x7f, 0x7f, 0x7f]));
+    a.send(&ClientMsg::Stdin(b"renamed\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[renamed]")));
+
+    // Client B, which never issued the rename, must also see the new name
+    // -- without any input of its own.
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("[renamed]")));
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `switch-client -p` (`prefix-(`) must be a true no-op when the
+/// registry has only one session -- `switch_client_session`'s own
+/// neighbor-equals-self guard, exercised end to end here for the first
+/// time (`switch_client_next_cycles_sessions` only ever covers the 2+
+/// session case). No visible change, and the client keeps rendering/routing
+/// input normally afterward (proves it wasn't left in some half-switched
+/// state).
+#[test]
+fn switch_client_prev_is_noop_with_single_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "solo", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[solo]")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'(']));
+
+    c.send(&ClientMsg::Stdin(b"echo still-solo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "still-solo").is_some());
+    assert!(
+        screen_text(&grid).iter().any(|l| l.contains("[solo]")),
+        "session name must be unchanged after a no-op switch-client -p"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `list-windows` with no `-t` defaults to the most RECENTLY
+/// created session (`exec_list_windows`'s `self.registry.sessions().last()`
+/// fallback), not the first one created and not an error. `lwA` (renamed to
+/// distinguish it) is created first; `lwB` (left at the default window
+/// name) second -- the no-target listing must show `lwB`'s window, not
+/// `lwA`'s.
+#[test]
+fn list_windows_no_target_defaults_to_most_recent_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "lwA".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "-t".into(), "lwA".into(), "winA".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "lwB".into()]));
+    expect_cli_done(&cli, 0);
+
+    // No -t: must default to lwB (most recently created), still showing its
+    // untouched default window name -- not lwA's renamed one.
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "0: powershell* (1 panes) [80x24] (active)\n");
+    assert!(!out.contains("winA"), "must not default to lwA (the older session): {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "lwA".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "lwB".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+/// #60: `swap-pane -U`/`-D` wraparound at the two ends of a 3+-pane window.
+/// The wrap arithmetic (`(pos+n-1)%n` for `-U`, `(pos+1)%n` for `-D`,
+/// `src/server/dispatch.rs::exec_swap_pane`) was already pretested via
+/// `rotate`, but had no dedicated coverage of its own -- this drives BOTH
+/// ends with n=3. Window 0 covers `-U` at position 0 (must wrap to the LAST
+/// pane, position 2); window 1 (a fresh layout, so leaf order == creation
+/// order again) covers `-D` at position 2 (must wrap to position 0).
+#[test]
+fn swap_pane_wraps_at_ends() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // ---- Window 0: `-U` at position 0 wraps to the LAST pane (n=3). ----
+    // H(1, V(2,3)): pane1 {0,0,40,24} (leaf 0), pane2 {41,0,39,12} (leaf 1),
+    // pane3 {41,13,39,11} (leaf 2, focused after the second split) -- same
+    // construction as `swap_pane_updown_with_target`.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "0".into(), "echo one111".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "one111").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1".into(), "echo two222".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "2".into(), "echo three333".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").is_some());
+
+    // `swap-pane -U -t 0`: position 0 is the FIRST pane (n=3, no
+    // predecessor) -- the wrap arithmetic `(pos+n-1)%n` must land on
+    // position n-1=2 (pane3, bottom-right), not silently no-op or panic.
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-U".into(), "-t".into(), "0".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Position 0 (left) now shows pane3's content; position 2 (bottom-right)
+    // now shows pane1's content. Position 1 (top-right) is untouched.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "one111", 13, 24).is_some());
+    assert!(marker_col_in_rows(&grid, "two222", 0, 12).is_some(), "position 1 (top-right) must be untouched by the -U wrap");
+
+    // ---- Window 1: `-D` at position n-1 (2) wraps to position 0. ----
+    // prefix-c creates window 1 and switches the client to it -- a FRESH
+    // window, so leaf order == creation order again (no prior swap to
+    // account for).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.0".into(), "echo alpha1".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "alpha1").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.1".into(), "echo beta2".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "beta2").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.2".into(), "echo gamma3".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "gamma3").is_some());
+
+    // `swap-pane -D -t 1.2`: position 2 is the LAST pane (n=3, no
+    // successor) -- the wrap arithmetic `(pos+1)%n` must land on position 0
+    // (pane at leaf 0, alpha1), not silently no-op or panic.
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-D".into(), "-t".into(), "1.2".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.recv_output_until(&mut grid, |g| marker_col(g, "gamma3").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "alpha1", 13, 24).is_some());
+    assert!(marker_col_in_rows(&grid, "beta2", 0, 12).is_some(), "position 1 (top-right) must be untouched by the -D wrap");
+
+    let mut kill_cli = cli_client(&name);
+    kill_cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&kill_cli, 0);
     server.join().expect("server exits after kill-server");
 }
