@@ -64,10 +64,15 @@ pub enum KeyInputEvent {
     /// NEVER routed through the prefix/table state machine or the repeat
     /// window — mouse "bindings" are hardcoded server-side (see the design
     /// spec's `## 4. Mouse` section), not looked up in
-    /// `crate::bindings::Bindings`. `raw` is kept for symmetry with `Key`
-    /// (currently unused: forwarding a click's raw SGR bytes to the pane's
-    /// own mouse-reporting mode is out of scope for v1, see the task brief's
-    /// documented deferral).
+    /// `crate::bindings::Bindings`. `raw` is kept for symmetry with `Key`,
+    /// still unused: SP7 Task 9 (closes follow-ups #35/#72) DOES now forward
+    /// mouse events to a pane whose own app requested mouse reporting, but
+    /// via `keys::encode_mouse` RE-ENCODING the already-decoded `event`
+    /// (rebased to the pane's own origin, in the pane's own requested
+    /// coordinate encoding) rather than replaying these CLIENT-terminal-
+    /// relative raw bytes verbatim — `server::handle_event`'s
+    /// `KeyInputEvent::Mouse { event, .. }` arm destructures and discards
+    /// `raw` before it ever reaches `dispatch_mouse`.
     Mouse { event: keys::MouseEvent, raw: Vec<u8> },
 }
 

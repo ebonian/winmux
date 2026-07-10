@@ -549,8 +549,25 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     UNBOUND space still forwards to the pane as ordinary typed input,
     exactly as before).
 
-35. **Mouse clicks/drags are never forwarded to the pane application's own
-    mouse-reporting mode** (Task 5, mouse). tmux, when a pane's own
+35. **RESOLVED** (SP7 Task 9, 2026-07-10; same fix as #72, see that entry for
+    the full writeup). `server::dispatch` now re-encodes and forwards mouse
+    events to a pane whose own application has requested mouse reporting
+    (`Grid::mouse_proto()`/`mouse_encoding()`, tracked by SP7 Task 3),
+    INSTEAD of consuming them for winmux's own copy-mode-entry/drag-
+    selection where real tmux's default bindings are gated
+    (`MouseDrag1Pane`/`WheelUpPane`), and IN ADDITION to focusing where
+    tmux's default is ungated (`MouseDown1Pane`). Border drags and status-
+    line clicks are unaffected either way, matching tmux's "ALWAYS KEEPS"
+    rule. See `docs/specs/2026-07-07-parity-polish-interfaces.md`'s "Task 9
+    amendment: application mouse passthrough" for the full design and test
+    inventory, including an honestly-noted residual gap (no live-process
+    byte-receipt e2e proof, for the same class of reason `alt_screen_wheel_
+    sends_arrows` was abandoned; unit-level coverage exercises the same
+    `forward_mouse_to_pane` -> `keys::encode_mouse` -> `Pty::write_input`
+    chain instead).
+    *Original text:* Mouse clicks/drags are never forwarded to the pane
+    application's own
+    mouse-reporting mode (Task 5, mouse). tmux, when a pane's own
     application has ALSO requested mouse reporting (e.g. vim/tmux-inside-
     tmux/htop with mouse support enabled), can forward click/drag events to
     that application instead of consuming them for pane focus/copy-mode/
@@ -1365,7 +1382,32 @@ None block the sub-project 4 merge.
     active-pane data in `status::WindowEntry` (or the ctx). Not exercised
     by the fixture config (`#I`/`#W`/`#F` only). SMALL. LOW.
 
-72. **No application mouse passthrough** (adjudicated in SP6 Task 6 review, 2026-07-10).
+72. **RESOLVED** (SP7 Task 9, 2026-07-10). `src/keys.rs` gained
+    `encode_mouse` (SGR/X10/UTF-8 re-encoding, the inverse of the existing
+    SGR decode side, byte-exact roundtrip-tested); `src/server/dispatch.rs`
+    gained `mouse_forward_eligible`/`forward_mouse_to_pane` plus a new
+    `MouseDrag::Forwarding { pane }` client-drag-state variant, wired into
+    `mouse_down` (unconditional forward-in-addition-to-focus, matching
+    tmux's ungated `MouseDown1Pane`), `mouse_drag`'s `PendingSelect {
+    enter_copy: true }` arm (forward INSTEAD of entering copy mode, mirrors
+    `MouseDrag1Pane`'s `if -F mouse_any_flag` guard), and `mouse_wheel`
+    (forward INSTEAD of entering copy mode / the old unconditional
+    alt-screen 3x-arrow-key translation, which this task REMOVED entirely
+    per `mouse.md` §9's "tmux never converts wheel to arrow keys" ruling —
+    an alt-screen pane that does NOT own the mouse now correctly swallows
+    wheel instead). Border drags and status-line clicks are deliberately
+    UNCHANGED, matching tmux's "ALWAYS KEEPS" rule. Full design + precedence
+    table + test inventory in `docs/specs/2026-07-07-parity-polish-
+    interfaces.md`'s "Task 9 amendment: application mouse passthrough"
+    (same section covers duplicate ticket #35). One residual gap honestly
+    noted there: no live-process byte-receipt e2e proof was attempted (same
+    class of risk that sank `alt_screen_wheel_sends_arrows`); the unit-level
+    coverage exercises the identical `forward_mouse_to_pane` ->
+    `keys::encode_mouse` -> `Pty::write_input` call chain instead, and
+    `Pty::write_input` delivery itself is already covered by
+    `tests/pty_smoke.rs` and every keystroke-based e2e test in the suite.
+    *Original text:* No application mouse passthrough (adjudicated in SP6
+    Task 6 review, 2026-07-10).
     winmux never relays raw mouse bytes to pane applications: a pane program that
     enables mouse reporting (vim, htop, less --mouse) receives nothing; wheel input
     is translated to 3x arrow keys only (src/server/dispatch.rs wheel path). Real

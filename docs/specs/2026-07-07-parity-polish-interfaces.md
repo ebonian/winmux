@@ -1472,20 +1472,164 @@ does NOT replicate `render::compose_back`'s final spatial right-truncation
 `exec_step_window(false, ..)` / `exec_step_window(true, ..)` (previous-window
 / next-window — tmux's default `WheelUpStatus`/`WheelDownStatus` bindings).
 
-**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
-forwarding a click/drag to the pane's own mouse-reporting application (the
-design spec's "v1: NOT forwarded" note; ticketed `docs/follow-ups.md` #72).
-Two PRIOR deferrals in this section are now RESOLVED and removed from this
-list: "drag-to-select on a live (non-copy-mode) pane" (Task 6's
-`PendingSelect { enter_copy: true }`) and "`word-separators` as a real
-option" (Task 7's `Options::word_separators`, replacing the old hardcoded
-`" -_@"` guess with the doc-verified tmux default). One new interaction is
-left untested rather than deferred outright: toggling `rectangle-toggle`
+**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):** THREE
+PRIOR deferrals in this section are now RESOLVED and removed from this list:
+"drag-to-select on a live (non-copy-mode) pane" (Task 6's `PendingSelect {
+enter_copy: true }`), "`word-separators` as a real option" (Task 7's
+`Options::word_separators`, replacing the old hardcoded `" -_@"` guess with
+the doc-verified tmux default), and "forwarding a click/drag to the pane's
+own mouse-reporting application" (follow-ups #35/#72 — SP7 Task 9, see the
+`### Task 9 amendment` immediately below this section). One new interaction
+is left untested rather than deferred outright: toggling `rectangle-toggle`
 (`R`/`v`) mid-drag on a `Word`/`Line`-kind selection — `sel.rect` and
 `sel.kind` are independent fields, so this is representable, but real tmux
 itself treats `SEL_WORD`/`SEL_LINE` and rectangle selection as mutually
 exclusive selection MODES rather than orthogonal flags; low risk (mouse-only
 entry point, no keybinding reaches this combination).
+
+### Task 9 amendment: application mouse passthrough (SP7, closes follow-ups #35/#72)
+
+Real tmux forwards mouse events to a pane whose own application has
+requested mouse reporting, INSTEAD of consuming them for winmux's own
+copy-mode-entry/drag-selection gestures, per `docs/tmux-reference/mouse.md`
+§3.1/§7.1/§7.4. This amendment wires that up using Task 3's pane-side
+tracking (`Grid::mouse_proto`/`mouse_encoding`) and Task 8's table-driven
+mouse routing.
+
+```rust
+// keys (new)
+pub fn encode_mouse(ev: &MouseEvent, encoding: MouseEncoding) -> Vec<u8>;
+```
+
+`encode_mouse` is the re-encoding half of `KeyDecoder`'s SGR mouse
+decoding — the inverse of `classify_sgr_mouse`/`mouse_kind_from_cb`, plus
+two more wire formats decode never needed to produce: legacy X10 (`CSI M
+<Cb+32><Cx+32><Cy+32>`, three raw bytes, coordinates capped at 223 since a
+single byte can't carry more) and UTF-8 (1005, same button byte, but
+`Cx+32`/`Cy+32` emitted as UTF-8-encoded codepoints, extending the
+coordinate range to 2015 — a best-effort encoding with no
+`docs/tmux-reference/*.md` source line pinning its exact algorithm, since
+1005 is a rare, largely-superseded-by-1006 protocol winmux itself never
+requests). `ev.x`/`ev.y` must already be PANE-relative and 0-based (the
+caller's job); `MouseEncoding::Sgr` is unbounded (1-based, no clamp).
+`MouseKind::Up` encodes with the SGR release final byte (`m`) / X10-and-UTF8
+still emit the button byte concretely since `MouseEvent` always carries the
+resolved kind, unlike real X10's release-button ambiguity.
+
+```rust
+// server (MouseDrag amendment)
+enum MouseDrag {
+    // ...existing variants unchanged...
+    Forwarding { pane: PaneId }, // NEW
+}
+```
+
+`MouseDrag::Forwarding { pane }`: armed when a drag START (the first
+`Drag1Pane` motion event after a `PendingSelect { enter_copy: true }`
+press) finds the pressed pane eligible to receive it instead of entering
+copy mode. Every subsequent `Drag`/`Up` event on this client re-attempts
+forwarding (`Server::forward_mouse_to_pane`, re-checked live per event,
+matching tmux's "no drag-update callback installed -> every motion
+re-synthesizes and re-dispatches" rule, `mouse.md` §2.5) rather than
+driving any winmux copy-mode/selection state; `Up` forwards the release
+too, resolved against whichever pane is under the pointer AT RELEASE
+(mirrors the pre-existing `Selecting`/`MouseDragEnd1Pane` release-position
+rule).
+
+```rust
+// server::dispatch (new)
+fn mouse_forward_eligible(proto: MouseProto, kind: MouseKind) -> bool;
+fn forward_mouse_to_pane(&mut self, pane: PaneId, ev: MouseEvent, rect: Rect) -> bool; // private method
+```
+
+`mouse_forward_eligible`: `Down`/`Up`/`WheelUp`/`WheelDown` are eligible
+whenever `proto != MouseProto::Off` — INCLUDING `MouseProto::X10`, the one
+variant modern tmux itself has no `MODE_MOUSE_*` bit for at all (per
+`Grid::mouse_proto`'s doc comment, tracked in winmux specifically because
+"a later task's interface promise requires the X10 variant to exist" — this
+is that promise: an app that only ever sent `CSI ?9h` still owns its own
+clicks, wire-encoded via `MouseEncoding::Default`/X10 since it never also
+requested 1005/1006). `Drag` (pure motion) additionally requires
+`MouseProto::Button`/`Any` (`MOTION_MOUSE_MODES` — X10/Normal never asked
+the terminal to report motion at all).
+
+`forward_mouse_to_pane`: re-encodes `ev` relative to `rect` (the pane's
+current rect — `px = ev.x - rect.x`, clamped, same for `py`) via
+`keys::encode_mouse(&rel, pane.grid.mouse_encoding())` and writes the
+result to the pane's `Pty::write_input`, IF `mouse_forward_eligible`. Returns
+whether it actually wrote anything — callers use this to decide "forward
+INSTEAD of my own action" (`mouse_drag`'s `PendingSelect { enter_copy: true
+}` arm, `mouse_wheel`) vs. "forward IN ADDITION to my own action, which
+always happens regardless" (`mouse_down`'s pane-click branch — mirrors
+tmux's UNGATED root `MouseDown1Pane -> select-pane -t=; send -M`, the only
+default root pane binding with no `if -F mouse_any_flag` guard at all).
+
+**Call-site precedence (mirrors each gated default binding's own `if -F`
+guard, which a plain `RawCmd` list can't express directly):**
+
+- `mouse_down` (pane click, any button): unconditional focus (unchanged),
+  PLUS an unconditional forward attempt when `!in_copy_here` — no
+  `mouse_lookup` gate at all, since real tmux's `MouseDown1Pane` default has
+  none either.
+- `mouse_drag`'s `PendingSelect { enter_copy: true }` arm (root
+  `MouseDrag1Pane`): the forward attempt runs in the `mouse_lookup ==
+  None` arm (real tmux's unconditional "unbound -> forward_key" step) AND
+  in the "resolved to the exact default" arm (standing in for the
+  default's own `if -F {mouse_any_flag} {send -M} {copy-mode -M}` body) —
+  NOT when a user's own override is bound, since an override fully replaces
+  the default's guard along with its action.
+- `mouse_wheel` (root `WheelUpPane`/`WheelDownPane`, only reached when the
+  pane is NOT already in this client's copy mode): same `None`-arm /
+  is-the-default-arm split as `mouse_drag` above. Replaces the OLD
+  unconditional alt-screen "wheel -> 3x synthesized arrow-key presses"
+  translation entirely (`docs/tmux-reference/mouse.md` §9: "No wheel→arrow
+  translation... tmux never converts wheel to arrow keys") — an alt-screen
+  pane that does NOT own the mouse now SWALLOWS wheel (matches tmux's
+  `alternate_on` guard: `send -M` reaches `input_key_get_mouse`, which
+  returns 0 for an app that hasn't enabled its own mouse reporting) instead
+  of receiving synthesized arrows.
+- Border drags and status-line clicks are UNCHANGED — no forwarding check
+  was added to either path, matching real tmux's "ALWAYS KEEPS: border
+  drags, status-line clicks" rule (`mouse.md` §7.4 point 2); a border-owning
+  pane's own mouse mode has no effect on border-drag resize.
+
+TDD evidence (`src/server/dispatch.rs::mouse_dispatch_tests`, all built the
+same "real `Server` + `Grid::feed`'d DECSET, no ConPTY" way
+`alt_screen_wheel_does_not_enter_copy_mode` established):
+`mouse_forward_eligible_gates_by_proto_and_kind` (exhaustive over every
+`MouseProto` × representative `MouseKind`), `forward_mouse_to_pane_writes_
+when_pane_owns_mouse_click` / `_false_when_pane_does_not_own_mouse`,
+`mouse_down_focuses_pane_that_owns_mouse` (focus AND forward both happen,
+proving the UNGATED-click claim), `drag_on_mouse_owning_pane_does_not_
+enter_copy_mode` (asserts `client.mode` stays `Normal` AND `client.mouse.
+drag` becomes `Forwarding`), `wheel_forwards_to_mouse_owning_pane_instead_
+of_copy_mode`, `border_drag_still_resizes_when_pane_owns_mouse` (a REAL
+2-pane split via `Layout::split`, proving actual resize still happens),
+`passthrough_stops_after_decrst` (proves the gate re-reads live state, not
+a one-time snapshot). Unit tests (`src/keys.rs::tests`):
+`encode_mouse_sgr_{press,release,drag,wheel}_*`, `encode_mouse_sgr_
+carries_modifiers`, `encode_mouse_sgr_roundtrips_through_decoder` (every
+SGR encode output, fed back into `KeyDecoder`, decodes to the exact
+`MouseEvent` it was built from), `encode_mouse_x10_offsets_by_32_and_caps_
+at_223`, `encode_mouse_utf8_extends_range_past_x10_cap`.
+
+**Residual gap, honestly noted:** an end-to-end proof of "the pane's own
+REAL PROCESS actually receives these bytes on its stdin" (as opposed to the
+above, which proves the SERVER decides to write them and byte-verifies
+their exact wire encoding) was evaluated and NOT attempted, for the same
+class of reason `alt_screen_wheel_sends_arrows` (Task 5/SP6) was
+abandoned: a real interactive shell's own line editor / conhost's VT-INPUT
+parser would almost certainly reinterpret (not passively echo) an
+unrecognized `CSI < ... M` sequence typed into its stdin in an
+unpredictable, un-pinnable way, unlike straightforward ASCII keystrokes
+(which the project's OTHER `send-keys`-style e2e tests already rely on
+echoing reliably). The unit-level coverage above exercises the exact same
+`forward_mouse_to_pane` → `keys::encode_mouse` → `Pty::write_input` call
+chain a live pane would receive; only the LAST hop (does `write_input`
+correctly deliver already-known-correct bytes to a real process) is
+unverified by THIS task specifically — general `Pty::write_input` delivery
+is already covered by `tests/pty_smoke.rs` and every other keystroke-based
+e2e test in the suite.
 
 Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
 sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
