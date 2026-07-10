@@ -177,6 +177,14 @@ enum ClientMode {
     /// mid-overlay simply stops being offered a digit rather than a stale
     /// key press acting on a dead `PaneId`.
     DisplayPanes(DisplayPanesState),
+    /// clock-mode overlay (Task 10, sub-project 6 wave 2; `t`, `clock-mode`):
+    /// a per-client mode bound to the pane that was FOCUSED at entry, same
+    /// binding rule as `Copy` (`docs/tmux-reference/status-line-and-
+    /// messages.md` `## 6. Clock mode`: "it is a window mode on the pane").
+    /// Unlike `DisplayPanes` there is no auto-dismiss deadline -- real
+    /// tmux's "any key exits" (`window_clock_key`/`window_pane_reset_mode`)
+    /// is the only way out (see `dispatch::Server::dispatch_clock_key`).
+    Clock(ClockState),
 }
 
 /// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
@@ -309,6 +317,48 @@ struct DisplayPanesState {
     deadline: Instant,
 }
 
+/// clock-mode's per-client state (Task 10): `pane` is the pane the mode was
+/// entered on (mirrors `CopyState::pane` -- kept explicit rather than
+/// implicitly "whatever's focused now", the correct DRY shape even though in
+/// practice nothing inside clock mode can change focus before the mode
+/// exits, since ANY key immediately does). `text` is the CURRENTLY DISPLAYED
+/// already-formatted time string (`format_clock`, `clock-mode-style`-
+/// governed) -- the render path (`Server::build_render_overlay`/
+/// `render_one`) just draws it verbatim, which is the seam that lets the
+/// render unit test inject a fixed string and never touch wall-clock. The
+/// `Tick` handler recomputes the current formatted string every 50ms and
+/// only marks the client dirty when it actually differs from `text`,
+/// matching real tmux's own "redraw only if the time actually changed"
+/// rule (`window-clock.c:146-168`).
+struct ClockState {
+    pane: PaneId,
+    text: String,
+}
+
+/// Format the clock-mode display string per `clock-mode-style`
+/// (`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock mode`):
+/// `style12 == false` (the `24` default) -> tmux's `%H:%M` (zero-padded);
+/// `style12 == true` -> tmux's `%l:%M ` (`%l` = space-padded, NOT
+/// zero-padded, 12-hour -- a POSIX strftime extension Windows lacks,
+/// special-cased here per the doc's `## 10` "Windows/winmux applicability"
+/// note) immediately followed by `AM`/`PM` with no extra space (matches
+/// `window-clock.c`'s literal `strftime(..., "%l:%M ", tm)` +
+/// `strcat(.., tm->tm_hour >= 12 ? "PM" : "AM")`). `hour24` is 0-23,
+/// `minute` 0-59; both are the caller's job to keep in range (from
+/// `system_time_parts`/`SYSTEMTIME`, always in range in practice).
+fn format_clock(hour24: u8, minute: u8, style12: bool) -> String {
+    if style12 {
+        let hour12 = match hour24 % 12 {
+            0 => 12,
+            h => h,
+        };
+        let ampm = if hour24 < 12 { "AM" } else { "PM" };
+        format!("{hour12:2}:{minute:02} {ampm}")
+    } else {
+        format!("{hour24:02}:{minute:02}")
+    }
+}
+
 /// Task 8 (display-panes): pane-index -> digit mapping, in the window's
 /// `layout.panes()` order (the SAME order the status bar's pane-index format
 /// and `select-pane -t <n>` use), capped at the first 10 panes -- digits
@@ -349,6 +399,11 @@ enum RenderOverlay {
     /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
     /// current rect and active-ness.
     Digits(Vec<(PaneId, u32)>),
+    /// clock-mode (Task 10): the bound pane's id (`render_one` resolves it
+    /// to a current rect, same as `Digits` does per-entry) and the
+    /// already-formatted time string (`ClockState::text`) -- `render_one`
+    /// just hands both, plus `clock-mode-colour`, to `render::Overlay::Clock`.
+    Clock { pane: PaneId, text: String },
 }
 
 /// The selected tree row's live preview content (SP6 wave 2, Task 8),
@@ -1271,6 +1326,17 @@ impl Server {
                 // above can't provide) and serviced just after this loop
                 // ends.
                 let mut autoscroll_due: Vec<ClientId> = Vec::new();
+                // clock-mode (Task 10): the current formatted time string,
+                // computed ONCE per tick (same wall time for every client)
+                // rather than per-client -- compared against each Clock-mode
+                // client's stored `text` below, only marking dirty (and
+                // rebuilding) on an actual change, matching real tmux's own
+                // "redraw only if the time actually changed" rule
+                // (`window-clock.c:146-168`). Real time, therefore untested
+                // at unit level beyond `format_clock` itself (the pure
+                // formatting seam) -- see that function's test module.
+                let clock_style12 = self.options.clock_mode_style_12();
+                let clock_now = system_time_parts();
                 for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
                         if deadline.duration_since(set_at) >= MESSAGE_LIFETIME {
@@ -1285,6 +1351,13 @@ impl Server {
                     if expired {
                         client.mode = ClientMode::Normal;
                         dirty = true;
+                    }
+                    if let ClientMode::Clock(cs) = &mut client.mode {
+                        let text = format_clock(clock_now.hour, clock_now.min, clock_style12);
+                        if text != cs.text {
+                            cs.text = text;
+                            dirty = true;
+                        }
                     }
                     if client.key_machine.escape_ready(deadline) {
                         escape_flush.push(*cid);
@@ -1693,6 +1766,48 @@ impl Server {
         }
     }
 
+    /// Cancel any attached client's clock mode (Task 10) whose bound pane no
+    /// longer exists, or is no longer in that client's session's current
+    /// window — the exact same staleness rule (and same two call sites) as
+    /// [`Server::cancel_stale_copy_modes`], which this mirrors verbatim
+    /// (clock mode has no capture/search-prompt state to reset, unlike copy
+    /// mode, so this is the simpler half of that method).
+    fn cancel_stale_clock_modes(&mut self) {
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        let ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        for id in ids {
+            let stale = match self.clients.get(&id).map(|c| &c.mode) {
+                Some(ClientMode::Clock(cs)) => {
+                    if !live_panes.contains(&cs.pane) {
+                        true
+                    } else {
+                        match self.clients.get(&id).and_then(|c| c.session.as_deref()) {
+                            Some(session_name) => !self
+                                .registry
+                                .sessions()
+                                .iter()
+                                .find(|s| s.name == session_name)
+                                .map(|s| s.current_window().layout.panes().contains(&cs.pane))
+                                .unwrap_or(false),
+                            None => true,
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if stale {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.mode = ClientMode::Normal;
+                }
+            }
+        }
+    }
+
     /// Cancel any attached client's choose-tree (Task 8) `pending_kill`
     /// confirm whose snapshotted target no longer exists (killed by another
     /// client, or by this same client's own dispatch, while the `x` (y/n)
@@ -1840,6 +1955,7 @@ impl Server {
         // any confirm on it must be reset, or its `y` would act on stale state.
         self.cancel_stale_confirms();
         self.cancel_stale_copy_modes();
+        self.cancel_stale_clock_modes();
         self.cancel_stale_choose_trees();
         true
     }
@@ -1996,6 +2112,17 @@ impl Server {
                                 break 'events;
                             }
                         }
+                    } else if matches!(client.mode, ClientMode::Clock(_)) {
+                        // clock-mode (Task 10): "any key exits"
+                        // (`window-clock.c:213-219`) with no digit/non-digit
+                        // split to make -- unlike display-panes there is
+                        // nothing to decode at all, the whole blob is simply
+                        // consumed and the mode closes.
+                        let outcome = self.dispatch_clock_key(&mut client);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
                     } else if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
@@ -2055,6 +2182,20 @@ impl Server {
                     // it.
                     if matches!(client.mode, ClientMode::DisplayPanes(_)) {
                         let outcome = self.dispatch_display_panes_key(&key, &mut client, &session_name);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
+                        continue;
+                    }
+                    // clock-mode (Task 10): same unconditional interception
+                    // as display-panes above -- "any key exits" per
+                    // `window-clock.c`'s own key handler, which has no key-
+                    // table lookup at all, so a completed prefix sequence
+                    // dismisses the overlay too, never running the bound
+                    // command underneath it.
+                    if matches!(client.mode, ClientMode::Clock(_)) {
+                        let outcome = self.dispatch_clock_key(&mut client);
                         dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                         if detach || destroy {
                             break 'events;
@@ -2186,6 +2327,9 @@ impl Server {
         // sequence, etc.) — re-check every client's copy mode after every
         // Stdin-driven dispatch batch.
         self.cancel_stale_copy_modes();
+        // Same idea for clock mode (Task 10): identical staleness rule to
+        // copy mode above.
+        self.cancel_stale_clock_modes();
         // Same idea for choose-tree's `pending_kill` (Task 8): a `y` from
         // this OR another client may have just removed the session/window
         // this client had a kill confirm armed on.
@@ -2247,6 +2391,7 @@ impl Server {
                 let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
                 Some(RenderOverlay::Digits(pane_digit_entries(session.current_window())))
             }
+            ClientMode::Clock(state) => Some(RenderOverlay::Clock { pane: state.pane, text: state.text.clone() }),
             _ => None,
         }
     }
@@ -2336,11 +2481,15 @@ fn render_one(
         // never has a message of its own beyond the digits themselves.
         ClientMode::ChooseTree(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::DisplayPanes(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::Clock(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::ChooseTree(state) => match &state.pending_kill {
             Some((_, prompt)) => Some(prompt.clone()),
             None => client.message.as_ref().map(|(msg, _)| msg.clone()),
         },
         ClientMode::DisplayPanes(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // clock-mode (Task 10): no message of its own -- the time is drawn
+        // directly on the pane, same as display-panes' digits.
+        ClientMode::Clock(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
@@ -2487,7 +2636,9 @@ fn render_one(
         // cursor has nothing sensible to sit on, so it's simply hidden
         // (same end effect `message.is_none()` gating already gives every
         // OTHER overlay/message case above).
-        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (None, false),
+        // clock-mode (Task 10): "Cursor is hidden" (`s->mode &= ~MODE_CURSOR`
+        // in `window-clock.c`) -- same treatment as the other two overlays.
+        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => (None, false),
         _ => match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
             (Some(r), Some(p)) => {
                 let (cx, cy) = p.grid.cursor();
@@ -2544,6 +2695,16 @@ fn render_one(
                 }
             }
             Overlay::PaneDigits(v)
+        }
+        RenderOverlay::Clock { pane, text } => {
+            // Falls back to a zero-size rect if the bound pane's rect can't
+            // be found (unreachable in practice -- `cancel_stale_clock_modes`
+            // already guarantees the pane is live and in the current window
+            // by the time a render happens -- but zero-size rects are always
+            // tolerated per the project's own "every consumer must tolerate
+            // w==0/h==0" rule, so `paint_clock` simply no-ops on it).
+            let rect = rects.iter().find(|(id, _)| id == pane).map(|(_, r)| *r).unwrap_or(Rect { x: 0, y: 0, w: 0, h: 0 });
+            Overlay::Clock(rect, text.clone(), options.clock_mode_colour())
         }
     });
 
@@ -2690,5 +2851,33 @@ mod config_discovery_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, PathBuf::from("real.conf"));
         assert!(got[0].required);
+    }
+}
+
+/// Task 10 (clock-mode): the pure formatting seam `format_clock` -- unit
+/// tested directly (no wall-clock, no server/client plumbing) against the
+/// exact strings pinned by `docs/tmux-reference/status-line-and-
+/// messages.md` `## 6. Clock mode`.
+#[cfg(test)]
+mod format_clock_tests {
+    use super::format_clock;
+
+    #[test]
+    fn style_24_zero_pads_both_fields() {
+        assert_eq!(format_clock(9, 5, false), "09:05");
+        assert_eq!(format_clock(0, 0, false), "00:00");
+        assert_eq!(format_clock(23, 59, false), "23:59");
+    }
+
+    /// `%l:%M ` + `AM`/`PM`: hour is SPACE-padded (not zero-padded, tmux's
+    /// `%l`), minute IS zero-padded, and AM/PM is appended directly after
+    /// the trailing space baked into the `%l:%M ` format (no extra space).
+    #[test]
+    fn style_12_space_pads_hour_and_appends_am_pm() {
+        assert_eq!(format_clock(0, 5, true), "12:05 AM"); // midnight -> 12 AM
+        assert_eq!(format_clock(9, 5, true), " 9:05 AM"); // single digit -> space-padded
+        assert_eq!(format_clock(12, 0, true), "12:00 PM"); // noon -> 12 PM
+        assert_eq!(format_clock(13, 34, true), " 1:34 PM");
+        assert_eq!(format_clock(23, 59, true), "11:59 PM");
     }
 }

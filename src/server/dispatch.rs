@@ -37,11 +37,11 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key, send_msg,
-    spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
-    ClientState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode, PromptKind,
-    SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL,
-    MOUSE_WHEEL_STEP,
+    advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
+    send_msg, spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
+    ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode,
+    PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
+    MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::{Cell, Grid, Style};
 use std::time::Duration;
@@ -1993,7 +1993,17 @@ impl Server {
         }
         if matches!(
             client.mode,
-            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
+            ClientMode::ConfirmCmd { .. }
+                | ClientMode::Prompt { .. }
+                | ClientMode::ChooseTree(_)
+                | ClientMode::DisplayPanes(_)
+                // clock-mode (Task 10): the reference doc documents no mouse
+                // behavior for window-clock (its mode struct defines no
+                // mouse callback) -- swallowed here as the safe default,
+                // same as every other momentary overlay, rather than
+                // falling through to ordinary pane click/drag/wheel
+                // handling underneath a mode the user can't see through.
+                | ClientMode::Clock(_)
         ) {
             // #64: a drag armed before the overlay opened (keyboard-
             // triggered mid-drag) must not survive across the overlay's
@@ -3113,6 +3123,7 @@ impl Server {
             FindWindow { pattern } => self.exec_find_window(pattern, None),
             ChooseTree { .. } => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
+            ClockMode => Err("no current client".to_string()),
         }
     }
 
@@ -3297,6 +3308,7 @@ impl Server {
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
+            ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
         }
     }
 
@@ -3338,12 +3350,14 @@ impl Server {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
             // Copy mode (Task 2) without an open search prompt, and
-            // choose-tree/display-panes (Task 8), never arm raw capture
-            // (`set_capture`) — their keys flow through the normal
-            // `KeyInputEvent::Key`/`Forward` path with a table override (see
-            // `handle_stdin`), not `Captured` bytes. This arm exists only
-            // for match-exhaustiveness.
-            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (true, None),
+            // choose-tree/display-panes/clock-mode (Tasks 8, 10), never arm
+            // raw capture (`set_capture`) — their keys flow through the
+            // normal `KeyInputEvent::Key`/`Forward` path with a table
+            // override (see `handle_stdin`), not `Captured` bytes. This arm
+            // exists only for match-exhaustiveness.
+            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => {
+                (true, None)
+            }
         }
     }
 
@@ -4067,6 +4081,21 @@ impl Server {
         ExecOutcome::Ok(String::new())
     }
 
+    /// Route one decoded key to the acting client's clock-mode overlay
+    /// (Task 10): unconditionally dismisses -- `docs/tmux-reference/
+    /// status-line-and-messages.md` `## 6. Clock mode`'s "any key exits"
+    /// (`window_clock_key` calls `window_pane_reset_mode` for literally
+    /// every key, `window-clock.c:213-219` -- no key-table lookup at all)
+    /// -- so unlike display-panes' digit/non-digit split above, there is no
+    /// case where the key does anything OTHER than close the overlay.
+    pub(super) fn dispatch_clock_key(&mut self, client: &mut ClientState) -> ExecOutcome {
+        if !matches!(client.mode, ClientMode::Clock(_)) {
+            return ExecOutcome::Ok(String::new());
+        }
+        client.mode = ClientMode::Normal;
+        ExecOutcome::Ok(String::new())
+    }
+
     /// `choose-tree [-s|-w]` (Task 8): opens the overlay, replacing whatever
     /// mode the client was previously in (matches copy mode's own entry
     /// behavior — no special-casing for "already in copy mode"/"prompt open"
@@ -4111,6 +4140,24 @@ impl Server {
     fn exec_display_panes_client(&mut self, ms: Option<u32>, client: &mut ClientState) -> ExecOutcome {
         let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or_else(|| self.options.display_panes_time());
         client.mode = ClientMode::DisplayPanes(DisplayPanesState { deadline: Instant::now() + dur });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// `clock-mode` (Task 10): opens the overlay on the acting client's
+    /// CURRENTLY FOCUSED pane (binds to that pane id for the mode's
+    /// lifetime, mirroring `exec_copy_mode`'s own "binds to the pane
+    /// focused at entry" rule), with the display string built immediately
+    /// from the current time (`clock-mode-style`-governed, see
+    /// `format_clock`) so the very first render has something to draw
+    /// rather than waiting for the next `Tick`.
+    fn exec_clock_mode_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let pane = match self.registry.session_mut(session_name) {
+            Some(s) => s.current_window().layout.focused(),
+            None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
+        };
+        let now = system_time_parts();
+        let text = format_clock(now.hour, now.min, self.options.clock_mode_style_12());
+        client.mode = ClientMode::Clock(ClockState { pane, text });
         ExecOutcome::Ok(String::new())
     }
 }
@@ -4259,6 +4306,7 @@ mod mouse_dispatch_tests {
                 ClientMode::ConfirmCmd { .. } => "ConfirmCmd",
                 ClientMode::ChooseTree(_) => "ChooseTree",
                 ClientMode::DisplayPanes(_) => "DisplayPanes",
+                ClientMode::Clock(_) => "Clock",
             }
         );
     }

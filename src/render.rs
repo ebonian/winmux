@@ -142,6 +142,15 @@ pub struct ListOverlay {
 pub enum Overlay {
     List(ListOverlay),
     PaneDigits(Vec<(Rect, u32, bool)>),
+    /// clock-mode (Task 10, sub-project 6 wave 2, `prefix-t`): the bound
+    /// pane's rect, its already-formatted time string (`server::
+    /// format_clock` -- the render layer never touches wall-clock, matching
+    /// `PaneDigits`' own "server resolves identity, render only paints"
+    /// split), and the resolved `clock-mode-colour`. See
+    /// [`Renderer::paint_clock`] for the exact drawing rule
+    /// (`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
+    /// mode`).
+    Clock(Rect, String, Color),
 }
 
 pub struct Scene<'a> {
@@ -584,6 +593,9 @@ impl Renderer {
                     self.paint_pane_digit(*rect, *digit, style, cols, rows);
                 }
             }
+            Some(Overlay::Clock(rect, text, colour)) => {
+                self.paint_clock(*rect, text, *colour, cols, rows);
+            }
         }
     }
 
@@ -617,6 +629,77 @@ impl Renderer {
             let y = rect.y + rect.h / 2;
             if x < cols && y < rows {
                 self.set(x, y, Cell { ch, style });
+            }
+        }
+    }
+
+    /// Paint clock-mode's (Task 10, `prefix-t`) big-digit time display into
+    /// `rect`, per `docs/tmux-reference/status-line-and-messages.md`
+    /// `## 6. Clock mode` (`window_clock_draw_screen`, `window-clock.c:222-
+    /// 315`): the whole rect is first cleared to the default style
+    /// (`clearscreen(8)` -- the mode replaces the pane's normal content,
+    /// mirroring `Overlay::List`'s own full-panel clear, just scoped to one
+    /// pane's rect instead of the whole client area), then EITHER:
+    /// - a 5x5 block-glyph rendering of `text` (glyph pitch 6 columns,
+    ///   needs `rect.w >= 6 * text.chars().count()` and `rect.h >= 6`, the
+    ///   doc's exact big-digit-mode size guard), in `colour` used as BOTH fg
+    ///   and bg for a solid block (reproduced here, like `paint_pane_digit`'s
+    ///   own block font, as a blank cell with `bg` set -- a space glyph has
+    ///   no visible foreground pixels either way, so this is visually
+    ///   identical to "both fg and bg painted"); origin `ox = rect.x +
+    ///   rect.w/2 - 3*len`, `oy = rect.y + rect.h/2 - 3` (the doc's exact
+    ///   centering formula, safe from underflow given the size guard above);
+    /// - OR, when too small for that but `text` still fits on one row, the
+    ///   plain `text` centered in `colour` (fg only, doc's documented
+    ///   fallback);
+    /// - OR nothing at all (rect too small even for the fallback, or
+    ///   zero-size) -- matching the doc's "nothing if even that doesn't
+    ///   fit".
+    fn paint_clock(&mut self, rect: Rect, text: &str, colour: Color, cols: u16, rows: u16) {
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        let default_style = Style::default();
+        for y in rect.y..rect.y + rect.h {
+            for x in rect.x..rect.x + rect.w {
+                if x < cols && y < rows {
+                    self.set(x, y, Cell { ch: ' ', style: default_style });
+                }
+            }
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len() as u16;
+        if len == 0 {
+            return;
+        }
+        if rect.w >= 6 * len && rect.h >= 6 {
+            let block_style = Style { bg: colour, ..default_style };
+            let ox = rect.x + rect.w / 2 - 3 * len;
+            let oy = rect.y + rect.h / 2 - 3;
+            for (i, ch) in chars.iter().enumerate() {
+                let gx = ox + i as u16 * 6;
+                for (dy, row) in clock_glyph_bitmap(*ch).iter().enumerate() {
+                    for (dx, gc) in row.chars().enumerate() {
+                        if gc != '#' {
+                            continue;
+                        }
+                        let x = gx + dx as u16;
+                        let y = oy + dy as u16;
+                        if x < cols && y < rows {
+                            self.set(x, y, Cell { ch: ' ', style: block_style });
+                        }
+                    }
+                }
+            }
+        } else if rect.w >= len {
+            let fg_style = Style { fg: colour, ..default_style };
+            let ox = rect.x + (rect.w - len) / 2;
+            let oy = rect.y + rect.h / 2;
+            for (i, ch) in chars.iter().enumerate() {
+                let x = ox + i as u16;
+                if x < cols && oy < rows {
+                    self.set(x, oy, Cell { ch: *ch, style: fg_style });
+                }
             }
         }
     }
@@ -747,6 +830,34 @@ fn digit_bitmap(digit: u32) -> [&'static str; 5] {
         8 => ["#####", "#...#", "#####", "#...#", "#####"],
         9 => ["#####", "#...#", "#####", "....#", "#####"],
         _ => ["", "", "", "", ""],
+    }
+}
+
+/// clock-mode's (Task 10, sub-project 6 wave 2) 5x5 block-glyph font: real
+/// tmux's clock and display-panes big-digit fonts are the SAME table
+/// (`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock mode`:
+/// "This is the same 5x5 table display-panes uses for its big pane
+/// numbers") -- winmux's own `digit_bitmap` above is already a from-scratch
+/// substitute for tmux's exact bitmap (not a byte-for-byte port, see its own
+/// doc comment), so this reproduces that SAME winmux-internal precedent:
+/// digits `0`-`9` delegate straight to [`digit_bitmap`] (one font family,
+/// shared between the two overlays, exactly like real tmux's), and `:`/`A`/
+/// `P`/`M` (needed for the `12`-style `%l:%M ` + `AM`/`PM` display, which
+/// `display-panes` never needed) are new winmux-original glyphs in the same
+/// 5x5 style. Any other character (a literal space, from the `12`-style
+/// format's `%l:%M ` separator) falls back to all-blank -- correct behavior
+/// for that specific case, since the rect was already cleared to blank by
+/// `paint_clock` before glyphs are painted.
+fn clock_glyph_bitmap(ch: char) -> [&'static str; 5] {
+    if let Some(d) = ch.to_digit(10) {
+        return digit_bitmap(d);
+    }
+    match ch {
+        ':' => [".....", "..#..", ".....", "..#..", "....."],
+        'A' => ["..#..", ".#.#.", "#####", "#...#", "#...#"],
+        'P' => ["#####", "#...#", "#####", "#....", "#...."],
+        'M' => ["#...#", "##.##", "#.#.#", "#...#", "#...#"],
+        _ => [".....", ".....", ".....", ".....", "....."],
     }
 }
 
@@ -1777,6 +1888,96 @@ mod tests {
         assert_eq!(r.back_cell(1, 1).ch, '7');
         assert_eq!(r.back_cell(1, 1).style.bg, Color::Idx(4));
         // nowhere else touched
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+    }
+
+    /// clock-mode's (Task 10) big-digit block rendering, `text = "12:34"`
+    /// (5 chars) in a rect sized exactly to the big-digit-mode threshold:
+    /// `rect.w == 6 * 5 == 30`, `rect.h == 6`. Per `paint_clock`'s doc
+    /// comment: `ox = 0 + 30/2 - 3*5 = 0`, `oy = 0 + 6/2 - 3 = 0`, glyph
+    /// pitch 6 columns, so glyph `i` starts at column `i*6`.
+    ///
+    /// Glyph 0 ('1', `gx=0`) per `digit_bitmap(1)` = `["..#..", ".##..",
+    /// "..#..", "..#..", "#####"]` -> on-cells `(2,0) (1,1) (2,1) (2,2)
+    /// (2,3) (0,4) (1,4) (2,4) (3,4) (4,4)`.
+    /// Glyph 2 (':', `gx=12`) per `clock_glyph_bitmap(':')` = `[".....",
+    /// "..#..", ".....", "..#..", "....."]` -> on-cells `(14,1) (14,3)`
+    /// (column `12+2`).
+    /// All "on" cells are a blank space char in `colour` used as BOTH fg
+    /// AND bg (a solid block -- `bg` is what actually renders it, per the
+    /// doc's "both fg and bg set to the clock colour" rule for a
+    /// space-glyph block).
+    #[test]
+    fn clock_overlay_draws_big_digits() {
+        let g = grid_with(30, 6, b"");
+        let blue = Color::Idx(4);
+        let scene = Scene {
+            size: (30, 6),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 30, h: 6 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::Clock(Rect { x: 0, y: 0, w: 30, h: 6 }, "12:34".to_string(), blue)),
+        };
+        let mut r = Renderer::new(30, 6);
+        r.compose_back(&scene);
+
+        let digit_one_on: &[(u16, u16)] = &[(2, 0), (1, 1), (2, 1), (2, 2), (2, 3), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)];
+        for &(x, y) in digit_one_on {
+            assert_eq!(r.back_cell(x, y).ch, ' ', "cell ({x},{y}) should be an 'on' block of the '1' glyph");
+            assert_eq!(r.back_cell(x, y).style.bg, blue, "cell ({x},{y}) should be clock-mode-colour");
+        }
+        let colon_on: &[(u16, u16)] = &[(14, 1), (14, 3)];
+        for &(x, y) in colon_on {
+            assert_eq!(r.back_cell(x, y).ch, ' ', "cell ({x},{y}) should be an 'on' block of the ':' glyph");
+            assert_eq!(r.back_cell(x, y).style.bg, blue, "cell ({x},{y}) should be clock-mode-colour");
+        }
+        // An "off" cell inside the '1' glyph's bounding box, and a cell
+        // outside every glyph's pitch entirely, are both left at the
+        // rect-clear default (blank, default style) -- not the block colour.
+        assert_eq!(r.back_cell(0, 0).ch, ' ');
+        assert_eq!(r.back_cell(0, 0).style, Style::default());
+        assert_eq!(r.back_cell(29, 5).style, Style::default());
+    }
+
+    /// A rect too small for the big-digit threshold (below `6 * len` wide or
+    /// `6` tall) falls back to the plain time string centered on one row, fg
+    /// only (not a filled block) -- `docs/tmux-reference/status-line-and-
+    /// messages.md` `## 6. Clock mode`'s documented fallback.
+    #[test]
+    fn clock_overlay_small_fallback_plain_text() {
+        let g = grid_with(7, 3, b"");
+        let blue = Color::Idx(4);
+        let scene = Scene {
+            size: (7, 3),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 7, h: 3 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            overlay: Some(Overlay::Clock(Rect { x: 0, y: 0, w: 7, h: 3 }, "12:34".to_string(), blue)),
+        };
+        let mut r = Renderer::new(7, 3);
+        r.compose_back(&scene);
+        // ox = 0 + (7-5)/2 = 1, oy = 0 + 3/2 = 1
+        let expected = "12:34";
+        for (i, ch) in expected.chars().enumerate() {
+            let cell = r.back_cell(1 + i as u16, 1);
+            assert_eq!(cell.ch, ch, "column {i} of the fallback row");
+            assert_eq!(cell.style.fg, blue, "fallback text is fg-only clock-mode-colour");
+            assert_eq!(cell.style.bg, Color::Default, "fallback text must NOT be a filled block");
+        }
+        // Rect was still cleared first: an untouched cell above the text row.
         assert_eq!(r.back_cell(0, 0).ch, ' ');
         assert_eq!(r.back_cell(0, 0).style, Style::default());
     }

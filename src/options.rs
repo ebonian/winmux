@@ -153,6 +153,12 @@ const SPECS: &[Spec] = &[
     // Bare colour token (like `display-panes-colour` above), not a full
     // style string -- stored as `Str`, parsed on read via `style::parse_color`.
     Spec { name: "clock-mode-colour", kind: Kind::Str, choices: &[] },
+    // clock-mode (Task 10, sub-project 6 wave 2): 12-/24-hour format
+    // selector. Real tmux's choice set is `12 | 24 | 12-with-seconds |
+    // 24-with-seconds` (`docs/tmux-reference/status-line-and-messages.md`
+    // `## 6. Clock mode`); winmux implements only the plain two, a
+    // documented task-scope simplification (no seconds-resolution display).
+    Spec { name: "clock-mode-style", kind: Kind::Choice, choices: &["12", "24"] },
     Spec { name: "window-status-bell-style", kind: Kind::Style, choices: &[] },
     Spec { name: "window-status-separator", kind: Kind::Str, choices: &[] },
     Spec { name: "status-justify", kind: Kind::Choice, choices: &["left", "centre", "right", "absolute-centre"] },
@@ -258,6 +264,10 @@ fn default_value(name: &str) -> Value {
         "bell-action" => Value::Choice("any"),
         "monitor-activity" => Value::Flag(false),
         "clock-mode-colour" => Value::Str("blue".to_string()),
+        // Verified against the reference doc's options appendix
+        // (`## 9`/options-table.c:1342-1348): default is `24`, same as
+        // classic tmux's narrower 12/24-only choice set.
+        "clock-mode-style" => Value::Choice("24"),
         "window-status-bell-style" => {
             let s = "reverse";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
@@ -728,6 +738,13 @@ impl Options {
     /// [`Options::display_panes_colour`].
     pub fn clock_mode_colour(&self) -> Color {
         style::parse_color(&self.str_ref("clock-mode-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    /// `clock-mode-style` (Task 10, sub-project 6 wave 2): `true` = `12`
+    /// (`%l:%M ` + `AM`/`PM`), `false` = the `24` default (`%H:%M`) -- see
+    /// `server::format_clock`, which this selects between.
+    pub fn clock_mode_style_12(&self) -> bool {
+        matches!(self.values.get("clock-mode-style"), Some(Value::Choice("12")))
     }
 
     /// `window-status-bell-style` (SP6 Task 2): style for a window tab with
@@ -1293,6 +1310,21 @@ mod tests {
         }
     }
 
+    /// Task 10 (clock-mode): `clock-mode-style`'s default and `set`
+    /// round-trip. `Choice`-kind validation rejects an out-of-set value
+    /// (`12-with-seconds` is a real tmux choice this task deliberately
+    /// doesn't implement -- see the `SPECS` entry's doc comment).
+    #[test]
+    fn clock_mode_style_getter_and_roundtrip() {
+        let mut o = Options::new();
+        assert!(!o.clock_mode_style_12());
+        o.set("clock-mode-style", Some("12"), false, false).unwrap();
+        assert!(o.clock_mode_style_12());
+        o.set("clock-mode-style", Some("24"), false, false).unwrap();
+        assert!(!o.clock_mode_style_12());
+        assert!(o.set("clock-mode-style", Some("12-with-seconds"), false, false).is_err());
+    }
+
     #[test]
     fn copy_mode_getters() {
         let mut o = Options::new();
@@ -1416,6 +1448,7 @@ mod tests {
         assert!(o.monitor_activity());
         o.set("clock-mode-colour", Some("green"), false, false).unwrap();
         assert_eq!(o.clock_mode_colour(), Color::Idx(2));
+        assert!(!o.clock_mode_style_12()); // default 24
         o.set("window-status-separator", Some("|"), false, false).unwrap();
         assert_eq!(o.window_status_separator(), "|");
         o.set("status-justify", Some("centre"), false, false).unwrap();

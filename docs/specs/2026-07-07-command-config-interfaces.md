@@ -1831,3 +1831,82 @@ followed the WINDOW OBJECT) and `swap_window_without_d_keeps_focus_on_index`
 (the no-`-d` case: after the same swap, the OTHER window's content becomes
 visible without any explicit `select-window`, proving focus stayed on the
 same INDEX/slot).
+
+## `clock-mode` — clock-mode command + `clock-mode-style` option (sub-project 6, Task 10)
+
+Adds `ParsedCmd::ClockMode` (zero fields) to the `cmd` enum locked above
+(Task 3), a `clock-mode-style` option (`options`), and a `t` prefix-table
+default (`bindings`) -- closing the `prefix-t` gap flagged by the SP6 gap
+analysis (`clock-mode-colour` already existed, accepted-and-stored but
+inert, from Task 2; clock-mode itself did not). Full spec:
+`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock mode`. The
+overlay STATE/RENDER machinery (`ClientMode::Clock`, `RenderOverlay::Clock`,
+`render::Overlay::Clock`, `Renderer::paint_clock`) is documented in the
+parity-polish contract doc's `## overlays` section amendment (Task 10),
+alongside the pre-existing choose-tree/display-panes machinery it mirrors --
+not repeated here.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `clock-mode`: open the big-clock overlay on the acting client's
+    /// current window, on the pane FOCUSED at entry (mirrors `copy-mode`'s
+    /// own "binds to the pane focused at entry" rule).
+    ClockMode,
+}
+```
+
+- `canonical()`: `"clock-mode" => "clock-mode"` (no alias — matches real
+  tmux, which has none either).
+- `usage("clock-mode")`: `"usage: clock-mode"`.
+- `resolve`: `scan_flags` with no bools/values and no positionals — ANY
+  argument (including tmux's own `-t target-pane`) is a usage error. This is
+  a documented deviation: real tmux's `clock-mode [-t target-pane]` is not
+  modeled, following `display-panes`' own established precedent of a
+  client-scoped, no-target overlay command (`## overlays`,
+  `2026-07-07-parity-polish-interfaces.md`) — winmux's overlay lives in
+  per-CLIENT state (`ClientMode::Clock`), not addressable by an arbitrary
+  target pane the way a real command target is. `Err("no current client")`
+  from the headless (CLI/`.tmux.conf`) execution path, same rule as
+  `copy-mode`/`copy-*`/`choose-tree`/`display-panes`. Test: `clock_mode_no_args`.
+
+### `options` (`src/options.rs`)
+
+One new `Spec`:
+
+| Name | Kind | Default |
+|---|---|---|
+| `clock-mode-style` | Choice (`12`, `24`) | `24` |
+
+Real tmux's choice set is `12 \| 24 \| 12-with-seconds \| 24-with-seconds`
+(`docs/tmux-reference/status-line-and-messages.md` `## 6`/`## 9`); winmux
+implements only the plain two, a documented task-scope simplification (no
+seconds-resolution display).
+
+```rust
+impl Options {
+    /// `true` = `12` (`%l:%M ` + `AM`/`PM`), `false` = the `24` default
+    /// (`%H:%M`).
+    pub fn clock_mode_style_12(&self) -> bool;
+}
+```
+
+### `bindings` (`src/bindings.rs`)
+
+One new prefix-table default:
+
+| Key | Command |
+|---|---|
+| `t` | `clock-mode` |
+
+Matches real tmux's own default (`key-bindings.c:433`).
+
+Tests: `clock_mode_no_args` (`cmd`), `clock_mode_style_getter_and_roundtrip`
+(`options`), `defaults_cover_current_behavior`'s `("t", "clock-mode", &[],
+false)` entry (`bindings`), `clock_mode_opens_and_any_key_exits`
+(`tests/server_proto.rs`, full-stack: opens on `prefix-t`, a completed
+prefix sequence typed while open both dismisses the overlay AND does not
+execute the bound command underneath it, pane content is genuinely
+restored afterward).

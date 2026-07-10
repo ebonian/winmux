@@ -5181,6 +5181,59 @@ fn display_panes_q_shows_digits_and_selects() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Task 10 (clock-mode, sub-project 6 wave 2): `prefix-t` opens the overlay
+/// (big-digit blocks in `clock-mode-colour`, default blue `Color::Idx(4)`
+/// -- an 80x23 pane comfortably clears the big-digit-mode threshold for the
+/// default `24`-style 5-char `HH:MM` string, `w >= 6*5 == 30`, `h >= 6`);
+/// per `docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
+/// mode`'s "any key exits" rule, a completed PREFIX SEQUENCE typed while
+/// clock mode is open (`C-b c`, normally bound to `new-window`) both closes
+/// the overlay AND must NOT run `new-window` underneath it -- the same
+/// "other key dismisses, and is NOT reprocessed" interception display-panes
+/// uses (`display_panes_prefix_sequence_dismisses_without_executing_bound_command`),
+/// proving the exiting keystroke is swallowed by the overlay rather than
+/// falling through to ordinary prefix-binding dispatch.
+#[test]
+fn clock_mode_opens_and_any_key_exits() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // prefix-t: the clock overlay opens, painting big-digit blocks in
+    // clock-mode-colour (default blue).
+    c.send(&ClientMsg::Stdin(vec![0x02, b't']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // A full prefix sequence typed WHILE clock mode is open (`C-b c`, bound
+    // to new-window): the overlay must dismiss (blue blocks disappear,
+    // pane content restored) AND `new-window` must NOT execute underneath
+    // it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Confirm from a fresh CLI connection (avoids racing this client's own
+    // redraw): still exactly one window.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "0".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(
+        out.lines().filter(|l| !l.is_empty()).count(),
+        1,
+        "new-window bound under C-b c must NOT have executed while clock mode was open: {out:?}"
+    );
+
+    // Pane content is genuinely restored (not just "no more blue"): a
+    // marker typed now round-trips through the shell normally.
+    c.send(&ClientMsg::Stdin(b"restored\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "restored").is_some());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn choose_tree_w_lists_and_switches() {
     let name = unique_pipe_name();

@@ -325,6 +325,16 @@ pub enum ParsedCmd {
     /// `display-panes-time` option's current value (resolved at dispatch
     /// time, not here).
     DisplayPanes { ms: Option<u32> },
+    /// `clock-mode` (Task 10, sub-project 6 wave 2): open the big-clock
+    /// overlay on the acting client's current window, on the FOCUSED pane
+    /// (mirrors `copy-mode`'s "binds to the pane focused at entry" rule —
+    /// see the `server` amendment in the parity-polish contract doc).
+    /// No flags: real tmux's `clock-mode [-t target-pane]` is not modeled
+    /// here, following `display-panes`' own precedent of a client-scoped,
+    /// no-target overlay command (`## overlays` design-spec section) —
+    /// winmux's overlay lives in per-CLIENT state, not addressable by an
+    /// arbitrary target pane.
+    ClockMode,
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
@@ -571,6 +581,7 @@ fn canonical(name: &str) -> Option<&'static str> {
         "find-window" | "findw" => "find-window",
         "choose-tree" | "choosetree" => "choose-tree",
         "display-panes" | "displayp" => "display-panes",
+        "clock-mode" => "clock-mode",
         _ => return None,
     })
 }
@@ -638,6 +649,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "find-window" => "usage: find-window pattern",
         "choose-tree" => "usage: choose-tree [-s] [-w]",
         "display-panes" => "usage: display-panes [-d ms]",
+        "clock-mode" => "usage: clock-mode",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -1219,6 +1231,13 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             };
             Ok(ParsedCmd::DisplayPanes { ms })
         }
+        "clock-mode" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ClockMode)
+        }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
 }
@@ -1654,6 +1673,18 @@ mod tests {
         );
         assert_eq!(resolve(&raw("display-panes", &["-d", "nope"])).unwrap_err(), usage("display-panes").unwrap());
         assert_eq!(resolve(&raw("display-panes", &["extra"])).unwrap_err(), usage("display-panes").unwrap());
+    }
+
+    /// Task 10 (clock-mode, sub-project 6 wave 2): bare `clock-mode` parses
+    /// to the zero-field `ClockMode` variant; any argument (winmux does not
+    /// implement real tmux's `-t target-pane`, see the variant's doc
+    /// comment) is a usage error.
+    #[test]
+    fn clock_mode_no_args() {
+        assert_eq!(resolve(&raw("clock-mode", &[])).unwrap(), ParsedCmd::ClockMode);
+        assert_eq!(resolve(&raw("clock-mode", &["-t", "1"])).unwrap_err(), usage("clock-mode").unwrap());
+        assert_eq!(resolve(&raw("clock-mode", &["extra"])).unwrap_err(), usage("clock-mode").unwrap());
+        assert_eq!(usage("clock-mode").unwrap(), "usage: clock-mode");
     }
 
     #[test]

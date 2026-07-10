@@ -2197,6 +2197,202 @@ selection starting point (a `Down`-from-row-0 assumption is now wrong when
 the default selection is already the current, often LAST, row) — see the
 task report for the specific before/after reasoning per test.
 
+## `clock-mode` — clock-mode overlay (sub-project 6 wave 2, Task 10)
+
+Implements `docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
+mode`. Architecturally the `overlays` section above's THIRD sibling: same
+shape as `DisplayPanes` (a `ClientMode` variant + `RenderOverlay` variant +
+`render::Overlay` variant + a `dispatch_*_key` interception helper), but
+bound to a SPECIFIC PANE like `Copy` rather than covering every pane of the
+current window, and with no auto-dismiss deadline (`DisplayPanesState`'s
+`deadline` has no clock-mode counterpart — the ONLY way out is a keypress).
+The `cmd`/`options`/`bindings` additions (`ParsedCmd::ClockMode`,
+`clock-mode-style`, the `t` default binding) are documented in the
+command-config contract doc's own `## clock-mode` amendment — not repeated
+here.
+
+### `server` amendment: `ClientMode::Clock` + `ClockState`
+
+One new variant, alongside the pre-existing `ChooseTree`/`DisplayPanes`:
+
+```rust
+enum ClientMode {
+    // ...
+    Clock(ClockState),
+}
+
+struct ClockState {
+    /// The pane clock mode was entered on (mirrors `CopyState::pane`) --
+    /// kept explicit rather than "whatever's focused now" even though, in
+    /// practice, nothing inside clock mode can change focus before the
+    /// mode exits (ANY key immediately does).
+    pane: PaneId,
+    /// The CURRENTLY DISPLAYED, already-formatted time string (see
+    /// `format_clock` below) -- render just draws this verbatim. THE
+    /// TESTABILITY SEAM: a render unit test injects a fixed string here
+    /// (via `render::Overlay::Clock`, one layer down) and never touches
+    /// wall-clock.
+    text: String,
+}
+
+/// Pure formatting per `clock-mode-style`: `style12 == false` (the `24`
+/// default) -> `%H:%M` (zero-padded); `style12 == true` -> `%l:%M ` (`%l`
+/// = SPACE-padded, not zero-padded, 12-hour -- a POSIX strftime extension
+/// Windows lacks, special-cased here per the doc's `## 10`
+/// "Windows/winmux applicability" note) immediately followed by `AM`/`PM`
+/// with no extra space (`window-clock.c`'s literal `strftime(..., "%l:%M
+/// ", tm)` + `strcat` of `"AM"`/`"PM"`). Unit tested directly
+/// (`style_24_zero_pads_both_fields`, `style_12_space_pads_hour_and_
+/// appends_am_pm`) -- the one piece of this feature exercisable without
+/// wall-clock OR the client/render plumbing.
+fn format_clock(hour24: u8, minute: u8, style12: bool) -> String;
+```
+
+Entry (`exec_clock_mode_client`, mirrors `exec_copy_mode`'s "binds to the
+pane focused at entry" rule exactly): resolves the acting client's current
+window's focused pane, builds `text` immediately from the current time
+(`system_time_parts()` + `options.clock_mode_style_12()`) so the very first
+render has something to draw rather than waiting for the next `Tick`, and
+sets `client.mode = ClientMode::Clock(ClockState { pane, text })`.
+
+**Refresh (`Tick`):** the current formatted string is computed ONCE per
+50ms tick (same wall time for every client) and compared against each
+`Clock`-mode client's stored `text`; only an actual difference marks the
+client dirty and rebuilds `text` — matching real tmux's own "redraw only if
+the time actually changed" rule (`window-clock.c:146-168`). This is real-
+time-dependent and therefore UNTESTED at unit level beyond `format_clock`
+itself; the `tests/server_proto.rs` full-stack test below exercises the
+entry-time string only (not a live minute-rollover), a documented test-
+coverage gap matching the task brief's own note.
+
+**Staleness (`cancel_stale_clock_modes`):** verbatim mirror of
+`cancel_stale_copy_modes` — a client's clock mode resets to `Normal` if its
+bound pane no longer exists, or is no longer in that client's session's
+current window. Called from the same two sites as
+`cancel_stale_copy_modes`/`cancel_stale_choose_trees`.
+
+**Key interception (`dispatch_clock_key`):** unconditionally dismisses —
+`docs/tmux-reference/status-line-and-messages.md`'s "any key exits"
+(`window_clock_key` calls `window_pane_reset_mode` for literally every key,
+`window-clock.c:213-219`, no key-table lookup at all). Wired into
+`handle_stdin` at BOTH the `Forward`-blob site and the `Key{table,..}` site
+using the SAME unconditional interception `DisplayPanes` uses (even a
+completed PREFIX sequence dismisses the overlay without running the bound
+command underneath it — unlike `Copy` mode, which deliberately lets
+`Prefix`-table events pass through). Unlike `DisplayPanes`' digit/non-digit
+split, there is no case where the key does anything OTHER than close the
+overlay, so `dispatch_clock_key` takes no `key`/`session_name` parameter at
+all — simply `client: &mut ClientState`.
+
+**Mouse:** swallowed unconditionally, added to `dispatch_mouse`'s existing
+`ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` guard. The reference doc
+documents no mouse behavior for window-clock (tmux's own mode struct
+defines no mouse callback) — this is the safe default (same as every other
+momentary overlay) rather than falling through to ordinary pane click/
+drag/wheel handling underneath a mode the user can't see through; a
+documented judgment call, not a doc-cited rule.
+
+**Cursor:** hidden (`(None, false)`), added to the `ChooseTree`/
+`DisplayPanes` cursor-hiding match arm — matches the doc's "Cursor is
+hidden" (`s->mode &= ~MODE_CURSOR`).
+
+**Message:** none of its own (same as `DisplayPanes`) — the time is drawn
+directly on the pane. `too_small` still wins first, same precedence as
+every other overlay.
+
+### `server` amendment: `RenderOverlay::Clock`
+
+```rust
+enum RenderOverlay {
+    // ...
+    /// The bound pane's id (resolved to a current rect in `render_one`,
+    /// same as `Digits` does per-entry) and the already-formatted time
+    /// string (`ClockState::text`).
+    Clock { pane: PaneId, text: String },
+}
+```
+
+`build_render_overlay`'s `ClientMode::Clock(state) => Some(RenderOverlay::
+Clock { pane: state.pane, text: state.text.clone() })`. `render_one` turns
+this into `render::Overlay::Clock(rect, text, colour)` by resolving `pane`
+against the current window's rects (falling back to a zero-size rect —
+which `paint_clock` simply no-ops on — in the structurally-unreachable case
+the pane's rect can't be found; `cancel_stale_clock_modes` already
+guarantees liveness by render time) and reading `options.clock_mode_
+colour()`.
+
+### `render` amendment: `Overlay::Clock` + `Renderer::paint_clock`
+
+```rust
+pub enum Overlay {
+    // ...
+    /// The bound pane's rect, its already-formatted time string, and the
+    /// resolved `clock-mode-colour` -- carried directly in the variant
+    /// (unlike `PaneDigits`, which resolves colour via two `Scene` fields
+    /// for its active/inactive split) since clock mode only ever needs
+    /// ONE colour, so no new `Scene` field was needed.
+    Clock(Rect, String, Color),
+}
+```
+
+`Renderer::paint_clock(rect, text, colour, cols, rows)`
+(`window_clock_draw_screen`, `window-clock.c:222-315`):
+
+1. The whole `rect` is cleared to the default style first (`clearscreen(8)`
+   -- the mode replaces the pane's normal content, same idea as
+   `Overlay::List`'s full-panel clear, just scoped to one pane's rect).
+2. **Big-digit mode** (`rect.w >= 6 * text.chars().count()` AND `rect.h >=
+   6`, the doc's exact size guard): each character is drawn as a 5x5
+   block-glyph (see [`clock_glyph_bitmap`] below), glyph pitch 6 columns,
+   origin `ox = rect.x + rect.w/2 - 3*len`, `oy = rect.y + rect.h/2 - 3`
+   (the doc's exact centering formula; safe from underflow given the size
+   guard). Painted as a blank space cell with `colour` as `bg` (visually a
+   solid block — a space glyph has no visible foreground pixels either
+   way, so this reproduces the doc's "both fg and bg set to the clock
+   colour" rule without literally drawing `#` characters).
+3. **Fallback** (too small for step 2, but `text` still fits on one row):
+   the plain string centered on the rect's middle row, `colour` as `fg`
+   ONLY (not a filled block) — the doc's documented fallback.
+4. **Nothing** (rect too small even for step 3, or zero-size): the clear
+   from step 1 is all that happens.
+
+```rust
+/// Real tmux's clock and display-panes big-digit fonts are the SAME table
+/// (the doc: "This is the same 5x5 table display-panes uses for its big
+/// pane numbers") -- winmux's own `digit_bitmap` is ALREADY a from-scratch
+/// substitute for tmux's exact bitmap (documented in that function's own
+/// doc comment, not a byte-for-byte port), so this reproduces that SAME
+/// winmux-internal precedent instead: digits `0`-`9` delegate straight to
+/// `digit_bitmap` (one font family, shared between the two overlays,
+/// exactly like real tmux's), and `:`/`A`/`P`/`M` (needed for the `12`-
+/// style `%l:%M ` + `AM`/`PM` display, which `display-panes` never needed)
+/// are new winmux-original glyphs in the same 5x5 style. Font-shape
+/// DEVIATION FROM REAL TMUX, same documented category as `digit_bitmap`
+/// itself.
+fn clock_glyph_bitmap(ch: char) -> [&'static str; 5];
+```
+
+### Tests
+
+`src/render.rs`: `clock_overlay_draws_big_digits` (fixed `"12:34"` string,
+exact on-cell assertions for the `1` glyph and the `:` glyph, computed in
+comments from `digit_bitmap`/`clock_glyph_bitmap`, in a rect sized exactly
+to the big-digit threshold), `clock_overlay_small_fallback_plain_text`
+(below-threshold rect falls back to the plain centered string, fg only).
+`src/cmd.rs`: `clock_mode_no_args`. `src/options.rs`:
+`clock_mode_style_getter_and_roundtrip`. `src/bindings.rs`:
+`defaults_cover_current_behavior`'s `t` entry. `src/server.rs`:
+`format_clock_tests::{style_24_zero_pads_both_fields,
+style_12_space_pads_hour_and_appends_am_pm}` (the pure formatting seam,
+real-time-independent). `tests/server_proto.rs`:
+`clock_mode_opens_and_any_key_exits` (`prefix-t` opens the overlay —
+detected via a blue-background cell scan, same technique
+`display_panes_q_shows_digits_and_selects` uses, rather than pinning exact
+bitmap coordinates; a completed `C-b c` prefix sequence typed while open
+both dismisses the overlay AND does not execute `new-window` underneath it,
+confirmed via a fresh CLI `list-windows` connection; pane content is
+genuinely restored afterward, confirmed via a marker string round-trip).
+
 ## `naming` — escape-time disambiguation + automatic-rename (Task 9)
 
 Implements the design spec's `## 8. escape-time` and `## 9.
