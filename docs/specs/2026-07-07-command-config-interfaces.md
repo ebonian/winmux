@@ -614,30 +614,18 @@ impl Options {
 }
 
 impl Default for Options { fn default() -> Options; } // == Options::new()
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SystemTimeParts {
-    pub year: i32,   // full year, e.g. 2026
-    pub month: u8,   // 1-12
-    pub day: u8,
-    pub weekday: u8, // 0 = Sunday, matches Win32 SYSTEMTIME.wDayOfWeek
-    pub hour: u8,
-    pub min: u8,
-    pub sec: u8,
-}
-
-pub struct FormatCtx<'a> {
-    pub session: &'a str,
-    pub window_index: u32,
-    pub window_name: &'a str,
-    pub window_flags: &'a str,
-    pub pane_index: u32,
-    pub hostname: &'a str,
-    pub now: SystemTimeParts,
-}
-
-pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String;
 ```
+
+**SP7 Task 1 amendment:** `SystemTimeParts`/`FormatCtx`/`expand_format`
+moved OUT of this module into a new `crate::format` module (general tmux
+format-expansion engine — see the `## format` section, at the end of this
+file, for its full contract). `options::{SystemTimeParts, FormatCtx}` are
+now `pub use` re-exports of `crate::format`'s types (source-compat: every
+pre-existing `use crate::options::{FormatCtx, ...}` import site still
+resolves unchanged); `options::expand_format` is now a one-line delegate to
+`crate::format::expand`. The signature shown above for `expand_format`
+(`fn expand_format(fmt: &str, ctx: &FormatCtx) -> String`) is UNCHANGED —
+only ITS OWN body, and what grammar it evaluates, changed.
 
 Pure module: no I/O, `std` only. **Implementation module:** `src/options.rs`.
 Depends on `crate::keys` (`Key`/`parse_key`/`key_name`, the `prefix` option's
@@ -773,53 +761,22 @@ tracked in `docs/follow-ups.md`'s SP3-deferred list).
   per option, sorted alphabetically by name, joined with `\n` (no trailing
   newline).
 
-### `expand_format` (format-string subset)
+### `expand_format` (format-string grammar)
 
-Evaluated left-to-right over the input string, `#` and `%` are the only
-two meta characters (everything else copies through verbatim):
-
-| sequence | expands to |
-|---|---|
-| `##` | literal `#` |
-| `#S` | `ctx.session` |
-| `#I` | `ctx.window_index` (decimal) |
-| `#W` | `ctx.window_name` |
-| `#F` | `ctx.window_flags` |
-| `#P` | `ctx.pane_index` (decimal) |
-| `#H` | `ctx.hostname` |
-| `#{session_name}` | `ctx.session` |
-| `#{window_index}` | `ctx.window_index` (decimal) |
-| `#{window_name}` | `ctx.window_name` |
-| `#{<anything else>}` | empty (documented SP3 simplification — no
-  conditionals/modifiers, full tmux format-expression engine is SP4) |
-| `#[...]` | passed through VERBATIM, brackets included, up to and including
-  the first `]` (SP6 Task 4 addition — `#[fg=white]`-style inline style
-  markers are NOT interpreted by `expand_format`; they're left in the output
-  for `status::styled_runs` to split into styled spans afterward. An
-  unterminated marker — no closing `]` — is copied to end-of-string rather
-  than dropped) |
-| `#<any other char>`, trailing lone `#` | empty (unrecognized short code
-  consumes the one following character; a `#` with nothing after it is
-  dropped; this does NOT apply to `#[`, handled above) |
-| `%%` | literal `%` |
-| `%H` `%M` `%S` `%d` `%m` | zero-padded 2-digit hour/min/sec/day/month
-  from `ctx.now` |
-| `%Y` | full 4-digit year (`ctx.now.year`, not zero-padded/truncated) |
-| `%y` | 2-digit year (`ctx.now.year.rem_euclid(100)`, zero-padded) |
-| `%b` | 3-letter English month abbreviation (`Jan`..`Dec`) |
-| `%a` | 3-letter English weekday abbreviation (`Sun`..`Sat`, `ctx.now.weekday % 7` indexes the table) |
-| `%p` | `AM` if `hour < 12` else `PM` |
-| `%I` | 12-hour zero-padded hour (`0` hour -> `12`, otherwise `hour % 12`) |
-| `%<any other char>` | literal passthrough, BOTH characters kept (`%x`
-  stays `%x` — not an error, not expanded) |
-| trailing lone `%` | literal `%` |
-
-`%H:%M %d-%b-%y` reproduces `src/server.rs`'s `local_clock()` string exactly
-for equivalent inputs (verified by `expand_strftime`), which is why it was
-chosen as `status-right`'s default value (see the design spec deviation
-note). Unknown `#{...}` forms and unrecognized `#<c>` codes are silent
-(empty), matching the design spec's "anything else renders empty"
-directive — `expand_format` never returns an `Err`.
+**SP7 Task 1 amendment:** the SP3-era fixed subset formerly documented in
+this subsection (`#S`/`#I`/`#W`/`#F`/`#P`/`#H`, three long-form `#{...}`
+aliases, no conditionals/modifiers) is SUPERSEDED — `expand_format` now
+delegates to the general format engine in the new `crate::format` module.
+See the `## format` section at the end of this file for the full current
+grammar (braced variables, `#{?cond,true,false}` conditionals, string
+comparisons, `&&`/`||`, length-limit modifiers, single-char aliases,
+`##`/`#,`/`#}` escapes, `#[...]` style-marker passthrough, `%`-strftime
+passthrough) and its documented non-supported remainder. Every behavior the
+table above used to document is still true (it was a strict subset of what
+`crate::format::expand` does now) — nothing in this subsection is
+contradicted, it is just no longer the complete picture, so the full
+grammar is documented once, at the `format` module's own contract section,
+rather than duplicated/kept in sync in two places.
 
 ## `input-v2` — table-driven key machine (Task 5, sub-project 3)
 
@@ -1675,22 +1632,18 @@ colour token like `display-panes-colour`, default `blue`, parsed on read via
 `absolute-centre`, default `left`), `status-left-style` / `status-right-style`
 (Style, default the literal string `"default"` — see the `style` amendment
 above for why this now parses), `window-status-format` /
-`window-status-current-format` (Str, default `#I:#W#F` as of **SP6 Task 4**
-— originally stored verbatim as tmux's literal
-`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); Task 4
-changed the DEFAULT to `#I:#W#F` because the `expand_format` subset still
-does not evaluate a general `#{?cond,a,b}` conditional. The default is
-exposed as a new public const `options::DEFAULT_WINDOW_STATUS_FORMAT` (fix
-round 1): `status::status_spans` compares each tab's effective format
-against it and, on the default path ONLY, pads an EMPTY flags string to a
-single space before expansion — reproducing the tmux conditional's `, }`
-else-branch, so the DEFAULT rendering is byte-identical to real tmux for
-both flagged and flagless windows and tab widths are stable across focus
-changes. What REMAINS of the deviation: a CUSTOM format containing
-`#{?...}` still expands its conditional to empty (docs/follow-ups.md #70;
-the general format engine is deferred to the TPM plan,
-`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`)). All defaults
-verified against `commands-config-options-formats.md`'s options appendix.
+`window-status-current-format` (Str; **historical note, SUPERSEDED by SP7
+Task 1** — originally stored verbatim as tmux's literal
+`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); SP6 Task 4
+temporarily changed the DEFAULT to the conditional-free `#I:#W#F` plus a
+`status::status_spans`-side padding shim, because the `expand_format`
+subset at the time didn't evaluate a general `#{?cond,a,b}` conditional at
+all. SP7 Task 1's general format engine (`crate::format`, see the `##
+format` section) closed that gap: the default is back to tmux's literal
+string (`options::DEFAULT_WINDOW_STATUS_FORMAT`), the SP6 Task 4 shim is
+deleted, and CUSTOM formats containing `#{?...}` now evaluate correctly too
+— this closes docs/follow-ups.md #70). All defaults verified against
+`commands-config-options-formats.md`'s options appendix.
 `visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
 `window-status-bell-style` remain INERT (no alerts/bell/clock-mode subsystem
 exists — same bucket as `mouse`/`history-limit` before their own Tasks
@@ -1957,3 +1910,168 @@ Tests: `two_pane_vertical_divider_half_styled`,
 `three_pane_left_tall_right_split_general_rule_unchanged` (`render`);
 `pane_active_border_style_runtime` (`tests/server_proto.rs`, amended --
 see the Task 11 report for the sanctioned inversion).
+
+## `format` — general tmux format-expansion engine (SP7 Task 1, closes follow-ups #27/#70)
+
+**New module**, `src/format.rs`, replacing the fixed `#`/`%` subset that
+used to live inline in `src/options.rs`. Pure: no I/O, `std` only, no
+dependency on any other winmux module in non-test code (the `#[cfg(test)]`
+module reads `crate::options::DEFAULT_WINDOW_STATUS_FORMAT` as a fixture
+constant for one acceptance test).
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemTimeParts {
+    pub year: i32,   // full year, e.g. 2026
+    pub month: u8,   // 1-12
+    pub day: u8,
+    pub weekday: u8, // 0 = Sunday, matches Win32 SYSTEMTIME.wDayOfWeek
+    pub hour: u8,
+    pub min: u8,
+    pub sec: u8,
+}
+
+pub struct FormatCtx<'a> {
+    pub session: &'a str,
+    pub window_index: u32,
+    pub window_name: &'a str,
+    pub window_flags: &'a str,
+    pub pane_index: u32,
+    pub hostname: &'a str,
+    pub now: SystemTimeParts,
+    pub pane_title: &'a str,
+}
+
+pub fn expand(fmt: &str, ctx: &FormatCtx) -> String;
+```
+
+`FormatCtx`'s field set is UNCHANGED from the pre-SP7
+`options::FormatCtx` it replaces (see "Explicit scope decision" below for
+why no `client_*` fields were added in this task).
+
+**Delegation (`options.rs`):** `options::FormatCtx`/`options::
+SystemTimeParts` are now `pub use crate::format::{FormatCtx,
+SystemTimeParts};` re-exports (source-compat choice, not a per-caller
+import-path migration — see the decision note below); `options::
+expand_format(fmt, ctx)` is a one-line delegate to `format::expand(fmt,
+ctx)`. Every existing caller (`status::status_spans`, `server::render_one`,
+`server::dispatch`'s two `FormatCtx` construction sites) needed NO code
+changes beyond what this task's own file-scope restrictions required
+(`status.rs`'s per-window loop, `server.rs`'s `render_one`) — imports of
+`crate::options::{expand_format, FormatCtx}` etc. still resolve.
+
+**`options::DEFAULT_WINDOW_STATUS_FORMAT`** changes value: from the SP6
+Task 4 deviation `"#I:#W#F"` to tmux's REAL literal default,
+`"#I:#W#{?window_flags,#{window_flags}, }"` — now expressible because
+`format::expand` evaluates the `#{?cond,a,b}` conditional directly. The
+SP6 Task 4 padding shim that used to live in `status::status_spans`'s
+per-window loop (padding an empty flags string to one space, ONLY on the
+default-format path, to reproduce the conditional's else-branch by hand)
+is DELETED — the real conditional now produces the identical output on
+its own for both flagged and flagless windows. All pre-existing
+`status.rs` tests pinning this behavior (`three_windows_order_and_
+separators`, `window_status_separator_respected`, `default_format_
+flagless_window_pads_one_space`, `custom_format_flagless_window_not_
+padded`) pass UNMODIFIED except doc-comment wording (no expected-value
+changes) — proof the new engine is byte-identical to the old shim's
+output for every case the shim covered.
+
+### Supported grammar (implements `docs/tmux-reference/commands-config-options-formats.md`'s `## 5. Formats` section, §5.1-§5.4)
+
+- `#S #W #I #P #F #H #T` single-char aliases (unchanged); `##`/`#,`/`#}`
+  literal escapes (`#,`/`#}` are NEW — `##` was the only escape in the old
+  subset).
+- `#[...]` inline style markers, passed through byte-for-byte (unchanged
+  behavior, needed by `status::styled_runs`).
+- `#{variable}` braced long-form variables: `session_name`, `window_index`,
+  `window_name`, `window_flags`, `pane_index`, `pane_title` (all pre-
+  existing), plus NEW `host` (alias for `hostname`) and `host_short`
+  (leading dot-component of `hostname`, derived, not a stored field).
+  Unknown plain names -> empty (§5.3).
+- `#{?cond,true,false}` conditionals (§5.2), including chained pairs
+  (`#{?c1,v1,c2,v2,fallback}`) and nested `#{...}`/`#,` inside any arm.
+  `cond` truthiness: direct variable-name lookup first; if that fails,
+  `cond` is format-expanded and, if unchanged, treated as false (exact
+  §5.2 two-step rule).
+- String comparisons `#{==:a,b}` `#{!=:a,b}` `#{<:a,b}` `#{>:a,b}`
+  `#{<=:a,b}` `#{>=:a,b}` -> `"1"`/`"0"`, both sides format-expanded before
+  comparing. **Scope note:** the task brief's own parenthetical examples
+  named only `==`/`!=`; the reference doc's §5.3 table documents all six
+  string comparisons together as one row/dispatch shape, so all six are
+  implemented here (deliberate doc-over-brief scope call, flagged per the
+  task's "ambiguous -> flag it, prefer the doc" instruction).
+- N-ary boolean `#{&&:a,b,...}` / `#{||:a,b,...}`, same truthiness rule as
+  a conditional's `cond` applied to each comma-separated operand.
+- Length-limit modifier `#{=N:x}` (keep the left `N` chars) / `#{=-N:x}`
+  (keep the right `N` chars) — no-op if `x` already fits. No marker-string
+  variant (`#{=/N/marker:x}`) — see non-supported remainder below. This is
+  what makes tmux's real `window-status-format` default (above) AND real
+  `status-right` default (`#{=21:pane_title}`) expand correctly for the
+  first time; `options::default_value("status-right")` is UNCHANGED in
+  this task (still the SP2-compatible `"%H:%M %d-%b-%y"`, no `#{=21:
+  pane_title}` prefix) — the engine now COULD expand tmux's real string
+  correctly, but changing that option's stored default was out of this
+  task's scope (not named in the brief; `window-status-format`'s default
+  change was explicitly named).
+- `%`-strftime passthrough: unchanged from the pre-SP7 subset (`%H %M %S
+  %d %m %Y %y %b %a %p %I %%`, any other `%<c>` literal passthrough).
+- Recursion/loop limit: expansion is capped at `FORMAT_LOOP_LIMIT` (100, the
+  real tmux `format.c` constant, §5.1) levels of recursion; past that depth
+  `expand` stops and returns the remaining input literally instead of
+  recursing further, so a pathologically/adversarially nested format string
+  degrades safely (partially-unexpanded output) rather than overflowing the
+  stack.
+
+### Documented non-supported remainder (§5.3's modifier table)
+
+Not implemented (no winmux caller needs these yet): `b:`/`d:`
+(basename/dirname), `t:` (Unix-time formatting), `p`/`pN:` (pad), `l:`
+(literal/no-expand), `E:`/`T:` (re-expand / re-expand+strftime), `S:`/
+`W:`/`P:`/`L:` (loop over sessions/windows/panes/clients), `O:`/`V:` (loop
+over options/environment), `N:` (window/session existence check), `C:`
+(pane-content search), `s/pat/repl/` (regex substitution), `m/pat/str/`
+(glob/regex match), `q:` (shell-quote), `n:`/`w:` (length/display-width),
+`a:` (ASCII-code-to-char), `c:` (colour-name-to-hex/SGR), `I/...` (client
+termcap/feature/environ lookup), `R:` (string repeat), `e|op|f|prec:`
+(arithmetic), `!:`/`!!:` (boolean NOT), `#(command)` shell jobs (no
+shell-job subsystem exists in winmux at all — a much larger pre-existing
+gap than this task's scope), and the `#{=/N/marker:x}` marker-string
+variant of the length-limit modifier (implemented: bare `#{=N:x}`/
+`#{=-N:x}` only).
+
+`client_*`, loop-injected (`loop_index` etc.), copy-mode/mouse/buffer
+format variables are unsupported because `FormatCtx` carries none of that
+data. **Explicit scope decision:** `server::dispatch.rs` (the `server`
+module's dispatch submodule, a SEPARATE FILE from `server.rs`) constructs
+`FormatCtx` at two call sites (`expand_with_ctx`, `mouse_status_click`);
+this task's file-scope restriction covers `server.rs`'s call sites only,
+not `server/dispatch.rs`'s — so `FormatCtx` gained NO new fields in this
+task (adding e.g. `client_width`/`client_height`, which WOULD have been
+cheap to source from `ClientState::cols`/`rows` at `server.rs`'s own
+`render_one` call site, would still have left `server/dispatch.rs`'s two
+struct-literal construction sites needing an update to keep compiling,
+outside this track's allowed-file list). A future task revisiting
+`server/dispatch.rs` can add `client_*` fields without touching this
+module's locked `expand`/`FormatCtx` signature (only adding fields, source
+-compatible for every caller that uses struct-literal construction with
+all fields named, which is every current caller).
+
+### Tests
+
+`src/format.rs`: `braced_variable_expands`, `undefined_variable_expands_
+empty`, `conditional_true_and_false_parts`, `conditional_nested_expansion`,
+`comparison_eq_ne`, `length_limit_truncates_right_and_left`, `hash_escape_
+literal`, `real_default_window_status_format_matches_sp6_shim_output` (both
+flagged and flagless cases), `strftime_passthrough_preserved` (9 tests).
+`src/options.rs`'s pre-existing format tests (`expand_basic`, `expand_hash_
+escape`, `expand_unknown_long_empty`, `expand_pane_title`, `expand_inline_
+style_marker_passthrough`, `expand_strftime`) are unmodified regression
+coverage through the new `expand_format` delegate; `sp6_config_compat_
+options_defaults_and_roundtrip`'s two `window_status_format`/
+`window_status_current_format` assertions were updated to compare against
+`DEFAULT_WINDOW_STATUS_FORMAT` (the real tmux string) instead of the old
+literal `"#I:#W#F"` pin. `src/status.rs`'s full pre-existing suite (14
+tests) passes UNMODIFIED (values, not just names) except doc-comment
+wording, per the brief's "regression suite must stay green unmodified
+except the shim-removal tests" — the "shim-removal" change here was
+deleting dead code, not any test's expected value.

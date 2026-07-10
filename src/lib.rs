@@ -3,6 +3,7 @@ pub mod buffers;
 pub mod cli;
 pub mod client;
 pub mod cmd;
+pub mod format;
 pub mod geom;
 pub mod grid;
 pub mod host;

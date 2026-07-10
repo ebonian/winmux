@@ -1,4 +1,8 @@
-//! Typed tmux option registry + the SP3 `#`/`%` format-string subset.
+//! Typed tmux option registry. The general tmux format-expansion engine
+//! (`#`/`%`/`#{...}`, conditionals, comparisons, length limits) lives in
+//! [`crate::format`] as of SP7 Task 1 — [`FormatCtx`]/[`SystemTimeParts`]/
+//! [`expand_format`] are re-exported/delegated here for source
+//! compatibility (see below).
 //!
 //! Pure module: no I/O, `std` only. Depends on [`crate::keys`] (the `prefix`
 //! option's `Key` type) and [`crate::style`] (every `*-style` option's
@@ -20,11 +24,13 @@
 //! control-char-clean (`#S`/`#W` come from `model::validate_name`-guarded
 //! session/window names, strftime output is fixed-format digits/month/
 //! weekday abbreviations), so a clean `status-left`/`status-right` template
-//! can only ever expand to a clean result.
+//! can only ever expand to a clean result — the SP7 format engine's wider
+//! grammar (conditionals, comparisons, length limits) only rearranges/
+//! selects among these same clean inputs, it never introduces a new
+//! character class, so the guarantee still holds.
 //!
-//! [`expand_format`] evaluates the SP3 format-string subset (`#S`, `#I`,
-//! `#{session_name}`, `%H:%M`, ...) used by `status-left`/`status-right`/
-//! `display-message`.
+//! [`expand_format`] delegates to [`crate::format::expand`], used by
+//! `status-left`/`status-right`/`display-message`/window-status formats.
 
 use crate::grid::Color;
 use crate::keys::{self, Key};
@@ -68,16 +74,16 @@ struct Spec {
 }
 
 /// The stored default for `window-status-format`/`window-status-current-format`
-/// (SP6 Task 4 — a documented deviation from tmux's literal
-/// `#I:#W#{?window_flags,#{window_flags}, }`, whose `#{?cond,a,b}`
-/// conditional the `expand_format` subset does not evaluate; see the
-/// deviation note on `default_value`'s arm). Public and named so
-/// `status::status_spans` can recognize "the effective format IS the
-/// default" and apply the one-space flagless padding shim that reproduces
-/// the conditional's `, }` else-branch — keeping the default rendering
-/// byte-identical to real tmux for BOTH flagged and flagless windows
-/// (width-stable across focus changes). Custom formats are never padded.
-pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
+/// — tmux's REAL literal default string, unchanged since SP7 Task 1's
+/// general format engine (`src/format.rs`) now evaluates its
+/// `#{?window_flags,#{window_flags}, }` conditional correctly (closes
+/// follow-up #70; superseded the SP6 Task 4 deviation, which stored the
+/// conditional-free `#I:#W#F` plus a `status::status_spans`-side padding
+/// shim because the old `expand_format` subset couldn't evaluate `#{?...}`
+/// at all). Public so tests (and any future caller) can compare an
+/// option's effective format against "the default" without duplicating the
+/// literal string.
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#{?window_flags,#{window_flags}, }";
 
 const SPECS: &[Spec] = &[
     Spec { name: "prefix", kind: Kind::Key, choices: &[] },
@@ -293,21 +299,11 @@ fn default_value(name: &str) -> Value {
             let s = "default";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
-        // SP6 Task 4 deviation from tmux's literal real default
-        // (`#I:#W#{?window_flags,#{window_flags}, }`): the `#{?cond,a,b}`
-        // conditional isn't in the `expand_format` subset (same "SP3
-        // simplification" bucket as status-right's `#{=21:pane_title}` gap —
-        // see that option's own deviation note above). `#I:#W#F` reproduces
-        // the identical rendered text for every FLAGGED window via the
-        // already-supported `#F` short code; the conditional's `, }`
-        // else-branch (one padding space when a window has NO flags, which
-        // keeps tab width stable across focus changes) is reproduced by a
-        // default-format-only shim in `status::status_spans` (fix round 1)
-        // that pads an empty flags string to a single space — see
-        // DEFAULT_WINDOW_STATUS_FORMAT's doc comment above. Net: the
-        // DEFAULT rendering is byte-identical to real tmux in all cases;
-        // only CUSTOM formats using `#{?...}` remain unsupported
-        // (docs/follow-ups.md #70).
+        // SP7 Task 1: tmux's literal real default, verbatim (the general
+        // format engine in `src/format.rs` evaluates its
+        // `#{?window_flags,#{window_flags}, }` conditional correctly, so no
+        // deviation/shim is needed anymore — see DEFAULT_WINDOW_STATUS_FORMAT's
+        // doc comment above; closes docs/follow-ups.md #70).
         "window-status-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         "window-status-current-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
@@ -820,9 +816,9 @@ impl Options {
     /// `window-status-format`/`window-status-current-format` (SP6 Task 2,
     /// rendering wired in Task 4): per-window tab format-string templates,
     /// expanded per window by `status::status_spans` via `expand_format`.
-    /// Default `#I:#W#F` -- see the deviation note on this option's
-    /// `default_value` arm for why it isn't tmux's literal
-    /// `#{?window_flags,...}` string.
+    /// Default is tmux's literal real string,
+    /// `#I:#W#{?window_flags,#{window_flags}, }` (SP7 Task 1: see
+    /// `DEFAULT_WINDOW_STATUS_FORMAT`'s doc comment).
     pub fn window_status_format(&self) -> &str {
         self.str_ref("window-status-format")
     }
@@ -921,221 +917,24 @@ fn quote_if_needed(s: &str) -> String {
     }
 }
 
-/// Plain calendar/time facts for [`expand_format`]'s strftime subset. A
-/// plain struct (no Windows types) so the module stays pure/testable; the
-/// server fills one in from `GetLocalTime` (see `src/server.rs`'s
-/// `local_clock`, which this format subset is designed to reproduce for
-/// `%H:%M %d-%b-%y`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SystemTimeParts {
-    pub year: i32,
-    /// 1-12.
-    pub month: u8,
-    pub day: u8,
-    /// 0 = Sunday, matching Win32 `SYSTEMTIME.wDayOfWeek`.
-    pub weekday: u8,
-    pub hour: u8,
-    pub min: u8,
-    pub sec: u8,
-}
+/// Re-exported from [`crate::format`] for source compatibility (SP7 Task 1:
+/// the general format engine moved out of this module — see that module's
+/// docs for the full grammar). [`expand_format`] below is now a one-line
+/// delegate to [`crate::format::expand`].
+pub use crate::format::{FormatCtx, SystemTimeParts};
 
-/// Everything [`expand_format`] needs beyond the format string itself.
-pub struct FormatCtx<'a> {
-    pub session: &'a str,
-    pub window_index: u32,
-    pub window_name: &'a str,
-    pub window_flags: &'a str,
-    pub pane_index: u32,
-    pub hostname: &'a str,
-    pub now: SystemTimeParts,
-    /// `#T`/`#{pane_title}` (Task 9, sub-project 4): the focused pane's OSC
-    /// 0/2 title (`server::PaneRuntime::title`), empty until the pane's
-    /// program ever sets one. Already control-char-clean and length-capped
-    /// by `grid::Grid`'s OSC handler — no further sanitizing needed here.
-    /// Documented divergence from real tmux (fix round, review minor 1):
-    /// tmux's `#T`/`#{pane_title}` falls back to the pane's running command
-    /// name when no title has ever been set; here it falls back to an empty
-    /// string, same root cause as the `automatic-rename` divergence
-    /// (`docs/follow-ups.md` #28) — no foreground-process tracking exists in
-    /// this codebase, only the ConPTY-surfaced console title.
-    pub pane_title: &'a str,
-}
-
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/// Expand the SP3 format-string subset used by `status-left`/`status-right`/
-/// `display-message`:
-///
-/// - `#S` session name, `#I` window index, `#W` window name, `#F` window
-///   flags, `#P` pane index, `#H` hostname, `#T` pane title (Task 9,
-///   sub-project 4), `##` literal `#`.
-/// - `#{session_name}`, `#{window_index}`, `#{window_name}` (long forms of
-///   the three most common `#`-codes); any other `#{...}` -> empty
-///   (documented SP3 simplification — the full tmux format-expression
-///   engine, conditionals, modifiers, etc. is out of scope until SP4).
-/// - Any other `#<c>` (unrecognized short code) -> empty.
-/// - `%`-strftime subset: `%H %M %S %d %m %Y %y %b %a %p %I %%`. Any other
-///   `%<c>` is left as a literal two-character passthrough (`%x` stays
-///   `%x`) rather than expanding or erroring.
+/// Expand a tmux format string against `ctx` — thin delegate to
+/// [`crate::format::expand`] (SP7 Task 1). Kept here, under its original
+/// name, so every existing caller (`status::status_spans`,
+/// `server::render_one`, `server::dispatch`) needs no import changes. See
+/// `crate::format`'s module docs for the full supported grammar (braced
+/// variables, `#{?cond,true,false}` conditionals, `==`/`!=`/`<`/`>`/`<=`/
+/// `>=` string comparisons, `&&`/`||`, `#{=N:x}`/`#{=-N:x}` length limits,
+/// single-char aliases, `##`/`#,`/`#}` escapes, `#[...]` style-marker
+/// passthrough, `%`-strftime passthrough) and its documented non-supported
+/// remainder.
 pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
-    let mut out = String::with_capacity(fmt.len());
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '#' => match chars.peek().copied() {
-                Some('#') => {
-                    chars.next();
-                    out.push('#');
-                }
-                Some('S') => {
-                    chars.next();
-                    out.push_str(ctx.session);
-                }
-                Some('I') => {
-                    chars.next();
-                    out.push_str(&ctx.window_index.to_string());
-                }
-                Some('W') => {
-                    chars.next();
-                    out.push_str(ctx.window_name);
-                }
-                Some('F') => {
-                    chars.next();
-                    out.push_str(ctx.window_flags);
-                }
-                Some('P') => {
-                    chars.next();
-                    out.push_str(&ctx.pane_index.to_string());
-                }
-                Some('H') => {
-                    chars.next();
-                    out.push_str(ctx.hostname);
-                }
-                Some('T') => {
-                    chars.next();
-                    out.push_str(ctx.pane_title);
-                }
-                Some('[') => {
-                    // Inline style marker (`#[fg=white]`, ...): expand_format
-                    // does text substitution only -- `#[...]` blocks are
-                    // interpreted by the RENDERER's span builder
-                    // (`status::styled_runs`, SP6 Task 4), not here, so they
-                    // must survive expansion byte-for-byte. Copied verbatim,
-                    // including the brackets; an unterminated marker (no
-                    // closing `]`) is copied to end-of-string rather than
-                    // silently dropped -- no well-formed template hits this.
-                    chars.next(); // consume '['
-                    out.push('#');
-                    out.push('[');
-                    for c2 in chars.by_ref() {
-                        out.push(c2);
-                        if c2 == ']' {
-                            break;
-                        }
-                    }
-                }
-                Some('{') => {
-                    chars.next();
-                    let mut name = String::new();
-                    let mut closed = false;
-                    for c2 in chars.by_ref() {
-                        if c2 == '}' {
-                            closed = true;
-                            break;
-                        }
-                        name.push(c2);
-                    }
-                    if closed {
-                        match name.as_str() {
-                            "session_name" => out.push_str(ctx.session),
-                            "window_index" => out.push_str(&ctx.window_index.to_string()),
-                            "window_name" => out.push_str(ctx.window_name),
-                            "pane_title" => out.push_str(ctx.pane_title),
-                            _ => {} // unknown long form -> empty
-                        }
-                    }
-                    // an unterminated `#{...` with no closing `}` is simply
-                    // consumed to end-of-string, producing empty — no input
-                    // is well-formed .tmux.conf either way.
-                }
-                Some(_) => {
-                    chars.next(); // unrecognized short code -> empty
-                }
-                None => {} // trailing lone `#` -> dropped
-            },
-            '%' => match chars.peek().copied() {
-                Some('%') => {
-                    chars.next();
-                    out.push('%');
-                }
-                Some('H') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.hour));
-                }
-                Some('M') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.min));
-                }
-                Some('S') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.sec));
-                }
-                Some('d') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.day));
-                }
-                Some('m') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.month));
-                }
-                Some('Y') => {
-                    chars.next();
-                    out.push_str(&ctx.now.year.to_string());
-                }
-                Some('y') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.year.rem_euclid(100)));
-                }
-                Some('b') => {
-                    chars.next();
-                    out.push_str(month_name(ctx.now.month));
-                }
-                Some('a') => {
-                    chars.next();
-                    out.push_str(weekday_name(ctx.now.weekday));
-                }
-                Some('p') => {
-                    chars.next();
-                    out.push_str(if ctx.now.hour < 12 { "AM" } else { "PM" });
-                }
-                Some('I') => {
-                    chars.next();
-                    let h12 = ctx.now.hour % 12;
-                    out.push_str(&format!("{:02}", if h12 == 0 { 12 } else { h12 }));
-                }
-                Some(other) => {
-                    // unrecognized strftime code -> literal passthrough
-                    out.push('%');
-                    out.push(other);
-                    chars.next();
-                }
-                None => out.push('%'), // trailing lone `%`
-            },
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn month_name(m: u8) -> &'static str {
-    MONTHS[(m.clamp(1, 12) as usize) - 1]
-}
-
-fn weekday_name(w: u8) -> &'static str {
-    WEEKDAYS[(w % 7) as usize]
+    crate::format::expand(fmt, ctx)
 }
 
 #[cfg(test)]
@@ -1471,12 +1270,12 @@ mod tests {
         let base = crate::grid::Style { fg: Color::Idx(3), ..crate::grid::Style::default() };
         assert_eq!(o.status_left_style().apply_to(base), base);
         assert_eq!(o.status_right_style().apply_to(base), base);
-        // SP6 Task 4: default changed from tmux's literal
-        // `#{?window_flags,#{window_flags}, }` (not expressible by the
-        // `expand_format` subset) to the equivalent-for-flagged-windows
-        // `#I:#W#F` -- see the `default_value` deviation note.
-        assert_eq!(o.window_status_format(), "#I:#W#F");
-        assert_eq!(o.window_status_current_format(), "#I:#W#F");
+        // SP7 Task 1: tmux's literal real default, now expressible by the
+        // general format engine's `#{?cond,a,b}` conditional support
+        // (closes follow-ups #27/#70 -- see `DEFAULT_WINDOW_STATUS_FORMAT`'s
+        // doc comment).
+        assert_eq!(o.window_status_format(), crate::options::DEFAULT_WINDOW_STATUS_FORMAT);
+        assert_eq!(o.window_status_current_format(), crate::options::DEFAULT_WINDOW_STATUS_FORMAT);
 
         o.set("visual-activity", Some("both"), false, false).unwrap();
         assert_eq!(o.visual_activity(), "both");
