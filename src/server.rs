@@ -42,7 +42,7 @@ use crate::bindings::Bindings;
 use crate::buffers::Buffers;
 use crate::cmd::RawCmd;
 use crate::geom::Rect;
-use crate::grid::{Grid, Style};
+use crate::grid::{Cell, Grid, Style};
 use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
@@ -50,7 +50,7 @@ use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{CopyView, ListOverlay, Overlay, PaneView, Renderer, Scene, StatusRow};
+use crate::render::{CopyView, ListOverlay, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell};
 use crate::status::{status_spans, strip_style_markers, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
@@ -180,14 +180,43 @@ enum ClientMode {
 }
 
 /// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
-/// one collapsed row; `Windows` (`-w`, the default) lists the CURRENT
-/// session's windows (a session header row + one indented row per window) --
-/// see the design spec's `## 7. Overlays` section for the documented
-/// "windows of the current session only" scope simplification.
+/// a real tree row (SP6 wave 2, Task 8: a `+`/`-` expand marker, collapsed by
+/// default per `docs/tmux-reference/choose-tree.md` `## 1.1` -- "sessions
+/// start collapsed"; `Right`/`+` reveals its windows as indented children);
+/// `Windows` (`-w`, the default) lists the CURRENT session's windows (a
+/// session header row + one indented row per window, unconditionally shown
+/// -- see the design spec's `## 7. Overlays` section for the documented
+/// "windows of the current session only" scope simplification, which this
+/// task does not change: real tmux's `-w` shows the whole multi-session
+/// tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChooseTreeView {
     Windows,
     Sessions,
+}
+
+/// choose-tree's live preview mode (SP6 wave 2, Task 8;
+/// `docs/tmux-reference/choose-tree.md` `## 3.1`/`## 7.1`): `v` cycles
+/// `Off -> Big -> Normal -> Off`. `Normal` (the tmux/winmux default) gives
+/// the row list two thirds of the panel; `Big` gives it one quarter (a
+/// bigger preview, smaller list); `Off` gives the list the whole panel.
+/// [`dispatch::Server::choose_tree_list_height`] turns this (plus the panel
+/// size and row count) into an actual row-count split every render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewMode {
+    Off,
+    Big,
+    Normal,
+}
+
+impl PreviewMode {
+    fn cycle(self) -> Self {
+        match self {
+            PreviewMode::Off => PreviewMode::Big,
+            PreviewMode::Big => PreviewMode::Normal,
+            PreviewMode::Normal => PreviewMode::Off,
+        }
+    }
 }
 
 /// choose-tree's per-client state (Task 8; review fix, Critical #1).
@@ -213,11 +242,24 @@ enum ChooseTreeView {
 /// every `Stdin` frame, which would make the prompt vanish before the user
 /// could answer it). `pending_kill` was already identity-based before this
 /// fix (`TreeTarget`, not an index) -- only `sel` needed the fix.
+///
+/// SP6 wave 2, Task 8 additions: `expanded` is the set of SESSION NAMES
+/// currently expanded in the `Sessions` view (keyed by session identity, same
+/// as `TreeTarget::Session`) -- sessions start collapsed (absent from the
+/// set) per `docs/tmux-reference/choose-tree.md` `## 1.1`; `Windows` view row
+/// generation ignores this set entirely (its window children are always
+/// shown, matching that doc section's "-w: sessions expanded" default and
+/// this project's pre-existing "current session only" scope simplification).
+/// `preview` is the `v`-cycled preview mode (`## 3.1`/`## 7.1`), starting at
+/// `Normal` (tmux's own default -- neither `-N` nor `-N -N` is ever passed by
+/// winmux's `w`/`s` bindings).
 struct ChooseTreeState {
     view: ChooseTreeView,
     sel: usize,
     selected: Option<TreeTarget>,
     pending_kill: Option<(TreeTarget, String)>,
+    expanded: HashSet<String>,
+    preview: PreviewMode,
 }
 
 /// Re-resolve choose-tree's selection identity to a display INDEX into a
@@ -288,15 +330,38 @@ fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
 /// clients`, neither of which the per-client `render_one` (called while
 /// `self.clients` is already mutably borrowed) can see directly.
 enum RenderOverlay {
-    /// Already-formatted row text, in order, plus which index is selected;
-    /// `render_one` turns this into a `render::Overlay::List` (padding/
-    /// scrolling is a rendering concern, computed there with the client's
-    /// own `rows`/`cols` in hand).
-    Tree { rows: Vec<String>, sel: usize },
+    /// Already-formatted row text (+ tree depth/expand-marker) in order,
+    /// plus which index is selected; `render_one` turns this into a
+    /// `render::Overlay::List` (padding/scrolling is a rendering concern,
+    /// computed there with the client's own `rows`/`cols` in hand).
+    /// `list_height` is the pre-sized row-list height (`Server::
+    /// choose_tree_list_height`, SP6 wave 2 Task 8) -- equal to the full
+    /// scene height whenever `preview` is `None` (preview OFF, or the panel
+    /// too small per the sizing rule), reproducing the pre-Task-8-wave-2
+    /// full-height list exactly in that case.
+    Tree {
+        rows: Vec<(String, u8, Option<char>)>,
+        sel: usize,
+        list_height: u16,
+        preview: Option<TreePreviewData>,
+    },
     /// The digit-to-pane mapping for the client's current window (see
     /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
     /// current rect and active-ness.
     Digits(Vec<(PaneId, u32)>),
+}
+
+/// The selected tree row's live preview content (SP6 wave 2, Task 8),
+/// pre-composed by `dispatch::Server::build_tree_preview` from the raw
+/// pane `Grid`s `self.panes` owns -- `render_one` only needs to place it (the
+/// panel-relative rect is computed there from `list_height`/the client's own
+/// `rows`/`cols`, since `build_render_overlay` runs before that's known) as
+/// a `render::PreviewBlock`.
+struct TreePreviewData {
+    title: String,
+    content_w: u16,
+    content_h: u16,
+    content: Vec<Cell>,
 }
 
 /// Copy mode's per-client state. `scroll` == tmux `oy` (lines scrolled up
@@ -2135,7 +2200,7 @@ impl Server {
         let session_name = client.session.as_deref()?;
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let rows = self.build_tree_rows(session_name, state.view);
+                let rows = self.build_tree_rows(session_name, state.view, &state.expanded);
                 // Task 8 review fix, Critical #1: resolve by IDENTITY, not
                 // a raw clamped index -- see `resolve_tree_sel`'s doc
                 // comment. `build_render_overlay` runs with `&self` only
@@ -2143,7 +2208,29 @@ impl Server {
                 // is a read-only re-derivation, same as every other render
                 // pass; the persisted `ChooseTreeState` is not mutated here.
                 let sel = resolve_tree_sel(&rows, &state.selected, state.sel);
-                Some(RenderOverlay::Tree { rows: rows.into_iter().map(|r| r.text).collect(), sel })
+                // SP6 wave 2, Task 8: sizing (`## 3.1`) + the selected row's
+                // live preview content, built here (not `render_one`) for the
+                // same reason the rows themselves are -- this is the one pass
+                // with `&self` (all panes' `Grid`s, the whole registry) in
+                // hand before `render_all`'s mutable per-client loop begins.
+                let sy = client.rows;
+                let w = client.cols;
+                let list_height = Server::choose_tree_list_height(sy, w, rows.len(), state.preview);
+                let preview = if list_height < sy {
+                    let interior_h = sy.saturating_sub(list_height).saturating_sub(1);
+                    rows.get(sel).map(|r| {
+                        let (title, content_w, content_h, content) = self.build_tree_preview(&r.target, w, interior_h);
+                        TreePreviewData { title, content_w, content_h, content }
+                    })
+                } else {
+                    None
+                };
+                Some(RenderOverlay::Tree {
+                    rows: rows.into_iter().map(|r| (r.text, r.depth, r.marker)).collect(),
+                    sel,
+                    list_height,
+                    preview,
+                })
             }
             ClientMode::DisplayPanes(_) => {
                 let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
@@ -2401,24 +2488,41 @@ fn render_one(
     };
 
     let overlay = overlay_data.map(|ov| match ov {
-        RenderOverlay::Tree { rows, sel } => {
+        RenderOverlay::Tree { rows, sel, list_height, preview } => {
             // Task 8 review fix, Important #3: `compose_back`'s actual paint
             // pass reserves the panel's OWN last row for `scene.message`
             // (choose-tree's `x` kill-confirm prompt) whenever it's `Some`
-            // -- `msg_reserved`/`visible` there, mirrored exactly here so
-            // `top`'s "keep `sel` on screen" math never assumes one more
-            // paintable row than `compose_back` will actually use. Without
-            // this, a scrolled selection at the bottom of a long list with
-            // a just-armed kill-confirm showing could be computed as
-            // "visible" here while `compose_back` paints one row less,
-            // pushing the selected/prompted row off-screen.
-            let msg_reserved = if message.is_some() { 1 } else { 0 };
-            let visible = (scene_size.1 as usize).saturating_sub(msg_reserved);
+            // AND there's no preview showing -- `msg_reserved`/`visible`
+            // there, mirrored exactly here so `top`'s "keep `sel` on screen"
+            // math never assumes one more paintable row than `compose_back`
+            // will actually use. Without this, a scrolled selection at the
+            // bottom of a long list with a just-armed kill-confirm showing
+            // could be computed as "visible" here while `compose_back`
+            // paints one row less, pushing the selected/prompted row
+            // off-screen. SP6 wave 2, Task 8: the list's paintable height is
+            // now `*list_height` (the preview-sizing rule, `## 3.1`) instead
+            // of the full scene height whenever a preview is showing --
+            // `*list_height == scene_size.1` in every other case, so this
+            // subsumes the pre-Task-8-wave-2 math exactly.
+            let msg_reserved = if message.is_some() && preview.is_none() { 1 } else { 0 };
+            let visible = (*list_height as usize).saturating_sub(msg_reserved);
             let top = sel.saturating_sub(visible.saturating_sub(1));
+            let preview_block = preview.as_ref().map(|p| PreviewBlock {
+                rect: Rect { x: 0, y: *list_height, w: scene_size.0, h: scene_size.1.saturating_sub(*list_height) },
+                title: p.title.clone(),
+                content_w: p.content_w,
+                content_h: p.content_h,
+                content: p.content.clone(),
+            });
             Overlay::List(ListOverlay {
                 title: String::new(),
-                rows: rows.iter().enumerate().map(|(i, t)| (t.clone(), i == *sel)).collect(),
+                rows: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (text, depth, marker))| TreeRowCell { text: text.clone(), depth: *depth, marker: *marker, selected: i == *sel })
+                    .collect(),
                 top,
+                preview: preview_block,
             })
         }
         RenderOverlay::Digits(entries) => {

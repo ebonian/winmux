@@ -2013,6 +2013,173 @@ pane exists, open the overlay, click where that pane would be, dismiss via
 the keyboard, assert focus is STILL the right pane — proving the click
 never reached the hidden pane's geometry).
 
+### **AMENDMENT (2026-07-10, SP6 wave 2 Task 8 — real tree view, current-item default selection, live preview):**
+
+Implements the three user-mandated behaviors from `docs/tmux-reference/
+choose-tree.md`: (a) a real tree — `Sessions` (`-s`) rows carry a `+`/`-`
+expand marker and start COLLAPSED (`## 1.1`: "sessions start collapsed"; the
+`Windows` (`-w`) view is UNCHANGED in scope — still the acting client's
+current session only, per this doc's original "current session only" note
+above, its header row now cosmetically marked `Some('-')` but with no
+collapse affordance of its own); (b) default selection = the CURRENT
+session/window, not row 0; (c) a live preview box below the row list, sized
+per `## 3.1`, `v`-cycled OFF/BIG/NORMAL.
+
+**`server`/`server::dispatch` (`ChooseTreeState`, `TreeRow`, `dispatch::
+Server`):**
+
+```rust
+enum PreviewMode { Off, Big, Normal }  // `v` cycles Off -> Big -> Normal -> Off
+
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    sel: usize,
+    selected: Option<TreeTarget>,
+    pending_kill: Option<(TreeTarget, String)>,
+    /// NEW: session names currently expanded in the `Sessions` view (absent
+    /// = collapsed, the default). `Windows` view row generation ignores this
+    /// entirely.
+    expanded: std::collections::HashSet<String>,
+    /// NEW: starts `Normal` (tmux's own default).
+    preview: PreviewMode,
+}
+
+pub(super) struct TreeRow {
+    pub(super) text: String,
+    pub(super) target: TreeTarget,
+    /// NEW: `0` = root (session), `1` = child (window).
+    pub(super) depth: u8,
+    /// NEW: `Some('+')`/`Some('-')` for an expandable root, `None` for a leaf.
+    pub(super) marker: Option<char>,
+}
+```
+
+`build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded:
+&HashSet<String>) -> Vec<TreeRow>` gains the `expanded` parameter (both
+existing call sites — `dispatch_choose_tree_key`, `build_render_overlay` —
+thread `state.expanded` / a fresh empty set at open time through). Two new
+free-standing pieces of logic on `impl Server` (both `pub(super)`, called
+from `server.rs`'s `build_render_overlay` — the `&self` precompute pass, same
+reasoning as `build_tree_rows` itself):
+
+- `choose_tree_list_height(sy: u16, w: u16, line_size: usize, mode:
+  PreviewMode) -> u16` — an exact, associated-function (no `self`) port of
+  `mode_tree_set_height` (`## 3.1`) plus `mode_tree_draw`'s own box-size
+  guard. Returns the row list's height; `sy` itself means "no preview at
+  all" (mode `Off`, or the computed split failed the NORMAL/BIG minimums, or
+  the panel is too small in either axis).
+- `build_tree_preview(&self, target: &TreeTarget, interior_w: u16,
+  interior_h: u16) -> (String title, u16 content_w, u16 content_h,
+  Vec<grid::Cell> content)` — the selected row's live filmstrip (`## 6`): a
+  session target filmstrips its windows' ACTIVE panes, a window target
+  filmstrips its own panes, each slot labelled and separated by a `│`
+  divider, raw cell copy from `self.panes[..].grid` starting at `(0,0)`
+  (**documented simplification**: no cursor-centered source viewport, no
+  `<`/`>` overflow gutters, no centered mini-box label — real tmux's
+  `screen_write_preview`/`window_tree_draw_label`, `## 6.1`/`## 6.5`).
+  Always returns content sized EXACTLY `(interior_w, interior_h)` in
+  production; the renderer's truncate-never-scale guarantee (below) is
+  defensive, exercised synthetically by a render unit test.
+
+`ChooseTreeAction` (the hardcoded key enum) gains `Expand`/`Collapse`
+(`Right`/`l`/`+` and `Left`/`h`/`-`, `## 5.1`/`## 7.1`) and `TogglePreview`
+(`v`, `## 3.1`) — `resolve_choose_tree_key` maps the new keys; `dispatch_
+choose_tree_key` implements: on a session (root) row, `Collapse` removes it
+from `expanded` and `Expand` adds it (selection unchanged either way); on a
+window (leaf) row, `Collapse` jumps to its parent session row and `Expand`
+just moves down one line (the doc's "flat" rule, since this project's tree
+has no pane-level children — `TogglePreview` cycles `state.preview`.
+
+`exec_choose_tree_client` now seeds `selected`/`sel` from the CURRENT
+session (`Sessions` view) / the current session's CURRENT window
+(`Windows` view) — falling back to `rows.first()` only in the structurally-
+unreachable case that lookup fails — instead of always `rows.first()`.
+
+**`server` (`RenderOverlay`, `build_render_overlay`, `render_one`):**
+
+```rust
+enum RenderOverlay {
+    Tree {
+        rows: Vec<(String, u8, Option<char>)>,  // was Vec<String>
+        sel: usize,
+        list_height: u16,       // NEW: Server::choose_tree_list_height's result
+        preview: Option<TreePreviewData>,  // NEW
+    },
+    Digits(Vec<(PaneId, u32)>),
+}
+
+struct TreePreviewData { title: String, content_w: u16, content_h: u16, content: Vec<grid::Cell> }
+```
+
+`build_render_overlay`'s `ChooseTree` arm computes `list_height` and (when
+`< sy`) the selected row's preview content, both BEFORE `render_all`'s
+mutable per-client loop, for the same reason the rows themselves are (this
+is the one pass with every pane's `Grid` and the whole registry in hand via
+`&self`). `render_one`'s `RenderOverlay::Tree` arm now uses `list_height`
+(not the full scene height) as the row list's paintable area — subsuming the
+pre-this-task math exactly when `list_height == scene_size.1` (preview off
+or dropped) — and builds a `render::PreviewBlock` from `TreePreviewData` at
+`Rect { x: 0, y: list_height, w: scene_size.0, h: scene_size.1 - list_height }`.
+
+### `render` amendment (supersedes the `2026-07-06-mvp-interfaces.md` snippet above for `ListOverlay`/`Overlay::List`)
+
+```rust
+pub struct TreeRowCell {
+    pub text: String,
+    pub depth: u8,             // 0 = root (session), 1 = child (window)
+    pub marker: Option<char>,  // Some('+')/Some('-') expandable, None = leaf
+    pub selected: bool,
+}
+
+pub struct PreviewBlock {
+    pub rect: Rect,   // row `rect.y` = border line; rows below = interior
+    pub title: String,
+    pub content_w: u16,
+    pub content_h: u16,
+    pub content: Vec<grid::Cell>,  // row-major; may exceed the interior (truncated, never scaled)
+}
+
+pub struct ListOverlay {
+    pub title: String,
+    pub rows: Vec<TreeRowCell>,   // was Vec<(String, bool)>
+    pub top: usize,
+    pub preview: Option<PreviewBlock>,  // NEW
+}
+```
+
+`compose_back`'s `Overlay::List` arm: each row's painted text is now
+`"  ".repeat(depth) + (marker as "{c} "  or "  ") + text` (tree furniture is
+a pure render concern, not baked into `text` by the caller). When `preview`
+is `Some`, the row list's visible window is capped to `preview.rect.y`
+(instead of the full panel) and the message-reservation rule only applies
+when there's NO preview (a message, when one is showing alongside a
+preview, is instead painted over the panel's last row unconditionally,
+same call site as before). The preview itself: a `'─'`-filled top border row
+in `Scene::border`'s style with `title` overwritten starting at column 1
+(same style), then `content` blitted verbatim (character AND style, no
+recoloring) into the interior (`rect.y + 1 ..`, full width) — truncated to
+the interior's size when `content` is larger, never scaled, and left as
+whatever the panel's full-clear already put there (blank) when smaller.
+
+### TDD evidence (this task)
+
+`render::tests`: `overlay_tree_rows_indent_children`, `overlay_preview_
+blits_grid_cells`, `overlay_preview_truncates_oversized_grid`, `overlay_
+list_shrinks_to_two_thirds_when_preview_on` (all exact-cell assertions, only
+`overlay_list_paints_rows_and_selection` amended in place for the new
+`TreeRowCell` shape — see the task report for the pinned-value change). `tests/
+server_proto.rs`: `choose_tree_sessions_show_window_children`, `choose_tree_
+collapse_hides_children_expand_restores`, `choose_tree_default_selects_
+current_session` (3 sessions, attach the middle one, `s`, immediate `Enter`
+stays put), `choose_tree_preview_shows_selected_windows_content` (a marker
+string printed in the current pane shows up inside the rendered preview
+region), `choose_tree_v_toggles_preview` (OFF/BIG/NORMAL border-row
+position, worked out from `choose_tree_list_height`'s formula in the test's
+own doc comment). Three pre-existing tests were updated for the new default-
+selection starting point (a `Down`-from-row-0 assumption is now wrong when
+the default selection is already the current, often LAST, row) — see the
+task report for the specific before/after reasoning per test.
+
 ## `naming` — escape-time disambiguation + automatic-rename (Task 9)
 
 Implements the design spec's `## 8. escape-time` and `## 9.

@@ -19,7 +19,7 @@
 //! object, so the resolution logic (`resolve_session_name`/
 //! `resolve_window_target`/`resolve_pane_target`) is shared verbatim.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -39,10 +39,11 @@ use crate::protocol::ServerMsg;
 use super::{
     advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key, send_msg,
     spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
-    ClientState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PromptKind, SearchPrompt,
-    SearchState, SelKind, SelState, Server, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
+    ClientState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode, PromptKind,
+    SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL,
+    MOUSE_WHEEL_STEP,
 };
-use crate::grid::Grid;
+use crate::grid::{Cell, Grid, Style};
 use std::time::Duration;
 
 /// Abbreviated C-locale English weekday names, indexed by
@@ -3540,13 +3541,18 @@ impl Server {
 
 // ---- overlays: choose-tree + display-panes (Task 8, sub-project 4) --------
 
-/// One choose-tree row: its already-formatted display text and the
-/// underlying session/window identity it acts on. Built fresh every time by
-/// [`Server::build_tree_rows`] — never cached across a render or a keypress
-/// (see `ClientMode::ChooseTree`'s doc comment for why).
+/// One choose-tree row: its already-formatted display text, the underlying
+/// session/window identity it acts on, and (SP6 wave 2, Task 8) its tree
+/// position — `depth` (`0` session/root, `1` window/child) and `marker`
+/// (`Some('+')`/`Some('-')` for an expandable root, `None` for a leaf).
+/// Built fresh every time by [`Server::build_tree_rows`] — never cached
+/// across a render or a keypress (see `ClientMode::ChooseTree`'s doc comment
+/// for why).
 pub(super) struct TreeRow {
     pub(super) text: String,
     pub(super) target: TreeTarget,
+    pub(super) depth: u8,
+    pub(super) marker: Option<char>,
 }
 
 /// Hardcoded choose-tree key resolution (Task 8) — deliberately NOT routed
@@ -3559,12 +3565,19 @@ pub(super) struct TreeRow {
 /// mode follows instead (`handle_stdin` intercepts already-DECODED `Key`
 /// events). `None` = unbound: swallowed (choose-tree, like copy mode, never
 /// leaks a keystroke to the pane underneath), overlay stays open.
+///
+/// SP6 wave 2, Task 8 additions: `Expand`/`Collapse` (`Right`/`l`/`+` and
+/// `Left`/`h`/`-` respectively, `docs/tmux-reference/choose-tree.md`
+/// `## 5.1`/`## 7.1`) and `TogglePreview` (`v`, `## 3.1`).
 enum ChooseTreeAction {
     Up,
     Down,
     Commit,
     Cancel,
     Kill,
+    Expand,
+    Collapse,
+    TogglePreview,
 }
 
 fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
@@ -3583,6 +3596,13 @@ fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
         KeyCode::Char('q') => Some(ChooseTreeAction::Cancel),
         KeyCode::Escape => Some(ChooseTreeAction::Cancel),
         KeyCode::Char('x') => Some(ChooseTreeAction::Kill),
+        KeyCode::Right => Some(ChooseTreeAction::Expand),
+        KeyCode::Char('l') => Some(ChooseTreeAction::Expand),
+        KeyCode::Char('+') => Some(ChooseTreeAction::Expand),
+        KeyCode::Left => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('h') => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('-') => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('v') => Some(ChooseTreeAction::TogglePreview),
         _ => None,
     }
 }
@@ -3594,42 +3614,204 @@ impl Server {
     /// what makes stale-row bugs structurally unreachable (see
     /// `ClientMode::ChooseTree`'s doc comment).
     ///
-    /// `Sessions`: one row per session, `<name>: N windows[ (attached)]`.
-    /// `Windows`: the CURRENT session only — a header row in the same format
-    /// as a `Sessions` row, followed by one indented row per window,
-    /// `  <index>: <name><flags>` (`*` current, `-` last, else nothing) —
-    /// see the design spec's `## 7. Overlays` section for the exact format
-    /// and the documented "current session's windows only" scope
-    /// simplification (real tmux's `-w` shows the whole tree).
-    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView) -> Vec<TreeRow> {
+    /// `Sessions` (SP6 wave 2, Task 8 — a real tree): one root row per
+    /// session, `<name>: N windows[ (attached)]`, `depth: 0`, marker
+    /// `Some('-')` if `expanded` contains that session's name (its windows
+    /// follow as `depth: 1` children, `<index>: <name><flags>`) or
+    /// `Some('+')` otherwise (collapsed — `docs/tmux-reference/choose-
+    /// tree.md` `## 1.1`: "sessions start collapsed"). `Windows`: the
+    /// CURRENT session only, unconditionally expanded (ignores `expanded`
+    /// entirely) — a header row in the same format as a `Sessions` row
+    /// (marker `Some('-')`, cosmetic only: this view has no collapse
+    /// affordance of its own), followed by one `depth: 1`, `marker: None`
+    /// leaf row per window, `<index>: <name><flags>` (`*` current, `-` last,
+    /// else nothing) — see the design spec's `## 7. Overlays` section for
+    /// the "current session's windows only" scope simplification this task
+    /// deliberately leaves unchanged (real tmux's `-w` shows the whole
+    /// multi-session tree; see `ChooseTreeView`'s doc comment).
+    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>) -> Vec<TreeRow> {
         let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
-        let session_row = |s: &Session| TreeRow {
-            text: format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" }),
-            target: TreeTarget::Session(s.name.clone()),
+        let session_text = |s: &Session| format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" });
+        let window_row = |session: &Session, w: &Window| {
+            let flag = if w.id == session.current {
+                "*"
+            } else if Some(w.id) == session.last {
+                "-"
+            } else {
+                ""
+            };
+            TreeRow {
+                text: format!("{}: {}{}", w.index, w.name, flag),
+                target: TreeTarget::Window(session.name.clone(), w.id),
+                depth: 1,
+                marker: None,
+            }
         };
         match view {
-            ChooseTreeView::Sessions => self.registry.sessions().iter().map(session_row).collect(),
+            ChooseTreeView::Sessions => {
+                let mut rows = Vec::new();
+                for s in self.registry.sessions() {
+                    let is_expanded = expanded.contains(&s.name);
+                    rows.push(TreeRow {
+                        text: session_text(s),
+                        target: TreeTarget::Session(s.name.clone()),
+                        depth: 0,
+                        marker: Some(if is_expanded { '-' } else { '+' }),
+                    });
+                    if is_expanded {
+                        rows.extend(s.windows.iter().map(|w| window_row(s, w)));
+                    }
+                }
+                rows
+            }
             ChooseTreeView::Windows => {
                 let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
                     return Vec::new();
                 };
-                let mut rows = vec![session_row(session)];
-                for w in &session.windows {
-                    let flag = if w.id == session.current {
-                        "*"
-                    } else if Some(w.id) == session.last {
-                        "-"
-                    } else {
-                        ""
-                    };
-                    rows.push(TreeRow {
-                        text: format!("  {}: {}{}", w.index, w.name, flag),
-                        target: TreeTarget::Window(session.name.clone(), w.id),
-                    });
-                }
+                let mut rows = vec![TreeRow {
+                    text: session_text(session),
+                    target: TreeTarget::Session(session.name.clone()),
+                    depth: 0,
+                    marker: Some('-'),
+                }];
+                rows.extend(session.windows.iter().map(|w| window_row(session, w)));
                 rows
             }
         }
+    }
+
+    /// choose-tree preview sizing (SP6 wave 2, Task 8;
+    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`
+    /// plus `mode_tree_draw`'s own box-size guard): the ROW LIST's height in
+    /// panel rows -- the preview (if any) occupies every row below it, i.e.
+    /// `sy - h`. Returns `sy` itself (no preview at all) whenever the mode
+    /// is `Off`, the computed split would leave the list under 10 rows
+    /// (NORMAL) / the preview under 2 rows total (BIG, or the final `sy - h
+    /// < 2` guard), or the panel is too small in either axis for a sensible
+    /// box (`sy <= 4 || h < 2 || sy - h <= 4 || w <= 4`).
+    pub(super) fn choose_tree_list_height(sy: u16, w: u16, line_size: usize, mode: PreviewMode) -> u16 {
+        let sy_i = sy as i32;
+        let ls = line_size as i32;
+        let mut h = match mode {
+            PreviewMode::Normal => {
+                let mut h = (sy_i / 3) * 2; // list gets 2/3
+                if h > ls {
+                    h = sy_i / 2; // short list: 1/2
+                }
+                if h < 10 {
+                    h = sy_i; // too small: no preview
+                }
+                h
+            }
+            PreviewMode::Big => {
+                let mut h = sy_i / 4; // list gets 1/4
+                if h > ls {
+                    h = ls;
+                }
+                if h < 2 {
+                    h = 2;
+                }
+                h
+            }
+            PreviewMode::Off => sy_i,
+        };
+        if sy_i - h < 2 {
+            h = sy_i; // preview must be >= 2 rows
+        }
+        if sy_i <= 4 || h < 2 || sy_i - h <= 4 || w <= 4 {
+            h = sy_i; // mode_tree_draw's own box-size guard
+        }
+        h.clamp(0, sy_i.max(0)) as u16
+    }
+
+    /// The selected tree row's live preview content (SP6 wave 2, Task 8;
+    /// `docs/tmux-reference/choose-tree.md` `## 6`): a session item's
+    /// preview is a horizontal filmstrip of its windows' ACTIVE panes; a
+    /// window item's is a filmstrip of its own panes. Each slot is
+    /// `interior_w / N` columns wide (the last slot absorbing the
+    /// remainder), separated by a `│` divider (except the first), with the
+    /// pane's `index:name` label on the slot's first row and a raw
+    /// (truncate, never scale), cell-for-cell copy of the pane's live
+    /// `Grid` from `(0,0)` filling the rows below it. This is a
+    /// deliberately simplified filmstrip -- no cursor-centered source
+    /// viewport, no `<`/`>` scroll gutters for an overflowing filmstrip, no
+    /// centered mini-box label (real tmux's `screen_write_preview`/
+    /// `window_tree_draw_label`, `## 6.1`/`## 6.5`) -- documented scope
+    /// decisions, not oversights; see the task report. Returns `(title,
+    /// content_w, content_h, content)` sized EXACTLY to `(interior_w,
+    /// interior_h)` (never oversized -- the renderer's truncate-not-scale
+    /// guarantee is defensive here, exercised synthetically by
+    /// `render::tests::overlay_preview_truncates_oversized_grid`, not
+    /// needed in production).
+    pub(super) fn build_tree_preview(&self, target: &TreeTarget, interior_w: u16, interior_h: u16) -> (String, u16, u16, Vec<Cell>) {
+        let mut content = vec![Cell::default(); interior_w as usize * interior_h as usize];
+        if interior_w == 0 || interior_h == 0 {
+            return (String::new(), interior_w, interior_h, content);
+        }
+        let (title, slots): (String, Vec<(PaneId, String)>) = match target {
+            TreeTarget::Session(name) => {
+                let Some(session) = self.registry.sessions().iter().find(|s| s.name == *name) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {} (sort: index)", session.name);
+                let slots = session.windows.iter().map(|w| (w.layout.focused(), format!("{}:{}", w.index, w.name))).collect();
+                (title, slots)
+            }
+            TreeTarget::Window(sname, wid) => {
+                let Some(window) =
+                    self.registry.sessions().iter().find(|s| s.name == *sname).and_then(|s| s.windows.iter().find(|w| w.id == *wid))
+                else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {}:{} (sort: index)", window.index, window.name);
+                let panes = window.layout.panes();
+                let slots = panes.iter().enumerate().map(|(idx, pid)| (*pid, format!("{idx}"))).collect();
+                (title, slots)
+            }
+        };
+        let n = slots.len();
+        if n == 0 {
+            return (title, interior_w, interior_h, content);
+        }
+        let slot_w = interior_w / n as u16;
+        let mut x0 = 0u16;
+        for (i, (pane_id, label)) in slots.iter().enumerate() {
+            let this_w = if i + 1 == n { interior_w - x0 } else { slot_w };
+            if this_w == 0 {
+                continue;
+            }
+            let divider = i > 0;
+            let gutter: u16 = if divider { 1 } else { 0 };
+            if divider {
+                for y in 0..interior_h {
+                    content[y as usize * interior_w as usize + x0 as usize] = Cell { ch: '│', style: Style::default() };
+                }
+            }
+            let label_x0 = x0 + gutter;
+            let pane_w = this_w.saturating_sub(gutter);
+            for (li, ch) in label.chars().enumerate() {
+                if (li as u16) >= pane_w {
+                    break;
+                }
+                content[(label_x0 + li as u16) as usize] = Cell { ch, style: Style::default() };
+            }
+            if let Some(pane) = self.panes.get(pane_id) {
+                for cy in 1..interior_h {
+                    if cy > pane.grid.rows() {
+                        break;
+                    }
+                    for cx in 0..pane_w {
+                        if cx >= pane.grid.cols() {
+                            break;
+                        }
+                        let cell = pane.grid.cell(cx, cy - 1);
+                        content[cy as usize * interior_w as usize + (label_x0 + cx) as usize] = cell;
+                    }
+                }
+            }
+            x0 += this_w;
+        }
+        (title, interior_w, interior_h, content)
     }
 
     /// `kill-session <name>? (y/n)` / `kill-window <name>? (y/n)` for `x`
@@ -3746,11 +3928,11 @@ impl Server {
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let view = match &client.mode {
-            ClientMode::ChooseTree(state) => state.view,
+        let (view, expanded) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone()),
             _ => return None,
         };
-        let rows = self.build_tree_rows(session_name, view);
+        let rows = self.build_tree_rows(session_name, view, &expanded);
 
         // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
         // IDENTITY against this freshly rebuilt `rows`, rather than trusting
@@ -3801,6 +3983,61 @@ impl Server {
                 client.mode = ClientMode::Normal;
                 Some(self.exec_tree_commit(target, client, session_name))
             }
+            // SP6 wave 2, Task 8 (`docs/tmux-reference/choose-tree.md`
+            // `## 5.1`/`## 7.1`): only session (depth-0) rows carry an
+            // expand/collapse affordance in this project's tree model (no
+            // pane-level children -- see `build_tree_rows`'s doc comment).
+            // On a session row, `Collapse` removes it from `expanded`
+            // (selection stays put) and `Expand` adds it (ditto); on a
+            // window (leaf) row, `Collapse` jumps to its parent session row
+            // ("flat, move to parent" per the doc) and `Expand` just moves
+            // down one line ("flat, move down").
+            ChooseTreeAction::Collapse => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                match &row.target {
+                    TreeTarget::Session(name) => {
+                        let name = name.clone();
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.expanded.remove(&name);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    TreeTarget::Window(sname, _) => {
+                        let parent = TreeTarget::Session(sname.clone());
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.sel = rows.iter().position(|r| r.target == parent).unwrap_or(state.sel);
+                            state.selected = Some(parent);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                }
+            }
+            ChooseTreeAction::Expand => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                match &row.target {
+                    TreeTarget::Session(name) => {
+                        let name = name.clone();
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.expanded.insert(name);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    TreeTarget::Window(..) => {
+                        let new_sel = (sel + 1).min(rows.len().saturating_sub(1));
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.sel = new_sel;
+                            state.selected = rows.get(new_sel).map(|r| r.target.clone());
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                }
+            }
+            ChooseTreeAction::TogglePreview => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.preview = state.preview.cycle();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
         }
     }
 
@@ -3837,12 +4074,35 @@ impl Server {
     /// never actually dispatch this command in the first place).
     fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
-        // Task 8 review fix, Critical #1: seed `selected` with row 0's
-        // identity (not just index 0) so the very first Up/Down/Commit/Kill
-        // has an identity to re-resolve, same as every subsequent keypress.
-        let rows = self.build_tree_rows(session_name, view);
-        let selected = rows.first().map(|r| r.target.clone());
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel: 0, selected, pending_kill: None });
+        let expanded = HashSet::new();
+        // Task 8 review fix, Critical #1: seed `selected` with an IDENTITY
+        // (not just an index) so the very first Up/Down/Commit/Kill has one
+        // to re-resolve, same as every subsequent keypress.
+        //
+        // SP6 wave 2, Task 8 (mode-tree's "current-item" default start,
+        // `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions`
+        // defaults to the ACTING CLIENT's own current session's row (always
+        // present -- sessions view lists every session unconditionally, and
+        // a session's own row always exists even collapsed); `Windows`
+        // defaults to that session's CURRENT window's row (also always
+        // present -- the windows view always shows every window of the
+        // current session). Row 0 (the old behavior) is only a fallback for
+        // the structurally-unreachable case that lookup fails.
+        let rows = self.build_tree_rows(session_name, view, &expanded);
+        let default_target = match view {
+            ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
+            ChooseTreeView::Windows => self
+                .registry
+                .sessions()
+                .iter()
+                .find(|s| s.name == session_name)
+                .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+        };
+        let selected = default_target
+            .filter(|t| rows.iter().any(|r| &r.target == t))
+            .or_else(|| rows.first().map(|r| r.target.clone()));
+        let sel = selected.as_ref().and_then(|t| rows.iter().position(|r| &r.target == t)).unwrap_or(0);
+        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal });
         ExecOutcome::Ok(String::new())
     }
 
@@ -4163,13 +4423,20 @@ mod choose_tree_dispatch_tests {
     /// The review's Critical #1, reproduced: `ChooseTreeState.sel` used to be
     /// a raw array index into a row list rebuilt fresh every keypress -- not
     /// a stable target identity. Rows = `[header, A, B, C]`. Select row 2
-    /// (window B) via real `Down` dispatches, then simulate a SAME-BATCH
+    /// (window B) via a real `Down` dispatch, then simulate a SAME-BATCH
     /// concurrent kill of window A (an EARLIER row) -- directly, bypassing
     /// this client's key machine and with NO intervening render, exactly
     /// the scenario the server's event-loop coalescing makes reachable
     /// (`server.rs`'s `run()` drains the whole channel before rendering).
     /// Rows are now `[header, B, C]`; the OLD raw index 2 would silently
     /// point at C instead of B. Enter must still commit to B.
+    ///
+    /// SP6 wave 2, Task 8 (`(b)` default selection = current item): opening
+    /// choose-tree now starts on window A's row (the session's CURRENT
+    /// window, per `test_server_with_three_windows`'s explicit `current =
+    /// a_id` reset), not the header row -- so ONE `Down` (A -> B) reaches
+    /// the same starting point the old two-`Down` header-relative sequence
+    /// did.
     #[test]
     fn choose_tree_commit_targets_selected_row_after_concurrent_kill() {
         let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
@@ -4179,8 +4446,7 @@ mod choose_tree_dispatch_tests {
         let outcome = server.exec_choose_tree_client(false, &mut client, &sname);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
-        // Down, Down: header -> A's row -> B's row.
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        // Down: A's row (the default selection) -> B's row.
         server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
@@ -4202,7 +4468,9 @@ mod choose_tree_dispatch_tests {
     }
 
     /// Same root cause, `x` (Kill) variant: arming the kill-confirm must
-    /// target the re-resolved identity too, not the stale index.
+    /// target the re-resolved identity too, not the stale index. See the
+    /// `Commit` variant's doc comment above for why a single `Down` (not
+    /// two) now reaches window B's row.
     #[test]
     fn choose_tree_kill_targets_selected_row_after_concurrent_kill() {
         let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
@@ -4210,7 +4478,6 @@ mod choose_tree_dispatch_tests {
         let mut sname = session_name.clone();
 
         server.exec_choose_tree_client(false, &mut client, &sname);
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
         server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
 
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");

@@ -5199,8 +5199,11 @@ fn choose_tree_w_lists_and_switches() {
             && lines.iter().any(|l| l.contains("  1: powershell*"))
     });
 
-    // Down (session header -> window 0's row) + Enter switches to window 0.
-    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    // SP6 wave 2, Task 8, `(b)`: the default selection is now the CURRENT
+    // item, i.e. window 1's row (the just-created, now-current window) --
+    // the last row, not the header. Up (window 1's row -> window 0's row) +
+    // Enter switches to window 0.
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec()));
     c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
 
@@ -5420,8 +5423,10 @@ fn choose_tree_x_kills_with_confirm() {
     c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("  0: powershell-")));
 
-    // Down selects window 0's row; `x` arms the confirm, `y` commits it.
-    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    // SP6 wave 2, Task 8, `(b)`: default selection is window 1's row (the
+    // just-created, now-current window) -- Up selects window 0's row; `x`
+    // arms the confirm, `y` commits it.
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec()));
     c.send(&ClientMsg::Stdin(b"x".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
 
@@ -5535,10 +5540,19 @@ fn choose_tree_prefix_sequence_ignored_overlay_stays_open() {
 /// `top`'s old math assumed. With a long, scrolled list and the selection
 /// at the very bottom, arming the kill-confirm (`x`) could push the
 /// selected/prompted row off the actually-painted area. 9 windows (10
-/// total with the session's original one) overflow a 10-row terminal;
-/// select the LAST row (the newest window, clamped there by sending far
-/// more `Down`s than there are rows) and arm `x` -- the selected row and
-/// its confirm prompt must both still be visible together.
+/// total with the session's original one) overflow a 10-row terminal.
+///
+/// SP6 wave 2, Task 8, `(b)` update: the default selection is now the
+/// CURRENT item -- window 9, the just-created, now-current window, is
+/// already the LAST row -- so it (and the scroll needed to show it) is
+/// immediate on opening, no `Down` presses required to reach it (the old
+/// version of this test drove 20 `Down`s from the OLD row-0 default to get
+/// there; that navigation is kept below, now purely as a defensive proof
+/// that clamping still holds at the end of the list, not as how the
+/// selection gets there). This 10-row terminal is also small enough that
+/// `choose_tree_list_height`'s NORMAL-mode `h < 10` rule drops the preview
+/// entirely (`sy=10`), so this test's msg_reserved/scrolling math is
+/// exercised exactly as before this task's preview work.
 #[test]
 fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     let name = unique_pipe_name();
@@ -5552,14 +5566,14 @@ fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     }
 
     c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
-    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 10 windows (attached)")));
-    // Selection starts at the header row (row 0, unscrolled): window 9's
-    // row is off the bottom of a 10-row terminal until we scroll down to
-    // it below.
-    assert!(!screen_text(&grid).iter().any(|l| l.contains("9: powershell")), "test setup: window 9's row must start OFF-screen (unscrolled)");
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("9: powershell*")));
+    // The header (and windows 0-8's rows) are scrolled OFF the top of the
+    // 10-row terminal instead, since window 9's row is the default
+    // selection, not the header.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("10 windows")), "test setup: header must be scrolled OFF (window 9 is the default selection)");
 
-    // Clamp-drive the selection all the way to the last row (far more Downs
-    // than there are rows), then arm the kill-confirm.
+    // Downs past the last row are still safely clamped there (defensive --
+    // the selection was already on window 9's row before this loop).
     for _ in 0..20 {
         c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
     }
@@ -5591,6 +5605,184 @@ fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+// ---- choose-tree: real tree view, default selection, preview (SP6 wave 2,
+// Task 8) --------------------------------------------------------------
+
+/// `(a)` tree structure: sessions are real tree PARENT rows with their
+/// windows as indented CHILD rows -- collapsed by default (`docs/tmux-
+/// reference/choose-tree.md` `## 1.1`: "sessions start collapsed"); `Right`
+/// reveals the (default-selected, current) session's window(s) as child
+/// rows underneath it.
+#[test]
+fn choose_tree_sessions_show_window_children() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+    // Collapsed by default: no window child row yet.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: powershell*")), "test setup: session must start collapsed");
+
+    // Right expands the (default-)selected session, revealing its window(s)
+    // as indented child rows.
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(a)`: expand/collapse state survives a round trip -- `Right` reveals the
+/// session's window child row, `Left` hides it again (jumps back up to the
+/// parent per the doc's "flat, move to parent" rule would only apply to a
+/// LEAF row; here the session row itself just collapses), and `Right` a
+/// second time restores it -- the `expanded` set is mutated in place, not
+/// reset on every rebuild.
+#[test]
+fn choose_tree_collapse_hides_children_expand_restores() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec())); // Right: expand
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[D".to_vec())); // Left: collapse
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec())); // Right again: restored
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(b)` default selection = current item: three sessions in creation order
+/// (sA, sB, sC); the acting client is attached to the MIDDLE one (sB).
+/// Opening `s` then immediately pressing Enter must be a no-op (committing
+/// to the ALREADY-current session) -- if the default selection had instead
+/// landed on row 0 (sA, the row-0-always behavior this task replaces),
+/// Enter would actually SWITCH this client to sA.
+#[test]
+fn choose_tree_default_selects_current_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut cli_a = cli_client(&name);
+    cli_a.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "sA".into()]));
+    expect_cli_done(&cli_a, 0);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    let mut cli_c = cli_client(&name);
+    cli_c.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "sC".into()]));
+    expect_cli_done(&cli_c, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("sA:")) && lines.iter().any(|l| l.contains("sB:")) && lines.iter().any(|l| l.contains("sC:"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    // Still on sB -- Enter on the default (current-session) selection was a
+    // no-op, not a switch to row 0 (sA).
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `(c)` preview box: the preview shows the SELECTED row's live pane
+/// content -- a marker string printed in the current window's pane appears
+/// inside the rendered preview region below the list. `Windows` view's
+/// default selection is the current window (see `choose_tree_default_
+/// selects_current_session`'s sibling test for the session-view half of
+/// `(b)`), so the preview is already showing it with no navigation needed.
+#[test]
+fn choose_tree_preview_shows_selected_windows_content() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo PREVIEWMARK123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PREVIEWMARK123")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    // The overlay clears the whole client area (the marker's OLD on-screen
+    // position is wiped); it must reappear -- now inside the preview box --
+    // for this to pass.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PREVIEWMARK123")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(c)`: `v` cycles the preview mode OFF -> BIG -> NORMAL -> OFF
+/// (`docs/tmux-reference/choose-tree.md` `## 3.1`/`## 7.1`), observable as
+/// the 0-based row the preview's top border line paints on. Starting state
+/// is NORMAL (the tmux/winmux default), so the FIRST `v` press advances to
+/// the state that follows NORMAL in that cycle, OFF -- not BIG (BIG comes
+/// right before NORMAL in the stated sequence, so it's only reached on the
+/// SECOND press). Worked out here for an 80x24 pane with a 2-row list
+/// (session header + 1 window), `choose_tree_list_height`'s formula: NORMAL
+/// -> `h = (24/3)*2 = 16`, `16 > line_size(2)` so `h = 24/2 = 12` (the
+/// "short list" branch) -> border at row 12. OFF -> `h = sy = 24` -> no
+/// preview at all (list fills the whole panel), so NO row contains a border
+/// character anywhere. BIG -> `h = 24/4 = 6`, `6 > line_size(2)` so `h =
+/// line_size = 2` -> border at row 2.
+#[test]
+fn choose_tree_v_toggles_preview() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+    // Default preview mode is NORMAL: border row at 12.
+    c.recv_output_until(&mut grid, |g| screen_text(g)[12].contains('─'));
+
+    // v -> OFF: no border anywhere (the list now spans the whole panel).
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains('─')));
+
+    // v -> BIG: border row at 2.
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[2].contains('─'));
+
+    // v -> NORMAL again: border row at 12, same as the default.
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[12].contains('─'));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
 }
 
 /// automatic-rename (Task 9, sub-project 4): PowerShell's
