@@ -192,7 +192,13 @@ pub enum ParsedCmd {
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
     SetOption { global: bool, window: bool, append: bool, unset: bool, name: String, value: Option<String> },
-    ShowOptions { global: bool, name: Option<String> },
+    /// `show-options`/`show`/`show-window-options`/`showw` (`-gwqv`, closes
+    /// follow-up #68): `window` mirrors `SetOption`'s (true when `-w` was
+    /// given OR the command word was `showw`/`show-window-options`); `quiet`
+    /// (`-q`) suppresses the unknown-option error (only meaningful for the
+    /// `@name` path today — see `Options::show_user_option`); `value_only`
+    /// (`-v`) prints just the value, no `name ` prefix.
+    ShowOptions { global: bool, window: bool, quiet: bool, value_only: bool, name: Option<String> },
     BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
     UnbindKey { all: bool, table: String, key: Option<String> },
     ListKeys,
@@ -555,7 +561,13 @@ fn canonical(name: &str) -> Option<&'static str> {
         // below, which infers `window: true` from `raw.name` for these two
         // spellings even without an explicit `-w` flag.
         "setw" | "set-window-option" => "set-option",
-        "show-options" | "show" => "show-options",
+        // `showw`/`show-window-options` mirrors `setw`'s real-separate-
+        // command-entry relationship to `set-option`
+        // (`commands-config-options-formats.md`: "Same for
+        // `show-window-options`/`showw`" — `cmd-show-options.c:54-65`):
+        // shares `show-options`'s exec function with an implied `-w`, see
+        // the "show-options" resolve arm below.
+        "show-options" | "show" | "show-window-options" | "showw" => "show-options",
         "bind-key" | "bind" => "bind-key",
         "unbind-key" | "unbind" => "unbind-key",
         "list-keys" | "lsk" => "list-keys",
@@ -623,7 +635,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "confirm-before" => "usage: confirm-before [-p prompt] command ...",
         "command-prompt" => "usage: command-prompt [-I initial]",
         "set-option" => "usage: set-option [-g] [-w] [-a] [-u] option [value]",
-        "show-options" => "usage: show-options [-g] [option]",
+        "show-options" => "usage: show-options [-g] [-w] [-q] [-v] [option]",
         "bind-key" => "usage: bind-key [-n] [-r] [-T table] key command ...",
         "unbind-key" => "usage: unbind-key [-a] [-n] [-T table] [key]",
         "list-keys" => "usage: list-keys",
@@ -976,11 +988,43 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SetOption { global, window, append, unset, name: name.clone(), value })
         }
         "show-options" => {
-            let Ok((b, _, p)) = scan_flags(&raw.args, &["-g"], &[]) else { return Err(bad()) };
-            if p.len() > 1 {
+            // All four flags are boolean-only (no value-taking flag in this
+            // command), so unlike `scan_flags` (shared by commands that DO
+            // mix bool/value flags, and therefore never split a clump —
+            // see its doc comment) this arm can safely support real tmux
+            // clump bundling (`-gqv` == `-g -q -v`, `arguments.c:205-252`)
+            // with a plain per-character scan: the exact TPM rung-1 idiom
+            // `show -gqv "@foo"` (#68) parses. `-w` mirrors `set-option`'s
+            // "table decides scope, flag only picks global-vs-local within
+            // it" rule, and `showw`/`show-window-options` imply it exactly
+            // like `setw`/`set-window-option` do for `set-option` (see that
+            // arm's comment) -- recovered from `raw.name` since
+            // `canonical()` already collapsed both spellings onto
+            // "show-options".
+            let mut global = false;
+            let mut window = matches!(raw.name.as_str(), "showw" | "show-window-options");
+            let mut quiet = false;
+            let mut value_only = false;
+            let mut positional = Vec::new();
+            for tok in &raw.args {
+                if tok.len() > 1 && tok.starts_with('-') {
+                    for c in tok[1..].chars() {
+                        match c {
+                            'g' => global = true,
+                            'w' => window = true,
+                            'q' => quiet = true,
+                            'v' => value_only = true,
+                            _ => return Err(bad()),
+                        }
+                    }
+                } else {
+                    positional.push(tok.clone());
+                }
+            }
+            if positional.len() > 1 {
                 return Err(bad());
             }
-            Ok(ParsedCmd::ShowOptions { global: has(&b, "-g"), name: p.into_iter().next() })
+            Ok(ParsedCmd::ShowOptions { global, window, quiet, value_only, name: positional.into_iter().next() })
         }
         "bind-key" => {
             let mut table: Option<String> = None;
@@ -1934,14 +1978,44 @@ mod tests {
     fn show_options_and_display_message() {
         assert_eq!(
             resolve(&raw("show", &["-g", "status-left"])).unwrap(),
-            ParsedCmd::ShowOptions { global: true, name: Some("status-left".to_string()) }
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: false, value_only: false, name: Some("status-left".to_string()) }
         );
-        assert_eq!(resolve(&raw("show", &[])).unwrap(), ParsedCmd::ShowOptions { global: false, name: None });
+        assert_eq!(
+            resolve(&raw("show", &[])).unwrap(),
+            ParsedCmd::ShowOptions { global: false, window: false, quiet: false, value_only: false, name: None }
+        );
         assert_eq!(
             resolve(&raw("display", &["hello", "world"])).unwrap(),
             ParsedCmd::DisplayMessage { text: Some("hello world".to_string()) }
         );
         assert_eq!(resolve(&raw("display-message", &[])).unwrap(), ParsedCmd::DisplayMessage { text: None });
+    }
+
+    /// #68: `show -gqv "@foo"` (the TPM rung-1 primitive) must parse `-q`
+    /// and `-v` (bundled with `-g` in one clump, tmux's real boolean-flag
+    /// bundling rule, `arguments.c:205-252`) alongside the pre-existing
+    /// `-g`. Also covers `-w`/`showw`/`show-window-options` implying
+    /// `window: true`, mirroring `setw_is_set_option_alias` above.
+    #[test]
+    fn show_options_parses_v_and_q_flags() {
+        assert_eq!(
+            resolve(&raw("show", &["-gqv", "@foo"])).unwrap(),
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: true, value_only: true, name: Some("@foo".to_string()) }
+        );
+        // Un-bundled, same result.
+        assert_eq!(
+            resolve(&raw("show-options", &["-g", "-q", "-v", "@foo"])).unwrap(),
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: true, value_only: true, name: Some("@foo".to_string()) }
+        );
+        // `-w` explicit.
+        assert_eq!(
+            resolve(&raw("show", &["-w", "mode-keys"])).unwrap(),
+            ParsedCmd::ShowOptions { global: false, window: true, quiet: false, value_only: false, name: Some("mode-keys".to_string()) }
+        );
+        // `showw`/`show-window-options` imply `-w` with no explicit flag.
+        let want_w = ParsedCmd::ShowOptions { global: false, window: true, quiet: false, value_only: false, name: None };
+        assert_eq!(resolve(&raw("showw", &[])).unwrap(), want_w);
+        assert_eq!(resolve(&raw("show-window-options", &[])).unwrap(), want_w);
     }
 
     /// SP6 Task 2: `setw`/`set-window-option` are real tmux command entries

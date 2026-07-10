@@ -309,13 +309,23 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     `escape_ready`/`flush_now`, driven by the server's `Tick` handler — see
     `docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## naming`
     section.
-26. **No per-session/per-window option scopes.** `Options` (Task 4) is one
-    global instance on `Server`, matching tmux's `-g` (global) scope only;
-    real tmux allows session- and window-level overlays (`set -w`,
-    unprefixed `set` inside a window context) that override the global
-    value. SP3 accepts `-g`/bare `set` as globally-scoped regardless of the
-    flag actually passed, which is a real behavioral gap for any config that
-    relies on per-window styling.
+26. **RESOLVED** (SP7 Task 6, 2026-07-10). Was: no per-session/per-window
+    option scopes. Real per-session and per-window option overlays now
+    exist: sparse `options::Overlay` stores embedded as
+    `model::Session::session_options`/`model::Window::window_options`,
+    with a table-decides-scope classifier (`options::scope`, per
+    `docs/tmux-reference/commands-config-options-formats.md` §3.3.4 /
+    Appendix B) and ONE scope-resolving read pattern (`_for`-suffixed
+    getters taking the acting entity's overlay; resolution local ->
+    global). Unprefixed `set` from a client targets that client's own
+    session; `setw`/`set -w` its current window; `-g` the global level;
+    headless (CLI/config) calls with no acting session fall back to the
+    global table, preserving pre-Task-6 behavior byte-for-byte. Documented
+    narrowings (see the new `## option-scopes` section of
+    `docs/specs/2026-07-07-command-config-interfaces.md`, plus follow-ups
+    #75/#76 below): no `-t` targeting for set/show, no per-PANE option
+    tree, live `set` side effects fire on global writes only, and
+    `status`/`status-position` GEOMETRY stays global-only.
 27. **Format engine covers a fixed subset of `#`-codes, not the general
     tmux format language.** `expand_format` (`src/options.rs`) supports
     `#S`/`#W`/`#I`/`#P`/`#F`/`#H`/strftime-style `%H:%M`-class codes and
@@ -392,15 +402,18 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     the code comment at `src/server.rs`'s status-row assembly, "status-right
     styling via `#[]` inline styles is SP4; until then the right side is
     drawn with the row's base style."
-32. **`pane-base-index` is accepted + stored but inert.** The design spec
-    lists it as a real option (default 0) alongside `base-index`, but
-    nothing consumes it: pane indexes in kill-pane prompts/targets are
-    position-based from 0 regardless of this option's value. Unlike the
-    other inert options, it DOES have a typed getter
-    (`Options::pane_base_index`) — the getter itself is simply never called.
-    Reclassified as accepted-inert (final whole-branch review, 2026-07-07);
-    no code change, since it is already stored/validated exactly like the
-    other inert options.
+32. **RESOLVED** (SP7 Task 6, 2026-07-10). Was: `pane-base-index` accepted
+    + stored but inert. Now LIVE (window-scoped, resolved through the
+    window's overlay via `Options::pane_base_index_for`) at every
+    user-visible pane-index site: `display-panes` digits (drawn overlay AND
+    digit-keypress mapping share `server::pane_digit_entries`, digit =
+    base + position), `#P`/`pane_index` format expansion (status row,
+    `display-message`, the `kill-pane #P? (y/n)` confirm prompt via
+    `dispatch::format_values`, the status-row click hit-test), and numeric
+    `:.N` pane targets (`dispatch::resolve_pane`: `.N` names the
+    user-visible index, so under `pane-base-index 1` `.1` is the first
+    pane and `.0` errors). Proven end to end by `tests/server_proto.rs::
+    pane_base_index_shifts_display_panes_digits_and_hash_p`.
 33. **Config errors surface via `server.log` + a first-attach transient
     message, not tmux's interactive error view.** Real tmux reports a
     `.tmux.conf` parse/apply error interactively (an in-place message in the
@@ -1059,13 +1072,16 @@ None block the sub-project 4 merge.
     (synthesized mouse key names resolved through `Bindings` like tmux); sizeable,
     interacts with SP6 Tasks 6-7's release-semantics work. LOW/MEDIUM.
 
-68. **`show-options -v`/`-q` CLI flags not wired into dispatch** (found in SP6
-    Task 2, 2026-07-10). `Options::show_user_option` implements tmux-correct
-    value-only/quiet semantics at the options layer (unit-tested), but `cmd.rs`
-    doesn't parse `-v`/`-q` for `show-options`/`show`, so `show -gqv "@foo"` — the
-    exact TPM rung-1 primitive (docs/superpowers/plans/2026-07-08-tpm-plugin-support.md)
-    — is not yet available end-to-end. Fix: parse the flags in cmd.rs, thread to
-    `exec_show_options`. SMALL. LOW (until SP5/TPM work starts).
+68. **RESOLVED** (SP7 Task 6, 2026-07-10). Was: `show-options -v`/`-q` CLI
+    flags not wired into dispatch. `cmd.rs`'s `show-options` arm now parses
+    `-g`/`-w`/`-q`/`-v` with real tmux boolean-flag BUNDLING (`show -gqv
+    "@foo"` — the exact TPM rung-1 primitive — parses as one clump), plus
+    the `showw`/`show-window-options` command spellings (imply `-w`, same
+    rule as `setw`); `ParsedCmd::ShowOptions` grew
+    `window`/`quiet`/`value_only` fields and dispatch threads them to
+    `exec_show_options` (`-v` = value-only output, `-q` = unset-@-option
+    silently succeeds; scoped reads per #26's resolution above). Proven end
+    to end by `tests/server_proto.rs::show_gqv_user_option_prints_value_only`.
 
 69. **`status-justify` has no overflow/scroll behavior, and `status-left`'s
     length cap counts `#[...]` marker bytes as visible width** (SP6 Task 4,
@@ -1179,3 +1195,54 @@ None block the sub-project 4 merge.
     machinery, not just wiring an existing signal to an existing option).
     LOW priority (no known user config actually turns these on and depends
     on the behavior; the one polled fixture explicitly turns them off).
+
+## Follow-ups from SP7 Task 6 (option scopes, 2026-07-10)
+
+75. **Live `set` side effects fire on GLOBAL writes only.** SP7 Task 6's
+    scope work routes per-session/per-window WRITES into the new
+    `options::Overlay` stores and per-entity READS through the
+    `_for`-suffixed getters, but the runtime side effects in
+    `dispatch::exec_set_option` (prefix rebinding + every attached
+    client's `KeyMachine::set_prefix`, `repeat-time`/`escape-time`
+    propagation, the `mouse` SGR enable/disable broadcast, the
+    `status`/`status-position` relayout) still run only in the
+    global-write branch. Concretely: a per-session `set prefix C-a` (no
+    `-g`) stores, shows, and correctly seeds any client that attaches to
+    that session LATER (`finish_attach` reads `prefix_for`), but does NOT
+    live-rebind that session's ALREADY-attached clients' key machines —
+    and a per-session `set mouse on` doesn't broadcast the SGR enable to
+    that session's attached clients until reattach (the mouse-event
+    ROUTING check, `dispatch_mouse`, IS per-session already). Fix sketch:
+    the side-effect block needs a "which clients does this write affect"
+    filter (global write -> all; session write -> clients of that
+    session) instead of its current all-or-nothing shape. SMALL/MEDIUM.
+76. **`status`/`status-position` pane-area GEOMETRY is global-only.** The
+    row-reservation math (`Server::status_rows`/`pane_area_y`, feeding
+    `recompute_session_size`/`apply_layout_for_session`/`render_all`'s
+    single shared `area_y`) reads the global option only — a per-session
+    `set status off` (no `-g`) changes nothing (deliberately: SP7 Task 6
+    kept BOTH the geometry and the row-painting check global so they can
+    never disagree; a half-threaded version that paints per-session but
+    reserves globally would show a blank dead row or overlap, strictly
+    worse). Making it truly per-session means threading a
+    session-specific `area_y`/pane-row-count through
+    `recompute_session_size`, `apply_layout_for_session`, every
+    `pane_area_y()` call site (6 in dispatch.rs alone), and `render_all`.
+    Every session-scoped option that affects the row's CONTENT only
+    (status-left/right/lengths/styles/justify, all window-status-*) IS
+    per-entity already. MEDIUM. LOW priority (per-session `status off`
+    is a rare idiom).
+77. **`Overlay::set`'s `-a` append / value-less Flag toggle are
+    local-entry-relative, and `show` (scoped) prints the EFFECTIVE value
+    rather than tmux's local-tree-only default.** Two small documented
+    simplifications from SP7 Task 6 (see the `## option-scopes` contract
+    section): (a) `set -a <opt> x` / `set <flag-opt>` (no value) on a
+    session/window with NO local entry starts from ""/false rather than
+    the inherited effective value (real tmux appends/toggles against the
+    tree the write targets, which also starts empty — but tmux's
+    read-side `options_get` walk means ITS toggle reads the inherited
+    value first); (b) `show <name>` without `-g` from a client prints the
+    inherited global value when there's no local override, where real
+    tmux prints nothing unless `-A` is given. Both chosen for usefulness
+    over strictness; revisit if a real config depends on the strict
+    semantics. SMALL. LOW.

@@ -383,8 +383,18 @@ fn format_clock(hour24: u8, minute: u8, style12: bool) -> String {
 /// (`Server::build_render_overlay`) and the digit-keypress resolution path
 /// (`dispatch::Server::dispatch_display_panes_key`) so they can never
 /// disagree about which digit means which pane.
-fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
-    window.layout.panes().into_iter().take(10).enumerate().map(|(i, id)| (id, i as u32)).collect()
+/// `options` supplies `pane-base-index` (#32, SP7 Task 6, window-scoped:
+/// consulted via `window`'s own [`Options::pane_base_index_for`] overlay,
+/// falling back to the global default like every other window-scoped
+/// read) — the digit shown for the Nth pane (and the digit a keypress must
+/// match, since both callers share this one function) is `base + N`, not
+/// always `N`. Still capped at the first 10 panes (documented
+/// simplification, unchanged): with a nonzero base a pane whose digit
+/// would exceed 9 simply gets no reachable single-digit key, same as the
+/// pre-existing "11th+ pane" cap.
+fn pane_digit_entries(window: &crate::model::Window, options: &Options) -> Vec<(PaneId, u32)> {
+    let base = options.pane_base_index_for(&window.window_options);
+    window.layout.panes().into_iter().take(10).enumerate().map(|(i, id)| (id, i as u32 + base)).collect()
 }
 
 /// Precomputed, render-ready overlay content for one client (Task 8),
@@ -1339,7 +1349,12 @@ impl Server {
                             // -- see `rename_window_from_esc_k`'s doc
                             // comment for why real tmux's `allow-rename`
                             // gate is independent of `automatic-rename`.
-                            if self.options.allow_rename() {
+                            // `allow-rename` is window-scoped (#26).
+                            let allow = match self.window_containing_pane(id) {
+                                Some(w) => self.options.allow_rename_for(&w.window_options),
+                                None => self.options.allow_rename(),
+                            };
+                            if allow {
                                 self.rename_window_from_esc_k(id, &title);
                             }
                         } else {
@@ -1389,7 +1404,6 @@ impl Server {
                 // (`window-clock.c:146-168`). Real time, therefore untested
                 // at unit level beyond `format_clock` itself (the pure
                 // formatting seam) -- see that function's test module.
-                let clock_style12 = self.options.clock_mode_style_12();
                 let clock_now = system_time_parts();
                 for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
@@ -1407,6 +1421,24 @@ impl Server {
                         dirty = true;
                     }
                     if let ClientMode::Clock(cs) = &mut client.mode {
+                        // clock-mode-style is window-scoped (#26): resolve
+                        // through the clock pane's own window. Inlined
+                        // (not `Server::window_containing_pane`, an opaque
+                        // `&self` method call that would borrow ALL of
+                        // `self` and conflict with the enclosing
+                        // `self.clients.iter_mut()`) as a direct
+                        // `self.registry` field projection, which the
+                        // borrow checker CAN see is disjoint from
+                        // `self.clients`.
+                        let window = self
+                            .registry
+                            .sessions()
+                            .iter()
+                            .find_map(|s| s.windows.iter().find(|w| w.layout.panes().contains(&cs.pane)));
+                        let clock_style12 = match window {
+                            Some(w) => self.options.clock_mode_style_12_for(&w.window_options),
+                            None => self.options.clock_mode_style_12(),
+                        };
                         let text = format_clock(clock_now.hour, clock_now.min, clock_style12);
                         if text != cs.text {
                             cs.text = text;
@@ -1476,6 +1508,31 @@ impl Server {
         })
     }
 
+    /// Locate the window that owns `pane_id` (any pane in the window, not
+    /// just its active one -- unlike [`Server::window_for_active_pane`]).
+    /// SP7 Task 6 (closes follow-up #26): the read helper used to route a
+    /// window-scoped option lookup through that window's
+    /// `window_options` overlay when the caller only has a `PaneId` in
+    /// hand.
+    fn window_containing_pane(&self, pane_id: PaneId) -> Option<&crate::model::Window> {
+        self.registry
+            .sessions()
+            .iter()
+            .find_map(|s| s.windows.iter().find(|w| w.layout.panes().contains(&pane_id)))
+    }
+
+    /// `mode-keys` is window-scoped (#26): which copy-mode key table
+    /// `pane`'s own window resolves to (falling back to global if the pane
+    /// isn't found in any live window, which shouldn't happen for a pane
+    /// currently in copy mode but is handled defensively like every other
+    /// `_for` fallback in this module).
+    fn mode_keys_vi_for_pane(&self, pane: PaneId) -> bool {
+        match self.window_containing_pane(pane) {
+            Some(w) => self.options.mode_keys_vi_for(&w.window_options),
+            None => self.options.mode_keys_vi(),
+        }
+    }
+
     /// automatic-rename (Task 9, sub-project 4): if `pane_id` is the ACTIVE
     /// pane of some window (`window.layout.focused() == pane_id`), and both
     /// the global `automatic-rename` option and that window's own
@@ -1498,13 +1555,16 @@ impl Server {
     /// review fix of cae6af2, which had wrongly routed `allow-rename`-gated
     /// `ESC k` titles through this function).
     fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str) {
-        if !self.options.automatic_rename() {
-            return;
-        }
         let Some(name) = derive_auto_name(title) else { return };
         let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
         let Some(session) = self.registry.session_mut(&session_name) else { return };
         let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        // `automatic-rename` is window-scoped (#26): checked HERE (after
+        // the window is resolved), not up front against the global-only
+        // value, so a per-window override actually takes effect.
+        if !self.options.automatic_rename_for(&window.window_options) {
+            return;
+        }
         if !window.auto_rename || window.name == name {
             return;
         }
@@ -1687,23 +1747,36 @@ impl Server {
         // First-attach-only config-error notice (Task 7): `take()` so a
         // SECOND client attaching later never sees it again.
         let message = self.pending_config_message.take().map(|m| (m, Instant::now()));
+        // `mouse`/`prefix` are session-scoped (#26): resolve through the
+        // session this client is attaching TO (it already exists by this
+        // point -- `handle_attach` creates it before calling here).
+        let session_overlay = self.registry.sessions().iter().find(|s| s.name == session_name).map(|s| &s.session_options);
         // Task 5 (mouse): a newly-attaching client needs the enable sequence
         // too if `mouse` is already on (e.g. set in a `.tmux.conf`, or a
         // second client attaching after a first client turned it on) — sent
         // directly as its own Output frame rather than waiting for the next
         // composed render, matching how `exec_set_option`'s runtime toggle
         // broadcasts it.
-        if self.options.mouse() {
+        let mouse_on = match session_overlay {
+            Some(ov) => self.options.mouse_for(ov),
+            None => self.options.mouse(),
+        };
+        if mouse_on {
             send_output(&tx, MOUSE_ENABLE_SEQ.to_vec());
         }
-        let mut key_machine = KeyMachine::new(self.options.prefix());
+        let prefix = match session_overlay {
+            Some(ov) => self.options.prefix_for(ov),
+            None => self.options.prefix(),
+        };
+        let mut key_machine = KeyMachine::new(prefix);
         // Escape-time (Task 9, sub-project 4): seed from the CURRENT option
         // value (e.g. already set by a `.tmux.conf` loaded at startup) --
         // mirrors `prefix`'s existing at-creation seeding above. Unlike
         // `repeat-time` (a pre-existing gap: only re-synced by a runtime
         // `set`, never at attach time), escape-time getting this wrong would
         // silently break Escape-key delivery for a client that attaches
-        // after config already changed it.
+        // after config already changed it. `escape-time` is Server-scope
+        // (always global, unaffected by this task).
         key_machine.set_escape_time(self.options.escape_time());
         let client = ClientState {
             session: Some(session_name.clone()),
@@ -2206,11 +2279,11 @@ impl Server {
                     // coalesced, since the blob is always a complete,
                     // self-contained run) and resolve each one against the
                     // copy table instead.
-                    if matches!(client.mode, ClientMode::Copy(_)) {
+                    if let ClientMode::Copy(cs) = &client.mode {
                         let mut dec = crate::keys::KeyDecoder::new();
                         let mut decoded = dec.feed(&data);
                         decoded.extend(dec.flush());
-                        let which = if self.options.mode_keys_vi() { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
+                        let which = if self.mode_keys_vi_for_pane(cs.pane) { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
                         for item in decoded {
                             // A coalesced `Forward` blob is built ONLY from
                             // plain-forwardable KEYS (`is_plain_forwardable`
@@ -2412,8 +2485,8 @@ impl Server {
                     // `## copy-mode` contract section). A `Prefix`-table
                     // event is left alone: prefix bindings (e.g. `C-b c`)
                     // still fire from copy mode, matching tmux.
-                    let table = if matches!(client.mode, ClientMode::Copy(_)) && table == WhichTable::Root {
-                        if self.options.mode_keys_vi() {
+                    let table = if let (ClientMode::Copy(cs), true) = (&client.mode, table == WhichTable::Root) {
+                        if self.mode_keys_vi_for_pane(cs.pane) {
                             WhichTable::CopyModeVi
                         } else {
                             WhichTable::CopyMode
@@ -2615,7 +2688,7 @@ impl Server {
             }
             ClientMode::DisplayPanes(_) => {
                 let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
-                Some(RenderOverlay::Digits(pane_digit_entries(session.current_window())))
+                Some(RenderOverlay::Digits(pane_digit_entries(session.current_window(), &self.options)))
             }
             ClientMode::Clock(state) => Some(RenderOverlay::Clock { pane: state.pane, text: state.text.clone() }),
             _ => None,
@@ -2677,7 +2750,8 @@ fn render_one(
     // `too_small` only applies in `Normal` mode, where it additionally takes
     // priority over a transient status message.
     let default_style = Style::default();
-    let msg_style = options.message_style().apply_to(default_style);
+    // message-style is session-scoped (#26).
+    let msg_style = options.message_style_for(&session.session_options).apply_to(default_style);
     let message = match &client.mode {
         ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
@@ -2722,15 +2796,42 @@ fn render_one(
     // Status row from the option table. status off -> None (no row painted;
     // the pane area already includes the freed row via
     // `recompute_session_size`).
+    //
+    // `status`/`status-position` are session-scoped per the reference doc,
+    // but a documented NARROWING (SP7 Task 6): the pane-area GEOMETRY that
+    // decides how many rows are reserved for the status bar
+    // (`Server::status_rows`/`pane_area_y`, which feed `recompute_
+    // session_size`/`apply_layout_for_session`/`render_all`'s single
+    // shared `area_y`) still reads the GLOBAL value only, not per-session
+    // -- those functions size EVERY session's shared pane area up front,
+    // before any per-client render pass, and `render_all` currently
+    // computes ONE `area_y` for every attached client regardless of
+    // session. Making the geometry itself per-session would need to
+    // thread a session-specific `area_y`/pane-row-count through that whole
+    // chain (`recompute_session_size`, `apply_layout_for_session`, EVERY
+    // `pane_area_y()` call site, `render_all`'s per-client loop) — real,
+    // but out of this task's tractable blast radius; a HALF-threaded
+    // version (visual content session-scoped, reserved row count global)
+    // would be actively WORSE than not threading at all, since a session
+    // with a local `status off` override would then paint no row while
+    // still reserving/hiding a blank one, or vice versa. So the on/off and
+    // top/bottom CHECKS below intentionally stay global-only (`options.
+    // status_on()`/`status_position_top()`, matching the pre-Task-6
+    // geometry every layout call already assumes); every option that
+    // affects the row's CONTENT ONLY, not whether/where it's reserved
+    // (`status-left`/`-right`/lengths/styles/`status-justify`, and every
+    // per-window `window-status-*` below), IS resolved per-session/
+    // per-window. Tracked as a new follow-up (see the task report).
     let status = if options.status_on() {
-        let base = options.status_style().apply_to(default_style);
+        let base = options.status_style_for(&session.session_options).apply_to(default_style);
         // Format context from live state: the current window's index/name/
         // flags and the focused pane's position in `layout.panes()`.
         let mut window_flags = String::from("*");
         if window.layout.is_zoomed() {
             window_flags.push('Z');
         }
-        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32;
+        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32
+            + options.pane_base_index_for(&window.window_options); // #32
         let pane_title = panes.get(&focused).map(|p| p.title.as_str()).unwrap_or("");
         let fctx = FormatCtx {
             session: &session.name,
@@ -2751,54 +2852,87 @@ fn render_one(
         // `#[...]`-styled sub-runs the way the left/window-list spans have),
         // so any markers are dropped to plain text rather than leaking their
         // literal `#[...]` bytes onto the screen (SP6 Task 4).
-        let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
-        let right_expanded = strip_style_markers(&expand_format(options.status_right(), &fctx));
-        let right = truncate_chars(&right_expanded, options.status_right_length());
+        let left = truncate_chars(
+            &expand_format(options.status_left_for(&session.session_options), &fctx),
+            options.status_left_length_for(&session.session_options),
+        );
+        let right_expanded = strip_style_markers(&expand_format(options.status_right_for(&session.session_options), &fctx));
+        let right = truncate_chars(&right_expanded, options.status_right_length_for(&session.session_options));
+        // window-status-format/-current-format/-style/-current-style ARE
+        // window-scoped (#26): each tab resolves through ITS OWN window's
+        // overlay, not the shared/current window's -- so one window's
+        // `setw window-status-current-format ...` never leaks onto another
+        // window's tab. `format_override`/`style_override` are always
+        // `Some(..)` here since the `_for` getter already folds in the
+        // "no local override -> global default" fallback (see `status::
+        // WindowEntry`'s doc comment for why `None` still exists, as the
+        // pure module's own zero-overlay default path).
         let entries: Vec<WindowEntry> = session
             .windows
             .iter()
-            .map(|w| WindowEntry {
-                index: w.index,
-                name: w.name.clone(),
-                current: w.id == session.current,
-                last: Some(w.id) == session.last,
-                zoomed: w.layout.is_zoomed(),
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    options.window_status_current_format_for(&w.window_options)
+                } else {
+                    options.window_status_format_for(&w.window_options)
+                };
+                let style = if is_current {
+                    options.window_status_current_style_for(&w.window_options)
+                } else {
+                    options.window_status_style_for(&w.window_options)
+                };
+                WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    format_override: Some(fmt.to_string()),
+                    style_override: Some(*style),
+                }
             })
             .collect();
         let spans = status_spans(
             &left,
-            options.status_left_style(),
+            options.status_left_style_for(&session.session_options),
             &entries,
             &fctx,
-            options.window_status_format(),
-            options.window_status_current_format(),
+            options.window_status_format_for(&window.window_options),
+            options.window_status_current_format_for(&window.window_options),
             base,
-            options.window_status_style(),
-            options.window_status_current_style(),
-            options.window_status_separator(),
-            options.status_justify(),
+            options.window_status_style_for(&window.window_options),
+            options.window_status_current_style_for(&window.window_options),
+            options.window_status_separator_for(&window.window_options),
+            options.status_justify_for(&session.session_options),
             session.size.0,
             right.chars().count(),
         );
         Some(StatusRow {
+            // Global-only, matching the geometry narrowing above (`area_y`
+            // is computed the same way regardless of session).
             top: options.status_position_top(),
             base,
             spans,
             right,
             // status-right-style layered over base (SP6 Task 4; previously
             // always bare `base` until this task wired the option in).
-            right_style: options.status_right_style().apply_to(base),
+            right_style: options.status_right_style_for(&session.session_options).apply_to(base),
         })
     } else {
         None
     };
 
-    let border = options.pane_border_style().apply_to(default_style);
-    let border_active = options.pane_active_border_style().apply_to(default_style);
-    let border_indicators = options.pane_border_indicators();
-    let mode_style = options.mode_style().apply_to(default_style);
-    let display_panes_colour = Style { bg: options.display_panes_colour(), ..default_style };
-    let display_panes_active_colour = Style { bg: options.display_panes_active_colour(), ..default_style };
+    // Window-scoped (#26): pane-border-style/-active-border-style/
+    // -border-indicators/mode-style resolve through the CURRENT window's
+    // overlay. display-panes-colour/-active-colour are session-scoped.
+    let border = options.pane_border_style_for(&window.window_options).apply_to(default_style);
+    let border_active = options.pane_active_border_style_for(&window.window_options).apply_to(default_style);
+    let border_indicators = options.pane_border_indicators_for(&window.window_options);
+    let mode_style = options.mode_style_for(&window.window_options).apply_to(default_style);
+    let display_panes_colour = Style { bg: options.display_panes_colour_for(&session.session_options), ..default_style };
+    let display_panes_active_colour =
+        Style { bg: options.display_panes_active_colour_for(&session.session_options), ..default_style };
     let scene_size = (client.cols, client.rows);
 
     if too_small {
@@ -2932,7 +3066,11 @@ fn render_one(
             // tolerated per the project's own "every consumer must tolerate
             // w==0/h==0" rule, so `paint_clock` simply no-ops on it).
             let rect = rects.iter().find(|(id, _)| id == pane).map(|(_, r)| *r).unwrap_or(Rect { x: 0, y: 0, w: 0, h: 0 });
-            Overlay::Clock(rect, text.clone(), options.clock_mode_colour())
+            // `clock-mode-colour` is window-scoped (#26); the clock pane
+            // is always in the client's CURRENT window by render time
+            // (`cancel_stale_clock_modes` guarantees it, per the comment
+            // above).
+            Overlay::Clock(rect, text.clone(), options.clock_mode_colour_for(&window.window_options))
         }
     });
 

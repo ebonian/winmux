@@ -65,6 +65,24 @@ pub struct WindowEntry {
     pub current: bool,
     pub last: bool,
     pub zoomed: bool,
+    /// SP7 Task 6 (closes follow-up #26): this window's own EFFECTIVE
+    /// `window-status-format`/`-current-format` (resolved by the caller
+    /// through this window's `window_options` overlay via `Options::
+    /// window_status_format_for`/`window_status_current_format_for` --
+    /// `window-status-format`/`-current-format` ARE window-scoped, so two
+    /// windows in the same session can legitimately show different tab
+    /// text/styling). `None` falls back to `status_spans`'s shared
+    /// `window_format`/`window_current_format` argument -- what every
+    /// pre-Task-6 caller/test still gets (byte-identical default
+    /// behavior). A real caller with a live `Options`/overlay always
+    /// resolves and passes `Some(..)`, since the `_for` getter already
+    /// folds in the "no local override -> global default" fallback, so
+    /// `Some` is correct whether or not this ONE window actually has a
+    /// local override.
+    pub format_override: Option<String>,
+    /// Same idea as `format_override`, for `window-status-style`/
+    /// `-current-style`.
+    pub style_override: Option<PartialStyle>,
 }
 
 /// Flags string for one window: `*` if current, else `-` if last, else empty,
@@ -212,7 +230,10 @@ pub fn status_spans(
     let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
     for w in windows {
         let flags_str = flags(w);
-        let fmt = if w.current { window_current_format } else { window_format };
+        let fmt = w
+            .format_override
+            .as_deref()
+            .unwrap_or(if w.current { window_current_format } else { window_format });
         // SP7 Task 1: no shim needed anymore. tmux's real default
         // (`#I:#W#{?window_flags,#{window_flags}, }`,
         // `options::DEFAULT_WINDOW_STATUS_FORMAT`) is now stored VERBATIM
@@ -234,7 +255,11 @@ pub fn status_spans(
             pane_title: ctx.pane_title,
         };
         let text = expand_format(fmt, &per_window_ctx);
-        let tab_base = if w.current { current } else { non_current };
+        let tab_base = match &w.style_override {
+            Some(s) => s.apply_to(base),
+            None if w.current => current,
+            None => non_current,
+        };
         let spans = styled_runs(&text, tab_base);
         let width: usize = spans.iter().map(|(t, _)| t.chars().count()).sum();
         tab_spans.push(spans);
@@ -270,7 +295,7 @@ mod tests {
     use crate::style::parse_style;
 
     fn win(index: u32, name: &str, current: bool, last: bool, zoomed: bool) -> WindowEntry {
-        WindowEntry { index, name: name.to_string(), current, last, zoomed }
+        WindowEntry { index, name: name.to_string(), current, last, zoomed, format_override: None, style_override: None }
     }
 
     /// tmux default `status-style` resolved: `bg=green,fg=black`.
@@ -778,6 +803,53 @@ mod tests {
                     "vim".to_string(),
                     Style { fg: Color::Idx(7), underline: true, ..base_style }
                 ),
+            ]
+        );
+    }
+
+    // ---- per-window format/style override (SP7 Task 6, closes follow-up #26) ----
+
+    /// A per-window `format_override`/`style_override` (what the caller
+    /// sets when a window has its OWN `window-status-format`/`-style`
+    /// override, resolved through THAT window's overlay) wins for that ONE
+    /// window; every other window with `None` still uses the shared
+    /// `window_format`/`win_style` arguments -- proving one window's
+    /// `setw` never leaks onto its neighbours.
+    #[test]
+    fn per_window_override_wins_for_that_window_only() {
+        let (ws, wcs) = default_partials();
+        let base_style = base();
+        let mut overridden = win(0, "special", false, false, false);
+        overridden.format_override = Some("CUSTOM:#W".to_string());
+        overridden.style_override = Some(parse_style("fg=red").unwrap());
+        let plain = win(1, "plain", true, false, false);
+        let windows = vec![overridden, plain];
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I:#W",
+            "[#I:#W]",
+            base_style,
+            &ws,
+            &wcs,
+            " ",
+            "left",
+            200,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                // window 0: override wins over BOTH the shared format
+                // (which would've been "#I:#W" since it's non-current)
+                // AND the shared non-current style.
+                ("CUSTOM:special".to_string(), Style { fg: Color::Idx(1), ..base_style }),
+                (" ".to_string(), base_style),
+                // window 1: no override -> shared current format/style.
+                ("[1:plain]".to_string(), Style { underline: true, ..base_style }),
             ]
         );
     }

@@ -182,6 +182,106 @@ fn find_spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
 }
 
+/// Which store level (SP7 Task 6, closes follow-up #26) a NAMED option
+/// resolves against: per tmux, **the table decides the scope** —
+/// `set`/`setw`'s `-g`/`-w` flags only pick global-vs-local WITHIN that
+/// scope, they never move a name to a different scope
+/// (`commands-config-options-formats.md` §3.3.4). Classified from that
+/// doc's Appendix B (`## 10`) options table:
+///
+/// - [`Scope::Server`]: always the one global table, `-g`/`-w` "harmless/
+///   ignored" (tmux's own words) — winmux has exactly one server-wide tree
+///   (there never was a per-session/window overlay for these), so these
+///   getters are UNCHANGED by this task: `escape-time`, `default-terminal`,
+///   `exit-empty`, `buffer-limit`.
+/// - [`Scope::Session`]: has a global level (`set -g`) plus a per-session
+///   override (unprefixed `set` inside a session context). Every SPECS
+///   entry not explicitly classified `Window` or `Server` below falls here
+///   (this is the common case — most of winmux's option table mirrors
+///   tmux's session-option list).
+/// - [`Scope::Window`]: has a global-window level (`setw -g`, or `set -g`
+///   — table decides, see above) plus a per-window override (`setw`/`set
+///   -w` with no `-g`). tmux's real table further splits `Win` vs `W/P`
+///   (window+pane); winmux has no per-PANE option tree, so both collapse
+///   onto `Window` here (the per-pane half of tmux's scope is out of
+///   scope for this task — documented narrowing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Server,
+    Session,
+    Window,
+}
+
+/// Public so `server::dispatch` can pick which store (`Options`'s global
+/// table, the acting session's [`Overlay`], or the acting window's
+/// [`Overlay`]) a `set-option`/`show-options` write/read targets. Returns
+/// `None` for a name not in [`SPECS`] (dispatch's existing "unknown
+/// option" error path already handles that via `Options::set`/`Overlay::
+/// set`'s own `find_spec` check — this function is a pure classifier, not
+/// a validator).
+pub fn scope(name: &str) -> Option<Scope> {
+    find_spec(name)?;
+    Some(match name {
+        "escape-time" | "default-terminal" | "exit-empty" | "buffer-limit" => Scope::Server,
+        "pane-base-index"
+        | "window-status-style"
+        | "window-status-current-style"
+        | "window-status-format"
+        | "window-status-current-format"
+        | "window-status-separator"
+        | "window-status-bell-style"
+        | "pane-border-style"
+        | "pane-active-border-style"
+        | "pane-border-indicators"
+        | "mode-keys"
+        | "mode-style"
+        | "main-pane-width"
+        | "main-pane-height"
+        | "aggressive-resize"
+        | "automatic-rename"
+        | "allow-rename"
+        | "monitor-activity"
+        | "clock-mode-colour"
+        | "clock-mode-style" => Scope::Window,
+        _ => Scope::Session,
+    })
+}
+
+/// Shared value-parsing core for `Options::set`/[`Overlay::set`] (SP7 Task
+/// 6 extraction — previously inlined only in `Options::set`): parses `value`
+/// against `spec.kind`, returning the same errors either caller already
+/// documented (`bad value: ...`, `bad style: ...`/`invalid style: ...` from
+/// [`style::parse_style`]). Does NOT insert anywhere — purely functional, so
+/// both the global table and a per-entity [`Overlay`] can share one
+/// validation path with no risk of the two drifting apart.
+fn parse_typed_value(spec: &Spec, value: &str) -> Result<Value, String> {
+    match spec.kind {
+        Kind::Flag => Ok(Value::Flag(parse_on_off(value).ok_or_else(|| format!("bad value: {value}"))?)),
+        Kind::Number => Ok(Value::Number(value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?)),
+        Kind::Key => Ok(Value::Key(keys::parse_key(value).ok_or_else(|| format!("bad value: {value}"))?)),
+        Kind::Choice => {
+            let lower = value.to_ascii_lowercase();
+            let matched = spec.choices.iter().find(|c| **c == lower).ok_or_else(|| format!("bad value: {value}"))?;
+            Ok(Value::Choice(matched))
+        }
+        Kind::Str => {
+            // See `Options::set`'s original doc note (still accurate):
+            // control chars are rejected uniformly across every Str-kind
+            // option, echoing a sanitized error so the rejection message
+            // itself can never smuggle a control sequence to a client's
+            // terminal.
+            if has_control_chars(value) {
+                return Err(format!("bad value: {}", sanitize_control_chars(value)));
+            }
+            Ok(Value::Str(value.to_string()))
+        }
+        Kind::Style => {
+            let parsed = style::parse_style(value)?;
+            Ok(Value::Style(value.to_string(), parsed))
+        }
+    }
+}
+
 /// Which [`Kind`] a concrete [`Value`] actually is -- used only by the
 /// `specs_and_defaults_stay_in_sync` test to catch a `SPECS`/`default_value`
 /// desync (a `Spec.kind` that doesn't match the `Value` variant
@@ -388,43 +488,7 @@ impl Options {
             }
         };
 
-        let parsed = match spec.kind {
-            Kind::Flag => Value::Flag(parse_on_off(value).ok_or_else(|| format!("bad value: {value}"))?),
-            Kind::Number => Value::Number(value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?),
-            Kind::Key => Value::Key(keys::parse_key(value).ok_or_else(|| format!("bad value: {value}"))?),
-            Kind::Choice => {
-                let lower = value.to_ascii_lowercase();
-                let matched = spec
-                    .choices
-                    .iter()
-                    .find(|c| **c == lower)
-                    .ok_or_else(|| format!("bad value: {value}"))?;
-                Value::Choice(matched)
-            }
-            Kind::Str => {
-                // `status-left`/`status-right` are settable at runtime by ANY
-                // attached client (`:set -g status-left ...`) and the
-                // composited status row goes to EVERY attached client's
-                // terminal -- embedded ESC/OSC/CSI (title spoofing, OSC 52
-                // clipboard) or bare \r\n could corrupt other clients'
-                // terminals. Reject the same way `model::validate_name`
-                // rejects control chars in session/window names: sanitize
-                // control chars to `?` in the echoed error text so the
-                // rejection message itself can never smuggle a control
-                // sequence back to the caller's terminal. Covers
-                // status-left/status-right/default-command/default-terminal
-                // uniformly -- a control character in any of them is equally
-                // bogus, not just the two status-bar options.
-                if has_control_chars(value) {
-                    return Err(format!("bad value: {}", sanitize_control_chars(value)));
-                }
-                Value::Str(value.to_string())
-            }
-            Kind::Style => {
-                let parsed = style::parse_style(value)?;
-                Value::Style(value.to_string(), parsed)
-            }
-        };
+        let parsed = parse_typed_value(spec, value)?;
         self.values.insert(spec.name, parsed);
         Ok(())
     }
@@ -492,7 +556,26 @@ impl Options {
     /// 2 scope is the `Options`-level semantics; CLI `-v`/`-q` flag parsing
     /// for `show-options` is future work).
     pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String> {
+        self.show_user_option_scoped(name, quiet, None)
+    }
+
+    /// Scoped `-q`-aware read of a user (`@name`) option (SP7 Task 6): the
+    /// same tmux idiom as [`Options::show_user_option`], but checking
+    /// `overlay`'s LOCAL store first (if given and it has a local entry)
+    /// before falling back to the global store — the same
+    /// local-then-inherited chain a named session-/window-scoped option
+    /// resolves through (`options_get` walks the tree's parent pointer
+    /// regardless of whether the entry is a table name or a free-form
+    /// `@name`). `overlay: None` reads the global store only, identical to
+    /// [`Options::show_user_option`] (which is now a thin `overlay: None`
+    /// call to this).
+    pub fn show_user_option_scoped(&self, name: &str, quiet: bool, overlay: Option<&Overlay>) -> Result<Option<String>, String> {
         let uname = name.strip_prefix('@').unwrap_or(name);
+        if let Some(ov) = overlay {
+            if let Some(v) = ov.user_options.get(uname) {
+                return Ok(Some(v.clone()));
+            }
+        }
         match self.user_options.get(uname) {
             Some(v) => Ok(Some(v.clone())),
             None if quiet => Ok(None),
@@ -860,6 +943,409 @@ impl Options {
             Some(Value::Style(_, s)) => s,
             _ => unreachable!("{name} is always Style"),
         }
+    }
+
+    // ---- scope-resolving reads (SP7 Task 6, closes follow-up #26) ----
+    //
+    // ONE resolution pattern, applied to every window-/session-scoped
+    // getter that a real production call site (`server.rs`/`server/
+    // dispatch.rs`) reads: a `_for` sibling of the existing zero-arg
+    // getter, taking the ACTING session's or window's [`Overlay`] (already
+    // resolved by the caller — dispatch/render always has the acting
+    // client's current session/window in scope). Resolution is exactly the
+    // two-level chain the design doc specifies (window → global-window;
+    // session → global — no third pane level, no `-t` cross-entity
+    // targeting): the overlay is checked first, and only when it has no
+    // LOCAL entry for that name does the read fall through to the shared
+    // global table (`self.values`) — the exact same value every pre-Task-6
+    // zero-arg getter already returns, so an entity with an EMPTY overlay
+    // (the default, `Overlay::new()`) is always byte-identical to the old
+    // global-only getter (the DEFAULT-BEHAVIOR REGRESSION BAR).
+    //
+    // Getters for [`Scope::Server`] names (`escape-time`, `default-
+    // terminal`, `exit-empty`, `buffer-limit`) intentionally have NO `_for`
+    // sibling: they only ever read `self.values`, matching tmux's "any
+    // -g/-w is harmless/ignored" rule for that scope.
+
+    fn resolve_session<'a>(&'a self, name: &'static str, session: &'a Overlay) -> &'a Value {
+        session
+            .values
+            .get(name)
+            .or_else(|| self.values.get(name))
+            .unwrap_or_else(|| unreachable!("{name} always has a global default"))
+    }
+
+    fn resolve_window<'a>(&'a self, name: &'static str, window: &'a Overlay) -> &'a Value {
+        window
+            .values
+            .get(name)
+            .or_else(|| self.values.get(name))
+            .unwrap_or_else(|| unreachable!("{name} always has a global default"))
+    }
+
+    /// Scope-aware `show`/`show-window-options` for a NAMED option
+    /// (`#68`/dispatch's `exec_show_options`): the EFFECTIVE value (local
+    /// override if the acting entity has one, else the inherited global) —
+    /// a documented simplification of tmux's "local-tree-only unless `-A`"
+    /// rule (`commands-config-options-formats.md` §3.5), chosen because
+    /// showing the value a user would actually observe in effect is far
+    /// more useful than tmux's stricter local-only default, and no
+    /// required test depends on the stricter behavior. `session`/`window`:
+    /// pass the one matching the name's [`scope`] (the other is ignored);
+    /// `None` for either simply means "no override at that level to check"
+    /// (same as passing an empty [`Overlay`]).
+    pub fn show_effective(&self, name: &str, session: Option<&Overlay>, window: Option<&Overlay>) -> Option<String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            if let Some(w) = window {
+                if let Some(v) = w.user_options.get(uname) {
+                    return Some(v.clone());
+                }
+            }
+            if let Some(s) = session {
+                if let Some(v) = s.user_options.get(uname) {
+                    return Some(v.clone());
+                }
+            }
+            return self.user_options.get(uname).cloned();
+        }
+        let spec = find_spec(name)?;
+        let value = match scope(spec.name) {
+            Some(Scope::Window) => window.map(|w| self.resolve_window(spec.name, w)),
+            Some(Scope::Session) => session.map(|s| self.resolve_session(spec.name, s)),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.values.get(spec.name).expect("known option"));
+        Some(format_value(value))
+    }
+
+    pub fn prefix_for(&self, session: &Overlay) -> Key {
+        match self.resolve_session("prefix", session) {
+            Value::Key(k) => *k,
+            _ => unreachable!("prefix is always Key"),
+        }
+    }
+
+    pub fn base_index_for(&self, session: &Overlay) -> u32 {
+        as_number(self.resolve_session("base-index", session))
+    }
+
+    pub fn status_on_for(&self, session: &Overlay) -> bool {
+        as_flag(self.resolve_session("status", session))
+    }
+
+    pub fn status_position_top_for(&self, session: &Overlay) -> bool {
+        matches!(self.resolve_session("status-position", session), Value::Choice("top"))
+    }
+
+    pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("status-left", session))
+    }
+
+    pub fn status_right_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("status-right", session))
+    }
+
+    pub fn status_left_length_for(&self, session: &Overlay) -> u16 {
+        as_number(self.resolve_session("status-left-length", session)) as u16
+    }
+
+    pub fn status_right_length_for(&self, session: &Overlay) -> u16 {
+        as_number(self.resolve_session("status-right-length", session)) as u16
+    }
+
+    pub fn status_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-style", session))
+    }
+
+    pub fn status_left_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-left-style", session))
+    }
+
+    pub fn status_right_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-right-style", session))
+    }
+
+    pub fn status_justify_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("status-justify", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("status-justify is always Choice"),
+        }
+    }
+
+    pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("message-style", session))
+    }
+
+    pub fn repeat_time_for(&self, session: &Overlay) -> Duration {
+        Duration::from_millis(as_number(self.resolve_session("repeat-time", session)) as u64)
+    }
+
+    pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("default-command", session))
+    }
+
+    pub fn renumber_windows_for(&self, session: &Overlay) -> bool {
+        as_flag(self.resolve_session("renumber-windows", session))
+    }
+
+    pub fn mouse_for(&self, session: &Overlay) -> bool {
+        as_flag(self.resolve_session("mouse", session))
+    }
+
+    pub fn history_limit_for(&self, session: &Overlay) -> u32 {
+        as_number(self.resolve_session("history-limit", session))
+    }
+
+    pub fn word_separators_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("word-separators", session))
+    }
+
+    pub fn display_panes_time_for(&self, session: &Overlay) -> Duration {
+        Duration::from_millis(as_number(self.resolve_session("display-panes-time", session)) as u64)
+    }
+
+    pub fn display_panes_colour_for(&self, session: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_session("display-panes-colour", session)).to_ascii_lowercase())
+            .unwrap_or(Color::Idx(4))
+    }
+
+    pub fn display_panes_active_colour_for(&self, session: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_session("display-panes-active-colour", session)).to_ascii_lowercase())
+            .unwrap_or(Color::Idx(1))
+    }
+
+    /// `pane-base-index` (#32): the window-scoped floor pane INDEXES are
+    /// displayed/targeted from -- see the getter's zero-arg sibling's doc
+    /// comment for the option's own semantics; this `_for` variant is the
+    /// one every user-visible pane-index call site (display-panes digits,
+    /// `#P`, kill-pane confirm text, `:.N` target parsing) now routes
+    /// through.
+    pub fn pane_base_index_for(&self, window: &Overlay) -> u32 {
+        as_number(self.resolve_window("pane-base-index", window))
+    }
+
+    pub fn window_status_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-style", window))
+    }
+
+    pub fn window_status_current_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-current-style", window))
+    }
+
+    pub fn window_status_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-format", window))
+    }
+
+    pub fn window_status_current_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-current-format", window))
+    }
+
+    pub fn window_status_separator_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-separator", window))
+    }
+
+    pub fn pane_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("pane-border-style", window))
+    }
+
+    pub fn pane_active_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("pane-active-border-style", window))
+    }
+
+    pub fn pane_border_indicators_for(&self, window: &Overlay) -> crate::render::BorderIndicators {
+        use crate::render::BorderIndicators;
+        match self.resolve_window("pane-border-indicators", window) {
+            Value::Choice("off") => BorderIndicators::Off,
+            Value::Choice("arrows") => BorderIndicators::Arrows,
+            Value::Choice("both") => BorderIndicators::Both,
+            _ => BorderIndicators::Colour,
+        }
+    }
+
+    pub fn mode_keys_vi_for(&self, window: &Overlay) -> bool {
+        matches!(self.resolve_window("mode-keys", window), Value::Choice("vi"))
+    }
+
+    pub fn mode_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("mode-style", window))
+    }
+
+    pub fn main_pane_width_for(&self, window: &Overlay) -> u16 {
+        as_number(self.resolve_window("main-pane-width", window)) as u16
+    }
+
+    pub fn main_pane_height_for(&self, window: &Overlay) -> u16 {
+        as_number(self.resolve_window("main-pane-height", window)) as u16
+    }
+
+    pub fn automatic_rename_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("automatic-rename", window))
+    }
+
+    pub fn allow_rename_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("allow-rename", window))
+    }
+
+    pub fn clock_mode_colour_for(&self, window: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_window("clock-mode-colour", window)).to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    pub fn clock_mode_style_12_for(&self, window: &Overlay) -> bool {
+        matches!(self.resolve_window("clock-mode-style", window), Value::Choice("12"))
+    }
+
+    pub fn monitor_activity_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("monitor-activity", window))
+    }
+}
+
+fn as_number(v: &Value) -> u32 {
+    match v {
+        Value::Number(n) => *n,
+        _ => unreachable!("expected a Number-kind option value"),
+    }
+}
+
+fn as_flag(v: &Value) -> bool {
+    match v {
+        Value::Flag(b) => *b,
+        _ => unreachable!("expected a Flag-kind option value"),
+    }
+}
+
+fn as_str(v: &Value) -> &str {
+    match v {
+        Value::Str(s) => s.as_str(),
+        _ => unreachable!("expected a Str-kind option value"),
+    }
+}
+
+fn as_style(v: &Value) -> &PartialStyle {
+    match v {
+        Value::Style(_, s) => s,
+        _ => unreachable!("expected a Style-kind option value"),
+    }
+}
+
+/// Sparse per-entity option overlay (SP7 Task 6, closes follow-up #26):
+/// holds only the options THIS session or window has explicitly
+/// overridden (`set`/`setw` with no `-g`) -- absence of a name here means
+/// "inherit the global value", exactly tmux's per-session/per-window
+/// option tree with the shared [`Options`] table standing in for its
+/// `global_s_options`/`global_w_options` (winmux, unlike tmux, does not
+/// separate those two global-window/global-session trees from the
+/// server's one global tree -- a documented simplification: `set -g`
+/// always writes the SAME global table regardless of whether the name is
+/// session- or window-scoped, matching what winmux already did pre-Task-6
+/// for every option).
+///
+/// Embedded as a field directly on `model::Session`/`model::Window`
+/// (`session_options`/`window_options`) rather than a keyed map inside
+/// [`Options`] itself -- sessions/windows are looked up by name/id that
+/// can be renamed or reused, and an overlay living ON the entity struct
+/// can never be orphaned by a rename or accidentally leak onto a
+/// different entity that reuses a freed id/name. This does mean `model.rs`
+/// gains a dependency on `options.rs` (previously the reverse never
+/// existed either way); `options.rs` itself stays entirely ignorant of
+/// `model`'s id types, so no cycle exists.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    values: BTreeMap<&'static str, Value>,
+    /// `@name` user options at this level (SP6 Task 2's free-form store,
+    /// now per-entity too -- `commands-config-options-formats.md` §3.4:
+    /// "Allowed at any scope, selected by flags").
+    user_options: BTreeMap<String, String>,
+}
+
+impl Overlay {
+    /// A fresh overlay with nothing overridden -- every read through it
+    /// falls straight through to the global table, which is what makes an
+    /// entity with a never-touched overlay byte-identical to pre-Task-6
+    /// behavior (the DEFAULT-BEHAVIOR REGRESSION BAR).
+    pub fn new() -> Overlay {
+        Overlay::default()
+    }
+
+    /// Set (or unset/append/toggle) one option AT THIS OVERLAY'S LEVEL
+    /// (the session or window it's embedded in) -- mirrors [`Options::
+    /// set`]'s validation/parsing (sharing [`parse_typed_value`]) but
+    /// writes into this sparse local map instead of the global table, and
+    /// differs from it in exactly the ways tmux's own local-tree `set`
+    /// differs from a global-tree `set`
+    /// (`commands-config-options-formats.md` §3.3.4 step 6): `-u` (`unset:
+    /// true`) REMOVES the local entry so inheritance from the global value
+    /// resumes (tmux: "in a session/window/pane tree the entry is
+    /// removed"), rather than resetting to the compiled default the way
+    /// [`Options::set`]'s `-u` does for the global tree ("globals must
+    /// always exist"). `-a` append and a value-less `Flag` toggle both
+    /// operate relative to whatever THIS overlay currently holds locally
+    /// (defaulting to "" / `false` if there is no local entry yet, NOT the
+    /// inherited global value) -- a documented simplification of tmux's
+    /// per-tree-only append/toggle semantics that keeps this method
+    /// self-contained (no `Options` borrow needed to compute a "starting
+    /// point" for append/toggle).
+    pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            if unset {
+                self.user_options.remove(uname);
+                return Ok(());
+            }
+            if append {
+                let mut current = self.user_options.get(uname).cloned().unwrap_or_default();
+                current.push_str(value.unwrap_or(""));
+                if has_control_chars(&current) {
+                    return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+                }
+                self.user_options.insert(uname.to_string(), current);
+                return Ok(());
+            }
+            let value = value.ok_or_else(|| format!("bad value: @{uname} requires a value"))?;
+            if has_control_chars(value) {
+                return Err(format!("bad value: {}", sanitize_control_chars(value)));
+            }
+            self.user_options.insert(uname.to_string(), value.to_string());
+            return Ok(());
+        }
+
+        let spec = find_spec(name).ok_or_else(|| format!("unknown option: {name}"))?;
+
+        if unset {
+            self.values.remove(spec.name);
+            return Ok(());
+        }
+
+        if append {
+            if spec.kind != Kind::Str {
+                return Err("bad value: -a requires a string option".to_string());
+            }
+            let addition = value.unwrap_or("");
+            let mut current = match self.values.get(spec.name) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => String::new(),
+            };
+            current.push_str(addition);
+            if has_control_chars(&current) {
+                return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+            }
+            self.values.insert(spec.name, Value::Str(current));
+            return Ok(());
+        }
+
+        let value = match value {
+            Some(v) => v,
+            None => {
+                if spec.kind == Kind::Flag {
+                    let current = matches!(self.values.get(spec.name), Some(Value::Flag(true)));
+                    self.values.insert(spec.name, Value::Flag(!current));
+                    return Ok(());
+                }
+                return Err(format!("bad value: {name} requires a value"));
+            }
+        };
+
+        let parsed = parse_typed_value(spec, value)?;
+        self.values.insert(spec.name, parsed);
+        Ok(())
     }
 }
 
@@ -1385,6 +1871,100 @@ mod tests {
         let c = ctx("s", sample_time());
         assert_eq!(expand_format("#I #[fg=white]#W", &c), "1 #[fg=white]bash");
         assert_eq!(expand_format("#[fg=white", &c), "#[fg=white");
+    }
+
+    // ---- scope resolution (SP7 Task 6, closes follow-up #26) ----
+
+    #[test]
+    fn window_option_overrides_global_for_that_window_only() {
+        let o = Options::new();
+        let mut win_a = Overlay::new();
+        let win_b = Overlay::new();
+        win_a.set("mode-keys", Some("vi"), false, false).unwrap();
+
+        assert!(o.mode_keys_vi_for(&win_a), "window A has a local override -> vi");
+        assert!(!o.mode_keys_vi_for(&win_b), "window B has none -> falls back to the global default (emacs)");
+        assert!(!o.mode_keys_vi(), "the global table itself is untouched by a window-local set");
+    }
+
+    #[test]
+    fn session_option_overrides_global() {
+        let o = Options::new();
+        let mut sess_a = Overlay::new();
+        let sess_b = Overlay::new();
+        sess_a.set("history-limit", Some("9999"), false, false).unwrap();
+
+        assert_eq!(o.history_limit_for(&sess_a), 9999);
+        assert_eq!(o.history_limit_for(&sess_b), 2000, "no local override -> global default");
+        assert_eq!(o.history_limit(), 2000, "global table itself untouched");
+    }
+
+    #[test]
+    fn unset_window_option_falls_back_to_global() {
+        let o = Options::new();
+        let mut win = Overlay::new();
+        win.set("main-pane-width", Some("30"), false, false).unwrap();
+        assert_eq!(o.main_pane_width_for(&win), 30);
+
+        // `-u` on the OVERLAY removes the local entry so inheritance
+        // resumes -- unlike `Options::set`'s `-u`, which resets a GLOBAL
+        // entry to its compiled default (globals must always exist).
+        win.set("main-pane-width", None, false, true).unwrap();
+        assert_eq!(o.main_pane_width_for(&win), 80, "falls back to the compiled global default");
+    }
+
+    /// `setw -g`/`set -g <window-scoped-name>` writes the shared GLOBAL
+    /// table (`Options::set`, simulating `-g`), which every window's
+    /// EMPTY overlay observes equally -- proving a `-g` write lands at the
+    /// true global-window level, not any one window's local overlay.
+    #[test]
+    fn setw_g_sets_global_window_level() {
+        let mut o = Options::new();
+        let win_x = Overlay::new();
+        let win_y = Overlay::new();
+        assert!(!o.mode_keys_vi_for(&win_x));
+        assert!(!o.mode_keys_vi_for(&win_y));
+
+        o.set("mode-keys", Some("vi"), false, false).unwrap(); // the `-g` path
+        assert!(o.mode_keys_vi_for(&win_x), "every window with no local override sees the new global");
+        assert!(o.mode_keys_vi_for(&win_y));
+        assert!(o.mode_keys_vi(), "and the plain global getter agrees");
+    }
+
+    #[test]
+    fn overlay_unknown_option_and_control_chars_rejected_same_as_global() {
+        let mut ov = Overlay::new();
+        assert_eq!(
+            ov.set("not-a-real-option", Some("x"), false, false),
+            Err("unknown option: not-a-real-option".to_string())
+        );
+        assert_eq!(
+            ov.set("default-command", Some("a\x1bb"), false, false),
+            Err("bad value: a?b".to_string())
+        );
+    }
+
+    #[test]
+    fn overlay_user_option_roundtrip() {
+        let mut ov = Overlay::new();
+        assert_eq!(ov.user_options.get("foo"), None);
+        ov.set("@foo", Some("bar"), false, false).unwrap();
+        assert_eq!(ov.user_options.get("foo").map(String::as_str), Some("bar"));
+        ov.set("@foo", None, false, true).unwrap();
+        assert_eq!(ov.user_options.get("foo"), None);
+    }
+
+    #[test]
+    fn show_effective_resolves_overlay_then_global() {
+        let o = Options::new();
+        let mut win = Overlay::new();
+        win.set("window-status-format", Some("CUSTOM"), false, false).unwrap();
+        assert_eq!(o.show_effective("window-status-format", None, Some(&win)), Some("CUSTOM".to_string()));
+        let empty = Overlay::new();
+        assert_eq!(
+            o.show_effective("window-status-format", None, Some(&empty)),
+            Some(quote_if_needed(DEFAULT_WINDOW_STATUS_FORMAT))
+        );
     }
 
     #[test]

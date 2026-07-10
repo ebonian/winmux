@@ -375,7 +375,13 @@ pub enum ParsedCmd {
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
     SetOption { global: bool, window: bool, append: bool, unset: bool, name: String, value: Option<String> },
-    ShowOptions { global: bool, name: Option<String> },
+    // AMENDED (SP7 Task 6, closes follow-up #68): grew `window`/`quiet`/
+    // `value_only` (`-w`/`-q`/`-v`; `showw`/`show-window-options` are now
+    // accepted command spellings implying `window: true`, mirroring
+    // `setw`/`set-window-option`). Boolean flags BUNDLE for this command
+    // (`show -gqv @foo` == `show -g -q -v @foo`, tmux's real clump rule) --
+    // see the `## option-scopes` section.
+    ShowOptions { global: bool, window: bool, quiet: bool, value_only: bool, name: Option<String> },
     BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
     UnbindKey { all: bool, table: String, key: Option<String> },
     ListKeys,
@@ -503,7 +509,7 @@ requirement); the rest are new tmux-style lines authored for SP3.
 | `confirm-before` | `confirm` | `usage: confirm-before [-p prompt] command ...` |
 | `command-prompt` | — | `usage: command-prompt [-I initial]` |
 | `set-option` | `set` | `usage: set-option [-g] [-w] [-a] [-u] option [value]` |
-| `show-options` | `show` | `usage: show-options [-g] [option]` |
+| `show-options` | `show` (also accepted spellings: `show-window-options`, `showw` — imply `-w`, SP7 Task 6) | `usage: show-options [-g] [-w] [-q] [-v] [option]` (AMENDED SP7 Task 6) |
 | `bind-key` | `bind` | `usage: bind-key [-n] [-r] [-T table] key command ...` |
 | `unbind-key` | `unbind` | `usage: unbind-key [-a] [-n] [-T table] [key]` |
 | `list-keys` | `lsk` | `usage: list-keys` |
@@ -630,10 +636,17 @@ only ITS OWN body, and what grammar it evaluates, changed.
 Pure module: no I/O, `std` only. **Implementation module:** `src/options.rs`.
 Depends on `crate::keys` (`Key`/`parse_key`/`key_name`, the `prefix` option's
 type) and `crate::style` (`PartialStyle`/`parse_style`, every `*-style`
-option's type). SP3 scope: one global `Options` instance — `-g`/`-w` on
+option's type). ~~SP3 scope: one global `Options` instance — `-g`/`-w` on
 `set-option`/`show-options` (from `cmd::ParsedCmd::SetOption`/`ShowOptions`)
 both hit this same table; per-session/window overlays are SP4 (documented
-deviation, matches the design spec).
+deviation, matches the design spec).~~ **SUPERSEDED (SP7 Task 6, closes
+follow-up #26):** real per-session and per-window option overlays now exist
+— see the `## option-scopes` section at the end of this file for the new
+public surface (`options::Scope`, `options::scope()`, `options::Overlay`,
+the `_for`-suffixed scope-resolving getters, `show_effective`,
+`show_user_option_scoped`) and the exact resolution/narrowing rules. The
+global `Options` table and every zero-arg getter above are UNCHANGED and
+remain the fallback level every overlay inherits from.
 
 Unit-tested with exact expected values (mirrors `keys.rs`/`style.rs`'s
 style): `defaults_match_tmux`, `set_prefix_key`, `set_style_validates`,
@@ -697,14 +710,18 @@ template can only ever expand to a clean result.
 | `default-terminal` | string (inert) | `screen` |
 | `exit-empty` | on/off (inert) | on |
 | `aggressive-resize` | on/off (inert) | off |
-| `pane-base-index` | number (inert) | 0 |
+| `pane-base-index` | number (LIVE since SP7 Task 6 — closes follow-up #32; window-scoped, see `## option-scopes`) | 0 |
 
 "Inert" options are typed, validated, stored, and shown, but have no getter
-beyond `show` — nothing reads them yet (SP4 functionality). Exception:
+beyond `show` — nothing reads them yet (SP4 functionality). ~~Exception:
 `pane-base-index` DOES have a typed getter (`Options::pane_base_index`), but
 the getter itself is unused — pane indexes in kill-pane prompts/targets are
 position-based from 0 regardless of this option (final review, 2026-07-07;
-tracked in `docs/follow-ups.md`'s SP3-deferred list).
+tracked in `docs/follow-ups.md`'s SP3-deferred list).~~ **SUPERSEDED (SP7
+Task 6, closes follow-up #32):** `pane-base-index` is LIVE — consulted at
+every user-visible pane-index site (display-panes digits, `#P` expansion,
+the kill-pane confirm prompt via `#P`, numeric `:.N` pane targets); see the
+`## option-scopes` section's "pane-base-index wiring" subsection.
 
 ### `set` semantics
 
@@ -1629,9 +1646,11 @@ name returns `None`, the SAME signal an unknown built-in name gives — so
 option: ...")` mapping needs no dispatch-side change to reproduce tmux's
 DEFAULT (non-`-q`) "unset user option errors" behavior. `show_user_option`
 is the separate, explicit `-q`-aware entry point requested by the task
-brief's delegated judgment call — it is not yet wired into `server::
+brief's delegated judgment call — ~~it is not yet wired into `server::
 dispatch` (CLI `-v`/`-q` flag parsing for `show-options` is future work);
-today it is directly unit-tested against `Options` only. `show_all` also
+today it is directly unit-tested against `Options` only.~~ **SUPERSEDED
+(SP7 Task 6, closes follow-up #68):** `-v`/`-q` are now parsed by `cmd.rs`
+and threaded through dispatch — see the `## option-scopes` section. `show_all` also
 lists any ACTUALLY-SET user options (never a "default" row, unlike every
 built-in option). Test: `user_option_set_show_roundtrip`.
 
@@ -2089,3 +2108,164 @@ tests) passes UNMODIFIED (values, not just names) except doc-comment
 wording, per the brief's "regression suite must stay green unmodified
 except the shim-removal tests" — the "shim-removal" change here was
 deleting dead code, not any test's expected value.
+
+## `option-scopes` — per-session/per-window option overlays + `show -gqv` + pane-base-index wiring (SP7 Task 6, closes follow-ups #26, #32, #68)
+
+Parity authority: `docs/tmux-reference/commands-config-options-formats.md`
+§3 (storage model, `set-option`/`show-options` semantics, scope resolution)
+and §10 Appendix B (the per-option scope classification).
+
+```rust
+// src/options.rs (additions)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope { Server, Session, Window }
+
+/// The SPECS table's scope classification for a named option (None for a
+/// name not in SPECS). Per tmux, THE TABLE DECIDES THE SCOPE — set/show's
+/// -g/-w flags only pick global-vs-local WITHIN it (doc §3.3.4).
+pub fn scope(name: &str) -> Option<Scope>;
+
+/// Sparse per-entity overlay: holds only the options one session or window
+/// has locally overridden (absence = inherit the global table). Embedded
+/// as model::Session::session_options / model::Window::window_options.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay { /* opaque: values + user_options maps */ }
+
+impl Overlay {
+    pub fn new() -> Overlay; // empty: reads fall through to the global table
+    /// Same validation/parsing as Options::set (shared private core), but
+    /// writes THIS overlay. Differences (tmux's local-tree rules, §3.3.4
+    /// step 6): `-u` REMOVES the local entry (inheritance resumes) instead
+    /// of resetting to the compiled default; `-a` append and the value-less
+    /// Flag toggle operate on the overlay's OWN current entry ("", false if
+    /// never set locally), NOT the inherited effective value (documented
+    /// simplification).
+    pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String>;
+}
+
+impl Options {
+    /// Effective (local-if-set, else global) value for show: a documented
+    /// simplification of tmux's local-only-unless -A show rule.
+    pub fn show_effective(&self, name: &str, session: Option<&Overlay>, window: Option<&Overlay>) -> Option<String>;
+    /// show_user_option + an overlay checked before the global @-store.
+    pub fn show_user_option_scoped(&self, name: &str, quiet: bool, overlay: Option<&Overlay>) -> Result<Option<String>, String>;
+
+    // ONE scope-resolving read pattern: a `_for` sibling per getter a real
+    // dispatch/status/render call site reads, taking the acting entity's
+    // Overlay. Resolution = overlay-local, else the global table (exactly
+    // two levels; an empty overlay is byte-identical to the zero-arg
+    // getter — the default-behavior regression bar). Session-scoped:
+    pub fn prefix_for(&self, session: &Overlay) -> crate::keys::Key;
+    pub fn base_index_for(&self, session: &Overlay) -> u32;
+    pub fn status_on_for(&self, session: &Overlay) -> bool;
+    pub fn status_position_top_for(&self, session: &Overlay) -> bool;
+    pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn status_right_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn status_left_length_for(&self, session: &Overlay) -> u16;
+    pub fn status_right_length_for(&self, session: &Overlay) -> u16;
+    pub fn status_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_left_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_right_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_justify_for(&self, session: &Overlay) -> &'static str;
+    pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn repeat_time_for(&self, session: &Overlay) -> std::time::Duration;
+    pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn renumber_windows_for(&self, session: &Overlay) -> bool;
+    pub fn mouse_for(&self, session: &Overlay) -> bool;
+    pub fn history_limit_for(&self, session: &Overlay) -> u32;
+    pub fn word_separators_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn display_panes_time_for(&self, session: &Overlay) -> std::time::Duration;
+    pub fn display_panes_colour_for(&self, session: &Overlay) -> crate::grid::Color;
+    pub fn display_panes_active_colour_for(&self, session: &Overlay) -> crate::grid::Color;
+    // Window-scoped:
+    pub fn pane_base_index_for(&self, window: &Overlay) -> u32;
+    pub fn window_status_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_current_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn window_status_current_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn window_status_separator_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn pane_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn pane_active_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn pane_border_indicators_for(&self, window: &Overlay) -> crate::render::BorderIndicators;
+    pub fn mode_keys_vi_for(&self, window: &Overlay) -> bool;
+    pub fn mode_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn main_pane_width_for(&self, window: &Overlay) -> u16;
+    pub fn main_pane_height_for(&self, window: &Overlay) -> u16;
+    pub fn automatic_rename_for(&self, window: &Overlay) -> bool;
+    pub fn allow_rename_for(&self, window: &Overlay) -> bool;
+    pub fn clock_mode_colour_for(&self, window: &Overlay) -> crate::grid::Color;
+    pub fn clock_mode_style_12_for(&self, window: &Overlay) -> bool;
+    pub fn monitor_activity_for(&self, window: &Overlay) -> bool;
+}
+```
+
+### Scope classification (per Appendix B of the reference doc)
+
+- **Server** (always the one global table; `-g`/`-w` harmless/ignored, per
+  tmux): `escape-time`, `default-terminal`, `exit-empty`, `buffer-limit`.
+  These getters have NO `_for` sibling on purpose.
+- **Window** (global-window level via `-g`; per-window via `setw`/`set -w`):
+  `pane-base-index`, `window-status-style`/`-current-style`/`-format`/
+  `-current-format`/`-separator`/`-bell-style`, `pane-border-style`/
+  `pane-active-border-style`/`pane-border-indicators`, `mode-keys`,
+  `mode-style`, `main-pane-width`/`-height`, `aggressive-resize`,
+  `automatic-rename`, `allow-rename`, `monitor-activity`,
+  `clock-mode-colour`/`clock-mode-style`. tmux's finer Win-vs-W/P split
+  collapses onto Window (winmux has no per-PANE option tree — documented
+  narrowing).
+- **Session** (global level via `-g`; per-session via unprefixed `set`):
+  everything else in SPECS. `@`-user options are any-scope, selected purely
+  by flags (`-w` window, default session, `-g` global), per doc §3.3.4.
+
+### Dispatch semantics (`exec_set_option`/`exec_show_options`, private)
+
+- The acting context is the dispatching CLIENT's current session (and its
+  current window for window-scoped names). **Documented narrowing:** no
+  `-t` targeting for set/show (tmux allows targeting any entity); and a
+  HEADLESS call (CLI frame or config loading — no acting client) with no
+  `-g` falls back to the GLOBAL table for named options, preserving every
+  pre-Task-6 CLI/config behavior byte-for-byte.
+- For NAMED options the table decides scope; `-w` only matters for
+  `@`-options (tmux rule). `-g` always addresses the global level.
+- `show` with a name prints the EFFECTIVE value (local else inherited) for
+  the acting entity unless `-g`; `-v` prints the value only (no `name `
+  prefix); `-q` makes an unset `@`-option silently succeed (empty output,
+  exit 0) instead of `invalid option: @name` — `show -gqv "@foo"` is the
+  TPM rung-1 primitive, end-to-end (closes follow-up #68). `show` with NO
+  name still prints the global `show_all()` listing regardless of flags
+  (documented simplification).
+- **Live-side-effect narrowing (documented):** the runtime side effects of
+  `set` (prefix rebinding + KeyMachine re-seeding, repeat-time/escape-time
+  propagation, the mouse-mode SGR broadcast, status on/position relayout)
+  fire only on a GLOBAL write, as before. A per-session `set prefix` (no
+  `-g`) stores and shows correctly but does not live-rebind that session's
+  already-attached clients' key machines (attach-time seeding IS
+  per-session); `status`/`status-position` reads that decide pane-area
+  GEOMETRY stay global-only (see the render_one comment in `src/server.rs`)
+  — both tracked in `docs/follow-ups.md` (SP7 Task 6 follow-ups).
+
+### pane-base-index wiring (closes follow-up #32)
+
+`Options::pane_base_index`(+`_for`) is now consulted at every user-visible
+pane-index site: `display-panes` digits (`server::pane_digit_entries`, which
+gained an `options: &Options` parameter — digit = base + position, keypress
+mapping and drawn overlay share it), `#P`/`pane_index` format expansion
+(`render_one`'s status FormatCtx, `dispatch::format_values` — which also
+covers the `kill-pane #P? (y/n)` confirm prompt — and the status-row
+click hit-test's FormatCtx), and numeric `:.N` pane targets
+(`dispatch::resolve_pane` gained a `base: u32` parameter; `.N` names the
+user-visible index, so under `pane-base-index 1` `.1` is the first pane and
+`.0` is `pane not found`). `+`/`-` relative specs are unaffected.
+
+### Tests
+
+`src/options.rs`: `window_option_overrides_global_for_that_window_only`,
+`session_option_overrides_global`, `unset_window_option_falls_back_to_global`,
+`setw_g_sets_global_window_level`, `overlay_unknown_option_and_control_chars_
+rejected_same_as_global`, `overlay_user_option_roundtrip`,
+`show_effective_resolves_overlay_then_global`. `src/cmd.rs`:
+`show_options_parses_v_and_q_flags`. `tests/server_proto.rs`:
+`setw_status_style_on_one_window_only_styles_that_window`,
+`set_without_g_targets_current_session`,
+`show_gqv_user_option_prints_value_only`,
+`pane_base_index_shifts_display_panes_digits_and_hash_p`.

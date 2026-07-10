@@ -8,6 +8,7 @@
 //! `## model` section of the sibling interfaces contract).
 
 use crate::layout::{Layout, PaneId};
+use crate::options;
 use std::time::{Instant, SystemTime};
 
 /// Server-global, monotonically increasing window id — NOT the tmux window
@@ -64,6 +65,13 @@ pub struct Window {
     /// auto-rename path, so a chatty pane can't rename it more than once per
     /// throttle window. `None` until the first automatic rename.
     pub last_auto_rename: Option<Instant>,
+    /// SP7 Task 6 (closes follow-up #26): this window's local overrides for
+    /// window-scoped options (`setw`/`set -w`, no `-g`) -- see
+    /// `options::Overlay`'s doc comment for why it lives HERE rather than
+    /// in a keyed map inside `Options`. Starts empty (inherits the global
+    /// table for everything), so a window that never runs `setw` behaves
+    /// byte-identically to every pre-Task-6 window.
+    pub window_options: options::Overlay,
 }
 
 pub struct Session {
@@ -91,6 +99,10 @@ pub struct Session {
     /// AFTER the `set`, matching tmux (existing sessions keep their
     /// original numbering).
     base_index: u32,
+    /// SP7 Task 6 (closes follow-up #26): this session's local overrides
+    /// for session-scoped options (unprefixed `set`, no `-g`) -- see
+    /// `options::Overlay`'s doc comment. Starts empty.
+    pub session_options: options::Overlay,
 }
 
 #[derive(Default)]
@@ -184,6 +196,7 @@ impl Registry {
             last_layout: None,
             auto_rename: true,
             last_auto_rename: None,
+            window_options: options::Overlay::new(),
         };
         let session = Session {
             name,
@@ -193,6 +206,7 @@ impl Registry {
             last: None,
             size,
             base_index,
+            session_options: options::Overlay::new(),
         };
         self.sessions.push(session);
         Ok(self.sessions.last_mut().expect("just pushed"))
@@ -309,6 +323,7 @@ impl Session {
             last_layout: None,
             auto_rename: true,
             last_auto_rename: None,
+            window_options: options::Overlay::new(),
         };
         let pos = self
             .windows

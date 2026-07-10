@@ -216,6 +216,11 @@ pub struct Window {
     pub index: u32,          // tmux window index (lowest unused >= 0 at creation)
     pub name: String,        // default "powershell"
     pub layout: crate::layout::Layout,
+    // AMENDED (SP7 Task 6, closes follow-up #26): this window's local
+    // window-scoped option overrides (`setw`/`set -w`, no `-g`), starting
+    // empty (inherits the global table). See the `## option-scopes` section
+    // of 2026-07-07-command-config-interfaces.md for `options::Overlay`.
+    pub window_options: crate::options::Overlay,
 }
 pub struct Session {
     pub name: String,
@@ -225,6 +230,10 @@ pub struct Session {
     pub last: Option<WindowId>,
     pub size: (u16, u16),            // current window size (smallest attached client)
     // base_index: u32,              // NOT pub (Task 7 amendment, see below)
+    // AMENDED (SP7 Task 6, closes follow-up #26): this session's local
+    // session-scoped option overrides (unprefixed `set`, no `-g`),
+    // starting empty. Same `options::Overlay` type as Window's.
+    pub session_options: crate::options::Overlay,
 }
 pub struct Registry { /* sessions: Vec<Session> in creation order, next_window_id */ }
 impl Registry {
@@ -460,6 +469,17 @@ pub struct WindowEntry {
     pub current: bool,
     pub last: bool,
     pub zoomed: bool,
+    // AMENDED (SP7 Task 6, closes follow-up #26): per-window EFFECTIVE
+    // window-status-format/-current-format and -style/-current-style,
+    // resolved by the CALLER through that window's own options overlay
+    // (`Options::window_status_*_for`). `None` falls back to the shared
+    // `window_format`/`window_current_format`/`win_style`/
+    // `win_current_style` arguments below — byte-identical to pre-SP7
+    // behavior, which is what keeps every earlier status test green
+    // unmodified. `server::render_one` always passes `Some(..)` (the
+    // `_for` getters already fold in the global fallback).
+    pub format_override: Option<String>,
+    pub style_override: Option<crate::style::PartialStyle>,
 }
 
 // SP6 Task 4 signature (status-justify, per-side styles, per-window

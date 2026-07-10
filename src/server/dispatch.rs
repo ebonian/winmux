@@ -33,7 +33,7 @@ use crate::input::WhichTable;
 use crate::keys::{Key, KeyCode, MouseEvent, MouseKind};
 use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
-use crate::options::FormatCtx;
+use crate::options::{self, FormatCtx};
 use crate::protocol::ServerMsg;
 
 use super::{
@@ -179,9 +179,14 @@ fn resolve_window(session: &Session, spec: Option<&str>) -> Result<WindowId, Str
 /// Resolve a pane spec (the part of a target after `window.`, or the whole
 /// remainder when there's no `.`): empty/absent -> the window's focused
 /// pane; `+`/`-` -> next/previous pane (cyclic) relative to focus; otherwise
-/// a bare number -> position in `window.layout.panes()` order (leaf/tree
-/// order), per the design spec's target grammar note.
-fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
+/// a bare number -> USER-VISIBLE pane index, i.e. position in
+/// `window.layout.panes()` order (leaf/tree order) SHIFTED by
+/// `pane-base-index` (#32, SP7 Task 6: `base` is the window's own effective
+/// `pane-base-index` -- with the default 0 this is byte-identical to the
+/// old raw-position rule; with `pane-base-index 1`, `:.1` names the FIRST
+/// pane, and `:.0` is `pane not found`, matching what `display-panes`
+/// digits and `#P` show the user).
+fn resolve_pane(window: &Window, spec: Option<&str>, base: u32) -> Result<PaneId, String> {
     let panes = window.layout.panes();
     let s = match spec {
         None => return Ok(window.layout.focused()),
@@ -196,7 +201,8 @@ fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
         let idx = panes.iter().position(|&p| p == window.layout.focused()).unwrap_or(0);
         return Ok(panes[(idx + panes.len() - 1) % panes.len()]);
     }
-    let idx: usize = s.parse().map_err(|_| format!("pane not found: {s}"))?;
+    let user_idx: u32 = s.parse().map_err(|_| format!("pane not found: {s}"))?;
+    let idx = user_idx.checked_sub(base).ok_or_else(|| format!("pane not found: {s}"))? as usize;
     panes.get(idx).copied().ok_or_else(|| format!("pane not found: {s}"))
 }
 
@@ -994,7 +1000,10 @@ impl Server {
             let session = self.registry.session_mut(&session_name).ok_or_else(|| format!("can't find session: {session_name}"))?;
             let wid = resolve_window(session, win_spec)?;
             let window = session.windows.iter().find(|w| w.id == wid).expect("resolve_window returned a live id");
-            let pid = resolve_pane(window, pane_spec)?;
+            // #32: a numeric `.N` names the user-visible index, which
+            // starts at the target window's effective pane-base-index.
+            let base = self.options.pane_base_index_for(&window.window_options);
+            let pid = resolve_pane(window, pane_spec, base)?;
             (wid, pid)
         };
         Ok((session_name, wid, pid))
@@ -1018,7 +1027,11 @@ impl Server {
             ""
         }
         .to_string();
-        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32;
+        // #32 (SP7 Task 6): `#P`/`pane_index` format expansion must reflect
+        // `pane-base-index`, not always a raw 0-based position -- window-
+        // scoped, so read through THIS window's overlay.
+        let base = self.options.pane_base_index_for(&window.window_options);
+        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32 + base;
         let pane_title = self.panes.get(&pane_id).map(|p| p.title.clone()).unwrap_or_default();
         Ok((session_name, window_index, window_name, flags, pane_index, pane_title))
     }
@@ -1074,7 +1087,8 @@ impl Server {
             self.destroy_session(session_name);
             return Ok(true);
         }
-        let renumber = self.options.renumber_windows();
+        // renumber-windows is session-scoped (#26).
+        let renumber = self.renumber_windows_for_session(session_name);
         if let Some(s) = self.registry.session_mut(session_name) {
             s.kill_window(wid);
             if renumber {
@@ -1104,7 +1118,8 @@ impl Server {
             .session_mut(session_name)
             .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()))
             .unwrap_or_default();
-        let renumber = self.options.renumber_windows();
+        // renumber-windows is session-scoped (#26).
+        let renumber = self.renumber_windows_for_session(session_name);
         let killed = self
             .registry
             .session_mut(session_name)
@@ -1155,8 +1170,7 @@ impl Server {
             .and_then(|s| s.current_window().layout.rects(area).into_iter().find(|(pid, _)| *pid == new_id))
             .map(|(_, r)| r)
             .unwrap_or(area);
-        let shell = self.options.default_command().to_string();
-        let history_limit = self.options.history_limit();
+        let (shell, history_limit) = self.shell_and_history_limit_for_session(&session_name);
         match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(new_id, pr);
@@ -1270,8 +1284,7 @@ impl Server {
         let session_name = self.resolve_session_name(None, cs)?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let pane_id = self.mint_pane_id();
-        let shell = self.options.default_command().to_string();
-        let history_limit = self.options.history_limit();
+        let (shell, history_limit) = self.shell_and_history_limit_for_session(&session_name);
         match spawn_pane(pane_id, size.0.max(1), size.1.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(pane_id, pr);
@@ -1384,12 +1397,50 @@ impl Server {
         ids
     }
 
+    /// `word-separators` is session-scoped (#26): a small convenience for
+    /// the several mouse-drag/word-select call sites that already have a
+    /// plain `&str` session name in hand.
+    fn word_separators_for_session(&self, session_name: &str) -> &str {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => self.options.word_separators_for(&s.session_options),
+            None => self.options.word_separators(),
+        }
+    }
+
+    /// `default-command`/`history-limit` are session-scoped (#26): resolve
+    /// through the session a NEW PANE is being spawned INTO. NOT used for
+    /// brand-new session creation (`exec_new_session`/`AttachMode::NewAuto`/
+    /// `NewNamed` in `server.rs`) -- that session doesn't exist yet to have
+    /// a local override, so those call sites correctly stay global-only
+    /// (unchanged from pre-Task-6).
+    fn shell_and_history_limit_for_session(&self, session_name: &str) -> (String, u32) {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => (self.options.default_command_for(&s.session_options).to_string(), self.options.history_limit_for(&s.session_options)),
+            None => (self.options.default_command().to_string(), self.options.history_limit()),
+        }
+    }
+
+    /// `main-pane-width`/`main-pane-height` are window-scoped (#26): resolve
+    /// through the TARGET window (not the acting client's current one --
+    /// `select-layout -t <target>` can name a different window/session).
+    fn main_pane_size_for_window(&self, session_name: &str, wid: WindowId) -> (u16, u16) {
+        let window = self
+            .registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == session_name)
+            .and_then(|s| s.windows.iter().find(|w| w.id == wid));
+        match window {
+            Some(w) => (self.options.main_pane_width_for(&w.window_options), self.options.main_pane_height_for(&w.window_options)),
+            None => (self.options.main_pane_width(), self.options.main_pane_height()),
+        }
+    }
+
     fn exec_select_layout(&mut self, target: Option<String>, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let main_w = self.options.main_pane_width();
-        let main_h = self.options.main_pane_height();
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1417,8 +1468,7 @@ impl Server {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let main_w = self.options.main_pane_width();
-        let main_h = self.options.main_pane_height();
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1629,7 +1679,8 @@ impl Server {
         if !session.move_window(wid, idx, kill) {
             return Err(format!("index in use: {idx}"));
         }
-        if self.options.renumber_windows() {
+        // renumber-windows is session-scoped (#26).
+        if self.renumber_windows_for_session(&session_name) {
             if let Some(s) = self.registry.session_mut(&session_name) {
                 s.renumber();
             }
@@ -1722,8 +1773,13 @@ impl Server {
     }
 
     fn exec_send_prefix(&mut self, cs: Option<&str>) -> Result<String, String> {
-        let (_session, _wid, pane_id) = self.resolve_pane_target(cs, None)?;
-        let bytes = crate::keys::encode_key(&self.options.prefix()).unwrap_or_default();
+        let (session, _wid, pane_id) = self.resolve_pane_target(cs, None)?;
+        // `prefix` is session-scoped (#26).
+        let prefix = match self.acting_session_overlay(Some(&session)) {
+            Ok(ov) => self.options.prefix_for(ov),
+            Err(_) => self.options.prefix(),
+        };
+        let bytes = crate::keys::encode_key(&prefix).unwrap_or_default();
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             if let Some(pty) = pane.pty.as_mut() {
                 let _ = pty.write_input(&bytes);
@@ -1988,7 +2044,12 @@ impl Server {
     /// tmux-style mouse routing into choose-tree (click selects a row,
     /// wheel scrolls the list) is ticketed, `docs/follow-ups.md` #61.
     pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        if !self.options.mouse() {
+        // `mouse` is session-scoped (#26).
+        let mouse_on = match self.acting_session_overlay(Some(session_name)) {
+            Ok(ov) => self.options.mouse_for(ov),
+            Err(_) => self.options.mouse(),
+        };
+        if !mouse_on {
             return ExecOutcome::Ok(String::new());
         }
         // clock-mode (Task 10, fix round 1): tmux's `window_clock_key`
@@ -2177,7 +2238,7 @@ impl Server {
                 };
                 let history_total = p.grid.history_total();
                 let cols = p.grid.cols();
-                let seps = self.options.word_separators();
+                let seps = self.word_separators_for_session(session_name);
                 if let ClientMode::Copy(cs) = &mut client.mode {
                     cs.cx = cx;
                     cs.cy = cy;
@@ -2266,8 +2327,8 @@ impl Server {
                 if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
                     let x_raw = ev.x.saturating_sub(rect.x);
                     let y_raw = ev.y.saturating_sub(rect.y);
-                    move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
-                    service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                    move_drag_cursor(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, y_raw);
+                    service_drag_edge(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, Instant::now());
                 }
                 client.mouse.drag = MouseDrag::Selecting { moved: true };
                 ExecOutcome::Ok(String::new())
@@ -2285,8 +2346,8 @@ impl Server {
                         Some((_, rect)) => {
                             let x_raw = ev.x.saturating_sub(rect.x);
                             let y_raw = ev.y.saturating_sub(rect.y);
-                            move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
-                            service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                            move_drag_cursor(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, y_raw);
+                            service_drag_edge(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, Instant::now());
                         }
                         // Task 7, SP6 wave 2 / `mouse.md` §5.4: motion
                         // OUTSIDE the pane rectangle is a no-op that also
@@ -2425,7 +2486,22 @@ impl Server {
             client.mouse.autoscroll = None;
             return false;
         }
-        scroll_and_resnap(&self.panes, self.options.word_separators(), client, a.pane, a.top, a.cursor_x);
+        // word-separators is session-scoped (#26). Inlined as a direct
+        // `self.registry`/`self.options` field projection (not the
+        // `word_separators_for_session` method, an opaque `&self` call
+        // that would borrow ALL of `self` and conflict with `client`,
+        // already a live mutable borrow of `self.clients` needed again
+        // below).
+        let session_overlay = client
+            .session
+            .as_deref()
+            .and_then(|name| self.registry.sessions().iter().find(|s| s.name == name))
+            .map(|s| &s.session_options);
+        let seps = match session_overlay {
+            Some(ov) => self.options.word_separators_for(ov),
+            None => self.options.word_separators(),
+        };
+        scroll_and_resnap(&self.panes, seps, client, a.pane, a.top, a.cursor_x);
         client.mouse.autoscroll = Some(AutoscrollState { deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL, ..a });
         true
     }
@@ -2537,7 +2613,10 @@ impl Server {
             return ExecOutcome::Ok(String::new());
         };
         let window = session.current_window();
-        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32;
+        // #32: pane-base-index shifts #P here too, for consistency with
+        // every other `#P`/`pane_index` expansion site.
+        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
         let mut window_flags = String::from("*");
         if window.layout.is_zoomed() {
             window_flags.push('Z');
@@ -2553,8 +2632,9 @@ impl Server {
             now: system_time_parts(),
             pane_title: &pane_title,
         };
-        let left = crate::options::expand_format(self.options.status_left(), &fctx);
-        let left_len = left.chars().count().min(self.options.status_left_length() as usize) as u16;
+        // status-left/-left-length are session-scoped (#26).
+        let left = crate::options::expand_format(self.options.status_left_for(&session.session_options), &fctx);
+        let left_len = left.chars().count().min(self.options.status_left_length_for(&session.session_options) as usize) as u16;
         if x < left_len {
             return ExecOutcome::Ok(String::new());
         }
@@ -2681,78 +2761,275 @@ impl Server {
         Ok(self.expand_with_ctx(&fmt, cs))
     }
 
-    fn exec_show_options(&mut self, _global: bool, name: Option<String>) -> Result<String, String> {
-        match name {
-            Some(n) => match self.options.show(&n) {
-                Some(v) => Ok(format!("{n} {v}\n")),
-                None => Err(format!("unknown option: {n}")),
-            },
+    /// #68 + SP7 Task 6 (closes follow-up #26 for the read side):
+    /// `show-options`/`show`/`show-window-options`/`showw`. `acting_session`
+    /// is the CLIENT'S current session (`None` for a headless/config-load
+    /// call, which has none — a session-/window-scoped name with no `-g`
+    /// and no acting session falls back to the global table, preserving
+    /// every pre-Task-6 headless/config-loading behavior unchanged, the
+    /// DEFAULT-BEHAVIOR REGRESSION BAR).
+    ///
+    /// Scope selection mirrors [`Server::exec_set_option`]'s (see that
+    /// method's doc comment for the full narrowing rationale — no `-t`
+    /// targeting, "acting" always means the client's own current session/
+    /// window): a [`crate::options::Scope::Server`] name always reads
+    /// global; [`crate::options::Scope::Session`]/[`crate::options::
+    /// Scope::Window`] read the acting entity's EFFECTIVE value (local
+    /// override if set, else inherited global — see [`Options::
+    /// show_effective`]'s doc comment for why this is a deliberate
+    /// simplification of tmux's stricter "local-tree-only unless `-A`"
+    /// rule) UNLESS `-g` was given, which always reads the global level
+    /// regardless of the name's scope.
+    fn exec_show_options(
+        &mut self,
+        global: bool,
+        window: bool,
+        quiet: bool,
+        value_only: bool,
+        name: Option<String>,
+        acting_session: Option<&str>,
+    ) -> Result<String, String> {
+        let n = match name {
+            Some(n) => n,
             None => {
                 let s = self.options.show_all();
-                Ok(if s.is_empty() { s } else { format!("{s}\n") })
+                return Ok(if s.is_empty() { s } else { format!("{s}\n") });
             }
+        };
+
+        let result: Result<Option<String>, String> = if n.starts_with('@') {
+            if global {
+                self.options.show_user_option_scoped(&n, quiet, None)
+            } else if window {
+                match self.acting_window_overlay(acting_session) {
+                    Ok(ov) => self.options.show_user_option_scoped(&n, quiet, Some(ov)),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match self.acting_session_overlay(acting_session) {
+                    Ok(ov) => self.options.show_user_option_scoped(&n, quiet, Some(ov)),
+                    // No acting session (headless): same as `-g` — read the
+                    // global @-option store, matching pre-Task-6 behavior.
+                    Err(_) => self.options.show_user_option_scoped(&n, quiet, None),
+                }
+            }
+        } else {
+            match options::scope(&n) {
+                None => Err(format!("unknown option: {n}")),
+                Some(options::Scope::Server) => Ok(self.options.show(&n)),
+                Some(sc) if global => {
+                    let _ = sc;
+                    Ok(self.options.show(&n))
+                }
+                Some(options::Scope::Session) => match self.acting_session_overlay(acting_session) {
+                    Ok(ov) => Ok(self.options.show_effective(&n, Some(ov), None)),
+                    Err(_) => Ok(self.options.show(&n)),
+                },
+                Some(options::Scope::Window) => match self.acting_window_overlay(acting_session) {
+                    Ok(ov) => Ok(self.options.show_effective(&n, None, Some(ov))),
+                    Err(_) => Ok(self.options.show(&n)),
+                },
+            }
+        };
+
+        match result {
+            Ok(Some(v)) => Ok(if value_only { format!("{v}\n") } else { format!("{n} {v}\n") }),
+            Ok(None) if quiet => Ok(String::new()),
+            Ok(None) => Err(format!("invalid option: {n}")),
+            Err(e) => Err(e),
         }
     }
 
-    fn exec_set_option(&mut self, _global: bool, _window: bool, append: bool, unset: bool, name: String, value: Option<String>) -> Result<String, String> {
-        let old_prefix = self.options.prefix();
-        self.options.set(&name, value.as_deref(), append, unset)?;
-        if name == "prefix" {
-            let new_prefix = self.options.prefix();
-            if new_prefix != old_prefix {
-                self.bindings.unbind(WhichTable::Prefix, &old_prefix);
-                self.bindings.bind(
-                    WhichTable::Prefix,
-                    new_prefix,
-                    Binding { cmds: vec![RawCmd { name: "send-prefix".to_string(), args: vec![] }], repeat: false },
-                );
+    /// The acting client's current session's [`options::Overlay`]
+    /// (`Err` if `acting_session` is `None` — headless — or the name no
+    /// longer resolves to a live session).
+    fn acting_session_overlay(&self, acting_session: Option<&str>) -> Result<&options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?;
+        self.registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| &s.session_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    /// `renumber-windows` is session-scoped (#26); a small convenience over
+    /// [`Server::acting_session_overlay`] for the several kill-window/
+    /// move-window call sites that only need this one flag and already
+    /// have a plain `&str` session name in hand (not a full `Option<&str>`
+    /// acting-client context).
+    fn renumber_windows_for_session(&self, session_name: &str) -> bool {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => self.options.renumber_windows_for(&s.session_options),
+            None => self.options.renumber_windows(),
+        }
+    }
+
+    /// The acting client's current session's CURRENT window's
+    /// [`options::Overlay`] — the "target window" every window-scoped
+    /// `set`/`show` with no `-t` (out of this task's narrowed scope, see
+    /// [`Server::exec_set_option`]'s doc comment) resolves against.
+    fn acting_window_overlay(&self, acting_session: Option<&str>) -> Result<&options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?;
+        self.registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| &s.current_window().window_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    fn acting_session_overlay_mut(&mut self, acting_session: Option<&str>) -> Result<&mut options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?.to_string();
+        self.registry
+            .session_mut(&name)
+            .map(|s| &mut s.session_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    fn acting_window_overlay_mut(&mut self, acting_session: Option<&str>) -> Result<&mut options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?.to_string();
+        self.registry
+            .session_mut(&name)
+            .map(|s| &mut s.current_window_mut().window_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    /// `set-option`/`set`/`set-window-option`/`setw` (SP7 Task 6, closes
+    /// follow-up #26). `acting_session`: the dispatching client's current
+    /// session, `None` for headless (CLI/config-file loading — see
+    /// `execute_headless`'s callers).
+    ///
+    /// **Narrowing, documented honestly (per the task brief's allowance):**
+    /// real tmux's `set-option -t <target>` can target ANY session/window/
+    /// pane by name/index, not just the current one. This task does NOT
+    /// add `-t` support to `set-option`/`show-options` — every session-/
+    /// window-scoped write or read with no `-g` (or `-w`'s window
+    /// counterpart) always targets the ACTING client's OWN current
+    /// session/window. A headless call (CLI `winmux <sock> set ...`, or a
+    /// `.tmux.conf`/`source-file` line — config loading runs before any
+    /// client is attached, so there IS no "current session" yet) has no
+    /// acting session at all: for those, a session-/window-scoped name
+    /// with no `-g` falls back to writing/reading the GLOBAL table exactly
+    /// as it did before this task — this is what keeps every existing
+    /// config-loading/CLI test passing unchanged (the DEFAULT-BEHAVIOR
+    /// REGRESSION BAR).
+    ///
+    /// The `window` flag (parsed from `-w`, or implied by `setw`/`set-
+    /// window-option`) matters ONLY for `@`-options, whose scope tmux
+    /// picks purely from flags (`-w` window, default session,
+    /// `commands-config-options-formats.md` §3.3.4 step 4's last bullet).
+    /// For NAMED options **the table decides scope** (same section) — so
+    /// `window` is accepted but ignored for a named option's WRITE target,
+    /// same as it always was pre-Task-6 (Server-scope names' `-g`/`-w` are
+    /// tmux-documented no-ops too: "any -g/-w is harmless/ignored").
+    ///
+    /// **Live side effects** (prefix rebinding, repeat-time/escape-time
+    /// propagation to every `KeyMachine`, the mouse-mode broadcast, and the
+    /// status on/position resize) are cross-cutting and currently only
+    /// implemented for a GLOBAL write, matching every behavior that
+    /// existed before this task (`escape-time`/`buffer-limit` are
+    /// Server-scope and therefore ALWAYS global, so their side effects are
+    /// unaffected either way). A per-session `set prefix ...` (no `-g`)
+    /// correctly round-trips through `show`/`setw`-style reads but does
+    /// NOT (yet) live-rebind that one session's clients — tracked as a new
+    /// follow-up (see the task report).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_set_option(
+        &mut self,
+        global: bool,
+        window: bool,
+        append: bool,
+        unset: bool,
+        name: String,
+        value: Option<String>,
+        acting_session: Option<&str>,
+    ) -> Result<String, String> {
+        if let Some(_uname) = name.strip_prefix('@') {
+            if global || acting_session.is_none() {
+                self.options.set(&name, value.as_deref(), append, unset)?;
+            } else if window {
+                self.acting_window_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
+            } else {
+                self.acting_session_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
+            }
+            return Ok(String::new());
+        }
+
+        let sc = options::scope(&name); // None -> unknown option; let the target's own `set` produce that exact error.
+        let wrote_global = global || matches!(sc, Some(options::Scope::Server) | None) || acting_session.is_none();
+
+        if wrote_global {
+            let old_prefix = self.options.prefix();
+            self.options.set(&name, value.as_deref(), append, unset)?;
+            if name == "prefix" {
+                let new_prefix = self.options.prefix();
+                if new_prefix != old_prefix {
+                    self.bindings.unbind(WhichTable::Prefix, &old_prefix);
+                    self.bindings.bind(
+                        WhichTable::Prefix,
+                        new_prefix,
+                        Binding { cmds: vec![RawCmd { name: "send-prefix".to_string(), args: vec![] }], repeat: false },
+                    );
+                    for c in self.clients.values_mut() {
+                        c.key_machine.set_prefix(new_prefix);
+                    }
+                }
+            } else if name == "repeat-time" {
+                let rt = self.options.repeat_time();
                 for c in self.clients.values_mut() {
-                    c.key_machine.set_prefix(new_prefix);
+                    c.key_machine.set_repeat_time(rt);
+                }
+            } else if name == "escape-time" {
+                // Task 9: propagate to every attached client's KeyMachine
+                // immediately (same pattern as `repeat-time` just above) -- a
+                // pending ESC that's ALREADY outstanding is not retroactively
+                // re-evaluated (see `KeyMachine::set_escape_time`'s doc
+                // comment), only the duration used for the NEXT `escape_ready`
+                // check changes.
+                let et = self.options.escape_time();
+                for c in self.clients.values_mut() {
+                    c.key_machine.set_escape_time(et);
+                }
+            } else if name == "mouse" {
+                // Task 5: broadcast the SGR mouse-mode enable/disable escape
+                // sequences to every CURRENTLY attached client immediately (a
+                // raw Output frame, not waiting for the next composed render —
+                // this global write affects every session, not
+                // just the acting client's). A client attaching AFTER this point
+                // gets the enable sequence from `finish_attach` instead. The
+                // client's own terminal restore path (`host::apply_restore`)
+                // unconditionally writes the disable sequence on exit regardless
+                // of what the server ever sent, so a crashed/killed server can't
+                // leave a client's real terminal with mouse reporting stuck on.
+                let seq = if self.options.mouse() { super::MOUSE_ENABLE_SEQ } else { super::MOUSE_DISABLE_SEQ };
+                for c in self.clients.values() {
+                    super::send_output(&c.tx, seq.to_vec());
+                }
+            } else if matches!(name.as_str(), "status" | "status-position") {
+                // The status row's on/off state and position change every
+                // session's pane area (row count for `status`, y origin for
+                // `status-position`): recompute the shared size and reapply the
+                // layout — resizing ptys/grids — for every session, not just the
+                // acting client's. The post-dispatch
+                // re-render then draws the moved/removed bar.
+                let names: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+                for n in names {
+                    self.recompute_session_size(&n);
+                    self.apply_layout_for_session(&n);
                 }
             }
-        } else if name == "repeat-time" {
-            let rt = self.options.repeat_time();
-            for c in self.clients.values_mut() {
-                c.key_machine.set_repeat_time(rt);
+            return Ok(String::new());
+        }
+
+        match sc {
+            Some(options::Scope::Session) => {
+                self.acting_session_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
             }
-        } else if name == "escape-time" {
-            // Task 9: propagate to every attached client's KeyMachine
-            // immediately (same pattern as `repeat-time` just above) -- a
-            // pending ESC that's ALREADY outstanding is not retroactively
-            // re-evaluated (see `KeyMachine::set_escape_time`'s doc
-            // comment), only the duration used for the NEXT `escape_ready`
-            // check changes.
-            let et = self.options.escape_time();
-            for c in self.clients.values_mut() {
-                c.key_machine.set_escape_time(et);
+            Some(options::Scope::Window) => {
+                self.acting_window_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
             }
-        } else if name == "mouse" {
-            // Task 5: broadcast the SGR mouse-mode enable/disable escape
-            // sequences to every CURRENTLY attached client immediately (a
-            // raw Output frame, not waiting for the next composed render —
-            // `mouse` is a global option so this affects every session, not
-            // just the acting client's). A client attaching AFTER this point
-            // gets the enable sequence from `finish_attach` instead. The
-            // client's own terminal restore path (`host::apply_restore`)
-            // unconditionally writes the disable sequence on exit regardless
-            // of what the server ever sent, so a crashed/killed server can't
-            // leave a client's real terminal with mouse reporting stuck on.
-            let seq = if self.options.mouse() { super::MOUSE_ENABLE_SEQ } else { super::MOUSE_DISABLE_SEQ };
-            for c in self.clients.values() {
-                super::send_output(&c.tx, seq.to_vec());
-            }
-        } else if matches!(name.as_str(), "status" | "status-position") {
-            // The status row's on/off state and position change every
-            // session's pane area (row count for `status`, y origin for
-            // `status-position`): recompute the shared size and reapply the
-            // layout — resizing ptys/grids — for every session, not just the
-            // acting client's (options are global). The post-dispatch
-            // re-render then draws the moved/removed bar.
-            let names: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
-            for n in names {
-                self.recompute_session_size(&n);
-                self.apply_layout_for_session(&n);
-            }
+            Some(options::Scope::Server) | None => unreachable!("handled by the wrote_global branch above"),
         }
         Ok(String::new())
     }
@@ -3100,8 +3377,8 @@ impl Server {
             DisplayMessage { text } => self.exec_display_message(text, None),
             ConfirmBefore { .. } => Err("confirm-before: only from a client connection".to_string()),
             CommandPrompt { .. } => Err("command-prompt: only from a client connection".to_string()),
-            SetOption { global, window, append, unset, name, value } => self.exec_set_option(global, window, append, unset, name, value),
-            ShowOptions { global, name } => self.exec_show_options(global, name),
+            SetOption { global, window, append, unset, name, value } => self.exec_set_option(global, window, append, unset, name, value, None),
+            ShowOptions { global, window, quiet, value_only, name } => self.exec_show_options(global, window, quiet, value_only, name, None),
             BindKey { table, repeat, key, tail } => self.exec_bind_key(table, repeat, key, tail),
             UnbindKey { all, table, key } => self.exec_unbind_key(all, table, key),
             ListKeys => Ok(self.bindings.list()),
@@ -3285,8 +3562,12 @@ impl Server {
                 client.key_machine.set_capture(true);
                 ExecOutcome::Ok(String::new())
             }
-            SetOption { global, window, append, unset, name, value } => wrap(self.exec_set_option(global, window, append, unset, name, value)),
-            ShowOptions { global, name } => wrap(self.exec_show_options(global, name)),
+            SetOption { global, window, append, unset, name, value } => {
+                wrap(self.exec_set_option(global, window, append, unset, name, value, Some(session_name.as_str())))
+            }
+            ShowOptions { global, window, quiet, value_only, name } => {
+                wrap(self.exec_show_options(global, window, quiet, value_only, name, Some(session_name.as_str())))
+            }
             BindKey { table, repeat, key, tail } => wrap(self.exec_bind_key(table, repeat, key, tail)),
             UnbindKey { all, table, key } => wrap(self.exec_unbind_key(all, table, key)),
             ListKeys => ExecOutcome::Ok(self.bindings.list()),
@@ -4076,7 +4357,7 @@ impl Server {
             if !key.ctrl && !key.meta {
                 if let Some(d) = c.to_digit(10) {
                     if let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) {
-                        let entries = pane_digit_entries(session.current_window());
+                        let entries = pane_digit_entries(session.current_window(), &self.options);
                         if let Some((pane_id, _)) = entries.into_iter().find(|(_, dg)| *dg == d) {
                             self.mouse_focus_pane(session_name, pane_id);
                         }
@@ -4144,7 +4425,12 @@ impl Server {
     /// `display-panes [-d ms]` (Task 8): `ms` overrides `display-panes-time`
     /// for this invocation only (the option itself is untouched).
     fn exec_display_panes_client(&mut self, ms: Option<u32>, client: &mut ClientState) -> ExecOutcome {
-        let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or_else(|| self.options.display_panes_time());
+        // display-panes-time is session-scoped (#26).
+        let opt_dur = match client.session.as_deref().map(|n| self.acting_session_overlay(Some(n))) {
+            Some(Ok(ov)) => self.options.display_panes_time_for(ov),
+            _ => self.options.display_panes_time(),
+        };
+        let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or(opt_dur);
         client.mode = ClientMode::DisplayPanes(DisplayPanesState { deadline: Instant::now() + dur });
         ExecOutcome::Ok(String::new())
     }
@@ -4157,12 +4443,17 @@ impl Server {
     /// `format_clock`) so the very first render has something to draw
     /// rather than waiting for the next `Tick`.
     fn exec_clock_mode_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        let pane = match self.registry.session_mut(session_name) {
-            Some(s) => s.current_window().layout.focused(),
+        // clock-mode-style is window-scoped (#26): resolve through the
+        // window the clock is opening on (the session's current window).
+        let (pane, style12) = match self.registry.session_mut(session_name) {
+            Some(s) => {
+                let w = s.current_window();
+                (w.layout.focused(), self.options.clock_mode_style_12_for(&w.window_options))
+            }
             None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
         };
         let now = system_time_parts();
-        let text = format_clock(now.hour, now.min, self.options.clock_mode_style_12());
+        let text = format_clock(now.hour, now.min, style12);
         client.mode = ClientMode::Clock(ClockState { pane, text });
         ExecOutcome::Ok(String::new())
     }

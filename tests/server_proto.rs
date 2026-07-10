@@ -6659,3 +6659,209 @@ fn allow_rename_on_renames_previously_manually_renamed_window() {
     server.join().expect("server exits after last session dies");
     let _ = std::fs::remove_file(&conf_path);
 }
+
+// ---- SP7 Task 6: per-session/per-window option scopes + pane-base-index +
+// show -gqv (closes follow-ups #26, #32, #68) ----
+
+/// #26 (window scope): `setw window-status-current-format` with no `-g`
+/// targets the ACTING client's CURRENT window only. Proof of per-window
+/// divergence: window 1 (current at set time) renders the custom tab
+/// format; after switching back to window 0, window 0's current-tab format
+/// is still the DEFAULT (`0:powershell*`) -- the override stayed pinned to
+/// window 1, it never followed "whichever window is current".
+#[test]
+fn setw_status_style_on_one_window_only_styles_that_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Second window (index 1), becomes current.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // Per-window set via the ':' prompt (an ACTING-client context -- a
+    // headless CLI `setw` with no client would fall back to the global
+    // table, see exec_set_option's documented narrowing).
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    // Quoted, as in real tmux -- an unquoted `#` starts a config-line
+    // comment in the shared tokenizer (`cmd::parse_line`).
+    c.send(&ClientMsg::Stdin(b"setw window-status-current-format \"<<#I>>\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- <<1>>"))
+    });
+
+    // Switch back to window 0: window 0 is now current and must render the
+    // DEFAULT current format (its own overlay is empty), proving the
+    // override didn't land at the global-window level.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*"))
+    });
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains("<<0>>")),
+        "window 0 must not inherit window 1's per-window format override; screen:\n{}",
+        lines.join("\n")
+    );
+
+    // And the global level is untouched: `show -g` still prints the default.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-g".into(), "window-status-current-format".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        !out.contains("<<#I>>"),
+        "global window-status-current-format must be unchanged by a windowed setw: {out:?}"
+    );
+
+    // Kill window 1 (not current; kill by target), then exit.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-window".into(), "-t".into(), "1".into()]));
+    expect_cli_done(&cli2, 0);
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #26 (session scope): unprefixed `set` from an attached client targets
+/// THAT client's session only -- a second session's status bar keeps the
+/// default `status-left`, and the global table (`show -g`) is unchanged.
+#[test]
+fn set_without_g_targets_current_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "sA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[sA]")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    // Session-scoped set from client A (no -g).
+    a.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    a.send(&ClientMsg::Stdin(b"set status-left AAA_\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("AAA_")));
+
+    // Session B is untouched: force a fresh frame via a rename (any
+    // re-render) and confirm its status still shows the default-expanded
+    // left prefix, never AAA_.
+    b.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    b.send(&ClientMsg::Stdin(b"rename-window wB\r".to_vec()));
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("0:wB*")));
+    let lines_b = screen_text(&grid_b);
+    assert!(
+        lines_b.iter().any(|l| l.contains("[sB]")),
+        "session B must keep the default status-left; screen:\n{}",
+        lines_b.join("\n")
+    );
+    assert!(
+        !lines_b.iter().any(|l| l.contains("AAA_")),
+        "session A's unprefixed set must not leak into session B; screen:\n{}",
+        lines_b.join("\n")
+    );
+
+    // Global table unchanged.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-g".into(), "status-left".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "status-left \"[#S] \"\n", "global status-left must be the default");
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #68: `show -gqv "@foo"` -- the exact TPM rung-1 primitive. Set: prints
+/// the bare value only (no `@foo ` prefix). Unset + `-q`: prints nothing,
+/// exit 0. Unset without `-q`: `invalid option` error, exit 1.
+#[test]
+fn show_gqv_user_option_prints_value_only() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    // Keep the server alive across CLI calls.
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "kq".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "@foo".into(), "bar".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@foo".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "bar\n", "-v prints the value only");
+    assert_eq!(err, "");
+
+    // Unset user option, quiet: silent success (TPM's "empty if unset").
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@never_set".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "", "unset @-option with -q prints nothing");
+    assert_eq!(err, "");
+
+    // Unset user option, NOT quiet: tmux's invalid-option error.
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gv".into(), "@never_set".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "invalid option: @never_set");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #32: `pane-base-index` shifts every user-visible pane index. With
+/// `setw -g pane-base-index 1` and two panes: `#P` (display-message)
+/// reports 2 for the focused second pane, and a display-panes digit
+/// keypress `1` focuses the FIRST pane (digit = base + position, so `1`
+/// names position 0 -- the same mapping the drawn digit overlay used).
+#[test]
+fn pane_base_index_shifts_display_panes_digits_and_hash_p() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "pane-base-index".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Two panes; split-window focuses the NEW (right) pane = position 1.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // #P for the focused (second) pane: base 1 + position 1 = 2.
+    let mut cli_p = cli_client(&name);
+    cli_p.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (out, _) = expect_cli_done(&cli_p, 0);
+    assert_eq!(out, "2", "#P must reflect pane-base-index 1 for the second pane");
+
+    // display-panes: digit `1` = base + position 0 = the FIRST pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'q']));
+    c.send(&ClientMsg::Stdin(b"1".to_vec()));
+    c.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1", "display-panes digit 1 must focus the first pane (index base+0)");
+
+    // And the pane target grammar agrees: `select-pane -t :.2` names the
+    // SECOND pane under base 1.
+    c.send(&ClientMsg::Cli(vec!["select-pane".into(), "-t".into(), ":.2".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    c.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "2", "select-pane -t :.2 must resolve to the second pane under pane-base-index 1");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
