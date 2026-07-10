@@ -241,10 +241,8 @@ fn resolve_swap_window_target(session: &Session, spec: Option<&str>) -> Result<W
 fn parse_relative_offset(s: &str) -> Option<i64> {
     let (sign, digits) = if let Some(d) = s.strip_prefix('+') {
         (1i64, d)
-    } else if let Some(d) = s.strip_prefix('-') {
-        (-1i64, d)
     } else {
-        return None;
+        (-1i64, s.strip_prefix('-')?)
     };
     if digits.is_empty() {
         return Some(sign);
