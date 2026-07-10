@@ -7105,3 +7105,126 @@ fn pane_base_index_shifts_display_panes_digits_and_hash_p() {
     expect_cli_done(&cli_k, 0);
     server.join().expect("server exits after kill-server");
 }
+
+// ---- Task 8, SP7 wave 3: table-driven mouse bindings (closes #57, #67) ----
+
+/// The user's real conf idiom (`unbind -T copy-mode-vi MouseDragEnd1Pane`,
+/// follow-up #67(b)) must now actually disable release-copy in vi copy mode:
+/// a full press-drag-release across known text creates NO paste buffer and
+/// leaves copy mode active, because `MouseDragEnd1Pane` -- now a real,
+/// table-resolved binding -- has been removed from the copy-mode-vi table.
+#[test]
+fn unbind_copy_mode_vi_dragend_disables_release_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-T".into(), "copy-mode-vi".into(), "MouseDragEnd1Pane".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Full drag-select over "hello123" (columns 0..=7) and release -- would
+    // copy under the default binding (see `mouse_drag_selects_and_release_copies`).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "unbound MouseDragEnd1Pane must not create a paste buffer: {out:?}");
+
+    assert!(has_indicator(&grid, "[0/"), "unbound MouseDragEnd1Pane must leave copy mode active");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `bind -n WheelUpPane <cmd>` replaces the DEFAULT root wheel-up-enters-
+/// copy-mode behavior with the user's own command: the custom command runs
+/// (proven via a `@`-user-option side effect) and copy mode is never
+/// entered.
+#[test]
+fn bind_wheelup_pane_custom_command_overrides_default() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "WheelUpPane".into(),
+        "set".into(),
+        "-g".into(),
+        "@wheelmark".into(),
+        "yes".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 5, 5, false)));
+
+    c.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@wheelmark".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "yes\n", "the custom WheelUpPane binding must have run: {out:?}");
+
+    assert!(!has_indicator(&grid, "["), "the DEFAULT wheel-up-enters-copy-mode behavior must NOT have run");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #67(a): `unbind` on a token `keys::parse_key` rejects now errors
+/// `unknown key: <tok>` (real tmux behavior) instead of silently no-oping.
+#[test]
+fn unbind_unknown_key_errors_without_q() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "Ct-x".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "unknown key: Ct-x");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #67(a): `-q` suppresses the same error, restoring the old silent-no-op
+/// behavior on request.
+#[test]
+fn unbind_unknown_key_quiet_with_q() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-q".into(), "-n".into(), "Ct-x".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
