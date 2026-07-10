@@ -2148,4 +2148,12 @@ or correctness niceties, not known-active bugs.
     banner-independent predicates (measure the prompt row after attach
     and assert relative to it) for group (b), and an ESC-k-relay
     capability probe (mirroring `tests/pty_smoke.rs`'s DECSET pin
-    pattern) gating group (a).
+    pattern) gating group (a). Addendum (same day): the documented
+    follow-up #58 pair (`selection_survives_concurrent_output`/
+    `other_end_survives_concurrent_output`) is gated too — the latter
+    timed out on a hosted runner in a run where all other 231 tests
+    passed serially (its panic dump shows `[0/13]` copy-mode history, a
+    count the banner offset also shifts), and the pair already has a
+    documented real race that `recv_output_settled` only widens margins
+    against, making it the suite's most hosted-runner-fragile pair
+    either way (15 gated tests total).

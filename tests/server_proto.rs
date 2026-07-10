@@ -3042,6 +3042,7 @@ fn rectangle_selection() {
 /// at its capture-time view row, so it drifted onto unrelated text).
 #[test]
 fn selection_survives_concurrent_output() {
+    if skip_host_sensitive() { return; }
     let name = unique_pipe_name();
     let server = start_server(&name);
     let mut c = Client::connect(&name);
@@ -3126,6 +3127,7 @@ fn selection_survives_concurrent_output() {
 /// the stale view row it was captured at.
 #[test]
 fn other_end_survives_concurrent_output() {
+    if skip_host_sensitive() { return; }
     let name = unique_pipe_name();
     let server = start_server(&name);
     let mut c = Client::connect(&name);
