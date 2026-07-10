@@ -936,6 +936,10 @@ fn spawn_pane(
 ) -> std::io::Result<PaneRuntime> {
     let mut pty = Pty::spawn(shell, cols.max(1), rows.max(1))?;
     let mut reader = pty.take_reader()?;
+    // Per-pane writer thread (follow-up #14): acquire the writer clone
+    // immediately after the reader, before spawning any threads that assume
+    // success (all fallible setup happens before threads are spawned).
+    let mut writer = pty.try_clone_writer()?;
 
     let out_tx = tx.clone();
     thread::spawn(move || {
@@ -962,11 +966,6 @@ fn spawn_pane(
         let _ = wait_tx.send(ServerEvent::Exited(id));
     });
 
-    // Per-pane writer thread (follow-up #14): owns an independent duplicate
-    // of the pty's input write handle and drains an unbounded channel of
-    // pending writes, mirroring `spawn_writer`'s per-client design exactly —
-    // see `PaneRuntime::input_tx`'s doc comment.
-    let mut writer = pty.try_clone_writer()?;
     let (input_tx, input_rx) = channel::<Vec<u8>>();
     thread::spawn(move || {
         while let Ok(bytes) = input_rx.recv() {
