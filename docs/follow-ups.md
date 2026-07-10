@@ -57,7 +57,12 @@ None ever blocked a merge.
 Non-blocking minor debt accumulated across the sub-project 2 plan's task
 reviews. None affect the sub-project 2 merge.
 
-7. **`pty::win_err` doesn't unmask the HRESULT.** `src/pty.rs`'s `win_err`
+7. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). `pty::win_err`
+   now unmasks the HRESULT back to the raw Win32 code via a `raw_win32_code`
+   helper duplicated from `src/pipe.rs`'s (same shape, two independent pure
+   modules), matching `pipe.rs`'s existing convention. Test:
+   `pty::tests::win_err_unmasks_hresult_to_plain_win32_code`.
+   *Original text:* `src/pty.rs`'s `win_err`
    does `io::Error::from_raw_os_error(e.code().0)`, passing the raw
    (negative, HRESULT-shaped) `i32` through. `src/pipe.rs`'s `win_err` goes
    through `raw_win32_code`, which unmasks HRESULTs built from Win32 codes
@@ -66,14 +71,25 @@ reviews. None affect the sub-project 2 merge.
    `pty.rs` currently never branches on `.kind()`, so this is latent, not
    active — but if `pty` code ever starts matching on error kind, backport
    `pipe.rs`'s unmasking for consistency.
-8. **`pipe.rs` username buffer is 256 `u16`s, not `UNLEN + 1`.**
+8. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10).
+   `current_username`'s buffer is now sized `UNLEN + 1` (257 `u16`s) via a
+   named `const UNLEN: usize = 256`, not a bare `256`. Test:
+   `pipe::tests::unlen_plus_one_is_257`.
+   *Original text:* `pipe.rs` username buffer is 256 `u16`s, not `UNLEN + 1`.
    `current_username()` uses a fixed `[0u16; 256]` buffer with `GetUserNameW`.
    Windows' documented `UNLEN` is 256, so the correct buffer size is
    `UNLEN + 1` (257, for the trailing NUL) — the current buffer is one
    `u16` short of the documented worst case for a maximum-length username.
    Practically unreachable (real usernames are far shorter), but worth
    sizing to the documented constant instead of a round number.
-9. **`protocol::write_frame` doesn't itself enforce `MAX_FRAME`** — only
+9. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10).
+   `protocol::write_frame` now rejects (`Err(InvalidData)`) any payload over
+   `MAX_FRAME` itself, rather than only `read_frame` catching an oversized
+   declared length on the receiving end. Tests:
+   `protocol::tests::write_frame_rejects_oversized_payload`,
+   `write_frame_accepts_exactly_max_frame`.
+   *Original text:* `protocol::write_frame` doesn't itself enforce `MAX_FRAME`
+   — only
    `read_frame` rejects an oversized declared length on decode. Verified the
    actual bound on the write side: `src/server.rs`'s `send_output` chunks
    pane `Output` bytes via `bytes.chunks(protocol::MAX_FRAME as usize)`
@@ -87,7 +103,16 @@ reviews. None affect the sub-project 2 merge.
    correctly reject it, but only after the sender has already written
    invalid bytes to the pipe). Consider an assert or defensive chunk/error in
    `write_frame` itself.
-10. **Trailing payload bytes are silently ignored by protocol decoders.**
+10. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Every decoder
+    that parses a fixed set of known fields (`Attach`/`Resize`/`Detach`/`Cli`
+    on the client side, `Exit`/`CliDone` on the server side) now calls a new
+    `expect_consumed` helper after its last `read_*` call, erroring
+    `InvalidData` on any leftover bytes. `Stdin`/`Output`, whose entire
+    payload IS the value with no fixed-field structure, are unaffected (there
+    is nothing to be "trailing" relative to). Tests:
+    `protocol::tests::decoder_rejects_trailing_bytes_{attach,resize,exit,cli,detach}`.
+    *Original text:* Trailing payload bytes are silently ignored by protocol
+    decoders.
     `read_client_msg`/`read_server_msg` parse known fields out of the
     frame's payload slice via sequential `read_*` helpers but never check
     that the slice is fully consumed afterward. A frame with correct known
@@ -124,8 +149,26 @@ are the control-char name validation covered elsewhere in this review round,
 tracked separately from the items below, which are accepted debt rather than
 merge blockers).
 
-14. **Main-loop pane-input writes can block all sessions on one stalled
-    pane.** `InputEvent::Forward` -> `pty.write_input` runs inline on the
+14. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). `PaneRuntime`
+    gains a per-pane `input_tx: Sender<Vec<u8>>` writer channel; `spawn_pane`
+    also spawns a dedicated writer thread (owning an independent duplicate of
+    the pty's input handle via the new `Pty::try_clone_writer`) that drains
+    it, mirroring the existing per-client `spawn_writer` design exactly. The
+    main loop's hot Forward/Key-forwarding path now enqueues onto this
+    channel instead of calling `pty.write_input` inline — a stalled pane's
+    writer thread can block, but never the main loop, never another session.
+    `src/server/dispatch.rs`'s lower-volume write sites (send-keys,
+    paste-buffer, mouse-drag forwarding) are unchanged, still direct
+    `pty.write_input` calls — only the two hottest call sites moved. Contract
+    amendments: `2026-07-06-mvp-interfaces.md`'s `## pty` section
+    (`Pty::try_clone_writer`/`PtyWriter`) and
+    `2026-07-07-server-client-interfaces.md`'s `## server` section
+    (architecture note). Test:
+    `tests/server_proto.rs::stalled_pane_stdin_does_not_block_other_sessions`
+    (RED against the pre-fix inline call, ~3.8s; GREEN after, ~1s).
+    *Original text:* Main-loop pane-input writes can block all sessions on
+    one stalled
+    pane. `InputEvent::Forward` -> `pty.write_input` runs inline on the
     server's single main-loop thread, unlike pane *output* and per-client
     writes (both already off the main loop via dedicated threads/channels,
     see follow-up #13). A pane whose child process stops draining stdin (a
@@ -135,7 +178,18 @@ merge blockers).
     thread, mirroring the existing per-client writer design) planned as a
     fast-follow; becomes more urgent once sub-project 3 adds `send-keys`
     (a scripted/automated way to pump arbitrary-sized input at a pane).
-15. **Named-pipe ACL relies on the default DACL.** `CreateNamedPipeW(...,
+15. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Every named
+    pipe instance (`create_instance`, `src/pipe.rs`) is now created with an
+    explicit `SECURITY_ATTRIBUTES` (`OwnerDacl`) granting the current
+    process's owner SID `GENERIC_ALL` and nothing else, built via
+    `OpenProcessToken`/`GetTokenInformation(TokenUser)` +
+    `InitializeAcl`/`AddAccessAllowedAce`/`InitializeSecurityDescriptor`/
+    `SetSecurityDescriptorDacl`, in place of the platform default (`None`).
+    Behavior otherwise identical; covered by the full existing
+    `tests/pipe_smoke.rs` suite (all pipe creation/connect paths go through
+    `create_instance`).
+    *Original text:* Named-pipe ACL relies on the default DACL.
+    `CreateNamedPipeW(...,
     None)` (in `src/pipe.rs`) passes no explicit `SECURITY_ATTRIBUTES`, so
     the pipe gets Windows' default DACL. Combined with per-username pipe
     naming (so a different user's pipe would need to be guessed), this is
@@ -147,23 +201,76 @@ merge blockers).
 
 ### Review ticket batch (final review, 2026-07-07) — short one-liners, none blocking
 
-16. `client.rs`'s stdin-reader thread panicking leaves the main loop waiting
+16. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). The stdin
+    thread's body now runs inside `std::panic::catch_unwind`; a panic sends
+    an `Err` through the same channel the reader thread uses (it holds its
+    own `tx` clone), which the main loop's existing fatal-error handling
+    already turns into a clean non-zero exit instead of hanging forever.
+    *Original text:* `client.rs`'s stdin-reader thread panicking leaves the
+    main loop waiting
     on it forever instead of signaling the main loop to exit non-zero.
-17. `attach -d` (steal) evicted clients get a bare `[detached]` exit message
+17. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10).
+    `detach_others` now sends `Exit{0, "[detached (from session
+    <name>)]"}`, identical text to every other detach exit path in this
+    module. Contract amendment:
+    `2026-07-07-server-client-interfaces.md`'s `## server` "Attach" bullet.
+    Test: `tests/server_proto.rs::steal_attach_eviction_message_names_session`
+    (RED against the pre-fix bare `[detached]`, GREEN after).
+    *Original text:* `attach -d` (steal) evicted clients get a bare
+    `[detached]` exit message
     (`src/server.rs:509`); tmux says `[detached (from session <name>)]`.
     When fixed, also update the `## server contract` table's documented
     exit-message string in `docs/specs/2026-07-07-server-client-interfaces.md`.
-18. `destroy_session`'s `TerminateProcess` loop over a session's panes runs
+18. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Comment added
+    on `destroy_session` noting the sequential-on-main-thread assumption and
+    why it's not a real scaling concern (bounded by one session's pane
+    count; unlike follow-up #14's stalled-CHILD concern, killing an
+    already-alive process isn't something a hung child can meaningfully
+    stall).
+    *Original text:* `destroy_session`'s `TerminateProcess` loop over a
+    session's panes runs
     sequentially on the main thread; bounded by pane count so not a real
     scaling concern today, but worth a comment noting the assumption.
-19. `kill-server` accept race: a client that connects during the server's
+19. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10).
+    `client::attach`'s main loop now tracks whether it has ever received a
+    real `ServerMsg` on this connection; if the connection is lost before
+    that (the exact race this ticket describes — connected and `Attach`
+    sent, but the server tore itself down before serving even one reply),
+    it prints the cleaner `no server running on <pipe>` (same text
+    `main.rs`'s `report_connect_error` uses) instead of the vaguer `[lost
+    server]`, which is now reserved for a disconnect AFTER a real session
+    was genuinely live. Exit code unchanged (1 either way).
+    *Original text:* `kill-server` accept race: a client that connects
+    during the server's
     teardown window sees `[lost server]` (`src/client.rs:156`) rather than
     the cleaner `no server running on <pipe>` (`src/main.rs:177`) a client
     connecting slightly later would get.
-20. `src/input.rs`'s `set_capture(true)` doc comment overstates how much
+20. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Note: the
+    exact test this ticket named (`capture_mode_clears_pending_prefix_state`)
+    belonged to the sub-project 2 `InputMachine`, deleted when sub-project 3
+    Task 6 rewired `src/input.rs` onto the table-driven `KeyMachine` — its
+    replacement, `capture_bypasses_prefix`, already existed under a
+    different name by the time this ticket was picked up. Closed here by (a)
+    splitting `KeyMachine`'s type-level doc comment into precise ON/OFF
+    clauses (turning capture ON leaves armed `Prefixed`/repeat-window state
+    untouched; only turning OFF resets it) and (b) renaming the test again,
+    to `capture_bypasses_prefix_and_off_clears_prefix_state`, which states
+    both halves of what it actually asserts.
+    *Original text:* `src/input.rs`'s `set_capture(true)` doc comment
+    overstates how much
     state it clears; the `capture_mode_clears_pending_prefix_state` test
     name similarly overpromises relative to what it actually asserts.
-21. `src/pipe.rs`'s accept loop has a dead `Ok(())` arm; `finish_attach`
+21. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). The dead
+    `Ok(())` arm in `PipeListener::accept`'s `ConnectNamedPipe` match is
+    replaced with an `unreachable!()` arm plus a comment explaining WHY it's
+    unreachable (Win32's documented contract: an overlapped-mode
+    `ConnectNamedPipe` never returns success synchronously). Separately,
+    `finish_attach`'s `Renderer::new(cols, rows)` followed immediately by a
+    same-size `resize` (whose only OTHER job, forcing `force_full: true`,
+    doesn't need a same-size `new` first) is now `Renderer::new(0, 0)` +
+    `resize(cols, rows)`, avoiding the double buffer allocation.
+    *Original text:* `src/pipe.rs`'s accept loop has a dead `Ok(())` arm;
+    `finish_attach`
     does a redundant `Renderer::new` immediately followed by a `resize`
     that makes the `new` call's initial size irrelevant.
 22. Untested paths: `rename_session` propagation to OTHER attached clients
@@ -177,7 +284,12 @@ merge blockers).
     non-empty rather than pinning its exact text; `-x 0`/`-y 0` is treated
     as a "use default size" sentinel rather than a literal zero size, which
     isn't obvious from the test names alone.
-24. `no_console_fails_fast` test naming is inconsistent with the sibling
+24. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Renamed to
+    `e2e_no_console_fails_fast`, matching every sibling test in
+    `tests/e2e_sessions.rs` (all `e2e_`-prefixed). Doc reference updated in
+    `2026-07-07-server-client-interfaces.md`.
+    *Original text:* `no_console_fails_fast` test naming is inconsistent
+    with the sibling
     tests around it (naming convention drift, not a behavior issue).
 
 ## Deferred from sub-project 3 (command layer + config, 2026-07-07) — SP4 candidates
@@ -589,8 +701,16 @@ None block the sub-project 4 merge.
     overlay's own row rects (mirroring `mouse_status_row`'s pattern) and
     map a click to `ChooseTreeAction::Commit`-equivalent behavior, wheel to
     `Up`/`Down`.
-62. **`Window::name`/`Session::name` field safety relies on an unstated
-    invariant** (Task 9, naming; security audit finding). Both fields are
+62. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10). Doc comments
+    added on both `Window::name` and `Session::name` (`src/model.rs`)
+    pinning the invariant ("only ever set via a `validate_name`-gated
+    setter") and the render-time trust it protects, so the risk is
+    documented at the field, not only at today's call sites. No code
+    behavior change (doc-only ticket, no RED test needed per the task
+    brief).
+    *Original text:* `Window::name`/`Session::name` field safety relies on
+    an unstated
+    invariant (Task 9, naming; security audit finding). Both fields are
     plain `String`s with no type-level guarantee that every write went
     through `model::validate_name` -- the invariant holds today only
     because every call site that sets a name (`exec_rename_window`,
@@ -604,7 +724,15 @@ None block the sub-project 4 merge.
     comment on `Window::name`/`Session::name` pinning "only ever set via a
     `validate_name`-gated setter" so the risk is documented at the field,
     not just at today's call sites.
-63. **`render::CopyView::cursor` is a dead field** (Task 2/3, copy mode;
+63. **RESOLVED** (SP7 Task 4, plumbing debt batch, 2026-07-10).
+    `render::CopyView::cursor` is deleted; the one construction site
+    (`src/server.rs`'s `render_one`) drops `cursor: (cs.cx, cs.cy)` from its
+    `CopyView { .. }` literal in the same commit. Contract amendments:
+    `2026-07-06-mvp-interfaces.md`'s `## render` section (new amendment note)
+    and `2026-07-07-parity-polish-interfaces.md`'s `## render` amendment
+    (under `## copy-mode`).
+    *Original text:* `render::CopyView::cursor` is a dead field (Task 2/3,
+    copy mode;
     security audit finding). `server::render_one` populates
     `CopyView { scroll, cursor: (cs.cx, cs.cy), sel }` for the pane bound
     to a client's `ClientMode::Copy`, but `render.rs`'s
