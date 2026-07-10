@@ -1,4 +1,8 @@
-//! Typed tmux option registry + the SP3 `#`/`%` format-string subset.
+//! Typed tmux option registry. The general tmux format-expansion engine
+//! (`#`/`%`/`#{...}`, conditionals, comparisons, length limits) lives in
+//! [`crate::format`] as of SP7 Task 1 — [`FormatCtx`]/[`SystemTimeParts`]/
+//! [`expand_format`] are re-exported/delegated here for source
+//! compatibility (see below).
 //!
 //! Pure module: no I/O, `std` only. Depends on [`crate::keys`] (the `prefix`
 //! option's `Key` type) and [`crate::style`] (every `*-style` option's
@@ -20,11 +24,13 @@
 //! control-char-clean (`#S`/`#W` come from `model::validate_name`-guarded
 //! session/window names, strftime output is fixed-format digits/month/
 //! weekday abbreviations), so a clean `status-left`/`status-right` template
-//! can only ever expand to a clean result.
+//! can only ever expand to a clean result — the SP7 format engine's wider
+//! grammar (conditionals, comparisons, length limits) only rearranges/
+//! selects among these same clean inputs, it never introduces a new
+//! character class, so the guarantee still holds.
 //!
-//! [`expand_format`] evaluates the SP3 format-string subset (`#S`, `#I`,
-//! `#{session_name}`, `%H:%M`, ...) used by `status-left`/`status-right`/
-//! `display-message`.
+//! [`expand_format`] delegates to [`crate::format::expand`], used by
+//! `status-left`/`status-right`/`display-message`/window-status formats.
 
 use crate::grid::Color;
 use crate::keys::{self, Key};
@@ -44,6 +50,20 @@ enum Value {
     Choice(&'static str),
     Str(String),
     Style(String, PartialStyle),
+    /// SP7 Task 12 (closes follow-ups #43/#54's sibling gap): a
+    /// `main-pane-width`/`main-pane-height`-shaped value -- either a plain
+    /// absolute cell count or an `N%` percentage, resolved against a caller-
+    /// supplied total at READ time (see [`resolve_size`]) rather than at
+    /// `set` time, since the "total" (the target window's area at
+    /// apply-time) isn't known until `server::dispatch` applies a preset.
+    Size(SizeSpec),
+}
+
+/// See [`Value::Size`]'s doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeSpec {
+    Cells(u32),
+    Percent(u32),
 }
 
 /// Which shape an option's value must take; drives `set`'s parsing/validation
@@ -56,6 +76,8 @@ enum Kind {
     Choice,
     Str,
     Style,
+    /// See [`Value::Size`]'s doc comment.
+    Size,
 }
 
 /// One row of the static option table: name, kind, and the default value
@@ -68,16 +90,16 @@ struct Spec {
 }
 
 /// The stored default for `window-status-format`/`window-status-current-format`
-/// (SP6 Task 4 — a documented deviation from tmux's literal
-/// `#I:#W#{?window_flags,#{window_flags}, }`, whose `#{?cond,a,b}`
-/// conditional the `expand_format` subset does not evaluate; see the
-/// deviation note on `default_value`'s arm). Public and named so
-/// `status::status_spans` can recognize "the effective format IS the
-/// default" and apply the one-space flagless padding shim that reproduces
-/// the conditional's `, }` else-branch — keeping the default rendering
-/// byte-identical to real tmux for BOTH flagged and flagless windows
-/// (width-stable across focus changes). Custom formats are never padded.
-pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
+/// — tmux's REAL literal default string, unchanged since SP7 Task 1's
+/// general format engine (`src/format.rs`) now evaluates its
+/// `#{?window_flags,#{window_flags}, }` conditional correctly (closes
+/// follow-up #70; superseded the SP6 Task 4 deviation, which stored the
+/// conditional-free `#I:#W#F` plus a `status::status_spans`-side padding
+/// shim because the old `expand_format` subset couldn't evaluate `#{?...}`
+/// at all). Public so tests (and any future caller) can compare an
+/// option's effective format against "the default" without duplicating the
+/// literal string.
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#{?window_flags,#{window_flags}, }";
 
 const SPECS: &[Spec] = &[
     Spec { name: "prefix", kind: Kind::Key, choices: &[] },
@@ -127,9 +149,14 @@ const SPECS: &[Spec] = &[
     // `word_separators()` getter's doc comment for the verified default.
     Spec { name: "word-separators", kind: Kind::Str, choices: &[] },
     // Layout presets (Task 6, sub-project 4): `main-horizontal`/
-    // `main-vertical`'s main-pane size.
-    Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
-    Spec { name: "main-pane-height", kind: Kind::Number, choices: &[] },
+    // `main-vertical`'s main-pane size. SP7 Task 12: promoted from plain
+    // `Number` to `Size` -- accepts an absolute cell count OR an `N%`
+    // percentage (`docs/tmux-reference/panes-and-layout.md`'s options table:
+    // "supports N%"), resolved against the target window's area at
+    // `select-layout`/`next-layout` apply-time (see `main_pane_width`/
+    // `main_pane_width_for`'s doc comment).
+    Spec { name: "main-pane-width", kind: Kind::Size, choices: &[] },
+    Spec { name: "main-pane-height", kind: Kind::Size, choices: &[] },
     // Overlays (Task 8, sub-project 4): choose-tree + display-panes.
     // `display-panes-colour`/`-active-colour` are plain BARE colours (not
     // full `fg=...`/`bg=...` style strings) -- stored as `Str` and parsed on
@@ -170,10 +197,152 @@ const SPECS: &[Spec] = &[
     Spec { name: "status-right-style", kind: Kind::Style, choices: &[] },
     Spec { name: "window-status-format", kind: Kind::Str, choices: &[] },
     Spec { name: "window-status-current-format", kind: Kind::Str, choices: &[] },
+    // Alerts subsystem (SP7 Task 17, closes follow-up #74). `bell-action`/
+    // `visual-bell`/`monitor-activity`/`clock-mode-colour`/
+    // `window-status-bell-style` were already SPECS entries (SP6 Task 2,
+    // accepted-and-stored but inert); this task wires them up AND adds the
+    // remaining options real tmux pairs with them (verified against
+    // `docs/tmux-reference/status-line-and-messages.md` §4.4/§9 and, where
+    // that doc is thin on defaults, tmux's own `options-table.c`):
+    // `activity-action`/`silence-action` (session-scoped, same choice set as
+    // `bell-action`, defaults `other`/`other` vs. `bell-action`'s `any` --
+    // options-table.c:733-739/1011-1017), `monitor-bell` (window-scoped
+    // flag, default ON -- options-table.c:1480-1485, note this is the
+    // OPPOSITE default of `monitor-activity`), `monitor-silence`
+    // (window-scoped number, seconds, default 0 = off --
+    // options-table.c:1487-1493), and `window-status-activity-style`
+    // (window-scoped style, default `reverse`, same as `-bell-style` --
+    // options-table.c:1799-1806).
+    Spec { name: "activity-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "silence-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "monitor-bell", kind: Kind::Flag, choices: &[] },
+    Spec { name: "monitor-silence", kind: Kind::Number, choices: &[] },
+    Spec { name: "window-status-activity-style", kind: Kind::Style, choices: &[] },
+    // Clipboard (SP7 Task 13, closes follow-up #53): OSC 52 emission gate.
+    // Real tmux default is `external` (options-table.c:513); scope is
+    // `server` there (single global value, matching winmux's own
+    // single-global-table model -- see `scope()` below). Per the plan
+    // review (`.superpowers/sdd/task-13-brief.md`): ConPTY has no `Ms`-
+    // capability probe, so winmux gates OSC 52 emission ONLY on this
+    // option's value (`on`/`external` emit, `off` doesn't) -- see
+    // `Options::set_clipboard_emits`.
+    Spec { name: "set-clipboard", kind: Kind::Choice, choices: &["on", "external", "off"] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
+}
+
+/// Which store level (SP7 Task 6, closes follow-up #26) a NAMED option
+/// resolves against: per tmux, **the table decides the scope** —
+/// `set`/`setw`'s `-g`/`-w` flags only pick global-vs-local WITHIN that
+/// scope, they never move a name to a different scope
+/// (`commands-config-options-formats.md` §3.3.4). Classified from that
+/// doc's Appendix B (`## 10`) options table:
+///
+/// - [`Scope::Server`]: always the one global table, `-g`/`-w` "harmless/
+///   ignored" (tmux's own words) — winmux has exactly one server-wide tree
+///   (there never was a per-session/window overlay for these), so these
+///   getters are UNCHANGED by this task: `escape-time`, `default-terminal`,
+///   `exit-empty`, `buffer-limit`.
+/// - [`Scope::Session`]: has a global level (`set -g`) plus a per-session
+///   override (unprefixed `set` inside a session context). Every SPECS
+///   entry not explicitly classified `Window` or `Server` below falls here
+///   (this is the common case — most of winmux's option table mirrors
+///   tmux's session-option list).
+/// - [`Scope::Window`]: has a global-window level (`setw -g`, or `set -g`
+///   — table decides, see above) plus a per-window override (`setw`/`set
+///   -w` with no `-g`). tmux's real table further splits `Win` vs `W/P`
+///   (window+pane); winmux has no per-PANE option tree, so both collapse
+///   onto `Window` here (the per-pane half of tmux's scope is out of
+///   scope for this task — documented narrowing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Server,
+    Session,
+    Window,
+}
+
+/// Public so `server::dispatch` can pick which store (`Options`'s global
+/// table, the acting session's [`Overlay`], or the acting window's
+/// [`Overlay`]) a `set-option`/`show-options` write/read targets. Returns
+/// `None` for a name not in [`SPECS`] (dispatch's existing "unknown
+/// option" error path already handles that via `Options::set`/`Overlay::
+/// set`'s own `find_spec` check — this function is a pure classifier, not
+/// a validator).
+pub fn scope(name: &str) -> Option<Scope> {
+    find_spec(name)?;
+    Some(match name {
+        "escape-time" | "default-terminal" | "exit-empty" | "buffer-limit" | "set-clipboard" => Scope::Server,
+        "pane-base-index"
+        | "window-status-style"
+        | "window-status-current-style"
+        | "window-status-format"
+        | "window-status-current-format"
+        | "window-status-separator"
+        | "window-status-bell-style"
+        | "pane-border-style"
+        | "pane-active-border-style"
+        | "pane-border-indicators"
+        | "mode-keys"
+        | "mode-style"
+        | "main-pane-width"
+        | "main-pane-height"
+        | "aggressive-resize"
+        | "automatic-rename"
+        | "allow-rename"
+        | "monitor-activity"
+        | "monitor-bell"
+        | "monitor-silence"
+        | "window-status-activity-style"
+        | "clock-mode-colour"
+        | "clock-mode-style" => Scope::Window,
+        _ => Scope::Session,
+    })
+}
+
+/// Shared value-parsing core for `Options::set`/[`Overlay::set`] (SP7 Task
+/// 6 extraction — previously inlined only in `Options::set`): parses `value`
+/// against `spec.kind`, returning the same errors either caller already
+/// documented (`bad value: ...`, `bad style: ...`/`invalid style: ...` from
+/// [`style::parse_style`]). Does NOT insert anywhere — purely functional, so
+/// both the global table and a per-entity [`Overlay`] can share one
+/// validation path with no risk of the two drifting apart.
+fn parse_typed_value(spec: &Spec, value: &str) -> Result<Value, String> {
+    match spec.kind {
+        Kind::Flag => Ok(Value::Flag(parse_on_off(value).ok_or_else(|| format!("bad value: {value}"))?)),
+        Kind::Number => Ok(Value::Number(value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?)),
+        Kind::Key => Ok(Value::Key(keys::parse_key(value).ok_or_else(|| format!("bad value: {value}"))?)),
+        Kind::Choice => {
+            let lower = value.to_ascii_lowercase();
+            let matched = spec.choices.iter().find(|c| **c == lower).ok_or_else(|| format!("bad value: {value}"))?;
+            Ok(Value::Choice(matched))
+        }
+        Kind::Str => {
+            // See `Options::set`'s original doc note (still accurate):
+            // control chars are rejected uniformly across every Str-kind
+            // option, echoing a sanitized error so the rejection message
+            // itself can never smuggle a control sequence to a client's
+            // terminal.
+            if has_control_chars(value) {
+                return Err(format!("bad value: {}", sanitize_control_chars(value)));
+            }
+            Ok(Value::Str(value.to_string()))
+        }
+        Kind::Style => {
+            let parsed = style::parse_style(value)?;
+            Ok(Value::Style(value.to_string(), parsed))
+        }
+        Kind::Size => {
+            if let Some(pct) = value.strip_suffix('%') {
+                let n = pct.parse::<u32>().map_err(|_| format!("bad value: {value}"))?;
+                Ok(Value::Size(SizeSpec::Percent(n)))
+            } else {
+                let n = value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?;
+                Ok(Value::Size(SizeSpec::Cells(n)))
+            }
+        }
+    }
 }
 
 /// Which [`Kind`] a concrete [`Value`] actually is -- used only by the
@@ -191,6 +360,7 @@ fn value_kind(v: &Value) -> Kind {
         Value::Choice(_) => Kind::Choice,
         Value::Str(_) => Kind::Str,
         Value::Style(_, _) => Kind::Style,
+        Value::Size(_) => Kind::Size,
     }
 }
 
@@ -240,7 +410,13 @@ fn default_value(name: &str) -> Value {
         "history-limit" => Value::Number(2000),
         "escape-time" => Value::Number(500),
         "automatic-rename" => Value::Flag(true),
-        "allow-rename" => Value::Flag(true),
+        // Verified against `docs/tmux-reference/windows-and-sessions.md`
+        // "allow-rename -- what it actually gates" (options-table.c:
+        // 1295-1301; CHANGES:1858): default OFF since tmux 2.6. This
+        // corrects a prior (unverified) `Flag(true)` default now that SP7
+        // Task 3 makes the option live (gates ESC-k-sourced
+        // automatic-rename; see `Options::allow_rename`).
+        "allow-rename" => Value::Flag(false),
         "mode-keys" => Value::Choice("emacs"),
         "default-terminal" => Value::Str("screen".to_string()),
         "exit-empty" => Value::Flag(true),
@@ -258,8 +434,8 @@ fn default_value(name: &str) -> Value {
         // `dispatch::char_class` as its own `CharClass::Whitespace` variant
         // rather than folded into `Separator` here.
         "word-separators" => Value::Str("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".to_string()),
-        "main-pane-width" => Value::Number(80),
-        "main-pane-height" => Value::Number(24),
+        "main-pane-width" => Value::Size(SizeSpec::Cells(80)),
+        "main-pane-height" => Value::Size(SizeSpec::Cells(24)),
         "display-panes-time" => Value::Number(1000),
         "display-panes-colour" => Value::Str("blue".to_string()),
         "display-panes-active-colour" => Value::Str("red".to_string()),
@@ -287,23 +463,24 @@ fn default_value(name: &str) -> Value {
             let s = "default";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
-        // SP6 Task 4 deviation from tmux's literal real default
-        // (`#I:#W#{?window_flags,#{window_flags}, }`): the `#{?cond,a,b}`
-        // conditional isn't in the `expand_format` subset (same "SP3
-        // simplification" bucket as status-right's `#{=21:pane_title}` gap —
-        // see that option's own deviation note above). `#I:#W#F` reproduces
-        // the identical rendered text for every FLAGGED window via the
-        // already-supported `#F` short code; the conditional's `, }`
-        // else-branch (one padding space when a window has NO flags, which
-        // keeps tab width stable across focus changes) is reproduced by a
-        // default-format-only shim in `status::status_spans` (fix round 1)
-        // that pads an empty flags string to a single space — see
-        // DEFAULT_WINDOW_STATUS_FORMAT's doc comment above. Net: the
-        // DEFAULT rendering is byte-identical to real tmux in all cases;
-        // only CUSTOM formats using `#{?...}` remain unsupported
-        // (docs/follow-ups.md #70).
+        // SP7 Task 1: tmux's literal real default, verbatim (the general
+        // format engine in `src/format.rs` evaluates its
+        // `#{?window_flags,#{window_flags}, }` conditional correctly, so no
+        // deviation/shim is needed anymore — see DEFAULT_WINDOW_STATUS_FORMAT's
+        // doc comment above; closes docs/follow-ups.md #70).
         "window-status-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         "window-status-current-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
+        // Alerts subsystem (SP7 Task 17, closes follow-up #74). See the
+        // SPECS entries' doc comment above for the tmux-verified defaults.
+        "activity-action" => Value::Choice("other"),
+        "silence-action" => Value::Choice("other"),
+        "monitor-bell" => Value::Flag(true),
+        "monitor-silence" => Value::Number(0),
+        "window-status-activity-style" => {
+            let s = "reverse";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "set-clipboard" => Value::Choice("external"),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -386,43 +563,7 @@ impl Options {
             }
         };
 
-        let parsed = match spec.kind {
-            Kind::Flag => Value::Flag(parse_on_off(value).ok_or_else(|| format!("bad value: {value}"))?),
-            Kind::Number => Value::Number(value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?),
-            Kind::Key => Value::Key(keys::parse_key(value).ok_or_else(|| format!("bad value: {value}"))?),
-            Kind::Choice => {
-                let lower = value.to_ascii_lowercase();
-                let matched = spec
-                    .choices
-                    .iter()
-                    .find(|c| **c == lower)
-                    .ok_or_else(|| format!("bad value: {value}"))?;
-                Value::Choice(matched)
-            }
-            Kind::Str => {
-                // `status-left`/`status-right` are settable at runtime by ANY
-                // attached client (`:set -g status-left ...`) and the
-                // composited status row goes to EVERY attached client's
-                // terminal -- embedded ESC/OSC/CSI (title spoofing, OSC 52
-                // clipboard) or bare \r\n could corrupt other clients'
-                // terminals. Reject the same way `model::validate_name`
-                // rejects control chars in session/window names: sanitize
-                // control chars to `?` in the echoed error text so the
-                // rejection message itself can never smuggle a control
-                // sequence back to the caller's terminal. Covers
-                // status-left/status-right/default-command/default-terminal
-                // uniformly -- a control character in any of them is equally
-                // bogus, not just the two status-bar options.
-                if has_control_chars(value) {
-                    return Err(format!("bad value: {}", sanitize_control_chars(value)));
-                }
-                Value::Str(value.to_string())
-            }
-            Kind::Style => {
-                let parsed = style::parse_style(value)?;
-                Value::Style(value.to_string(), parsed)
-            }
-        };
+        let parsed = parse_typed_value(spec, value)?;
         self.values.insert(spec.name, parsed);
         Ok(())
     }
@@ -490,7 +631,26 @@ impl Options {
     /// 2 scope is the `Options`-level semantics; CLI `-v`/`-q` flag parsing
     /// for `show-options` is future work).
     pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String> {
+        self.show_user_option_scoped(name, quiet, None)
+    }
+
+    /// Scoped `-q`-aware read of a user (`@name`) option (SP7 Task 6): the
+    /// same tmux idiom as [`Options::show_user_option`], but checking
+    /// `overlay`'s LOCAL store first (if given and it has a local entry)
+    /// before falling back to the global store — the same
+    /// local-then-inherited chain a named session-/window-scoped option
+    /// resolves through (`options_get` walks the tree's parent pointer
+    /// regardless of whether the entry is a table name or a free-form
+    /// `@name`). `overlay: None` reads the global store only, identical to
+    /// [`Options::show_user_option`] (which is now a thin `overlay: None`
+    /// call to this).
+    pub fn show_user_option_scoped(&self, name: &str, quiet: bool, overlay: Option<&Overlay>) -> Result<Option<String>, String> {
         let uname = name.strip_prefix('@').unwrap_or(name);
+        if let Some(ov) = overlay {
+            if let Some(v) = ov.user_options.get(uname) {
+                return Ok(Some(v.clone()));
+            }
+        }
         match self.user_options.get(uname) {
             Some(v) => Ok(Some(v.clone())),
             None if quiet => Ok(None),
@@ -666,17 +826,43 @@ impl Options {
         self.number("buffer-limit")
     }
 
-    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4): the
-    /// `main-horizontal`/`main-vertical` layout presets' main-pane size,
-    /// clamped at APPLICATION time by `layout::apply_preset` so the other
-    /// panes never fall below `MIN_PANE_W`/`MIN_PANE_H`. tmux defaults: width
-    /// 80, height 24.
-    pub fn main_pane_width(&self) -> u16 {
-        self.number("main-pane-width") as u16
+    /// `set-clipboard` (SP7 Task 13, closes follow-up #53): `on`/`external`/
+    /// `off`. tmux default `external`.
+    pub fn set_clipboard(&self) -> &'static str {
+        self.choice("set-clipboard")
     }
 
-    pub fn main_pane_height(&self) -> u16 {
-        self.number("main-pane-height") as u16
+    /// Whether a copy in copy mode should emit OSC 52
+    /// (`\x1b]52;c;<base64>\x07`) to the acting client. Per the plan review
+    /// (`.superpowers/sdd/task-13-brief.md`, decision (a)): winmux has no
+    /// ConPTY `Ms`-capability probe, so this is gated ONLY on the option
+    /// value -- `on`/`external` emit, `off` does not (matches real tmux's
+    /// own outgoing-OSC-52 gate, `!= 0`, `docs/tmux-reference/
+    /// copy-mode-and-buffers.md` §9.7 "Outgoing").
+    pub fn set_clipboard_emits(&self) -> bool {
+        self.set_clipboard() != "off"
+    }
+
+    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4; SP7 Task
+    /// 12 promotes these to percentage-aware `total`-resolving getters,
+    /// closing follow-up #43's sibling gap): the `main-horizontal`/
+    /// `main-vertical` layout presets' main-pane size. `total` is the
+    /// window's area length along the relevant axis AT THE MOMENT the
+    /// caller is about to apply a preset (`area.w` for width, `area.h` for
+    /// height) -- needed to resolve a stored `N%` value into an absolute
+    /// cell count (`resolve_size`); a plain absolute value ignores `total`
+    /// entirely. The RESULT is still clamped at APPLICATION time by
+    /// `layout::apply_preset`/`clamp_main` so the other panes never fall
+    /// below `MIN_PANE_W`/`MIN_PANE_H` -- and, since SP7 Task 12, re-clamped
+    /// on every subsequent render too (see `layout::Node::main_size`'s doc
+    /// comment), not just once at apply-time. tmux defaults: width 80,
+    /// height 24.
+    pub fn main_pane_width(&self, total: u16) -> u16 {
+        resolve_size(self.values.get("main-pane-width").expect("main-pane-width always has a default"), total)
+    }
+
+    pub fn main_pane_height(&self, total: u16) -> u16 {
+        resolve_size(self.values.get("main-pane-height").expect("main-pane-height always has a default"), total)
     }
 
     /// `display-panes-time` (Task 8, sub-project 4): how long the
@@ -722,11 +908,25 @@ impl Options {
         self.flag("automatic-rename")
     }
 
-    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2): how an
-    /// activity/bell/silence alert is shown (`off`/`on`/`both` -- `both`
-    /// means visual AND audible). Accepted-and-stored but INERT: no
-    /// alerts/bell subsystem exists yet (`docs/follow-ups.md`-tracked; see
-    /// `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    /// `allow-rename` (SP7 Task 3, closes follow-up #52): gates ONLY the
+    /// historical `ESC k <name> ESC \` rename escape, tmux default off
+    /// since 2.6 -- does NOT affect `automatic-rename` or OSC 0/2 (see
+    /// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what
+    /// it actually gates"). Consumed by `server::Server::maybe_auto_rename`'s
+    /// caller to decide whether an ESC-k-sourced title participates in
+    /// automatic-rename at all; the OSC 0/2 path is unconditional.
+    pub fn allow_rename(&self) -> bool {
+        self.flag("allow-rename")
+    }
+
+    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2; wired
+    /// up SP7 Task 17, closes follow-up #74): how an activity/bell/silence
+    /// alert is shown (`off`/`on`/`both`). Per
+    /// `docs/tmux-reference/status-line-and-messages.md` §4.4
+    /// (`alerts_set_message`): `off` -> terminal BEL passthrough to every
+    /// client attached to the alerting window's session, no message; `on`
+    /// -> a status-line message only, no BEL; `both` -> BEL AND message.
+    /// Consumed by `server::Server::react_alert`.
     pub fn visual_activity(&self) -> &'static str {
         self.choice("visual-activity")
     }
@@ -739,18 +939,103 @@ impl Options {
         self.choice("visual-silence")
     }
 
-    /// `bell-action` (SP6 Task 2): which window(s) a bell alert routes to
-    /// (`any`/`none`/`current`/`other`). Accepted-and-stored but INERT, same
-    /// bucket as the `visual-*` getters above.
+    pub fn visual_activity_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-activity", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-activity is always Choice"),
+        }
+    }
+
+    pub fn visual_bell_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-bell", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-bell is always Choice"),
+        }
+    }
+
+    pub fn visual_silence_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-silence", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-silence is always Choice"),
+        }
+    }
+
+    /// `bell-action`/`activity-action`/`silence-action` (SP6 Task 2 for
+    /// `bell-action`; the other two added SP7 Task 17, closes follow-up
+    /// #74): which window(s) an alert's notify/visual REACTION applies to
+    /// (`any`/`none`/`current`/`other` -- `alerts_action_applies`,
+    /// alerts.c:70-89). This is a SEPARATE gate from the window-flag
+    /// (`#`/`!`/`~`) detection itself, which only checks `monitor-*` (see
+    /// `model::Window::mark_bell`/`mark_activity`/`mark_silence`'s doc
+    /// comments) -- a window can show `!` with NO reaction (`bell-action
+    /// none`), or vice versa is impossible (a reaction always implies
+    /// `monitor-*` was on, but the FLAG might still not be set if the
+    /// window happens to be current). tmux defaults: `bell-action any`,
+    /// `activity-action other`, `silence-action other`
+    /// (options-table.c:733-739/761-767/1011-1017).
     pub fn bell_action(&self) -> &'static str {
         self.choice("bell-action")
     }
 
-    /// `monitor-activity` (SP6 Task 2): per-window activity monitoring
-    /// on/off. Accepted-and-stored but INERT (no activity tracking exists
-    /// yet).
+    pub fn activity_action(&self) -> &'static str {
+        self.choice("activity-action")
+    }
+
+    pub fn silence_action(&self) -> &'static str {
+        self.choice("silence-action")
+    }
+
+    pub fn bell_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("bell-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("bell-action is always Choice"),
+        }
+    }
+
+    pub fn activity_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("activity-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("activity-action is always Choice"),
+        }
+    }
+
+    pub fn silence_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("silence-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("silence-action is always Choice"),
+        }
+    }
+
+    /// `monitor-activity`/`monitor-bell` (SP6 Task 2 for `monitor-
+    /// activity`, wired up SP7 Task 17 alongside the new `monitor-bell`,
+    /// closes follow-up #74): per-window bell/activity monitoring on/off --
+    /// gates the WINDOW FLAG (`!`/`#`) detection itself, independent of
+    /// `bell-action`/`activity-action`'s reaction scoping (see
+    /// `bell_action`'s doc comment). tmux defaults: `monitor-bell` ON,
+    /// `monitor-activity` OFF (options-table.c:1473-1485 -- note the two
+    /// options default OPPOSITE ways).
     pub fn monitor_activity(&self) -> bool {
         self.flag("monitor-activity")
+    }
+
+    pub fn monitor_bell(&self) -> bool {
+        self.flag("monitor-bell")
+    }
+
+    pub fn monitor_bell_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("monitor-bell", window))
+    }
+
+    /// `monitor-silence` (SP7 Task 17, closes follow-up #74): per-window
+    /// silence-monitoring interval in seconds, `0` = off (tmux default).
+    /// `server::Server`'s Tick handler compares this against each window's
+    /// `model::Window::last_output` age.
+    pub fn monitor_silence(&self) -> Duration {
+        Duration::from_secs(self.number("monitor-silence") as u64)
+    }
+
+    pub fn monitor_silence_for(&self, window: &Overlay) -> Duration {
+        Duration::from_secs(as_number(self.resolve_window("monitor-silence", window)) as u64)
     }
 
     /// `clock-mode-colour` (SP6 Task 2): the big-clock overlay's colour.
@@ -768,11 +1053,33 @@ impl Options {
         matches!(self.values.get("clock-mode-style"), Some(Value::Choice("12")))
     }
 
-    /// `window-status-bell-style` (SP6 Task 2): style for a window tab with
-    /// an unseen bell. Accepted-and-stored but INERT (no bell-state tracking
-    /// exists yet).
+    /// `window-status-bell-style`/`-activity-style` (SP6 Task 2 for
+    /// `-bell-style`; `-activity-style` added + both wired up SP7 Task 17,
+    /// closes follow-up #74): style layered over a flagged window's tab.
+    /// Per `docs/tmux-reference/status-line-and-messages.md` §2.2's style
+    /// resolution order: bell-style applies (if != `default`) whenever
+    /// `alert_bell` is set; activity-style applies (if != `default`) only
+    /// as the ELSE branch -- i.e. only when bell-style did NOT already
+    /// apply -- whenever `alert_activity` OR `alert_silence` is set (both
+    /// flags share this one style option). "!= `default`" is checked via
+    /// `PartialStyle::default()` equality (an unmentioned/`default`-keyword
+    /// style parses to the same all-`None` value). See `server::Server`'s
+    /// `WindowEntry` construction for the actual layering. tmux default for
+    /// both: `reverse`.
     pub fn window_status_bell_style(&self) -> &PartialStyle {
         self.style_ref("window-status-bell-style")
+    }
+
+    pub fn window_status_activity_style(&self) -> &PartialStyle {
+        self.style_ref("window-status-activity-style")
+    }
+
+    pub fn window_status_bell_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-bell-style", window))
+    }
+
+    pub fn window_status_activity_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-activity-style", window))
     }
 
     /// `window-status-separator` (SP6 Task 2): literal text between window
@@ -803,9 +1110,9 @@ impl Options {
     /// `window-status-format`/`window-status-current-format` (SP6 Task 2,
     /// rendering wired in Task 4): per-window tab format-string templates,
     /// expanded per window by `status::status_spans` via `expand_format`.
-    /// Default `#I:#W#F` -- see the deviation note on this option's
-    /// `default_value` arm for why it isn't tmux's literal
-    /// `#{?window_flags,...}` string.
+    /// Default is tmux's literal real string,
+    /// `#I:#W#{?window_flags,#{window_flags}, }` (SP7 Task 1: see
+    /// `DEFAULT_WINDOW_STATUS_FORMAT`'s doc comment).
     pub fn window_status_format(&self) -> &str {
         self.str_ref("window-status-format")
     }
@@ -847,6 +1154,393 @@ impl Options {
             Some(Value::Style(_, s)) => s,
             _ => unreachable!("{name} is always Style"),
         }
+    }
+
+    // ---- scope-resolving reads (SP7 Task 6, closes follow-up #26) ----
+    //
+    // ONE resolution pattern, applied to every window-/session-scoped
+    // getter that a real production call site (`server.rs`/`server/
+    // dispatch.rs`) reads: a `_for` sibling of the existing zero-arg
+    // getter, taking the ACTING session's or window's [`Overlay`] (already
+    // resolved by the caller — dispatch/render always has the acting
+    // client's current session/window in scope). Resolution is exactly the
+    // two-level chain the design doc specifies (window → global-window;
+    // session → global — no third pane level, no `-t` cross-entity
+    // targeting): the overlay is checked first, and only when it has no
+    // LOCAL entry for that name does the read fall through to the shared
+    // global table (`self.values`) — the exact same value every pre-Task-6
+    // zero-arg getter already returns, so an entity with an EMPTY overlay
+    // (the default, `Overlay::new()`) is always byte-identical to the old
+    // global-only getter (the DEFAULT-BEHAVIOR REGRESSION BAR).
+    //
+    // Getters for [`Scope::Server`] names (`escape-time`, `default-
+    // terminal`, `exit-empty`, `buffer-limit`) intentionally have NO `_for`
+    // sibling: they only ever read `self.values`, matching tmux's "any
+    // -g/-w is harmless/ignored" rule for that scope.
+
+    fn resolve_session<'a>(&'a self, name: &'static str, session: &'a Overlay) -> &'a Value {
+        session
+            .values
+            .get(name)
+            .or_else(|| self.values.get(name))
+            .unwrap_or_else(|| unreachable!("{name} always has a global default"))
+    }
+
+    fn resolve_window<'a>(&'a self, name: &'static str, window: &'a Overlay) -> &'a Value {
+        window
+            .values
+            .get(name)
+            .or_else(|| self.values.get(name))
+            .unwrap_or_else(|| unreachable!("{name} always has a global default"))
+    }
+
+    /// Scope-aware `show`/`show-window-options` for a NAMED option
+    /// (`#68`/dispatch's `exec_show_options`): the EFFECTIVE value (local
+    /// override if the acting entity has one, else the inherited global) —
+    /// a documented simplification of tmux's "local-tree-only unless `-A`"
+    /// rule (`commands-config-options-formats.md` §3.5), chosen because
+    /// showing the value a user would actually observe in effect is far
+    /// more useful than tmux's stricter local-only default, and no
+    /// required test depends on the stricter behavior. `session`/`window`:
+    /// pass the one matching the name's [`scope`] (the other is ignored);
+    /// `None` for either simply means "no override at that level to check"
+    /// (same as passing an empty [`Overlay`]).
+    pub fn show_effective(&self, name: &str, session: Option<&Overlay>, window: Option<&Overlay>) -> Option<String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            if let Some(w) = window {
+                if let Some(v) = w.user_options.get(uname) {
+                    return Some(v.clone());
+                }
+            }
+            if let Some(s) = session {
+                if let Some(v) = s.user_options.get(uname) {
+                    return Some(v.clone());
+                }
+            }
+            return self.user_options.get(uname).cloned();
+        }
+        let spec = find_spec(name)?;
+        let value = match scope(spec.name) {
+            Some(Scope::Window) => window.map(|w| self.resolve_window(spec.name, w)),
+            Some(Scope::Session) => session.map(|s| self.resolve_session(spec.name, s)),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.values.get(spec.name).expect("known option"));
+        Some(format_value(value))
+    }
+
+    pub fn prefix_for(&self, session: &Overlay) -> Key {
+        match self.resolve_session("prefix", session) {
+            Value::Key(k) => *k,
+            _ => unreachable!("prefix is always Key"),
+        }
+    }
+
+    pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("status-left", session))
+    }
+
+    pub fn status_right_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("status-right", session))
+    }
+
+    pub fn status_left_length_for(&self, session: &Overlay) -> u16 {
+        as_number(self.resolve_session("status-left-length", session)) as u16
+    }
+
+    pub fn status_right_length_for(&self, session: &Overlay) -> u16 {
+        as_number(self.resolve_session("status-right-length", session)) as u16
+    }
+
+    pub fn status_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-style", session))
+    }
+
+    pub fn status_left_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-left-style", session))
+    }
+
+    pub fn status_right_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("status-right-style", session))
+    }
+
+    pub fn status_justify_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("status-justify", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("status-justify is always Choice"),
+        }
+    }
+
+    pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_session("message-style", session))
+    }
+
+    pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("default-command", session))
+    }
+
+    pub fn renumber_windows_for(&self, session: &Overlay) -> bool {
+        as_flag(self.resolve_session("renumber-windows", session))
+    }
+
+    pub fn mouse_for(&self, session: &Overlay) -> bool {
+        as_flag(self.resolve_session("mouse", session))
+    }
+
+    pub fn history_limit_for(&self, session: &Overlay) -> u32 {
+        as_number(self.resolve_session("history-limit", session))
+    }
+
+    pub fn word_separators_for<'a>(&'a self, session: &'a Overlay) -> &'a str {
+        as_str(self.resolve_session("word-separators", session))
+    }
+
+    pub fn display_panes_time_for(&self, session: &Overlay) -> Duration {
+        Duration::from_millis(as_number(self.resolve_session("display-panes-time", session)) as u64)
+    }
+
+    pub fn display_panes_colour_for(&self, session: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_session("display-panes-colour", session)).to_ascii_lowercase())
+            .unwrap_or(Color::Idx(4))
+    }
+
+    pub fn display_panes_active_colour_for(&self, session: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_session("display-panes-active-colour", session)).to_ascii_lowercase())
+            .unwrap_or(Color::Idx(1))
+    }
+
+    /// `pane-base-index` (#32): the window-scoped floor pane INDEXES are
+    /// displayed/targeted from -- see the getter's zero-arg sibling's doc
+    /// comment for the option's own semantics; this `_for` variant is the
+    /// one every user-visible pane-index call site (display-panes digits,
+    /// `#P`, kill-pane confirm text, `:.N` target parsing) now routes
+    /// through.
+    pub fn pane_base_index_for(&self, window: &Overlay) -> u32 {
+        as_number(self.resolve_window("pane-base-index", window))
+    }
+
+    pub fn window_status_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-style", window))
+    }
+
+    pub fn window_status_current_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-current-style", window))
+    }
+
+    pub fn window_status_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-format", window))
+    }
+
+    pub fn window_status_current_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-current-format", window))
+    }
+
+    pub fn window_status_separator_for<'a>(&'a self, window: &'a Overlay) -> &'a str {
+        as_str(self.resolve_window("window-status-separator", window))
+    }
+
+    pub fn pane_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("pane-border-style", window))
+    }
+
+    pub fn pane_active_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("pane-active-border-style", window))
+    }
+
+    pub fn pane_border_indicators_for(&self, window: &Overlay) -> crate::render::BorderIndicators {
+        use crate::render::BorderIndicators;
+        match self.resolve_window("pane-border-indicators", window) {
+            Value::Choice("off") => BorderIndicators::Off,
+            Value::Choice("arrows") => BorderIndicators::Arrows,
+            Value::Choice("both") => BorderIndicators::Both,
+            _ => BorderIndicators::Colour,
+        }
+    }
+
+    pub fn mode_keys_vi_for(&self, window: &Overlay) -> bool {
+        matches!(self.resolve_window("mode-keys", window), Value::Choice("vi"))
+    }
+
+    pub fn mode_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("mode-style", window))
+    }
+
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16 {
+        resolve_size(self.resolve_window("main-pane-width", window), total)
+    }
+
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16 {
+        resolve_size(self.resolve_window("main-pane-height", window), total)
+    }
+
+    pub fn automatic_rename_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("automatic-rename", window))
+    }
+
+    pub fn allow_rename_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("allow-rename", window))
+    }
+
+    pub fn clock_mode_colour_for(&self, window: &Overlay) -> Color {
+        style::parse_color(&as_str(self.resolve_window("clock-mode-colour", window)).to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    pub fn clock_mode_style_12_for(&self, window: &Overlay) -> bool {
+        matches!(self.resolve_window("clock-mode-style", window), Value::Choice("12"))
+    }
+
+    pub fn monitor_activity_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("monitor-activity", window))
+    }
+}
+
+fn as_number(v: &Value) -> u32 {
+    match v {
+        Value::Number(n) => *n,
+        _ => unreachable!("expected a Number-kind option value"),
+    }
+}
+
+fn as_flag(v: &Value) -> bool {
+    match v {
+        Value::Flag(b) => *b,
+        _ => unreachable!("expected a Flag-kind option value"),
+    }
+}
+
+fn as_str(v: &Value) -> &str {
+    match v {
+        Value::Str(s) => s.as_str(),
+        _ => unreachable!("expected a Str-kind option value"),
+    }
+}
+
+fn as_style(v: &Value) -> &PartialStyle {
+    match v {
+        Value::Style(_, s) => s,
+        _ => unreachable!("expected a Style-kind option value"),
+    }
+}
+
+/// Sparse per-entity option overlay (SP7 Task 6, closes follow-up #26):
+/// holds only the options THIS session or window has explicitly
+/// overridden (`set`/`setw` with no `-g`) -- absence of a name here means
+/// "inherit the global value", exactly tmux's per-session/per-window
+/// option tree with the shared [`Options`] table standing in for its
+/// `global_s_options`/`global_w_options` (winmux, unlike tmux, does not
+/// separate those two global-window/global-session trees from the
+/// server's one global tree -- a documented simplification: `set -g`
+/// always writes the SAME global table regardless of whether the name is
+/// session- or window-scoped, matching what winmux already did pre-Task-6
+/// for every option).
+///
+/// Embedded as a field directly on `model::Session`/`model::Window`
+/// (`session_options`/`window_options`) rather than a keyed map inside
+/// [`Options`] itself -- sessions/windows are looked up by name/id that
+/// can be renamed or reused, and an overlay living ON the entity struct
+/// can never be orphaned by a rename or accidentally leak onto a
+/// different entity that reuses a freed id/name. This does mean `model.rs`
+/// gains a dependency on `options.rs` (previously the reverse never
+/// existed either way); `options.rs` itself stays entirely ignorant of
+/// `model`'s id types, so no cycle exists.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    values: BTreeMap<&'static str, Value>,
+    /// `@name` user options at this level (SP6 Task 2's free-form store,
+    /// now per-entity too -- `commands-config-options-formats.md` §3.4:
+    /// "Allowed at any scope, selected by flags").
+    user_options: BTreeMap<String, String>,
+}
+
+impl Overlay {
+    /// A fresh overlay with nothing overridden -- every read through it
+    /// falls straight through to the global table, which is what makes an
+    /// entity with a never-touched overlay byte-identical to pre-Task-6
+    /// behavior (the DEFAULT-BEHAVIOR REGRESSION BAR).
+    pub fn new() -> Overlay {
+        Overlay::default()
+    }
+
+    /// Set (or unset/append/toggle) one option AT THIS OVERLAY'S LEVEL
+    /// (the session or window it's embedded in) -- mirrors [`Options::
+    /// set`]'s validation/parsing (sharing [`parse_typed_value`]) but
+    /// writes into this sparse local map instead of the global table, and
+    /// differs from it in exactly the ways tmux's own local-tree `set`
+    /// differs from a global-tree `set`
+    /// (`commands-config-options-formats.md` §3.3.4 step 6): `-u` (`unset:
+    /// true`) REMOVES the local entry so inheritance from the global value
+    /// resumes (tmux: "in a session/window/pane tree the entry is
+    /// removed"), rather than resetting to the compiled default the way
+    /// [`Options::set`]'s `-u` does for the global tree ("globals must
+    /// always exist"). `-a` append and a value-less `Flag` toggle both
+    /// operate relative to whatever THIS overlay currently holds locally
+    /// (defaulting to "" / `false` if there is no local entry yet, NOT the
+    /// inherited global value) -- a documented simplification of tmux's
+    /// per-tree-only append/toggle semantics that keeps this method
+    /// self-contained (no `Options` borrow needed to compute a "starting
+    /// point" for append/toggle).
+    pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            if unset {
+                self.user_options.remove(uname);
+                return Ok(());
+            }
+            if append {
+                let mut current = self.user_options.get(uname).cloned().unwrap_or_default();
+                current.push_str(value.unwrap_or(""));
+                if has_control_chars(&current) {
+                    return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+                }
+                self.user_options.insert(uname.to_string(), current);
+                return Ok(());
+            }
+            let value = value.ok_or_else(|| format!("bad value: @{uname} requires a value"))?;
+            if has_control_chars(value) {
+                return Err(format!("bad value: {}", sanitize_control_chars(value)));
+            }
+            self.user_options.insert(uname.to_string(), value.to_string());
+            return Ok(());
+        }
+
+        let spec = find_spec(name).ok_or_else(|| format!("unknown option: {name}"))?;
+
+        if unset {
+            self.values.remove(spec.name);
+            return Ok(());
+        }
+
+        if append {
+            if spec.kind != Kind::Str {
+                return Err("bad value: -a requires a string option".to_string());
+            }
+            let addition = value.unwrap_or("");
+            let mut current = match self.values.get(spec.name) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => String::new(),
+            };
+            current.push_str(addition);
+            if has_control_chars(&current) {
+                return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+            }
+            self.values.insert(spec.name, Value::Str(current));
+            return Ok(());
+        }
+
+        let value = match value {
+            Some(v) => v,
+            None => {
+                if spec.kind == Kind::Flag {
+                    let current = matches!(self.values.get(spec.name), Some(Value::Flag(true)));
+                    self.values.insert(spec.name, Value::Flag(!current));
+                    return Ok(());
+                }
+                return Err(format!("bad value: {name} requires a value"));
+            }
+        };
+
+        let parsed = parse_typed_value(spec, value)?;
+        self.values.insert(spec.name, parsed);
+        Ok(())
     }
 }
 
@@ -893,6 +1587,30 @@ fn format_value(value: &Value) -> String {
         Value::Choice(c) => c.to_string(),
         Value::Str(s) => quote_if_needed(s),
         Value::Style(src, _) => quote_if_needed(src),
+        Value::Size(SizeSpec::Cells(n)) => n.to_string(),
+        Value::Size(SizeSpec::Percent(n)) => format!("{n}%"),
+    }
+}
+
+/// Resolve a [`Value::Size`] (`main-pane-width`/`-height`'s stored value)
+/// against `total` (the axis length of the area a preset is being applied
+/// against RIGHT NOW -- `area.w` for width, `area.h` for height): `Cells(n)`
+/// passes `n` through unchanged (percent semantics never apply to it, even
+/// if `total` later shrinks -- that clamping happens downstream, in
+/// `layout::clamp_main`/`split_rects`, not here); `Percent(p)` computes
+/// `floor(total * p / 100)`, matching tmux's own integer-percentage
+/// convention (`docs/tmux-reference/panes-and-layout.md` §2 "`-p pct`":
+/// `size = curval * p / 100`). Saturates rather than panics on a
+/// pathological huge `p` (there is no upper-bound validation on `set-option`
+/// today, matching every other `Number`-kind option in this table).
+fn resolve_size(v: &Value, total: u16) -> u16 {
+    match v {
+        Value::Size(SizeSpec::Cells(n)) => (*n).min(u16::MAX as u32) as u16,
+        Value::Size(SizeSpec::Percent(p)) => {
+            let scaled = (total as u32).saturating_mul(*p) / 100;
+            scaled.min(u16::MAX as u32) as u16
+        }
+        _ => unreachable!("resolve_size called on a non-Size value"),
     }
 }
 
@@ -904,221 +1622,24 @@ fn quote_if_needed(s: &str) -> String {
     }
 }
 
-/// Plain calendar/time facts for [`expand_format`]'s strftime subset. A
-/// plain struct (no Windows types) so the module stays pure/testable; the
-/// server fills one in from `GetLocalTime` (see `src/server.rs`'s
-/// `local_clock`, which this format subset is designed to reproduce for
-/// `%H:%M %d-%b-%y`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SystemTimeParts {
-    pub year: i32,
-    /// 1-12.
-    pub month: u8,
-    pub day: u8,
-    /// 0 = Sunday, matching Win32 `SYSTEMTIME.wDayOfWeek`.
-    pub weekday: u8,
-    pub hour: u8,
-    pub min: u8,
-    pub sec: u8,
-}
+/// Re-exported from [`crate::format`] for source compatibility (SP7 Task 1:
+/// the general format engine moved out of this module — see that module's
+/// docs for the full grammar). [`expand_format`] below is now a one-line
+/// delegate to [`crate::format::expand`].
+pub use crate::format::{FormatCtx, SystemTimeParts};
 
-/// Everything [`expand_format`] needs beyond the format string itself.
-pub struct FormatCtx<'a> {
-    pub session: &'a str,
-    pub window_index: u32,
-    pub window_name: &'a str,
-    pub window_flags: &'a str,
-    pub pane_index: u32,
-    pub hostname: &'a str,
-    pub now: SystemTimeParts,
-    /// `#T`/`#{pane_title}` (Task 9, sub-project 4): the focused pane's OSC
-    /// 0/2 title (`server::PaneRuntime::title`), empty until the pane's
-    /// program ever sets one. Already control-char-clean and length-capped
-    /// by `grid::Grid`'s OSC handler — no further sanitizing needed here.
-    /// Documented divergence from real tmux (fix round, review minor 1):
-    /// tmux's `#T`/`#{pane_title}` falls back to the pane's running command
-    /// name when no title has ever been set; here it falls back to an empty
-    /// string, same root cause as the `automatic-rename` divergence
-    /// (`docs/follow-ups.md` #28) — no foreground-process tracking exists in
-    /// this codebase, only the ConPTY-surfaced console title.
-    pub pane_title: &'a str,
-}
-
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/// Expand the SP3 format-string subset used by `status-left`/`status-right`/
-/// `display-message`:
-///
-/// - `#S` session name, `#I` window index, `#W` window name, `#F` window
-///   flags, `#P` pane index, `#H` hostname, `#T` pane title (Task 9,
-///   sub-project 4), `##` literal `#`.
-/// - `#{session_name}`, `#{window_index}`, `#{window_name}` (long forms of
-///   the three most common `#`-codes); any other `#{...}` -> empty
-///   (documented SP3 simplification — the full tmux format-expression
-///   engine, conditionals, modifiers, etc. is out of scope until SP4).
-/// - Any other `#<c>` (unrecognized short code) -> empty.
-/// - `%`-strftime subset: `%H %M %S %d %m %Y %y %b %a %p %I %%`. Any other
-///   `%<c>` is left as a literal two-character passthrough (`%x` stays
-///   `%x`) rather than expanding or erroring.
+/// Expand a tmux format string against `ctx` — thin delegate to
+/// [`crate::format::expand`] (SP7 Task 1). Kept here, under its original
+/// name, so every existing caller (`status::status_spans`,
+/// `server::render_one`, `server::dispatch`) needs no import changes. See
+/// `crate::format`'s module docs for the full supported grammar (braced
+/// variables, `#{?cond,true,false}` conditionals, `==`/`!=`/`<`/`>`/`<=`/
+/// `>=` string comparisons, `&&`/`||`, `#{=N:x}`/`#{=-N:x}` length limits,
+/// single-char aliases, `##`/`#,`/`#}` escapes, `#[...]` style-marker
+/// passthrough, `%`-strftime passthrough) and its documented non-supported
+/// remainder.
 pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
-    let mut out = String::with_capacity(fmt.len());
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '#' => match chars.peek().copied() {
-                Some('#') => {
-                    chars.next();
-                    out.push('#');
-                }
-                Some('S') => {
-                    chars.next();
-                    out.push_str(ctx.session);
-                }
-                Some('I') => {
-                    chars.next();
-                    out.push_str(&ctx.window_index.to_string());
-                }
-                Some('W') => {
-                    chars.next();
-                    out.push_str(ctx.window_name);
-                }
-                Some('F') => {
-                    chars.next();
-                    out.push_str(ctx.window_flags);
-                }
-                Some('P') => {
-                    chars.next();
-                    out.push_str(&ctx.pane_index.to_string());
-                }
-                Some('H') => {
-                    chars.next();
-                    out.push_str(ctx.hostname);
-                }
-                Some('T') => {
-                    chars.next();
-                    out.push_str(ctx.pane_title);
-                }
-                Some('[') => {
-                    // Inline style marker (`#[fg=white]`, ...): expand_format
-                    // does text substitution only -- `#[...]` blocks are
-                    // interpreted by the RENDERER's span builder
-                    // (`status::styled_runs`, SP6 Task 4), not here, so they
-                    // must survive expansion byte-for-byte. Copied verbatim,
-                    // including the brackets; an unterminated marker (no
-                    // closing `]`) is copied to end-of-string rather than
-                    // silently dropped -- no well-formed template hits this.
-                    chars.next(); // consume '['
-                    out.push('#');
-                    out.push('[');
-                    for c2 in chars.by_ref() {
-                        out.push(c2);
-                        if c2 == ']' {
-                            break;
-                        }
-                    }
-                }
-                Some('{') => {
-                    chars.next();
-                    let mut name = String::new();
-                    let mut closed = false;
-                    for c2 in chars.by_ref() {
-                        if c2 == '}' {
-                            closed = true;
-                            break;
-                        }
-                        name.push(c2);
-                    }
-                    if closed {
-                        match name.as_str() {
-                            "session_name" => out.push_str(ctx.session),
-                            "window_index" => out.push_str(&ctx.window_index.to_string()),
-                            "window_name" => out.push_str(ctx.window_name),
-                            "pane_title" => out.push_str(ctx.pane_title),
-                            _ => {} // unknown long form -> empty
-                        }
-                    }
-                    // an unterminated `#{...` with no closing `}` is simply
-                    // consumed to end-of-string, producing empty — no input
-                    // is well-formed .tmux.conf either way.
-                }
-                Some(_) => {
-                    chars.next(); // unrecognized short code -> empty
-                }
-                None => {} // trailing lone `#` -> dropped
-            },
-            '%' => match chars.peek().copied() {
-                Some('%') => {
-                    chars.next();
-                    out.push('%');
-                }
-                Some('H') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.hour));
-                }
-                Some('M') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.min));
-                }
-                Some('S') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.sec));
-                }
-                Some('d') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.day));
-                }
-                Some('m') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.month));
-                }
-                Some('Y') => {
-                    chars.next();
-                    out.push_str(&ctx.now.year.to_string());
-                }
-                Some('y') => {
-                    chars.next();
-                    out.push_str(&format!("{:02}", ctx.now.year.rem_euclid(100)));
-                }
-                Some('b') => {
-                    chars.next();
-                    out.push_str(month_name(ctx.now.month));
-                }
-                Some('a') => {
-                    chars.next();
-                    out.push_str(weekday_name(ctx.now.weekday));
-                }
-                Some('p') => {
-                    chars.next();
-                    out.push_str(if ctx.now.hour < 12 { "AM" } else { "PM" });
-                }
-                Some('I') => {
-                    chars.next();
-                    let h12 = ctx.now.hour % 12;
-                    out.push_str(&format!("{:02}", if h12 == 0 { 12 } else { h12 }));
-                }
-                Some(other) => {
-                    // unrecognized strftime code -> literal passthrough
-                    out.push('%');
-                    out.push(other);
-                    chars.next();
-                }
-                None => out.push('%'), // trailing lone `%`
-            },
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn month_name(m: u8) -> &'static str {
-    MONTHS[(m.clamp(1, 12) as usize) - 1]
-}
-
-fn weekday_name(w: u8) -> &'static str {
-    WEEKDAYS[(w % 7) as usize]
+    crate::format::expand(fmt, ctx)
 }
 
 #[cfg(test)]
@@ -1360,12 +1881,32 @@ mod tests {
     #[test]
     fn main_pane_size_getters() {
         let mut o = Options::new();
-        assert_eq!(o.main_pane_width(), 80);
-        assert_eq!(o.main_pane_height(), 24);
+        assert_eq!(o.main_pane_width(80), 80);
+        assert_eq!(o.main_pane_height(24), 24);
         o.set("main-pane-width", Some("30"), false, false).unwrap();
         o.set("main-pane-height", Some("10"), false, false).unwrap();
-        assert_eq!(o.main_pane_width(), 30);
-        assert_eq!(o.main_pane_height(), 10);
+        assert_eq!(o.main_pane_width(999), 30);
+        assert_eq!(o.main_pane_height(999), 10);
+    }
+
+    /// SP7 Task 12 (closes follow-up #43's sibling gap): `main-pane-width`/
+    /// `-height` also accept an `N%` value, resolved against the caller's
+    /// `total` at READ time -- `floor(total * p / 100)`, per
+    /// `docs/tmux-reference/panes-and-layout.md`'s `-p pct` percentage rule.
+    #[test]
+    fn main_pane_size_percent() {
+        let mut o = Options::new();
+        o.set("main-pane-width", Some("50%"), false, false).unwrap();
+        assert_eq!(o.main_pane_width(80), 40);
+        assert_eq!(o.main_pane_width(81), 40); // floor(81*50/100) = 40
+        assert_eq!(o.show("main-pane-width"), Some("50%".to_string()));
+
+        o.set("main-pane-height", Some("25%"), false, false).unwrap();
+        assert_eq!(o.main_pane_height(24), 6);
+
+        // `-u` restores the plain-cells default.
+        o.set("main-pane-width", None, false, true).unwrap();
+        assert_eq!(o.main_pane_width(80), 80);
     }
 
     /// Task 8, sub-project 4: `display-panes-time` (Duration getter) and the
@@ -1454,12 +1995,12 @@ mod tests {
         let base = crate::grid::Style { fg: Color::Idx(3), ..crate::grid::Style::default() };
         assert_eq!(o.status_left_style().apply_to(base), base);
         assert_eq!(o.status_right_style().apply_to(base), base);
-        // SP6 Task 4: default changed from tmux's literal
-        // `#{?window_flags,#{window_flags}, }` (not expressible by the
-        // `expand_format` subset) to the equivalent-for-flagged-windows
-        // `#I:#W#F` -- see the `default_value` deviation note.
-        assert_eq!(o.window_status_format(), "#I:#W#F");
-        assert_eq!(o.window_status_current_format(), "#I:#W#F");
+        // SP7 Task 1: tmux's literal real default, now expressible by the
+        // general format engine's `#{?cond,a,b}` conditional support
+        // (closes follow-ups #27/#70 -- see `DEFAULT_WINDOW_STATUS_FORMAT`'s
+        // doc comment).
+        assert_eq!(o.window_status_format(), crate::options::DEFAULT_WINDOW_STATUS_FORMAT);
+        assert_eq!(o.window_status_current_format(), crate::options::DEFAULT_WINDOW_STATUS_FORMAT);
 
         o.set("visual-activity", Some("both"), false, false).unwrap();
         assert_eq!(o.visual_activity(), "both");
@@ -1571,6 +2112,100 @@ mod tests {
         assert_eq!(expand_format("#[fg=white", &c), "#[fg=white");
     }
 
+    // ---- scope resolution (SP7 Task 6, closes follow-up #26) ----
+
+    #[test]
+    fn window_option_overrides_global_for_that_window_only() {
+        let o = Options::new();
+        let mut win_a = Overlay::new();
+        let win_b = Overlay::new();
+        win_a.set("mode-keys", Some("vi"), false, false).unwrap();
+
+        assert!(o.mode_keys_vi_for(&win_a), "window A has a local override -> vi");
+        assert!(!o.mode_keys_vi_for(&win_b), "window B has none -> falls back to the global default (emacs)");
+        assert!(!o.mode_keys_vi(), "the global table itself is untouched by a window-local set");
+    }
+
+    #[test]
+    fn session_option_overrides_global() {
+        let o = Options::new();
+        let mut sess_a = Overlay::new();
+        let sess_b = Overlay::new();
+        sess_a.set("history-limit", Some("9999"), false, false).unwrap();
+
+        assert_eq!(o.history_limit_for(&sess_a), 9999);
+        assert_eq!(o.history_limit_for(&sess_b), 2000, "no local override -> global default");
+        assert_eq!(o.history_limit(), 2000, "global table itself untouched");
+    }
+
+    #[test]
+    fn unset_window_option_falls_back_to_global() {
+        let o = Options::new();
+        let mut win = Overlay::new();
+        win.set("main-pane-width", Some("30"), false, false).unwrap();
+        assert_eq!(o.main_pane_width_for(&win, 999), 30);
+
+        // `-u` on the OVERLAY removes the local entry so inheritance
+        // resumes -- unlike `Options::set`'s `-u`, which resets a GLOBAL
+        // entry to its compiled default (globals must always exist).
+        win.set("main-pane-width", None, false, true).unwrap();
+        assert_eq!(o.main_pane_width_for(&win, 999), 80, "falls back to the compiled global default");
+    }
+
+    /// `setw -g`/`set -g <window-scoped-name>` writes the shared GLOBAL
+    /// table (`Options::set`, simulating `-g`), which every window's
+    /// EMPTY overlay observes equally -- proving a `-g` write lands at the
+    /// true global-window level, not any one window's local overlay.
+    #[test]
+    fn setw_g_sets_global_window_level() {
+        let mut o = Options::new();
+        let win_x = Overlay::new();
+        let win_y = Overlay::new();
+        assert!(!o.mode_keys_vi_for(&win_x));
+        assert!(!o.mode_keys_vi_for(&win_y));
+
+        o.set("mode-keys", Some("vi"), false, false).unwrap(); // the `-g` path
+        assert!(o.mode_keys_vi_for(&win_x), "every window with no local override sees the new global");
+        assert!(o.mode_keys_vi_for(&win_y));
+        assert!(o.mode_keys_vi(), "and the plain global getter agrees");
+    }
+
+    #[test]
+    fn overlay_unknown_option_and_control_chars_rejected_same_as_global() {
+        let mut ov = Overlay::new();
+        assert_eq!(
+            ov.set("not-a-real-option", Some("x"), false, false),
+            Err("unknown option: not-a-real-option".to_string())
+        );
+        assert_eq!(
+            ov.set("default-command", Some("a\x1bb"), false, false),
+            Err("bad value: a?b".to_string())
+        );
+    }
+
+    #[test]
+    fn overlay_user_option_roundtrip() {
+        let mut ov = Overlay::new();
+        assert_eq!(ov.user_options.get("foo"), None);
+        ov.set("@foo", Some("bar"), false, false).unwrap();
+        assert_eq!(ov.user_options.get("foo").map(String::as_str), Some("bar"));
+        ov.set("@foo", None, false, true).unwrap();
+        assert_eq!(ov.user_options.get("foo"), None);
+    }
+
+    #[test]
+    fn show_effective_resolves_overlay_then_global() {
+        let o = Options::new();
+        let mut win = Overlay::new();
+        win.set("window-status-format", Some("CUSTOM"), false, false).unwrap();
+        assert_eq!(o.show_effective("window-status-format", None, Some(&win)), Some("CUSTOM".to_string()));
+        let empty = Overlay::new();
+        assert_eq!(
+            o.show_effective("window-status-format", None, Some(&empty)),
+            Some(quote_if_needed(DEFAULT_WINDOW_STATUS_FORMAT))
+        );
+    }
+
     #[test]
     fn expand_strftime() {
         let c = ctx("s", sample_time());
@@ -1579,5 +2214,28 @@ mod tests {
         assert_eq!(expand_format("%Y-%m-%d %a %I:%M%p", &c), "2026-07-07 Tue 02:05PM");
         assert_eq!(expand_format("%%", &c), "%");
         assert_eq!(expand_format("%x stays", &c), "%x stays");
+    }
+
+    /// `set-clipboard` (SP7 Task 13, closes follow-up #53): default
+    /// `external`, all three choices settable, and `set_clipboard_emits`'s
+    /// on/external-emit, off-does-not rule.
+    #[test]
+    fn set_clipboard_getter_and_emits_rule() {
+        let mut o = Options::new();
+        assert_eq!(o.set_clipboard(), "external");
+        assert!(o.set_clipboard_emits());
+
+        o.set("set-clipboard", Some("on"), false, false).unwrap();
+        assert_eq!(o.set_clipboard(), "on");
+        assert!(o.set_clipboard_emits());
+
+        o.set("set-clipboard", Some("off"), false, false).unwrap();
+        assert_eq!(o.set_clipboard(), "off");
+        assert!(!o.set_clipboard_emits());
+
+        assert_eq!(
+            o.set("set-clipboard", Some("bogus"), false, false),
+            Err("bad value: bogus".to_string())
+        );
     }
 }

@@ -22,28 +22,35 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
+use regex::Regex;
+
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
-use crate::bindings::Binding;
+use crate::bindings::{
+    mouse_default_double_click_pane, mouse_default_drag_pane_enter_copy, mouse_default_drag_pane_select, mouse_default_menu_pane,
+    mouse_default_menu_status, mouse_default_menu_status_left, mouse_default_status_select_window, mouse_default_triple_click_pane,
+    mouse_default_wheel_up_pane_root, Binding,
+};
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
-use crate::keys::{Key, KeyCode, MouseEvent, MouseKind};
-use crate::layout::{PaneId, SplitDir};
+use crate::keys::{self, Key, KeyCode, MouseEvent, MouseKeyKind, MouseKeyLoc, MouseKind};
+use crate::layout::{Layout, PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
-use crate::options::FormatCtx;
+use crate::options::{self, FormatCtx};
 use crate::protocol::ServerMsg;
+use crate::status;
 
 use super::{
     advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
-    send_msg, spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
-    ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode,
-    PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
-    MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
+    send_msg, spawn_pane, system_time_parts, truncate_chars, AutoscrollState, ChooseTreeState, ChooseTreeView,
+    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MenuAnchor, MenuRow,
+    MenuState, MouseDrag, PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server,
+    SortKey, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
-use crate::grid::{Cell, Grid, Style};
+use crate::grid::{Cell, Grid, MouseProto, Style};
 use std::time::Duration;
 
 /// Abbreviated C-locale English weekday names, indexed by
@@ -179,9 +186,14 @@ fn resolve_window(session: &Session, spec: Option<&str>) -> Result<WindowId, Str
 /// Resolve a pane spec (the part of a target after `window.`, or the whole
 /// remainder when there's no `.`): empty/absent -> the window's focused
 /// pane; `+`/`-` -> next/previous pane (cyclic) relative to focus; otherwise
-/// a bare number -> position in `window.layout.panes()` order (leaf/tree
-/// order), per the design spec's target grammar note.
-fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
+/// a bare number -> USER-VISIBLE pane index, i.e. position in
+/// `window.layout.panes()` order (leaf/tree order) SHIFTED by
+/// `pane-base-index` (#32, SP7 Task 6: `base` is the window's own effective
+/// `pane-base-index` -- with the default 0 this is byte-identical to the
+/// old raw-position rule; with `pane-base-index 1`, `:.1` names the FIRST
+/// pane, and `:.0` is `pane not found`, matching what `display-panes`
+/// digits and `#P` show the user).
+fn resolve_pane(window: &Window, spec: Option<&str>, base: u32) -> Result<PaneId, String> {
     let panes = window.layout.panes();
     let s = match spec {
         None => return Ok(window.layout.focused()),
@@ -196,7 +208,8 @@ fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
         let idx = panes.iter().position(|&p| p == window.layout.focused()).unwrap_or(0);
         return Ok(panes[(idx + panes.len() - 1) % panes.len()]);
     }
-    let idx: usize = s.parse().map_err(|_| format!("pane not found: {s}"))?;
+    let user_idx: u32 = s.parse().map_err(|_| format!("pane not found: {s}"))?;
+    let idx = user_idx.checked_sub(base).ok_or_else(|| format!("pane not found: {s}"))? as usize;
     panes.get(idx).copied().ok_or_else(|| format!("pane not found: {s}"))
 }
 
@@ -298,18 +311,114 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// `find-window` (Task 7, sub-project 4) content-search predicate:
-/// case-insensitive substring match against a pane's CURRENTLY VISIBLE
-/// screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever cover
-/// the live viewport. `needle` must already be lowercased by the caller
-/// (avoids re-lowering it once per pane/row).
-fn grid_contains(grid: &Grid, needle: &str) -> bool {
+/// `find-window` (SP7 Task 12, closes follow-up #54): a small hand-rolled
+/// fnmatch-lite glob matcher -- `*` matches any run of characters
+/// (including empty), `?` matches exactly one character, no character
+/// classes (`[...]`, a documented scope narrowing -- see the
+/// `find-window-and-main-pane-sizing` contract section). Classic
+/// greedy-backtrack wildcard algorithm: linear amortized, no recursion (so
+/// no stack-depth concern from a long pattern/text). Compares by Unicode
+/// scalar (`char`), not byte, so multi-byte window names/titles match
+/// correctly.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut match_pos = 0usize;
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = Some(pi);
+            match_pos = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            match_pos += 1;
+            ti = match_pos;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// `find-window` (SP7 Task 12): a compiled matcher -- either a real regex
+/// (`-r`, with `-i` folded in as an inline `(?i)` flag) or a plain
+/// glob/substring pattern (case already folded to lowercase at
+/// construction time when `-i`, matching every other `-i`-style case-fold
+/// in this codebase, so the per-text comparison below never re-checks
+/// `ignore_case` itself). See the `find-window-and-main-pane-sizing`
+/// contract section for the full `matches_name`/`matches_content` rationale
+/// (name/title matching glob-wraps in `*...*` and does a FULL match; content
+/// matching is a plain, unwrapped substring/regex search, mirroring tmux's
+/// distinct `m:`/`C:` format functions).
+struct FindMatcher {
+    regex: Option<Regex>,
+    glob_pattern: String,
+    ignore_case: bool,
+}
+
+impl FindMatcher {
+    fn new(pattern: &str, use_regex: bool, ignore_case: bool) -> Result<FindMatcher, String> {
+        if use_regex {
+            let pat = if ignore_case { format!("(?i){pattern}") } else { pattern.to_string() };
+            let re = Regex::new(&pat).map_err(|e| format!("invalid regex: {e}"))?;
+            Ok(FindMatcher { regex: Some(re), glob_pattern: String::new(), ignore_case })
+        } else {
+            let p = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+            Ok(FindMatcher { regex: None, glob_pattern: p, ignore_case })
+        }
+    }
+
+    fn norm(&self, s: &str) -> String {
+        if self.ignore_case {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// `-N`/`-T` (window name / pane title): full-string glob match, wrapped
+    /// in `*...*` when not `-r` (tmux's implicit substring-glob wrapping);
+    /// regex mode is an unanchored `is_match` (already substring-search
+    /// semantics unless the user's own pattern anchors with `^`/`$`).
+    fn matches_name(&self, text: &str) -> bool {
+        match &self.regex {
+            Some(re) => re.is_match(text),
+            None => glob_match(&format!("*{}*", self.glob_pattern), &self.norm(text)),
+        }
+    }
+
+    /// `-C` (pane content): PLAIN substring search (no glob wrapping --
+    /// tmux's `#{C:}` format function is a literal substring/regex search,
+    /// not fnmatch) or regex `is_match`, checked against one already-
+    /// extracted visible row at a time (see [`grid_matches`]).
+    fn matches_content(&self, text: &str) -> bool {
+        match &self.regex {
+            Some(re) => re.is_match(text),
+            None => self.norm(text).contains(self.glob_pattern.as_str()),
+        }
+    }
+}
+
+/// `find-window`'s `-C` content-search predicate: walks a pane's CURRENTLY
+/// VISIBLE screen (not scrollback) -- `grid.rows()`/`grid.cols()` only ever
+/// cover the live viewport -- one row at a time against `matcher.
+/// matches_content` (mirrors the retired `grid_contains`'s per-row walk, now
+/// matcher-generic instead of hardcoded lowercase-substring).
+fn grid_matches(grid: &Grid, matcher: &FindMatcher) -> bool {
     for row in 0..grid.rows() {
         let mut line = String::with_capacity(grid.cols() as usize);
         for col in 0..grid.cols() {
             line.push(grid.cell(col, row).ch);
         }
-        if line.to_lowercase().contains(needle) {
+        if matcher.matches_content(&line) {
             return true;
         }
     }
@@ -392,6 +501,121 @@ fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll:
         lines.push(trim_trailing_blanks(&slice));
     }
     lines.join("\n")
+}
+
+// ---- clipboard: copy-pipe / OSC 52 / bracketed paste (SP7 Task 13, closes
+// follow-ups #53/#55/#56) ----
+
+/// Extract cursor-to-end-of-line text (emacs `C-k` /
+/// [`CopyAction::EndOfLineAndCancel`]) from the CURRENT view row, trailing
+/// blanks trimmed (same rule `extract_selection_text` applies per line). No
+/// selection/anchor involved -- just the live cursor position.
+fn extract_end_of_line_text(grid: &Grid, cx: u16, cy: u16, scroll: u32) -> String {
+    let chars: Vec<char> = grid.view_row_text(scroll, cy).chars().collect();
+    let lo = (cx as usize).min(chars.len());
+    let slice: String = chars[lo..].iter().collect();
+    trim_trailing_blanks(&slice)
+}
+
+/// `paste-buffer -p`'s bracket-wrap decision (SP7 Task 13, closes follow-up
+/// #55): wrap `bytes` in `ESC[200~`/`ESC[201~` ONLY when BOTH the command
+/// asked for it (`bracket`, the `-p` flag) AND the TARGET pane's grid
+/// currently has bracketed-paste mode set (DECSET 2004,
+/// `pane_bracketed_paste` -- read via `Grid::bracketed_paste` at the call
+/// site). Otherwise returns `bytes` unchanged -- `-p` is a silent no-op
+/// wrapper when the pane never asked for it, matching real tmux
+/// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5). Extracted
+/// as a pure function (no `Pty`/I/O) so this exact decision is unit-testable
+/// without a real ConPTY pane -- see the doc comment on the `clipboard_tests`
+/// module below for why that matters here specifically.
+fn maybe_bracket_paste(bytes: Vec<u8>, bracket: bool, pane_bracketed_paste: bool) -> Vec<u8> {
+    if !(bracket && pane_bracketed_paste) {
+        return bytes;
+    }
+    let mut wrapped = Vec::with_capacity(bytes.len() + 12);
+    wrapped.extend_from_slice(b"\x1b[200~");
+    wrapped.extend_from_slice(&bytes);
+    wrapped.extend_from_slice(b"\x1b[201~");
+    wrapped
+}
+
+/// Hand-rolled base64 (standard alphabet, RFC 4648 §4, `=`-padded) for OSC
+/// 52's payload -- plan decision (b) in `.superpowers/sdd/task-13-brief.md`:
+/// no crate dependency for something this small.
+const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { BASE64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// OSC 52 clipboard-set escape for `text`, exact wire form per the task
+/// brief: `\x1b]52;c;<base64>\x07` -- `c` selects the "clipboard" buffer
+/// (as opposed to `p`rimary/`s`election), BEL-terminated (widely-supported
+/// alternative to the `ESC \` ST terminator, and the form real terminals
+/// including Windows Terminal recognize).
+fn osc52_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 16);
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(base64_encode(text.as_bytes()).as_bytes());
+    out.push(0x07);
+    out
+}
+
+/// `copy-pipe`/`copy-pipe-and-cancel`'s pipe half (SP7 Task 13, closes
+/// follow-ups #53/#56): run `command` through `cmd.exe /C` (the natural
+/// Windows stand-in for tmux's `/bin/sh -c`, per `docs/tmux-reference/
+/// copy-mode-and-buffers.md` §11 "winmux applicability notes") with `data`
+/// written to its stdin, then closed (EOF) -- no console window
+/// (`CREATE_NO_WINDOW`), stdout/stderr discarded. Deliberately NOT waited
+/// on: real tmux's job system runs pipe commands asynchronously too (the
+/// dispatch loop must never block on an arbitrary external command); on
+/// Windows, dropping a `std::process::Child` does not kill the process, it
+/// only detaches Rust's handle to it, which is exactly the desired
+/// fire-and-forget semantics here. Spawn failure (bad command, `cmd.exe`
+/// missing, ...) is silently swallowed -- same "best effort, no user-facing
+/// error" contract as e.g. `swap_pane`'s pty-write failures elsewhere in
+/// this file.
+fn spawn_copy_pipe(command: &str, data: &str) {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", command]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Final-gate regression review MUST-FIX #2: `write_all` blocks
+            // until the child drains its stdin pipe buffer -- for a large
+            // selection piped to a slow/hung user-configured command, that
+            // write must NOT run on the server's single main dispatch
+            // thread (same bug class as follow-up #14). Move it to its own
+            // short-lived, detached thread; the command itself is already
+            // fire-and-forget (not waited on), so a detached writer thread
+            // is consistent with the rest of this function's semantics.
+            let data = data.to_owned();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(data.as_bytes());
+                // `stdin` drops here, closing the pipe -- the child sees EOF.
+            });
+        }
+        // Not waited on -- see doc comment above.
+    }
 }
 
 // ---- copy-mode search (Task 4, sub-project 4) ----
@@ -679,6 +903,29 @@ enum MouseHit {
     /// `Layout::resize_from` reference leaf for an Up/Down resize.
     HBorder { top: PaneId },
     None,
+}
+
+/// Whether a pane whose own app has requested `proto` mouse reporting is
+/// eligible to receive a forwarded event of `kind` (SP7 Task 9, closes
+/// follow-ups #35/#72; `docs/tmux-reference/mouse.md` §3.1's
+/// `MOTION_MOUSE_MODES`/`ALL_MOUSE_MODES` split, `input-keys.c:713-793`):
+/// `Down`/`Up`/wheel events forward whenever the pane asked for ANY mouse
+/// mode at all (X10/Normal/Button/Any -- real tmux's `ALL_MOUSE_MODES` is
+/// STANDARD|BUTTON|ALL and has no X10 bit at all since mode 9 is legacy/
+/// pane-side-unimplemented in modern tmux, but winmux tracks X10 as its own
+/// `MouseProto` variant per `Grid::mouse_proto`'s doc comment specifically
+/// so THIS task can treat "the app asked for legacy X10 clicks" as owning
+/// the mouse too -- an app that only ever sent `CSI ?9h` still wants its
+/// clicks, just wire-encoded the legacy way, which `Grid::mouse_encoding`
+/// already resolves to `MouseEncoding::Default` when neither 1005 nor 1006
+/// was also requested). Pure motion (`Drag`) additionally requires
+/// `Button`/`Any` (1002/1003 -- `MOTION_MOUSE_MODES`), since an X10/Normal-
+/// only app never asked the terminal to report motion at all.
+fn mouse_forward_eligible(proto: MouseProto, kind: MouseKind) -> bool {
+    match kind {
+        MouseKind::Drag(_) => matches!(proto, MouseProto::Button | MouseProto::Any),
+        _ => !matches!(proto, MouseProto::Off),
+    }
 }
 
 /// Hit-test `(x, y)` against `rects` (a window's current pane rects, as
@@ -994,7 +1241,10 @@ impl Server {
             let session = self.registry.session_mut(&session_name).ok_or_else(|| format!("can't find session: {session_name}"))?;
             let wid = resolve_window(session, win_spec)?;
             let window = session.windows.iter().find(|w| w.id == wid).expect("resolve_window returned a live id");
-            let pid = resolve_pane(window, pane_spec)?;
+            // #32: a numeric `.N` names the user-visible index, which
+            // starts at the target window's effective pane-base-index.
+            let base = self.options.pane_base_index_for(&window.window_options);
+            let pid = resolve_pane(window, pane_spec, base)?;
             (wid, pid)
         };
         Ok((session_name, wid, pid))
@@ -1018,7 +1268,11 @@ impl Server {
             ""
         }
         .to_string();
-        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32;
+        // #32 (SP7 Task 6): `#P`/`pane_index` format expansion must reflect
+        // `pane-base-index`, not always a raw 0-based position -- window-
+        // scoped, so read through THIS window's overlay.
+        let base = self.options.pane_base_index_for(&window.window_options);
+        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32 + base;
         let pane_title = self.panes.get(&pane_id).map(|p| p.title.clone()).unwrap_or_default();
         Ok((session_name, window_index, window_name, flags, pane_index, pane_title))
     }
@@ -1074,7 +1328,8 @@ impl Server {
             self.destroy_session(session_name);
             return Ok(true);
         }
-        let renumber = self.options.renumber_windows();
+        // renumber-windows is session-scoped (#26).
+        let renumber = self.renumber_windows_for_session(session_name);
         if let Some(s) = self.registry.session_mut(session_name) {
             s.kill_window(wid);
             if renumber {
@@ -1104,7 +1359,8 @@ impl Server {
             .session_mut(session_name)
             .and_then(|s| s.windows.iter().find(|w| w.id == wid).map(|w| w.layout.panes()))
             .unwrap_or_default();
-        let renumber = self.options.renumber_windows();
+        // renumber-windows is session-scoped (#26).
+        let renumber = self.renumber_windows_for_session(session_name);
         let killed = self
             .registry
             .session_mut(session_name)
@@ -1155,8 +1411,7 @@ impl Server {
             .and_then(|s| s.current_window().layout.rects(area).into_iter().find(|(pid, _)| *pid == new_id))
             .map(|(_, r)| r)
             .unwrap_or(area);
-        let shell = self.options.default_command().to_string();
-        let history_limit = self.options.history_limit();
+        let (shell, history_limit) = self.shell_and_history_limit_for_session(&session_name);
         match spawn_pane(new_id, rect.w.max(1), rect.h.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(new_id, pr);
@@ -1220,6 +1475,7 @@ impl Server {
             if wid != session.current {
                 session.last = Some(session.current);
                 session.current = wid;
+                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
             }
         }
         self.apply_layout_for_session(&session_name);
@@ -1270,8 +1526,7 @@ impl Server {
         let session_name = self.resolve_session_name(None, cs)?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let pane_id = self.mint_pane_id();
-        let shell = self.options.default_command().to_string();
-        let history_limit = self.options.history_limit();
+        let (shell, history_limit) = self.shell_and_history_limit_for_session(&session_name);
         match spawn_pane(pane_id, size.0.max(1), size.1.max(1), &self.tx, &shell, history_limit) {
             Ok(pr) => {
                 self.panes.insert(pane_id, pr);
@@ -1359,10 +1614,13 @@ impl Server {
                 bytes.extend(encoded.unwrap_or_else(|| k.as_bytes().to_vec()));
             }
         }
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        if let Some(pane) = self.panes.get(&pane_id) {
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread (follow-up #14's mechanism), not a synchronous
+            // `pty.write_input` on the main dispatch thread -- `send-keys
+            // -l` can carry an arbitrarily large literal payload, exactly
+            // the "huge paste" scenario #14 was written to guard against.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -1384,12 +1642,58 @@ impl Server {
         ids
     }
 
+    /// `word-separators` is session-scoped (#26): a small convenience for
+    /// the several mouse-drag/word-select call sites that already have a
+    /// plain `&str` session name in hand.
+    fn word_separators_for_session(&self, session_name: &str) -> &str {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => self.options.word_separators_for(&s.session_options),
+            None => self.options.word_separators(),
+        }
+    }
+
+    /// `default-command`/`history-limit` are session-scoped (#26): resolve
+    /// through the session a NEW PANE is being spawned INTO. NOT used for
+    /// brand-new session creation (`exec_new_session`/`AttachMode::NewAuto`/
+    /// `NewNamed` in `server.rs`) -- that session doesn't exist yet to have
+    /// a local override, so those call sites correctly stay global-only
+    /// (unchanged from pre-Task-6).
+    fn shell_and_history_limit_for_session(&self, session_name: &str) -> (String, u32) {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => (self.options.default_command_for(&s.session_options).to_string(), self.options.history_limit_for(&s.session_options)),
+            None => (self.options.default_command().to_string(), self.options.history_limit()),
+        }
+    }
+
+    /// `main-pane-width`/`main-pane-height` are window-scoped (#26): resolve
+    /// through the TARGET window (not the acting client's current one --
+    /// `select-layout -t <target>` can name a different window/session).
+    /// `area` is the target window's PRESET-APPLY-TIME area (same `Rect`
+    /// `exec_select_layout`/`exec_next_layout` already computed before
+    /// calling this) -- SP7 Task 12: threaded through so a stored `N%`
+    /// value (`options::SizeSpec::Percent`) resolves against the axis it
+    /// actually applies to (`area.w` for width, `area.h` for height).
+    fn main_pane_size_for_window(&self, session_name: &str, wid: WindowId, area: Rect) -> (u16, u16) {
+        let window = self
+            .registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == session_name)
+            .and_then(|s| s.windows.iter().find(|w| w.id == wid));
+        match window {
+            Some(w) => (
+                self.options.main_pane_width_for(&w.window_options, area.w),
+                self.options.main_pane_height_for(&w.window_options, area.h),
+            ),
+            None => (self.options.main_pane_width(area.w), self.options.main_pane_height(area.h)),
+        }
+    }
+
     fn exec_select_layout(&mut self, target: Option<String>, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let main_w = self.options.main_pane_width();
-        let main_h = self.options.main_pane_height();
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid, area);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1417,8 +1721,7 @@ impl Server {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
         let size = self.registry.session_mut(&session_name).map(|s| s.size).ok_or_else(|| format!("can't find session: {session_name}"))?;
         let area = Rect { x: 0, y: self.pane_area_y(), w: size.0, h: size.1 };
-        let main_w = self.options.main_pane_width();
-        let main_h = self.options.main_pane_height();
+        let (main_w, main_h) = self.main_pane_size_for_window(&session_name, wid, area);
         let Some(session) = self.registry.session_mut(&session_name) else {
             return Err(format!("can't find session: {session_name}"));
         };
@@ -1437,39 +1740,46 @@ impl Server {
         Ok(String::new())
     }
 
-    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap a target pane with the
+    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap a PIVOT pane with the
     /// previous/next pane in creation order (wrapping), operating only on
-    /// that pane's own window (matches the `{`/`}` bindings' intent; tmux
+    /// the pivot's own window (matches the `{`/`}` bindings' intent; tmux
     /// itself scopes `-U`/`-D` to the target window's own pane list too).
-    /// The target pane is `-t` if given (SP4 fix round: previously silently
-    /// discarded alongside `-U`/`-D` -- see `docs/follow-ups.md`), else the
-    /// acting client's active pane (tmux's own default when `-t` is
-    /// omitted). A co-supplied `-s` is REJECTED with a usage error rather
-    /// than silently ignored: real tmux additionally lets `-s` override the
-    /// "which pane is `-U`/`-D` relative to" side of the swap, but winmux
-    /// does not implement that fuller matrix yet -- smaller, honest scope
-    /// chosen over a silent partial implementation.
+    /// The pivot is `-s` if given, else `-t` if given (SP4 fix round: `-t`
+    /// previously silently discarded alongside `-U`/`-D`), else the acting
+    /// client's active pane (tmux's own default when both are omitted). SP7
+    /// Task 11 (closes follow-up #42): a co-supplied `-s` used to be
+    /// REJECTED outright; real tmux's `cmd-swap-pane.c:80-91` computes the
+    /// `-U`/`-D` neighbor relative to whichever pane is the "target" of the
+    /// computation, and `-s` (when given) plays that role instead of `-t` --
+    /// see `docs/tmux-reference/panes-and-layout.md` §5.1. A co-supplied
+    /// `-t` alongside BOTH `-s` and a direction is not itself a distinct
+    /// third pivot (an intentionally narrower scope than the full tmux
+    /// matrix, per follow-up #42's own honest-scope note) -- `-s` always
+    /// wins the pivot once present.
     ///
     /// The explicit `-s`/`-t` form (`dir: None`) resolves two independent
-    /// pane targets via the normal `resolve_pane_target` fallback chain and
-    /// REQUIRES both to resolve to the same window (SP4 fix round: this used
-    /// to silently no-op cross-window instead of erroring -- see
-    /// `docs/follow-ups.md`). Real tmux supports moving a pane to a
-    /// different window this way; winmux does not yet.
+    /// pane targets via the normal `resolve_pane_target` fallback chain.
+    /// When they land in the SAME window, this is the original same-window
+    /// leaf relabel (`Layout::swap_panes`). SP7 Task 11 (closes follow-up
+    /// #41): when they land in DIFFERENT windows (or sessions), this is now
+    /// a genuine cross-window swap (`Layout::swap_leaf_across` -- panes keep
+    /// their own ids, only their tree/screen SLOTS trade places, matching
+    /// tmux's real "swap positions in the pane list... layout cells, and
+    /// geometry; when the windows differ they also swap window membership"
+    /// behavior) instead of the SP4-era honest error ("swap-pane: can only
+    /// swap panes within the same window").
     fn exec_swap_pane(&mut self, dir: Option<Direction>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String> {
-        let (session_name, a, b, target_wid) = if let Some(d) = dir {
-            if src.is_some() {
-                return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string());
-            }
-            let (session_name, wid, target) = self.resolve_pane_target(cs, dst.as_deref())?;
-            let Some(session) = self.registry.session_mut(&session_name) else {
-                return Err(format!("can't find session: {session_name}"));
+        let (s1, w1, a, s2, w2, b) = if let Some(d) = dir {
+            let pivot_target = src.as_deref().or(dst.as_deref());
+            let (pivot_session, pivot_wid, pivot_pane) = self.resolve_pane_target(cs, pivot_target)?;
+            let Some(session) = self.registry.session_mut(&pivot_session) else {
+                return Err(format!("can't find session: {pivot_session}"));
             };
-            let Some(window) = session.windows.iter().find(|w| w.id == wid) else {
+            let Some(window) = session.windows.iter().find(|w| w.id == pivot_wid) else {
                 return Err("window not found".to_string());
             };
             let order = Self::panes_in_creation_order(window);
-            let Some(pos) = order.iter().position(|&p| p == target) else {
+            let Some(pos) = order.iter().position(|&p| p == pivot_pane) else {
                 return Err("pane not found".to_string());
             };
             let n = order.len();
@@ -1480,22 +1790,71 @@ impl Server {
                 // `-U`/`-D`; any other `Direction` is unreachable.
                 _ => return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string()),
             };
-            (session_name, target, other, wid)
+            (pivot_session.clone(), pivot_wid, pivot_pane, pivot_session, pivot_wid, other)
         } else {
             let (s1, w1, pa) = self.resolve_pane_target(cs, src.as_deref())?;
-            let (_s2, w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
-            if w1 != w2 {
-                return Err("swap-pane: can only swap panes within the same window".to_string());
-            }
-            (s1, pa, pb, w1)
+            let (s2, w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
+            (s1, w1, pa, s2, w2, pb)
         };
-        if let Some(session) = self.registry.session_mut(&session_name) {
-            if let Some(window) = session.windows.iter_mut().find(|w| w.id == target_wid) {
-                window.layout.swap_panes(a, b);
+
+        if w1 == w2 {
+            if let Some(session) = self.registry.session_mut(&s1) {
+                if let Some(window) = session.windows.iter_mut().find(|w| w.id == w1) {
+                    window.layout.swap_panes(a, b);
+                }
+            }
+            self.apply_layout_for_session(&s1);
+        } else {
+            // Cross-window/session: pull both Layouts out (temporarily
+            // replacing each with a harmless placeholder -- pane id 0 is
+            // never minted, `Server::next_pane_id` starts at 1 -- so no
+            // other code can observe it mid-swap on this single-threaded
+            // main loop), swap leaves across the two owned Layout values
+            // (sidesteps needing two simultaneous `&mut` borrows into
+            // possibly the SAME session's `Vec<Window>`), then write both
+            // back.
+            let mut layout1 = self.take_window_layout(&s1, w1).ok_or_else(|| "window not found".to_string())?;
+            let mut layout2 = self.take_window_layout(&s2, w2).ok_or_else(|| "window not found".to_string())?;
+            let swapped = layout1.swap_leaf_across(a, &mut layout2, b);
+            self.put_window_layout(&s1, w1, layout1);
+            self.put_window_layout(&s2, w2, layout2);
+            if !swapped {
+                // Defensive: `a`/`b` were just resolved live via
+                // `resolve_pane_target`, so this should be unreachable.
+                return Err("pane not found".to_string());
+            }
+            self.apply_layout_for_session(&s1);
+            if s2 != s1 {
+                self.apply_layout_for_session(&s2);
             }
         }
-        self.apply_layout_for_session(&session_name);
         Ok(String::new())
+    }
+
+    /// Temporarily remove window `wid`'s `Layout` out of session
+    /// `session_name`, replacing it with a throwaway placeholder (SP7 Task
+    /// 11: `exec_swap_pane`'s cross-window path needs to hold TWO `Layout`
+    /// values at once, possibly both leaves of the SAME session's
+    /// `Vec<Window>`, which the borrow checker can't give out as two live
+    /// `&mut` at the same time -- taking each by VALUE sidesteps that).
+    /// Must be paired with [`Self::put_window_layout`] before any other code
+    /// observes the placeholder. `None` if the session/window isn't found.
+    fn take_window_layout(&mut self, session_name: &str, wid: WindowId) -> Option<Layout> {
+        let session = self.registry.session_mut(session_name)?;
+        let window = session.windows.iter_mut().find(|w| w.id == wid)?;
+        Some(std::mem::replace(&mut window.layout, Layout::new(0)))
+    }
+
+    /// Restore a `Layout` taken by [`Self::take_window_layout`]. A no-op
+    /// (silently drops `layout`) if the session/window has somehow vanished
+    /// in between -- unreachable in practice (single-threaded main loop, no
+    /// other mutation runs between a `take`/`put` pair).
+    fn put_window_layout(&mut self, session_name: &str, wid: WindowId, layout: Layout) {
+        if let Some(session) = self.registry.session_mut(session_name) {
+            if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
+                window.layout = layout;
+            }
+        }
     }
 
     fn exec_rotate_window(&mut self, down: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
@@ -1522,22 +1881,36 @@ impl Server {
     // ---- window ops (Task 7, sub-project 4): break-pane, move-window,
     // find-window ----
 
-    /// `break-pane|breakp [-d] [-n name]`: the resolved CURRENT pane leaves
-    /// its window and becomes a new window (next free index, via
-    /// `Session::new_window`'s existing `lowest_unused_index` floor). Errors
-    /// `"can't break with only one pane"` (verbatim from the task brief,
-    /// itself quoting real tmux's own message -- design spec `## 6. Window
-    /// ops` doesn't spell out a refusal string) if the source window has
-    /// only that one pane -- checked
-    /// BEFORE any mutation, regardless of how many OTHER windows the
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]`: the pane named
+    /// by `-s` (default: the resolved current pane -- SP7 Task 11 closes
+    /// follow-up #44, which used to hardcode this to `None`/current only)
+    /// leaves its window and becomes a new window. `-t` (SP7 Task 11) is a
+    /// `[session:]index` destination: an explicit index places the new
+    /// window there in the named session (defaulting to `-s`'s own session
+    /// when no `session:` prefix is given), erroring `"index in use: <n>"`
+    /// on collision (no kill/shuffle); an absent index falls back to the
+    /// destination session's lowest free slot (`Session::insert_window`'s
+    /// existing `lowest_unused_index` floor, same as the pre-Task-11
+    /// `Session::new_window` path this replaces). Errors `"can't break with
+    /// only one pane"` (verbatim from the task brief, itself quoting real
+    /// tmux's own message) if the source window has only that one pane --
+    /// checked BEFORE any mutation, regardless of how many OTHER windows the
     /// session has (a window can never be left with zero panes; matches
     /// `Layout::remove`'s own "the only pane" refusal, which
-    /// `kill_pane_by_id` relies on the same way). Focus follows the pane
-    /// into the new window (`Session::new_window` makes it current) unless
-    /// `-d`, which restores the source window as current and only updates
-    /// `last`.
-    fn exec_break_pane(&mut self, detached: bool, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
-        let (session_name, wid, pane_id) = self.resolve_pane_target(cs, None)?;
+    /// `kill_pane_by_id` relies on the same way). Without `-d`, the new
+    /// window becomes the DESTINATION session's current window (real tmux's
+    /// `session_select`, `cmd-break-pane.c:177-180`); with `-d` it stays in
+    /// the background and neither session's current/last changes as a
+    /// result of the new window's creation.
+    fn exec_break_pane(
+        &mut self,
+        detached: bool,
+        name: Option<String>,
+        src: Option<String>,
+        dst: Option<String>,
+        cs: Option<&str>,
+    ) -> Result<String, String> {
+        let (session_name, wid, pane_id) = self.resolve_pane_target(cs, src.as_deref())?;
         let pane_count = self
             .registry
             .session_mut(&session_name)
@@ -1550,6 +1923,48 @@ impl Server {
         if let Some(n) = &name {
             crate::model::validate_name(n, "window")?;
         }
+        // Resolve the destination BEFORE any mutation, so a bad `-t`
+        // (unknown session, unparseable index) fails atomically -- nothing
+        // changed.
+        let (dst_sess_part, dst_win_spec) = match &dst {
+            Some(d) => {
+                let (s, r) = split_session_prefix(d);
+                (s, if r.is_empty() { None } else { Some(r) })
+            }
+            None => (None, None),
+        };
+        let dst_session_name = match dst_sess_part {
+            Some(s) => self.registry.find(s).map(|s| s.name.clone())?,
+            None => session_name.clone(),
+        };
+        let dst_index: Option<u32> = match dst_win_spec {
+            Some(w) => Some(
+                w.strip_prefix('=')
+                    .unwrap_or(w)
+                    .parse::<u32>()
+                    .map_err(|_| cmd::usage("break-pane").expect("break-pane has a usage string").to_string())?,
+            ),
+            None => None,
+        };
+        // An explicit destination index's occupancy is ALSO checked here,
+        // before the source pane is touched -- `Session::insert_window`
+        // (via `insert_new_window` below) checks the SAME thing, but only
+        // AFTER this function has already removed the pane from its source
+        // window. Without this early check, a rejected `insert_new_window`
+        // would leave the pane orphaned (detached from every window's
+        // layout, its `PaneRuntime` still alive in `self.panes` but
+        // unreachable) instead of the whole command failing atomically.
+        if let Some(i) = dst_index {
+            let occupied = self
+                .registry
+                .session_mut(&dst_session_name)
+                .map(|s| s.windows.iter().any(|w| w.index == i))
+                .unwrap_or(false);
+            if occupied {
+                return Err(format!("index in use: {i}"));
+            }
+        }
+
         // NOTE (fix round 3): the source window's `Layout::remove` may hand
         // focus to a surviving sibling -- deliberately NOT stamped, same
         // `window_lost_pane` no-bump rule as `kill_pane_by_id` (the moved
@@ -1568,21 +1983,29 @@ impl Server {
             return Err("can't break with only one pane".to_string());
         }
         let new_wid = self.registry.mint_window_id();
-        if let Some(session) = self.registry.session_mut(&session_name) {
-            let w = session.new_window(new_wid, pane_id);
-            if let Some(n) = name {
-                w.name = n;
-                // Explicit naming at creation is manual naming too (Task 9)
-                // -- matches `exec_rename_window`/`exec_new_window`.
-                w.auto_rename = false;
+        let new_id = self.registry.insert_new_window(&dst_session_name, new_wid, pane_id, dst_index)?;
+        if let Some(session) = self.registry.session_mut(&dst_session_name) {
+            if let Some(w) = session.windows.iter_mut().find(|w| w.id == new_id) {
+                if let Some(n) = name {
+                    w.name = n;
+                    // Explicit naming at creation is manual naming too
+                    // (Task 9) -- matches `exec_rename_window`/`exec_new_window`.
+                    w.auto_rename = false;
+                }
             }
-            // `new_window` always makes the new window current -- `-d`
-            // (`detached`) means focus should stay in the SOURCE window
-            // instead (tmux: the pane still moves, but the client's
-            // displayed window doesn't follow it).
-            if detached {
-                session.current = wid;
-                session.last = Some(new_wid);
+            // `insert_new_window` never touches current/last (SP7 Task 11:
+            // unlike the `Session::new_window` this replaces, it has to
+            // serve a DESTINATION session that may differ from the acting
+            // client's own) -- this handler owns that bookkeeping instead.
+            // Real tmux: without `-d` the new window becomes the
+            // destination's current window; with `-d`, nothing changes.
+            if !detached {
+                session.last = Some(session.current);
+                session.current = new_id;
+                // SP7 Task 17 (#74): clear-on-visit whenever `current`
+                // changes (no-op for a brand-new window, kept for the
+                // invariant's uniformity across every current-mutation site).
+                session.clear_alerts_for(new_id);
             }
         }
         // NOTE (fix round 4): the moved pane becoming the new window's
@@ -1596,51 +2019,118 @@ impl Server {
         // `window_set_active_pane` at cmd-break-pane.c:80 belongs to the
         // `-W` floating-window feature, which winmux doesn't implement.)
         self.apply_layout_for_session(&session_name);
+        if dst_session_name != session_name {
+            self.apply_layout_for_session(&dst_session_name);
+        }
         Ok(String::new())
     }
 
-    /// `move-window|movew [-k] -t index`: re-index the target session's
-    /// CURRENT window to `target` (parsed as a bare/`:`-prefixed index --
-    /// any `session:` prefix is accepted but IGNORED, since winmux's
-    /// `move-window` only re-indexes within the SAME session, per the
-    /// design spec). Occupied index -> `index in use: <n>` unless `kill`.
+    /// `move-window|movew [-k] -t [session:]index`: re-index the target
+    /// session's CURRENT window to `target`. A bare/`:`-prefixed index with
+    /// NO `session:` part keeps the pre-Task-11 same-session re-indexing
+    /// behavior exactly (`Session::move_window`, index REQUIRED). SP7 Task
+    /// 11 (closes follow-up #45): an explicit `session:` prefix that names a
+    /// DIFFERENT session now actually moves the window there
+    /// (`Registry::move_window_to_session`) instead of silently discarding
+    /// the prefix -- the index becomes OPTIONAL on this path (absent ->
+    /// destination's lowest free slot, same "explicit or lowest_unused_
+    /// index" rule the doc spec calls for). Occupied index -> `index in
+    /// use: <n>` unless `-k` (`kill`), on EITHER path.
     fn exec_move_window(&mut self, kill: bool, target: String, cs: Option<&str>) -> Result<String, String> {
         let session_name = self.resolve_session_name(None, cs)?;
-        let (_, win_spec) = split_session_prefix(&target);
-        let idx: u32 = win_spec
-            .strip_prefix('=')
-            .unwrap_or(win_spec)
-            .parse()
-            .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?;
-        let Some(session) = self.registry.session_mut(&session_name) else {
-            return Err(format!("can't find session: {session_name}"));
+        let (sess_part, win_spec) = split_session_prefix(&target);
+        let dst_session_name = match sess_part {
+            Some(s) => self.registry.find(s).map(|s| s.name.clone())?,
+            None => session_name.clone(),
         };
-        let wid = session.current;
-        // Snapshot the occupant's panes (if any) BEFORE the move, so a
-        // killed occupant's pane runtimes/rects can be cleaned up after --
-        // once `Session::move_window` kills it, its `Window`/`Layout` is
-        // gone from the registry.
-        let occupant_panes: Vec<PaneId> = session
-            .windows
-            .iter()
-            .find(|w| w.index == idx && w.id != wid)
-            .map(|w| w.layout.panes())
-            .unwrap_or_default();
-        if !session.move_window(wid, idx, kill) {
-            return Err(format!("index in use: {idx}"));
-        }
-        if self.options.renumber_windows() {
-            if let Some(s) = self.registry.session_mut(&session_name) {
-                s.renumber();
+
+        if dst_session_name == session_name {
+            // Unchanged same-session path: an explicit index is REQUIRED
+            // (real tmux itself accepts a bare `-t <session>` with no index
+            // for the cross-session form, but this SAME-session shape keeps
+            // its pre-Task-11 contract byte-for-byte).
+            let idx: u32 = win_spec
+                .strip_prefix('=')
+                .unwrap_or(win_spec)
+                .parse()
+                .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?;
+            let Some(session) = self.registry.session_mut(&session_name) else {
+                return Err(format!("can't find session: {session_name}"));
+            };
+            let wid = session.current;
+            // Snapshot the occupant's panes (if any) BEFORE the move, so a
+            // killed occupant's pane runtimes/rects can be cleaned up after
+            // -- once `Session::move_window` kills it, its `Window`/`Layout`
+            // is gone from the registry.
+            let occupant_panes: Vec<PaneId> = session
+                .windows
+                .iter()
+                .find(|w| w.index == idx && w.id != wid)
+                .map(|w| w.layout.panes())
+                .unwrap_or_default();
+            if !session.move_window(wid, idx, kill) {
+                return Err(format!("index in use: {idx}"));
             }
+            // renumber-windows is session-scoped (#26).
+            if self.renumber_windows_for_session(&session_name) {
+                if let Some(s) = self.registry.session_mut(&session_name) {
+                    s.renumber();
+                }
+            }
+            for pid in occupant_panes {
+                self.panes.remove(&pid);
+                self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
+            }
+            self.apply_layout_for_session(&session_name);
+            Ok(String::new())
+        } else {
+            // SP7 Task 11 cross-session path (closes follow-up #45).
+            let idx: Option<u32> = if win_spec.is_empty() {
+                None
+            } else {
+                Some(
+                    win_spec
+                        .strip_prefix('=')
+                        .unwrap_or(win_spec)
+                        .parse::<u32>()
+                        .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?,
+                )
+            };
+            let wid = self
+                .registry
+                .session_mut(&session_name)
+                .ok_or_else(|| format!("can't find session: {session_name}"))?
+                .current;
+            // Snapshot the destination occupant's panes (if any) BEFORE the
+            // move, same reasoning as the same-session path above.
+            let occupant_panes: Vec<PaneId> = idx
+                .and_then(|i| {
+                    self.registry
+                        .session_mut(&dst_session_name)
+                        .and_then(|s| s.windows.iter().find(|w| w.index == i))
+                        .map(|w| w.layout.panes())
+                })
+                .unwrap_or_default();
+            self.registry
+                .move_window_to_session(&session_name, wid, &dst_session_name, idx, kill, true)?;
+            // renumber-windows is session-scoped (#26): real tmux renumbers
+            // the SOURCE session only (`windows-and-sessions.md`
+            // §renumber-windows), never the destination.
+            if self.renumber_windows_for_session(&session_name) {
+                if let Some(s) = self.registry.session_mut(&session_name) {
+                    s.renumber();
+                }
+            }
+            for pid in occupant_panes {
+                self.panes.remove(&pid);
+                self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid);
+            }
+            self.apply_layout_for_session(&session_name);
+            self.apply_layout_for_session(&dst_session_name);
+            Ok(String::new())
         }
-        for pid in occupant_panes {
-            self.panes.remove(&pid);
-            self.last_rects.remove(&pid);
-            self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
-        }
-        self.apply_layout_for_session(&session_name);
-        Ok(String::new())
     }
 
     /// `swap-window|swapw [-d] [-s src] -t dst` (SP6 Task 5,
@@ -1679,55 +2169,73 @@ impl Server {
         Ok(String::new())
     }
 
-    /// `find-window|findw <pattern>`: case-insensitive substring search
-    /// (v1, no regex) over the target session's window NAMES first, then
-    /// every pane's CURRENTLY VISIBLE content, in window-index order (the
-    /// current window is a normal candidate, not excluded); jumps to the
-    /// FIRST match. No match -> `Ok` carrying a transient `no windows
-    /// matching: <p>` message (not an `Err` -- "nothing found" is not a
-    /// command failure in tmux).
-    fn exec_find_window(&mut self, pattern: String, cs: Option<&str>) -> Result<String, String> {
-        let session_name = self.resolve_session_name(None, cs)?;
-        let needle = pattern.to_lowercase();
-        let snapshot: Vec<(WindowId, String, Vec<PaneId>)> = self
-            .registry
-            .session_mut(&session_name)
-            .map(|s| s.windows.iter().map(|w| (w.id, w.name.clone(), w.layout.panes())).collect())
-            .ok_or_else(|| format!("can't find session: {session_name}"))?;
-        let mut found: Option<WindowId> = None;
-        for (wid, wname, panes) in &snapshot {
-            if wname.to_lowercase().contains(&needle) {
-                found = Some(*wid);
-                break;
+    /// `find-window|findw [-CNTirZ] <pattern>` (SP7 Task 12, closes
+    /// follow-ups #46/#54): matches every window of the target session
+    /// against the enabled criteria (name/title/content, OR'd -- all three
+    /// when none of `-C`/`-N`/`-T` are given, per
+    /// `docs/tmux-reference/windows-and-sessions.md` `### find-window`),
+    /// then **always** opens a choose-tree filtered to the matches --
+    /// selecting an entry there performs the actual jump. This REPLACES the
+    /// old direct-jump-to-first-match behavior (a documented parity
+    /// deviation, follow-up #46) even for exactly one match, matching real
+    /// tmux exactly. No match -> `Ok` carrying the existing transient `no
+    /// windows matching: <p>` message with NO tree opening (a deliberate,
+    /// documented scope narrowing versus real tmux's empty-tree-opens
+    /// behavior -- see the `find-window-and-main-pane-sizing` contract
+    /// section).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_find_window_client(
+        &mut self,
+        pattern: String,
+        by_content: bool,
+        by_name: bool,
+        by_title: bool,
+        use_regex: bool,
+        ignore_case: bool,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        let matcher = match FindMatcher::new(&pattern, use_regex, ignore_case) {
+            Ok(m) => m,
+            Err(e) => return ExecOutcome::Err(e),
+        };
+        // Doc: "default when none given is all three (C = N = T = 1)".
+        let (by_content, by_name, by_title) = if !by_content && !by_name && !by_title { (true, true, true) } else { (by_content, by_name, by_title) };
+
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Err(format!("can't find session: {session_name}"));
+        };
+        let mut matches: HashSet<WindowId> = HashSet::new();
+        for w in &session.windows {
+            let mut hit = by_name && matcher.matches_name(&w.name);
+            if !hit && by_title {
+                hit = w.layout.panes().iter().any(|pid| self.panes.get(pid).and_then(|pr| pr.grid.title()).map(|t| matcher.matches_name(t)).unwrap_or(false));
             }
-            let content_match = panes.iter().any(|pid| self.panes.get(pid).map(|pr| grid_contains(&pr.grid, &needle)).unwrap_or(false));
-            if content_match {
-                found = Some(*wid);
-                break;
+            if !hit && by_content {
+                hit = w.layout.panes().iter().any(|pid| self.panes.get(pid).map(|pr| grid_matches(&pr.grid, &matcher)).unwrap_or(false));
+            }
+            if hit {
+                matches.insert(w.id);
             }
         }
-        match found {
-            Some(wid) => {
-                if let Some(session) = self.registry.session_mut(&session_name) {
-                    if wid != session.current {
-                        session.last = Some(session.current);
-                        session.current = wid;
-                    }
-                }
-                self.apply_layout_for_session(&session_name);
-                Ok(String::new())
-            }
-            None => Ok(format!("no windows matching: {pattern}")),
+        if matches.is_empty() {
+            return ExecOutcome::Ok(format!("no windows matching: {pattern}"));
         }
+        self.open_choose_tree(ChooseTreeView::Windows, Some(matches), client, session_name)
     }
 
     fn exec_send_prefix(&mut self, cs: Option<&str>) -> Result<String, String> {
-        let (_session, _wid, pane_id) = self.resolve_pane_target(cs, None)?;
-        let bytes = crate::keys::encode_key(&self.options.prefix()).unwrap_or_default();
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        let (session, _wid, pane_id) = self.resolve_pane_target(cs, None)?;
+        // `prefix` is session-scoped (#26).
+        let prefix = match self.acting_session_overlay(Some(&session)) {
+            Ok(ov) => self.options.prefix_for(ov),
+            Err(_) => self.options.prefix(),
+        };
+        let bytes = crate::keys::encode_key(&prefix).unwrap_or_default();
+        if let Some(pane) = self.panes.get(&pane_id) {
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread, not a synchronous main-thread `pty.write_input`.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -1955,8 +2463,84 @@ impl Server {
                 if let Some(t) = text {
                     if !t.is_empty() {
                         let limit = self.options.buffer_limit();
-                        self.buffers.add_automatic(t, limit);
+                        self.buffers.add_automatic(t.clone(), limit);
+                        // OSC 52 (SP7 Task 13, closes follow-up #53): every
+                        // copy destination, not just copy-pipe -- see
+                        // `Options::set_clipboard_emits`'s doc comment for
+                        // the gating rule.
+                        if self.options.set_clipboard_emits() {
+                            super::send_output(&client.tx, osc52_bytes(&t));
+                        }
                     }
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // SP7 Task 13 (closes follow-up #56): first non-blank column of
+            // the current view row -- emacs `M-m`. See `CopyAction::
+            // BackToIndentation`'s doc comment for the v1 no-line-wrap
+            // scoping this shares with `NextWord`/`PreviousWord` above.
+            CopyAction::BackToIndentation => {
+                let text = p.grid.view_row_text(cs.scroll, cs.cy);
+                let first_non_blank = text.chars().position(|c| c != ' ' && c != '\t');
+                cs.cx = first_non_blank.unwrap_or(0).min(cols.saturating_sub(1) as usize) as u16;
+            }
+            // SP7 Task 13 (closes follow-up #56): emacs `C-k` -- see
+            // `CopyAction::EndOfLineAndCancel`'s doc comment for why this is
+            // NOT the master-branch `copy-pipe-end-of-line-and-cancel`.
+            CopyAction::EndOfLineAndCancel => {
+                let text = extract_end_of_line_text(&p.grid, cs.cx, cs.cy, cs.scroll);
+                client.mode = ClientMode::Normal;
+                if !text.is_empty() {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(text.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(&text));
+                    }
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // `copy-pipe [command]` (SP7 Task 13, closes follow-ups
+            // #53/#56): copy destinations same as `SelectionAndCancel`
+            // (buffer + OSC 52), PLUS spawn `command` (if given) with the
+            // copied text on its stdin. Stays in copy mode; per real tmux's
+            // "copy-selection" (no `-no-clear`) precedent the selection
+            // itself is cleared after copying, same as a plain
+            // `clear-selection` would do.
+            CopyAction::CopyPipe(command) => {
+                let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
+                let text = sel_opt
+                    .map(|sel| extract_selection_text(&p.grid, &sel, ccx, ccy, cscroll))
+                    .filter(|t| !t.is_empty());
+                cs.sel = None;
+                if let Some(t) = &text {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(t.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(t));
+                    }
+                }
+                if let (Some(t), Some(cmd)) = (&text, &command) {
+                    spawn_copy_pipe(cmd, t);
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // `copy-pipe-and-cancel [command]` (SP7 Task 13): same as
+            // `CopyPipe` above, then exits copy mode.
+            CopyAction::CopyPipeAndCancel(command) => {
+                let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
+                let text = sel_opt
+                    .map(|sel| extract_selection_text(&p.grid, &sel, ccx, ccy, cscroll))
+                    .filter(|t| !t.is_empty());
+                client.mode = ClientMode::Normal;
+                if let Some(t) = &text {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(t.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(t));
+                    }
+                }
+                if let (Some(t), Some(cmd)) = (&text, &command) {
+                    spawn_copy_pipe(cmd, t);
                 }
                 return ExecOutcome::Ok(String::new());
             }
@@ -1964,31 +2548,119 @@ impl Server {
         ExecOutcome::Ok(String::new())
     }
 
-    // ---- mouse (Task 5, sub-project 4) ----
+    // ---- mouse (Task 5, sub-project 4; table-driven since Task 8, SP7 wave 3) ----
+
+    /// Which key table a `Pane`-location mouse key resolves against: the
+    /// pane's copy-mode table (emacs/vi per `mode-keys`) if `pane` is the
+    /// SAME pane the client is currently in copy mode on, else `Root` --
+    /// mirrors the keyboard `Key`-event substitution rule at
+    /// `server.rs::process_key_events`'s `KeyInputEvent::Key` arm, and real
+    /// tmux's own "target pane in a mode uses the mode table" dispatch rule
+    /// (`docs/tmux-reference/mouse.md` `## 3`). `Border`/`Status*` locations
+    /// have no target pane and are always resolved against `Root` directly
+    /// by their call sites (this helper is only for `Pane`-location keys).
+    fn mouse_table_for_pane(&self, client: &ClientState, pane: PaneId) -> WhichTable {
+        if let ClientMode::Copy(cs) = &client.mode {
+            if cs.pane == pane {
+                return if self.mode_keys_vi_for_pane(pane) { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
+            }
+        }
+        WhichTable::Root
+    }
+
+    /// Resolve a synthesized mouse pseudo-key against `table`, ignoring the
+    /// event's own modifier bits (Task 8 scoping decision: winmux's PRE-
+    /// existing hardcoded mouse dispatch never branched on `MouseEvent::
+    /// ctrl/meta/shift` at all, so always looking up the UNMODIFIED key form
+    /// here reproduces that exactly -- modifier-specific tmux defaults like
+    /// `C-MouseDown1Pane`/`M-MouseDrag1Pane` are a documented gap, not
+    /// modeled). `None` = unbound; this function itself is silent either
+    /// way (real tmux's "unbound mouse key -> forwarded to the pane app or
+    /// dropped" decision, `forward_mouse_to_pane`, is made by each CALL
+    /// SITE -- `mouse_drag`'s `PendingSelect { enter_copy: true }` arm and
+    /// `mouse_wheel` -- on a `None`/is-still-the-default result, SP7 Task 9,
+    /// closes follow-ups #35/#72).
+    fn mouse_lookup(&self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Option<Vec<RawCmd>> {
+        let key = Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false };
+        self.bindings.lookup(table, &key).map(|b| b.cmds.clone())
+    }
+
+    /// Execute an already-resolved binding's `cmds` (default OR user-
+    /// overridden) through the SAME command pipeline keyboard bindings use
+    /// (`dispatch_client`/`cmd::resolve`/`execute_for_client`) -- used for
+    /// every mouse default that's expressible as real, generically-
+    /// executable commands (`copy-mode -e`, `copy-scroll-up`,
+    /// `copy-selection-and-cancel`, `previous-window`, `next-window`), so a
+    /// user override "just works" with no special-casing. `session_name` is
+    /// a throwaway local copy (`dispatch_client` takes `&mut String` for its
+    /// bare-rename-prompt special case) -- a mouse-bound command that
+    /// SWITCHES the acting session is a documented non-goal of this task
+    /// (out of scope: no required test exercises it, and `dispatch_mouse`'s
+    /// own signature -- shared with `server.rs`, outside this task's file
+    /// scope -- takes `session_name: &str`, not `&mut`).
+    fn dispatch_mouse_cmds(&mut self, cmds: &[RawCmd], client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let mut sn = session_name.to_string();
+        self.dispatch_client(cmds, client, &mut sn)
+    }
+
+    /// Look up `kind`/`btn`/`loc` in `table` and, if bound, execute it via
+    /// [`Self::dispatch_mouse_cmds`]; unbound is a silent no-op. The uniform
+    /// "always dispatch whatever's bound" helper for the mouse defaults that
+    /// need no bespoke Rust logic at all (see `bindings::mouse_default_*`'s
+    /// module doc comment).
+    fn dispatch_mouse_bound(
+        &mut self,
+        table: WhichTable,
+        kind: MouseKeyKind,
+        btn: u8,
+        loc: MouseKeyLoc,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        match self.mouse_lookup(table, kind, btn, loc) {
+            None => ExecOutcome::Ok(String::new()),
+            Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+        }
+    }
 
     /// Route one decoded [`MouseEvent`] for `client` (already resolved to
     /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
     /// option is off (design spec: "mouse events with mouse off are
-    /// dropped"), or while `client` has an active confirm/prompt/choose-
-    /// tree/display-panes overlay (Task 5 decision, undecided by the brief:
-    /// real tmux's mouse-during-prompt behavior is a can of worms out of
-    /// scope here -- winmux swallows mouse events in those modes so a stray
-    /// click can never race a confirm's y/n capture or act on pane geometry
-    /// the overlay is currently hiding; documented deviation, see
-    /// `docs/follow-ups.md` #38). `ChooseTree`/`DisplayPanes` (Task 8,
-    /// added later) joined this guard in the final SP4 review fix round --
-    /// both draw full-screen, so the exact same "hidden pane geometry" risk
-    /// applies: a click/drag/wheel would otherwise focus/resize/copy-mode a
-    /// pane the user cannot currently see. Dismissal policy mirrors the
-    /// keyboard policy documented in `## overlays` of
-    /// `docs/specs/2026-07-07-parity-polish-interfaces.md`: mouse events
-    /// never dismiss either overlay (unlike display-panes' "any non-digit
-    /// KEY dismisses" rule) and never navigate/select a choose-tree row --
-    /// they are swallowed outright, same as `ConfirmCmd`/`Prompt`. Real
-    /// tmux-style mouse routing into choose-tree (click selects a row,
-    /// wheel scrolls the list) is ticketed, `docs/follow-ups.md` #61.
-    pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        if !self.options.mouse() {
+    /// dropped"), or while `client` has an active confirm/prompt/display-
+    /// panes overlay, OR a choose-tree kill-confirm prompt is pending (Task
+    /// 5 decision, undecided by the brief: real tmux's mouse-during-prompt
+    /// behavior is a can of worms out of scope here -- winmux swallows
+    /// mouse events in those modes so a stray click can never race a
+    /// confirm's y/n capture or act on pane geometry the overlay is
+    /// currently hiding; documented deviation, see `docs/follow-ups.md`
+    /// #38). `DisplayPanes` (Task 8, added later) joined this guard in the
+    /// final SP4 review fix round -- it draws full-screen, so the same
+    /// "hidden pane geometry" risk applies: a click/drag/wheel would
+    /// otherwise focus/resize/copy-mode a pane the user cannot currently
+    /// see; no `docs/tmux-reference/*.md` source pins any display-panes
+    /// mouse behavior at all (`cmd_display_panes_key` is a KEY-only
+    /// handler), so this stays swallowed rather than guessed at. `ChooseTree`
+    /// (SP7 Task 10, closes follow-up #61) now routes `Down(1)` into the
+    /// tree list itself -- see [`dispatch_choose_tree_mouse`] -- UNLESS a
+    /// kill-confirm prompt is currently pending on it, which absorbs mouse
+    /// exactly like `ConfirmCmd`/`Prompt` for the same race-safety reason.
+    /// Every other choose-tree mouse event kind (wheel, drag, non-left
+    /// buttons) is still swallowed: `docs/tmux-reference/choose-tree.md`
+    /// §7.4 documents real tmux's mouse branch as click/double-click/
+    /// right-click ONLY (wheel is UNREACHABLE via mouse with `mouse on` --
+    /// "matching tmux exactly means click/double-click/right-click only");
+    /// right-click and drag are out of scope for the tree list SPECIFICALLY
+    /// (SP7 Task 16 gave winmux a real context-menu system for panes/
+    /// window tabs/the session name, `## display-menu`, but did not extend
+    /// it to per-row choose-tree context menus -- `mouse.md` §2.5's drag-
+    /// selection semantics don't apply to a list overlay either way).
+    pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome {
+        // `mouse` is session-scoped (#26).
+        let mouse_on = match self.acting_session_overlay(Some(session_name)) {
+            Ok(ov) => self.options.mouse_for(ov),
+            Err(_) => self.options.mouse(),
+        };
+        if !mouse_on {
             return ExecOutcome::Ok(String::new());
         }
         // clock-mode (Task 10, fix round 1): tmux's `window_clock_key`
@@ -2007,10 +2679,41 @@ impl Server {
             client.mode = ClientMode::Normal;
             return ExecOutcome::Ok(String::new());
         }
-        if matches!(
-            client.mode,
-            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
-        ) {
+        // SP7 Task 10 (closes follow-up #61): choose-tree gets its OWN
+        // guard, routing `Down(1)` into the tree list rather than swallowing
+        // it outright -- see `dispatch_choose_tree_mouse`. Still swallows
+        // everything (including `Down(1)`) while a kill-confirm prompt is
+        // pending on it, matching `ConfirmCmd`/`Prompt` below.
+        if let ClientMode::ChooseTree(state) = &client.mode {
+            let no_pending_kill = state.pending_kill.is_none();
+            // #64: a drag armed before the overlay opened must not survive
+            // across it (see the sibling guard below for the full
+            // rationale); `end_drag` also stops the edge-autoscroll timer.
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            if no_pending_kill && matches!(ev.kind, MouseKind::Down(1)) {
+                return self.dispatch_choose_tree_mouse(ev, client, session_name, acting_id);
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+        // SP7 Task 16 (closes #51): display-menu gets its OWN guard, same
+        // shape as choose-tree's above -- a press (any button) is routed
+        // into the menu's own click-inside/outside handling instead of
+        // being swallowed outright; every other event kind (drag/up/wheel)
+        // still no-ops, after clearing any drag armed before the menu
+        // opened (same #64-style hygiene as every other overlay guard here).
+        if matches!(client.mode, ClientMode::Menu(_)) {
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            if matches!(ev.kind, MouseKind::Down(_)) {
+                let mut sn = session_name.to_string();
+                return self.dispatch_menu_mouse(ev, client, &mut sn);
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(client.mode, ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::DisplayPanes(_)) {
             // #64: a drag armed before the overlay opened (keyboard-
             // triggered mid-drag) must not survive across the overlay's
             // lifetime -- clear it just like the sibling "outside pane
@@ -2063,7 +2766,7 @@ impl Server {
         match ev.kind {
             MouseKind::Down(btn) => self.mouse_down(ev, btn, &rects, client, session_name),
             MouseKind::Drag(_) => self.mouse_drag(ev, &rects, client, session_name),
-            MouseKind::Up(_) => self.mouse_up(ev, &rects, client),
+            MouseKind::Up(_) => self.mouse_up(ev, &rects, client, session_name),
             MouseKind::WheelUp => self.mouse_wheel(ev, true, &rects, client, session_name),
             MouseKind::WheelDown => self.mouse_wheel(ev, false, &rects, client, session_name),
         }
@@ -2100,6 +2803,45 @@ impl Server {
         }
     }
 
+    /// Re-encode `ev` (screen coordinates) relative to `pane`'s own `rect`
+    /// and write it to that pane's pty, IF `pane`'s own application has
+    /// requested mouse reporting eligible for `ev.kind`
+    /// ([`mouse_forward_eligible`]) -- the forwarding primitive SP7 Task 9
+    /// (closes follow-ups #35/#72) plugs into every root-table mouse
+    /// decision point (`mouse_down`'s pane-click branch, `mouse_drag`'s
+    /// `PendingSelect { enter_copy: true }`/`Forwarding` arms,
+    /// `mouse_wheel`'s not-already-in-copy-mode branch). Returns `true` iff
+    /// something was actually written -- the caller's signal to skip its own
+    /// winmux gesture for this event ("forward INSTEAD of", matching every
+    /// GATED root binding in `docs/tmux-reference/mouse.md` §7.1/§7.4 except
+    /// `MouseDown1Pane`, which forwards unconditionally IN ADDITION to
+    /// focusing -- `mouse_down`'s call site ignores the return value for
+    /// that reason). `false` (nothing written, caller proceeds with its own
+    /// action) when the pane isn't eligible, its rect isn't in `rects`
+    /// (already gone/hidden), or its `Pty`/runtime no longer exists.
+    fn forward_mouse_to_pane(&mut self, pane: PaneId, ev: MouseEvent, rect: Rect) -> bool {
+        let Some(p) = self.panes.get(&pane) else { return false };
+        let proto = p.grid.mouse_proto();
+        if !mouse_forward_eligible(proto, ev.kind) {
+            return false;
+        }
+        let encoding = p.grid.mouse_encoding();
+        let px = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
+        let py = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+        let rel = MouseEvent { x: px, y: py, ..ev };
+        let bytes = keys::encode_mouse(&rel, encoding);
+        if let Some(pane) = self.panes.get(&pane) {
+            // Follow-up #14: route through the per-pane writer thread, not a
+            // synchronous `pty.write_input` on the main dispatch thread — a
+            // mouse-owning app that stops draining stdin must not be able to
+            // block every session on the server (see forward_raw_to_focused_pane
+            // and the Forward-blob arm in process_key_events for the same
+            // pattern on the keyboard path).
+            let _ = pane.input_tx.send(bytes);
+        }
+        true
+    }
+
     /// `Down1`/`Down2`/`Down3` inside the pane area: a border press arms a
     /// live resize drag; a pane press always focuses that pane (tmux
     /// `select-pane`), and a LEFT click additionally arms `PendingSelect`
@@ -2112,9 +2854,18 @@ impl Server {
     /// selection immediately here, matching tmux's separate
     /// `DoubleClick1Pane`/`TripleClick1Pane` bindings (not `MouseDown1Pane`)
     /// which fire `select-word`/`select-line` right away. Non-left buttons
-    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet;
-    /// forwarding the click to the pane's own mouse-reporting application is
-    /// out of scope for v1, documented deferral).
+    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet.
+    /// SP7 Task 9 (closes follow-ups #35/#72): a click is ALSO forwarded
+    /// (`forward_mouse_to_pane`) to the pane's own application if it has
+    /// requested mouse reporting -- unconditionally, not gated on whether
+    /// this is `!in_copy_here`'s later branches take, matching real tmux's
+    /// UNGATED root `MouseDown1Pane -> select-pane -t=; send -M` (`mouse.md`
+    /// §7.1: focus and forward both always happen; only `MouseDrag1Pane`/
+    /// `WheelUpPane`/`DoubleClick1Pane`/`TripleClick1Pane` are gated
+    /// "forward INSTEAD of"). Skipped while `in_copy_here` (copy-mode's OWN
+    /// `MouseDown1Pane` table entry is `select-pane`, ungated, no `send -M`
+    /// variant at all -- §5.2/§7.3), matching the pre-existing double/
+    /// triple-click gate immediately below.
     fn mouse_down(
         &mut self,
         ev: MouseEvent,
@@ -2128,23 +2879,55 @@ impl Server {
         // leftover would otherwise keep scrolling a selection nothing is
         // dragging anymore).
         client.mouse.autoscroll = None;
+        // Border-drag existence gate (Task 8, SP7 wave 3): `MouseDrag1Border`
+        // must be BOUND (default or a user's own binding -- winmux can't
+        // meaningfully replace the continuous per-motion resize logic with a
+        // static command list, so only bound-vs-unbound is honored, not
+        // WHICH command it's bound to; see the task report) for a border
+        // press to arm live resizing at all. Checked once here, at arm time,
+        // rather than on every subsequent `Drag` motion event -- real tmux
+        // itself only consults the key table on the FIRST motion event of a
+        // drag (`docs/tmux-reference/mouse.md` §2.5's "bindings are
+        // completely bypassed" rule); `mouse_drag`/`mouse_drag_border` stay
+        // exactly as before once armed.
+        let border_drag_enabled = self.mouse_lookup(WhichTable::Root, MouseKeyKind::Drag, 1, MouseKeyLoc::Border).is_some();
         match hit_test(rects, ev.x, ev.y) {
             MouseHit::VBorder { left } => {
-                client.mouse.drag = MouseDrag::Border { pane: left, vertical: true };
+                client.mouse.drag = if border_drag_enabled { MouseDrag::Border { pane: left, vertical: true } } else { MouseDrag::None };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::HBorder { top } => {
-                client.mouse.drag = MouseDrag::Border { pane: top, vertical: false };
+                client.mouse.drag = if border_drag_enabled { MouseDrag::Border { pane: top, vertical: false } } else { MouseDrag::None };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::Pane(pane_id) => {
                 self.mouse_focus_pane(session_name, pane_id);
                 let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
+                let rect = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r);
+                // SP7 Task 9 (closes follow-ups #35/#72): forward, in
+                // ADDITION to focus, for any button -- see this fn's own doc
+                // comment for why this is unconditional (unlike the
+                // Drag/Wheel/DoubleClick/TripleClick gates below).
+                if !in_copy_here {
+                    if let Some(rect) = rect {
+                        self.forward_mouse_to_pane(pane_id, ev, rect);
+                    }
+                }
+                // SP7 Task 16 (closes #51): `MouseDown3Pane` — the default
+                // right-click pane context menu, table-driven like every
+                // other Task-8 mouse default (`mouse_down_pane_button3`).
+                // Checked ahead of the generic `btn != 1` early-return below
+                // (which would otherwise silently swallow button 3 the same
+                // as button 2 always has).
+                if btn == 3 {
+                    client.mouse.drag = MouseDrag::None;
+                    return self.mouse_down_pane_button3(pane_id, ev, client, session_name);
+                }
                 if btn != 1 {
                     client.mouse.drag = MouseDrag::None;
                     return ExecOutcome::Ok(String::new());
                 }
-                let Some(rect) = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r) else {
+                let Some(rect) = rect else {
                     return ExecOutcome::Ok(String::new());
                 };
                 let cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
@@ -2172,21 +2955,47 @@ impl Server {
                     client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
                     return ExecOutcome::Ok(String::new());
                 }
-                let Some(p) = self.panes.get(&pane_id) else {
-                    return ExecOutcome::Ok(String::new());
-                };
-                let history_total = p.grid.history_total();
-                let cols = p.grid.cols();
-                let seps = self.options.word_separators();
-                if let ClientMode::Copy(cs) = &mut client.mode {
-                    cs.cx = cx;
-                    cs.cy = cy;
-                    match run {
-                        2 => select_word_at(cs, &p.grid, history_total, seps),
-                        _ => select_line_at(cs, cols, history_total),
+                // Table-driven since Task 8, SP7 wave 3: `DoubleClick1Pane`/
+                // `TripleClick1Pane` resolved against the pane's copy-mode
+                // table (`mode_keys_vi_for_pane`, matching real tmux --
+                // `docs/tmux-reference/mouse.md` §7.3). Unbound falls back
+                // to plain-click semantics (no default in real tmux either,
+                // so the press just re-arms a normal char-selection anchor);
+                // bound-to-a-user-override runs that command generically;
+                // bound-to-the-default runs the EXACT same select-word/-line
+                // logic this task found here, now gated.
+                let table = self.mouse_table_for_pane(client, pane_id);
+                let kind = if run == 2 { MouseKeyKind::DoubleClick } else { MouseKeyKind::TripleClick };
+                let default = if run == 2 { mouse_default_double_click_pane() } else { mouse_default_triple_click_pane() };
+                match self.mouse_lookup(table, kind, 1, MouseKeyLoc::Pane) {
+                    None => {
+                        client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
+                    }
+                    Some(cmds) if cmds == default => {
+                        let Some(p) = self.panes.get(&pane_id) else {
+                            return ExecOutcome::Ok(String::new());
+                        };
+                        let history_total = p.grid.history_total();
+                        let cols = p.grid.cols();
+                        let seps = self.word_separators_for_session(session_name);
+                        if let ClientMode::Copy(cs) = &mut client.mode {
+                            cs.cx = cx;
+                            cs.cy = cy;
+                            match run {
+                                2 => select_word_at(cs, &p.grid, history_total, seps),
+                                _ => select_line_at(cs, cols, history_total),
+                            }
+                        }
+                        client.mouse.drag = MouseDrag::Selecting { moved: false };
+                    }
+                    Some(cmds) => {
+                        let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                        if matches!(outcome, ExecOutcome::Err(_)) {
+                            return outcome;
+                        }
+                        client.mouse.drag = MouseDrag::Selecting { moved: false };
                     }
                 }
-                client.mouse.drag = MouseDrag::Selecting { moved: false };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::None => {
@@ -2213,13 +3022,56 @@ impl Server {
             }
             MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy } => {
                 if enter_copy {
+                    // Root `MouseDrag1Pane` (Task 8, SP7 wave 3: table-driven
+                    // -- was unconditional through SP6). Unbound: SP7 Task 9
+                    // (closes #35/#72) -- real tmux's "unbound mouse key ->
+                    // forward_key" step (`mouse.md` §3 point 5) applies here
+                    // regardless of any specific binding's own guard, so try
+                    // forwarding before abandoning with no copy-mode entry.
+                    // Bound to a user override: run it generically and
+                    // abandon winmux's own anchor-install tail (the override
+                    // fully replaces the default's "enter copy mode + begin
+                    // selecting" pair, INCLUDING its `if -F mouse_any_flag`
+                    // guard -- a user's own command has no such wrapper, so
+                    // no forwarding check applies to an override at all).
+                    // Bound to the default: THIS is where the default's own
+                    // `if -F {mouse_any_flag} {send -M} {copy-mode -M}` guard
+                    // lives, so the forwarding check runs here too, ahead of
+                    // the "enter copy mode" fallthrough.
+                    let default = mouse_default_drag_pane_enter_copy();
+                    match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Drag, 1, MouseKeyLoc::Pane) {
+                        None => {
+                            if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                                if self.forward_mouse_to_pane(pane, ev, rect) {
+                                    client.mouse.drag = MouseDrag::Forwarding { pane };
+                                    return ExecOutcome::Ok(String::new());
+                                }
+                            }
+                            client.mouse.drag = MouseDrag::None;
+                            return ExecOutcome::Ok(String::new());
+                        }
+                        Some(cmds) if cmds != default => {
+                            let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                            client.mouse.drag = MouseDrag::Selecting { moved: true };
+                            return outcome;
+                        }
+                        _ => {
+                            if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                                if self.forward_mouse_to_pane(pane, ev, rect) {
+                                    client.mouse.drag = MouseDrag::Forwarding { pane };
+                                    return ExecOutcome::Ok(String::new());
+                                }
+                            }
+                        }
+                    }
                     // (c) SP6 Task 6: enter copy mode on `pane` NOW, at the
                     // first motion event (tmux's drag-START classification,
                     // `mouse.md` §2.5) -- mirrors the root binding `if
                     // pane_in_mode/mouse_any_flag { send -M } else {
-                    // copy-mode -M }`; winmux has no app-owns-mouse relay for
-                    // drag yet, so this always enters copy mode. `mouse:
-                    // false` matches real `-M` (it does NOT set
+                    // copy-mode -M }`; the forwarding branch just above
+                    // already took the `send -M` side when eligible, so
+                    // reaching here means the pane does NOT own the mouse.
+                    // `mouse: false` matches real `-M` (it does NOT set
                     // `scroll_exit` -- only `-e` does).
                     if !self.panes.contains_key(&pane) {
                         client.mouse.drag = MouseDrag::None;
@@ -2238,6 +3090,26 @@ impl Server {
                         client.mode = ClientMode::Normal;
                         client.mouse.drag = MouseDrag::None;
                         return ExecOutcome::Ok(String::new());
+                    }
+                } else {
+                    // Copy-mode table's `MouseDrag1Pane` (begin-selection).
+                    // Unbound: leave `PendingSelect` exactly as-is -- a
+                    // sticky no-op matching real tmux's "no default ->
+                    // nothing happens", and consistent with `mouse_down`'s
+                    // own plain-click-stays-PendingSelect rule (a later
+                    // motion event will re-check this same lookup). Bound to
+                    // a user override: run it generically and abandon the
+                    // anchor-install tail.
+                    let table = self.mouse_table_for_pane(client, pane);
+                    let default = mouse_default_drag_pane_select();
+                    match self.mouse_lookup(table, MouseKeyKind::Drag, 1, MouseKeyLoc::Pane) {
+                        None => return ExecOutcome::Ok(String::new()),
+                        Some(cmds) if cmds != default => {
+                            let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                            client.mouse.drag = MouseDrag::Selecting { moved: true };
+                            return outcome;
+                        }
+                        _ => {}
                     }
                 }
                 // Install the anchor at the PRESS position (tmux's
@@ -2266,8 +3138,8 @@ impl Server {
                 if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
                     let x_raw = ev.x.saturating_sub(rect.x);
                     let y_raw = ev.y.saturating_sub(rect.y);
-                    move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
-                    service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                    move_drag_cursor(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, y_raw);
+                    service_drag_edge(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, Instant::now());
                 }
                 client.mouse.drag = MouseDrag::Selecting { moved: true };
                 ExecOutcome::Ok(String::new())
@@ -2285,8 +3157,8 @@ impl Server {
                         Some((_, rect)) => {
                             let x_raw = ev.x.saturating_sub(rect.x);
                             let y_raw = ev.y.saturating_sub(rect.y);
-                            move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
-                            service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                            move_drag_cursor(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, y_raw);
+                            service_drag_edge(&self.panes, self.word_separators_for_session(session_name), client, pane, x_raw, Instant::now());
                         }
                         // Task 7, SP6 wave 2 / `mouse.md` §5.4: motion
                         // OUTSIDE the pane rectangle is a no-op that also
@@ -2298,6 +3170,21 @@ impl Server {
                 ExecOutcome::Ok(String::new())
             }
             MouseDrag::None => ExecOutcome::Ok(String::new()),
+            // SP7 Task 9 (closes follow-ups #35/#72): every subsequent
+            // motion event while forwarding is re-checked live and re-sent
+            // (`mouse.md` §2.5: "no callback installed -> every motion
+            // re-synthesizes and re-dispatches" -- unlike a real winmux
+            // drag callback, forwarding installs no persistent state beyond
+            // "which pane", so eligibility is re-verified every event; a
+            // pane that turns its own mouse mode off mid-drag simply stops
+            // receiving further bytes rather than winmux inventing a
+            // fallback gesture for the rest of the drag).
+            MouseDrag::Forwarding { pane } => {
+                if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                    self.forward_mouse_to_pane(pane, ev, rect);
+                }
+                ExecOutcome::Ok(String::new())
+            }
         }
     }
 
@@ -2375,7 +3262,7 @@ impl Server {
     /// `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of which require actual
     /// motion). The click's `select-pane` (`mouse_down`'s unconditional
     /// focus) still stands -- only the "release" side is a no-op.
-    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState) -> ExecOutcome {
+    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
         // Task 7, SP6 wave 2: releasing always ends any armed drag
         // autoscroll timer, whether or not this `Up` ends up copying.
@@ -2393,11 +3280,36 @@ impl Server {
                 // `MouseDragEnd1Pane` binding for a non-copy-mode pane, so
                 // no copy happens; the origin pane keeps its selection and
                 // stays in copy mode.
+                //
+                // Table-driven since Task 8, SP7 wave 3 (closes the user's
+                // real conf idiom `unbind -T copy-mode-vi MouseDragEnd1Pane`,
+                // follow-up #67(b)): the default (`copy-selection-and-
+                // cancel`, a real command) and any user override both run
+                // through the SAME generic pipeline; unbound is a silent
+                // no-op -- no copy, selection and copy mode both survive.
                 if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == cs.pane) {
-                    self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+                    let table = self.mouse_table_for_pane(client, cs.pane);
+                    self.dispatch_mouse_bound(table, MouseKeyKind::DragEnd, 1, MouseKeyLoc::Pane, client, session_name)
                 } else {
                     ExecOutcome::Ok(String::new())
                 }
+            }
+            // SP7 Task 9 (closes follow-ups #35/#72): the release itself is
+            // forwarded too (real tmux's root table has no
+            // `MouseDragEnd1Pane` binding at all, so an unbound release is
+            // `forward_key`'d just like every other unbound mouse key,
+            // `mouse.md` §3 point 5) -- resolved against whichever pane is
+            // CURRENTLY under the pointer at release (may differ from the
+            // drag-origin pane if it moved/closed), matching the same
+            // release-position-not-origin-position rule `Selecting` uses
+            // just above.
+            MouseDrag::Forwarding { pane } => {
+                if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == pane) {
+                    if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                        self.forward_mouse_to_pane(pane, ev, rect);
+                    }
+                }
+                ExecOutcome::Ok(String::new())
             }
             _ => ExecOutcome::Ok(String::new()),
         }
@@ -2425,7 +3337,22 @@ impl Server {
             client.mouse.autoscroll = None;
             return false;
         }
-        scroll_and_resnap(&self.panes, self.options.word_separators(), client, a.pane, a.top, a.cursor_x);
+        // word-separators is session-scoped (#26). Inlined as a direct
+        // `self.registry`/`self.options` field projection (not the
+        // `word_separators_for_session` method, an opaque `&self` call
+        // that would borrow ALL of `self` and conflict with `client`,
+        // already a live mutable borrow of `self.clients` needed again
+        // below).
+        let session_overlay = client
+            .session
+            .as_deref()
+            .and_then(|name| self.registry.sessions().iter().find(|s| s.name == name))
+            .map(|s| &s.session_options);
+        let seps = match session_overlay {
+            Some(ov) => self.options.word_separators_for(ov),
+            None => self.options.word_separators(),
+        };
+        scroll_and_resnap(&self.panes, seps, client, a.pane, a.top, a.cursor_x);
         client.mouse.autoscroll = Some(AutoscrollState { deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL, ..a });
         true
     }
@@ -2439,44 +3366,48 @@ impl Server {
         client: &mut ClientState,
         session_name: &str,
     ) -> ExecOutcome {
-        let Some(pane_id) = rects
+        let Some((pane_id, rect)) = rects
             .iter()
             .find(|(_, r)| ev.x >= r.x && ev.x < r.x + r.w && ev.y >= r.y && ev.y < r.y + r.h)
-            .map(|(id, _)| *id)
+            .map(|(id, r)| (*id, *r))
         else {
             return ExecOutcome::Ok(String::new());
         };
-        let Some(p) = self.panes.get(&pane_id) else {
+        // Captured as a plain `bool` (not a live `&PaneRuntime`) since it's
+        // read again AFTER a `&mut self` forwarding attempt below -- holding
+        // a borrow of `self.panes` across that call would conflict with it.
+        let Some(alt_screen) = self.panes.get(&pane_id).map(|p| p.grid.alt_screen()) else {
             return ExecOutcome::Ok(String::new());
         };
-        if p.grid.alt_screen() {
-            // tmux's alternate-screen wheel translation: an alt-screen app
-            // (`less`, vim, ...) has its own scrollback/paging concept, not
-            // winmux's, so each wheel event becomes 3 arrow-key presses sent
-            // straight to the pane instead of entering copy mode.
-            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-            let mut data = Vec::with_capacity(arrow.len() * 3);
-            for _ in 0..3 {
-                data.extend_from_slice(arrow);
-            }
-            if let Some(pane) = self.panes.get_mut(&pane_id) {
-                if let Some(pty) = pane.pty.as_mut() {
-                    let _ = pty.write_input(&data);
-                }
-            }
-            return ExecOutcome::Ok(String::new());
-        }
+
+        // Table-driven since Task 8, SP7 wave 3 (required regression:
+        // `bind_wheelup_pane_custom_command_overrides_default`). The four
+        // wheel-in-pane defaults are all expressible as real, generically-
+        // executable commands (`copy-mode -e` + `copy-scroll-up`/`-down` x5,
+        // see `bindings::mouse_default_wheel_*`), so `dispatch_mouse_bound`
+        // always runs whatever's bound -- default or a user override --
+        // through the SAME pipeline, uniformly; no separate "is this the
+        // default" branch is needed here.
+        // `bindings::mouse_default_wheel_*` hardcodes this same step count
+        // as a literal `5` (bindings.rs can't reach this private `server.rs`
+        // const across the module boundary) -- this keeps the two in sync.
+        debug_assert_eq!(MOUSE_WHEEL_STEP, 5);
 
         let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
         if in_copy_here {
-            let action = if up { CopyAction::ScrollUp } else { CopyAction::ScrollDown };
-            for _ in 0..MOUSE_WHEEL_STEP {
-                self.exec_copy_action(action, client);
+            let table = self.mouse_table_for_pane(client, pane_id);
+            let kind = if up { MouseKeyKind::WheelUp } else { MouseKeyKind::WheelDown };
+            let outcome = self.dispatch_mouse_bound(table, kind, 0, MouseKeyLoc::Pane, client, session_name);
+            if matches!(outcome, ExecOutcome::Err(_)) {
+                return outcome;
             }
             if !up {
                 // tmux's scroll-to-bottom auto-exit: only when THIS copy-mode
                 // session was entered by the wheel (`CopyState::scroll_exit`,
-                // a Task 2 placeholder whose first consumer is Task 5).
+                // a Task 2 placeholder whose first consumer is Task 5). This
+                // check runs regardless of whether the DEFAULT or a user
+                // override just ran -- it's a property of how copy mode was
+                // ENTERED, not of which command scrolled it.
                 let should_exit = matches!(&client.mode, ClientMode::Copy(cs) if cs.scroll == 0 && cs.scroll_exit);
                 if should_exit {
                     client.mode = ClientMode::Normal;
@@ -2485,38 +3416,78 @@ impl Server {
             return ExecOutcome::Ok(String::new());
         }
 
-        if !up {
-            // WheelDown on a live (non-copy-mode) pane: no-op (design spec's
-            // documented v1 decision -- there is no "downward" scrollback
-            // direction to enter copy mode from at the live bottom).
-            return ExecOutcome::Ok(String::new());
+        // WheelDownPane is deliberately unbound at ROOT by default (real
+        // tmux has no default there either, `docs/tmux-reference/mouse.md`
+        // §6). WheelUpPane's default enters copy mode scrolled 5 lines
+        // (tmux's `WheelUpPane` default, `mouse: true`/`-e` sets
+        // `scroll_exit` so scrolling back down to the live bottom by wheel
+        // auto-exits) -- UNLESS gated away by SP7 Task 9 (closes follow-ups
+        // #35/#72), replacing the old unconditional alt-screen 3x-arrow-key
+        // translation (`mouse.md` §9: "No wheel→arrow translation... tmux
+        // never converts wheel to arrow keys"):
+        //
+        // - Unbound (`None`, i.e. WheelDownPane, or WheelUpPane after
+        //   `unbind -n WheelUpPane`): real tmux's unconditional "unbound
+        //   mouse key -> forward_key" step (`mouse.md` §3 point 5) --
+        //   forward if the pane owns the mouse, else a true no-op either
+        //   way (there is no bound command to fall back to regardless).
+        // - Bound to a user override: run it generically, no forwarding
+        //   check at all (the override fully replaces the default's own
+        //   `if -F {alternate_on || pane_in_mode || mouse_any_flag} {send
+        //   -M} {copy-mode -e}` guard, which has no equivalent in a plain
+        //   user command).
+        // - Bound to the default (WheelUpPane only -- WheelDownPane has no
+        //   root default to match): THIS is where that guard lives --
+        //   forward if the pane owns the mouse; else, on the alternate
+        //   screen, SWALLOW (`alternate_on` guard: `send -M` would reach
+        //   `input_key_get_mouse`, which returns 0 for an app that hasn't
+        //   enabled its own mouse reporting -- no copy-mode entry from
+        //   wheel on alt screen either way); else (live screen, not
+        //   forwarded) fall through to the default's `copy-mode -e`.
+        let kind = if up { MouseKeyKind::WheelUp } else { MouseKeyKind::WheelDown };
+        match self.mouse_lookup(WhichTable::Root, kind, 0, MouseKeyLoc::Pane) {
+            None => {
+                self.forward_mouse_to_pane(pane_id, ev, rect);
+                ExecOutcome::Ok(String::new())
+            }
+            Some(cmds) => {
+                let is_default = up && cmds == mouse_default_wheel_up_pane_root();
+                if is_default {
+                    if self.forward_mouse_to_pane(pane_id, ev, rect) {
+                        return ExecOutcome::Ok(String::new());
+                    }
+                    if alt_screen {
+                        return ExecOutcome::Ok(String::new());
+                    }
+                }
+                self.dispatch_mouse_cmds(&cmds, client, session_name)
+            }
         }
-
-        // WheelUp on a live pane: enter copy mode scrolled MOUSE_WHEEL_STEP
-        // lines (tmux's WheelUpPane default); `mouse: true` sets
-        // `scroll_exit` (via `exec_copy_mode`'s wiring) so scrolling back
-        // down to the live bottom by wheel auto-exits.
-        let outcome = self.exec_copy_mode(false, true, client, session_name);
-        if matches!(outcome, ExecOutcome::Err(_)) {
-            return outcome;
-        }
-        for _ in 0..MOUSE_WHEEL_STEP {
-            self.exec_copy_action(CopyAction::ScrollUp, client);
-        }
-        ExecOutcome::Ok(String::new())
     }
 
     /// A click or wheel event on the status row (tmux default status-table
     /// bindings: `MouseDown1Status` -> select the clicked window tab;
     /// `WheelUpStatus`/`WheelDownStatus` -> previous-window/next-window).
-    fn dispatch_mouse_status(&mut self, ev: MouseEvent, _client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        // No client-mode state is needed for status-row routing today; the
-        // parameter is kept (unused) so the call site in `dispatch_mouse`
-        // stays symmetric with the pane-area dispatch methods.
+    /// Table-driven since Task 8, SP7 wave 3.
+    fn dispatch_mouse_status(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         match ev.kind {
-            MouseKind::Down(1) => self.mouse_status_click(ev.x, session_name),
-            MouseKind::WheelUp => wrap(self.exec_step_window(false, Some(session_name))),
-            MouseKind::WheelDown => wrap(self.exec_step_window(true, Some(session_name))),
+            MouseKind::Down(1) => {
+                let default = mouse_default_status_select_window();
+                match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 1, MouseKeyLoc::Status) {
+                    None => ExecOutcome::Ok(String::new()),
+                    Some(cmds) if cmds == default => self.mouse_status_click(ev.x, session_name),
+                    Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+                }
+            }
+            // SP7 Task 16 (closes #51): `MouseDown3Status`/
+            // `MouseDown3StatusLeft` — the default right-click window/
+            // session context menus, dispatched from `mouse_status_button3`
+            // which discriminates the two by hit-testing `ev.x`.
+            MouseKind::Down(3) => self.mouse_status_button3(ev, client, session_name),
+            MouseKind::WheelUp => self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status, client, session_name),
+            MouseKind::WheelDown => {
+                self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelDown, 0, MouseKeyLoc::Status, client, session_name)
+            }
             _ => ExecOutcome::Ok(String::new()),
         }
     }
@@ -2524,20 +3495,47 @@ impl Server {
     /// Left click on the status row at column `x`: select the window tab
     /// under it, if any. A click on the `status-left` prefix, a separator
     /// space, or past the last tab is a no-op (design spec: "Down-click on a
-    /// status-line area with no window: no-op"). Rebuilds the SAME left-
-    /// prefix-width-then-per-window-span layout `render_one`/`status_spans`
-    /// draws (one space between tabs, none after the last) so hit-testing
-    /// always agrees with what's actually on screen; deliberately does NOT
-    /// replicate `render::compose_back`'s final spatial truncation when
-    /// left+right don't fit the terminal width (a click past the truncation
-    /// point on an extremely narrow terminal may resolve to a tab that isn't
-    /// actually drawn there -- documented v1 gap, `docs/follow-ups.md`).
+    /// status-line area with no window: no-op").
+    ///
+    /// FIX (review of 128cfc0, SP7 parity wave 3): this used to rebuild the
+    /// tab layout ITSELF (unscrolled, hardcoded `"{index}:{name}{flags}"`
+    /// text), which predated -- and disagreed with -- `status::status_spans`'s
+    /// window-list overflow scrolling (closes follow-up #69a): once the list
+    /// actually scrolled, a click on the visually-current tab could resolve
+    /// to the wrong window. It now builds the exact same per-window inputs
+    /// `server::render_one` does (format/style overrides, each window's own
+    /// active pane -- see #26/#71) and maps `x` through `status::
+    /// status_tab_columns`, the SAME layout core `status_spans` draws from,
+    /// so the hit-test always agrees with what's actually on screen.
+    ///
+    /// VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39): this used to
+    /// carry a caveat that it doesn't replicate `render::compose_back`'s
+    /// final spatial right-truncation (when left+right don't fit the
+    /// terminal width). Re-investigated: it doesn't need to. `left`/
+    /// `right_len`/`width` (`session.size.0`) are constructed IDENTICALLY
+    /// here and in `render_one`'s status-row build (same `expand_format`/
+    /// `truncate_visible`/`truncate_chars` calls, same option reads), so
+    /// both feed `plan_tab_layout` the exact same inputs; `plan_tab_layout`
+    /// itself guarantees `left_width + list_avail == width - right_len`
+    /// whenever the list fits, and produces ZERO tab hitboxes at all
+    /// whenever it doesn't (the overflow branch's `content_w` saturates to
+    /// 0 before any clip window is computed) -- so `compose_back`'s own
+    /// final truncation step is a provable no-op under matching inputs, not
+    /// a residual gap. `status_click_past_truncation_is_noop`
+    /// (`tests/server_proto.rs`) proves the one place a hit-test bug (as
+    /// opposed to a `compose_back`-truncation-specifically bug) COULD hide
+    /// -- a click on the `<`/`>` overflow marker character itself -- is
+    /// also a no-op, matching real hitboxes (markers are drawn outside
+    /// every `TabColumn` range).
     fn mouse_status_click(&mut self, x: u16, session_name: &str) -> ExecOutcome {
         let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
             return ExecOutcome::Ok(String::new());
         };
         let window = session.current_window();
-        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32;
+        // #32: pane-base-index shifts #P here too, for consistency with
+        // every other `#P`/`pane_index` expansion site.
+        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
         let mut window_flags = String::from("*");
         if window.layout.is_zoomed() {
             window_flags.push('Z');
@@ -2553,35 +3551,80 @@ impl Server {
             now: system_time_parts(),
             pane_title: &pane_title,
         };
-        let left = crate::options::expand_format(self.options.status_left(), &fctx);
-        let left_len = left.chars().count().min(self.options.status_left_length() as usize) as u16;
-        if x < left_len {
-            return ExecOutcome::Ok(String::new());
-        }
+        // status-left/-right/-length are session-scoped (#26). `right_len`
+        // feeds the SAME justify/overflow math `render_one` computes with
+        // (previously ignored entirely here, which also meant `status-
+        // justify` other than the default "left" was silently wrong for
+        // hit-testing).
+        let left = crate::options::expand_format(self.options.status_left_for(&session.session_options), &fctx);
+        let left = status::truncate_visible(&left, self.options.status_left_length_for(&session.session_options));
+        let right_expanded = status::strip_style_markers(&crate::options::expand_format(
+            self.options.status_right_for(&session.session_options),
+            &fctx,
+        ));
+        let right_len =
+            truncate_chars(&right_expanded, self.options.status_right_length_for(&session.session_options)).chars().count();
 
-        let mut cursor = left_len;
-        let last_idx = session.windows.len().saturating_sub(1);
-        let mut target: Option<WindowId> = None;
-        for (i, w) in session.windows.iter().enumerate() {
-            let mut flags = String::new();
-            if w.id == session.current {
-                flags.push('*');
-            } else if Some(w.id) == session.last {
-                flags.push('-');
-            }
-            if w.layout.is_zoomed() {
-                flags.push('Z');
-            }
-            let text_len = format!("{}:{}{}", w.index, w.name, flags).chars().count() as u16;
-            if x >= cursor && x < cursor + text_len {
-                target = Some(w.id);
-                break;
-            }
-            cursor += text_len;
-            if i != last_idx {
-                cursor += 1; // separator space
-            }
-        }
+        // Per-window entries: the SAME construction `render_one` uses (SP7
+        // Task 6/7 -- format/style overrides and each window's OWN active
+        // pane), so `status::status_tab_columns` sees exactly what `status::
+        // status_spans` would draw for this session right now. `style_override`
+        // is left `None`: `status_tab_columns` never reads it (a click
+        // doesn't care what color a tab is), so resolving it here would only
+        // be wasted work.
+        let entries: Vec<status::WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    self.options.window_status_current_format_for(&w.window_options)
+                } else {
+                    self.options.window_status_format_for(&w.window_options)
+                };
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + self.options.pane_base_index_for(&w.window_options);
+                let w_pane_title = self.panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
+                status::WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                    // MUST mirror `render_one`'s entries exactly (see the
+                    // doc comment above) -- the flag chars affect tab text
+                    // width, so leaving these `false` would desync a click
+                    // hit-test's column math from what's actually drawn on
+                    // any window with an active alert.
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
+                    format_override: Some(fmt.to_string()),
+                    style_override: None,
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
+                }
+            })
+            .collect();
+
+        let columns = status::status_tab_columns(
+            &left,
+            &entries,
+            &fctx,
+            self.options.window_status_format_for(&window.window_options),
+            self.options.window_status_current_format_for(&window.window_options),
+            self.options.window_status_separator_for(&window.window_options),
+            self.options.status_justify_for(&session.session_options),
+            session.size.0,
+            right_len,
+        );
+        let target = columns
+            .iter()
+            .find(|c| x >= c.start && x < c.end)
+            .and_then(|c| session.windows.get(c.window_pos))
+            .map(|w| w.id);
         let Some(wid) = target else {
             return ExecOutcome::Ok(String::new());
         };
@@ -2589,6 +3632,7 @@ impl Server {
             if wid != session.current {
                 session.last = Some(session.current);
                 session.current = wid;
+                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
             }
         }
         self.apply_layout_for_session(session_name);
@@ -2603,17 +3647,27 @@ impl Server {
     /// false` replaces every `\n` in the buffer with `\r` before writing —
     /// tmux's own default (`-r` disables it; see the `ParsedCmd::PasteBuffer`
     /// doc comment).
-    fn exec_paste_buffer(&mut self, name: Option<String>, target: Option<String>, no_replace: bool, cs: Option<&str>) -> Result<String, String> {
+    fn exec_paste_buffer(
+        &mut self,
+        name: Option<String>,
+        target: Option<String>,
+        no_replace: bool,
+        bracket: bool,
+        cs: Option<&str>,
+    ) -> Result<String, String> {
         let (_session, _wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
         let data = match &name {
             Some(n) => self.buffers.get(n).ok_or_else(|| format!("buffer not found: {n}"))?.to_string(),
             None => self.buffers.newest().map(|(_, d)| d.to_string()).ok_or_else(|| "no buffer".to_string())?,
         };
         let bytes = if no_replace { data.into_bytes() } else { data.replace('\n', "\r").into_bytes() };
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        if let Some(pane) = self.panes.get(&pane_id) {
+            let bytes = maybe_bracket_paste(bytes, bracket, pane.grid.bracketed_paste());
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread, not a synchronous main-thread `pty.write_input`
+            // -- `paste-buffer` can carry an arbitrarily large buffer, the
+            // exact "huge paste" scenario follow-up #14 targeted.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -2681,78 +3735,275 @@ impl Server {
         Ok(self.expand_with_ctx(&fmt, cs))
     }
 
-    fn exec_show_options(&mut self, _global: bool, name: Option<String>) -> Result<String, String> {
-        match name {
-            Some(n) => match self.options.show(&n) {
-                Some(v) => Ok(format!("{n} {v}\n")),
-                None => Err(format!("unknown option: {n}")),
-            },
+    /// #68 + SP7 Task 6 (closes follow-up #26 for the read side):
+    /// `show-options`/`show`/`show-window-options`/`showw`. `acting_session`
+    /// is the CLIENT'S current session (`None` for a headless/config-load
+    /// call, which has none — a session-/window-scoped name with no `-g`
+    /// and no acting session falls back to the global table, preserving
+    /// every pre-Task-6 headless/config-loading behavior unchanged, the
+    /// DEFAULT-BEHAVIOR REGRESSION BAR).
+    ///
+    /// Scope selection mirrors [`Server::exec_set_option`]'s (see that
+    /// method's doc comment for the full narrowing rationale — no `-t`
+    /// targeting, "acting" always means the client's own current session/
+    /// window): a [`crate::options::Scope::Server`] name always reads
+    /// global; [`crate::options::Scope::Session`]/[`crate::options::
+    /// Scope::Window`] read the acting entity's EFFECTIVE value (local
+    /// override if set, else inherited global — see [`Options::
+    /// show_effective`]'s doc comment for why this is a deliberate
+    /// simplification of tmux's stricter "local-tree-only unless `-A`"
+    /// rule) UNLESS `-g` was given, which always reads the global level
+    /// regardless of the name's scope.
+    fn exec_show_options(
+        &mut self,
+        global: bool,
+        window: bool,
+        quiet: bool,
+        value_only: bool,
+        name: Option<String>,
+        acting_session: Option<&str>,
+    ) -> Result<String, String> {
+        let n = match name {
+            Some(n) => n,
             None => {
                 let s = self.options.show_all();
-                Ok(if s.is_empty() { s } else { format!("{s}\n") })
+                return Ok(if s.is_empty() { s } else { format!("{s}\n") });
             }
+        };
+
+        let result: Result<Option<String>, String> = if n.starts_with('@') {
+            if global {
+                self.options.show_user_option_scoped(&n, quiet, None)
+            } else if window {
+                match self.acting_window_overlay(acting_session) {
+                    Ok(ov) => self.options.show_user_option_scoped(&n, quiet, Some(ov)),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match self.acting_session_overlay(acting_session) {
+                    Ok(ov) => self.options.show_user_option_scoped(&n, quiet, Some(ov)),
+                    // No acting session (headless): same as `-g` — read the
+                    // global @-option store, matching pre-Task-6 behavior.
+                    Err(_) => self.options.show_user_option_scoped(&n, quiet, None),
+                }
+            }
+        } else {
+            match options::scope(&n) {
+                None => Err(format!("unknown option: {n}")),
+                Some(options::Scope::Server) => Ok(self.options.show(&n)),
+                Some(sc) if global => {
+                    let _ = sc;
+                    Ok(self.options.show(&n))
+                }
+                Some(options::Scope::Session) => match self.acting_session_overlay(acting_session) {
+                    Ok(ov) => Ok(self.options.show_effective(&n, Some(ov), None)),
+                    Err(_) => Ok(self.options.show(&n)),
+                },
+                Some(options::Scope::Window) => match self.acting_window_overlay(acting_session) {
+                    Ok(ov) => Ok(self.options.show_effective(&n, None, Some(ov))),
+                    Err(_) => Ok(self.options.show(&n)),
+                },
+            }
+        };
+
+        match result {
+            Ok(Some(v)) => Ok(if value_only { format!("{v}\n") } else { format!("{n} {v}\n") }),
+            Ok(None) if quiet => Ok(String::new()),
+            Ok(None) => Err(format!("invalid option: {n}")),
+            Err(e) => Err(e),
         }
     }
 
-    fn exec_set_option(&mut self, _global: bool, _window: bool, append: bool, unset: bool, name: String, value: Option<String>) -> Result<String, String> {
-        let old_prefix = self.options.prefix();
-        self.options.set(&name, value.as_deref(), append, unset)?;
-        if name == "prefix" {
-            let new_prefix = self.options.prefix();
-            if new_prefix != old_prefix {
-                self.bindings.unbind(WhichTable::Prefix, &old_prefix);
-                self.bindings.bind(
-                    WhichTable::Prefix,
-                    new_prefix,
-                    Binding { cmds: vec![RawCmd { name: "send-prefix".to_string(), args: vec![] }], repeat: false },
-                );
+    /// The acting client's current session's [`options::Overlay`]
+    /// (`Err` if `acting_session` is `None` — headless — or the name no
+    /// longer resolves to a live session).
+    fn acting_session_overlay(&self, acting_session: Option<&str>) -> Result<&options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?;
+        self.registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| &s.session_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    /// `renumber-windows` is session-scoped (#26); a small convenience over
+    /// [`Server::acting_session_overlay`] for the several kill-window/
+    /// move-window call sites that only need this one flag and already
+    /// have a plain `&str` session name in hand (not a full `Option<&str>`
+    /// acting-client context).
+    fn renumber_windows_for_session(&self, session_name: &str) -> bool {
+        match self.registry.sessions().iter().find(|s| s.name == session_name) {
+            Some(s) => self.options.renumber_windows_for(&s.session_options),
+            None => self.options.renumber_windows(),
+        }
+    }
+
+    /// The acting client's current session's CURRENT window's
+    /// [`options::Overlay`] — the "target window" every window-scoped
+    /// `set`/`show` with no `-t` (out of this task's narrowed scope, see
+    /// [`Server::exec_set_option`]'s doc comment) resolves against.
+    fn acting_window_overlay(&self, acting_session: Option<&str>) -> Result<&options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?;
+        self.registry
+            .sessions()
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| &s.current_window().window_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    fn acting_session_overlay_mut(&mut self, acting_session: Option<&str>) -> Result<&mut options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?.to_string();
+        self.registry
+            .session_mut(&name)
+            .map(|s| &mut s.session_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    fn acting_window_overlay_mut(&mut self, acting_session: Option<&str>) -> Result<&mut options::Overlay, String> {
+        let name = acting_session.ok_or_else(|| "no current session".to_string())?.to_string();
+        self.registry
+            .session_mut(&name)
+            .map(|s| &mut s.current_window_mut().window_options)
+            .ok_or_else(|| format!("session not found: {name}"))
+    }
+
+    /// `set-option`/`set`/`set-window-option`/`setw` (SP7 Task 6, closes
+    /// follow-up #26). `acting_session`: the dispatching client's current
+    /// session, `None` for headless (CLI/config-file loading — see
+    /// `execute_headless`'s callers).
+    ///
+    /// **Narrowing, documented honestly (per the task brief's allowance):**
+    /// real tmux's `set-option -t <target>` can target ANY session/window/
+    /// pane by name/index, not just the current one. This task does NOT
+    /// add `-t` support to `set-option`/`show-options` — every session-/
+    /// window-scoped write or read with no `-g` (or `-w`'s window
+    /// counterpart) always targets the ACTING client's OWN current
+    /// session/window. A headless call (CLI `winmux <sock> set ...`, or a
+    /// `.tmux.conf`/`source-file` line — config loading runs before any
+    /// client is attached, so there IS no "current session" yet) has no
+    /// acting session at all: for those, a session-/window-scoped name
+    /// with no `-g` falls back to writing/reading the GLOBAL table exactly
+    /// as it did before this task — this is what keeps every existing
+    /// config-loading/CLI test passing unchanged (the DEFAULT-BEHAVIOR
+    /// REGRESSION BAR).
+    ///
+    /// The `window` flag (parsed from `-w`, or implied by `setw`/`set-
+    /// window-option`) matters ONLY for `@`-options, whose scope tmux
+    /// picks purely from flags (`-w` window, default session,
+    /// `commands-config-options-formats.md` §3.3.4 step 4's last bullet).
+    /// For NAMED options **the table decides scope** (same section) — so
+    /// `window` is accepted but ignored for a named option's WRITE target,
+    /// same as it always was pre-Task-6 (Server-scope names' `-g`/`-w` are
+    /// tmux-documented no-ops too: "any -g/-w is harmless/ignored").
+    ///
+    /// **Live side effects** (prefix rebinding, repeat-time/escape-time
+    /// propagation to every `KeyMachine`, the mouse-mode broadcast, and the
+    /// status on/position resize) are cross-cutting and currently only
+    /// implemented for a GLOBAL write, matching every behavior that
+    /// existed before this task (`escape-time`/`buffer-limit` are
+    /// Server-scope and therefore ALWAYS global, so their side effects are
+    /// unaffected either way). A per-session `set prefix ...` (no `-g`)
+    /// correctly round-trips through `show`/`setw`-style reads but does
+    /// NOT (yet) live-rebind that one session's clients — tracked as a new
+    /// follow-up (see the task report).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_set_option(
+        &mut self,
+        global: bool,
+        window: bool,
+        append: bool,
+        unset: bool,
+        name: String,
+        value: Option<String>,
+        acting_session: Option<&str>,
+    ) -> Result<String, String> {
+        if let Some(_uname) = name.strip_prefix('@') {
+            if global || acting_session.is_none() {
+                self.options.set(&name, value.as_deref(), append, unset)?;
+            } else if window {
+                self.acting_window_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
+            } else {
+                self.acting_session_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
+            }
+            return Ok(String::new());
+        }
+
+        let sc = options::scope(&name); // None -> unknown option; let the target's own `set` produce that exact error.
+        let wrote_global = global || matches!(sc, Some(options::Scope::Server) | None) || acting_session.is_none();
+
+        if wrote_global {
+            let old_prefix = self.options.prefix();
+            self.options.set(&name, value.as_deref(), append, unset)?;
+            if name == "prefix" {
+                let new_prefix = self.options.prefix();
+                if new_prefix != old_prefix {
+                    self.bindings.unbind(WhichTable::Prefix, &old_prefix);
+                    self.bindings.bind(
+                        WhichTable::Prefix,
+                        new_prefix,
+                        Binding { cmds: vec![RawCmd { name: "send-prefix".to_string(), args: vec![] }], repeat: false },
+                    );
+                    for c in self.clients.values_mut() {
+                        c.key_machine.set_prefix(new_prefix);
+                    }
+                }
+            } else if name == "repeat-time" {
+                let rt = self.options.repeat_time();
                 for c in self.clients.values_mut() {
-                    c.key_machine.set_prefix(new_prefix);
+                    c.key_machine.set_repeat_time(rt);
+                }
+            } else if name == "escape-time" {
+                // Task 9: propagate to every attached client's KeyMachine
+                // immediately (same pattern as `repeat-time` just above) -- a
+                // pending ESC that's ALREADY outstanding is not retroactively
+                // re-evaluated (see `KeyMachine::set_escape_time`'s doc
+                // comment), only the duration used for the NEXT `escape_ready`
+                // check changes.
+                let et = self.options.escape_time();
+                for c in self.clients.values_mut() {
+                    c.key_machine.set_escape_time(et);
+                }
+            } else if name == "mouse" {
+                // Task 5: broadcast the SGR mouse-mode enable/disable escape
+                // sequences to every CURRENTLY attached client immediately (a
+                // raw Output frame, not waiting for the next composed render —
+                // this global write affects every session, not
+                // just the acting client's). A client attaching AFTER this point
+                // gets the enable sequence from `finish_attach` instead. The
+                // client's own terminal restore path (`host::apply_restore`)
+                // unconditionally writes the disable sequence on exit regardless
+                // of what the server ever sent, so a crashed/killed server can't
+                // leave a client's real terminal with mouse reporting stuck on.
+                let seq = if self.options.mouse() { super::MOUSE_ENABLE_SEQ } else { super::MOUSE_DISABLE_SEQ };
+                for c in self.clients.values() {
+                    super::send_output(&c.tx, seq.to_vec());
+                }
+            } else if matches!(name.as_str(), "status" | "status-position") {
+                // The status row's on/off state and position change every
+                // session's pane area (row count for `status`, y origin for
+                // `status-position`): recompute the shared size and reapply the
+                // layout — resizing ptys/grids — for every session, not just the
+                // acting client's. The post-dispatch
+                // re-render then draws the moved/removed bar.
+                let names: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+                for n in names {
+                    self.recompute_session_size(&n);
+                    self.apply_layout_for_session(&n);
                 }
             }
-        } else if name == "repeat-time" {
-            let rt = self.options.repeat_time();
-            for c in self.clients.values_mut() {
-                c.key_machine.set_repeat_time(rt);
+            return Ok(String::new());
+        }
+
+        match sc {
+            Some(options::Scope::Session) => {
+                self.acting_session_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
             }
-        } else if name == "escape-time" {
-            // Task 9: propagate to every attached client's KeyMachine
-            // immediately (same pattern as `repeat-time` just above) -- a
-            // pending ESC that's ALREADY outstanding is not retroactively
-            // re-evaluated (see `KeyMachine::set_escape_time`'s doc
-            // comment), only the duration used for the NEXT `escape_ready`
-            // check changes.
-            let et = self.options.escape_time();
-            for c in self.clients.values_mut() {
-                c.key_machine.set_escape_time(et);
+            Some(options::Scope::Window) => {
+                self.acting_window_overlay_mut(acting_session)?.set(&name, value.as_deref(), append, unset)?;
             }
-        } else if name == "mouse" {
-            // Task 5: broadcast the SGR mouse-mode enable/disable escape
-            // sequences to every CURRENTLY attached client immediately (a
-            // raw Output frame, not waiting for the next composed render —
-            // `mouse` is a global option so this affects every session, not
-            // just the acting client's). A client attaching AFTER this point
-            // gets the enable sequence from `finish_attach` instead. The
-            // client's own terminal restore path (`host::apply_restore`)
-            // unconditionally writes the disable sequence on exit regardless
-            // of what the server ever sent, so a crashed/killed server can't
-            // leave a client's real terminal with mouse reporting stuck on.
-            let seq = if self.options.mouse() { super::MOUSE_ENABLE_SEQ } else { super::MOUSE_DISABLE_SEQ };
-            for c in self.clients.values() {
-                super::send_output(&c.tx, seq.to_vec());
-            }
-        } else if matches!(name.as_str(), "status" | "status-position") {
-            // The status row's on/off state and position change every
-            // session's pane area (row count for `status`, y origin for
-            // `status-position`): recompute the shared size and reapply the
-            // layout — resizing ptys/grids — for every session, not just the
-            // acting client's (options are global). The post-dispatch
-            // re-render then draws the moved/removed bar.
-            let names: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
-            for n in names {
-                self.recompute_session_size(&n);
-                self.apply_layout_for_session(&n);
-            }
+            Some(options::Scope::Server) | None => unreachable!("handled by the wrote_global branch above"),
         }
         Ok(String::new())
     }
@@ -2776,7 +4027,15 @@ impl Server {
         Ok(String::new())
     }
 
-    fn exec_unbind_key(&mut self, all: bool, table: String, key: Option<String>) -> Result<String, String> {
+    /// `quiet` (`-q`, follow-up #67(a)): real tmux errors `unknown key: %s`
+    /// on an unparseable key token unless `-q` is given
+    /// (`docs/tmux-reference/commands-config-options-formats.md:442`) --
+    /// winmux used to swallow this unconditionally (a "no such binding can
+    /// exist anyway" rationalization that predates mouse pseudo-keys
+    /// actually parsing for real, Task 8, SP7 wave 3: those now resolve via
+    /// `keys::parse_key` like any other key, so this path is purely about
+    /// genuinely malformed tokens, e.g. a typo like `unbind Ct-x`).
+    fn exec_unbind_key(&mut self, all: bool, table: String, key: Option<String>, quiet: bool) -> Result<String, String> {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
@@ -2789,22 +4048,14 @@ impl Server {
             return Ok(String::new());
         }
         let key = key.expect("cmd::resolve guarantees a key unless -a is given");
-        // A key token that isn't valid winmux key notation (e.g. tmux's
-        // mouse pseudo-keys like `MouseDragEnd1Pane` -- real tmux keys, but
-        // winmux's mouse handling is hardcoded dispatch logic, not
-        // table-driven via named pseudo-keys, so no such binding could ever
-        // exist here to remove) is a silent no-op on UNBIND, not an error:
-        // removing something that structurally can never be bound is at
-        // least as harmless as removing something merely unbound (doc:
-        // "Removing a key that isn't bound is a silent no-op"; an
-        // unrecognized key is also one of the things real tmux's `-q`
-        // suppresses). `bind-key` (above) still errors on a bad key --
-        // CREATING a binding to a garbage key is a real mistake worth
-        // reporting; removing a no-op binding is not.
-        if let Some(k) = crate::keys::parse_key(&key) {
-            self.bindings.unbind(which, &k);
+        match crate::keys::parse_key(&key) {
+            Some(k) => {
+                self.bindings.unbind(which, &k);
+                Ok(String::new())
+            }
+            None if quiet => Ok(String::new()),
+            None => Err(format!("unknown key: {key}")),
         }
-        Ok(String::new())
     }
 
     /// Load and dispatch every config candidate in order, joining line
@@ -2944,13 +4195,24 @@ impl Server {
         let session = self.registry.sessions().iter().find(|s| s.name == name).ok_or_else(|| format!("can't find session: {name}"))?;
         let mut out = String::new();
         for w in &session.windows {
-            let flag = if w.id == session.current {
-                "*"
+            // Alerts subsystem (SP7 Task 17, closes follow-up #74): same
+            // `#`/`!`/`~` chars and ordering as `status::flags` (tmux's
+            // `window_printable_flags`), ahead of `*`/`-`.
+            let mut flag = String::new();
+            if w.alert_activity {
+                flag.push('#');
+            }
+            if w.alert_bell {
+                flag.push('!');
+            }
+            if w.alert_silence {
+                flag.push('~');
+            }
+            if w.id == session.current {
+                flag.push('*');
             } else if Some(w.id) == session.last {
-                "-"
-            } else {
-                ""
-            };
+                flag.push('-');
+            }
             let active = if w.id == session.current { " (active)" } else { "" };
             let panes = w.layout.panes().len();
             let (cols, rows) = session.size;
@@ -3100,10 +4362,10 @@ impl Server {
             DisplayMessage { text } => self.exec_display_message(text, None),
             ConfirmBefore { .. } => Err("confirm-before: only from a client connection".to_string()),
             CommandPrompt { .. } => Err("command-prompt: only from a client connection".to_string()),
-            SetOption { global, window, append, unset, name, value } => self.exec_set_option(global, window, append, unset, name, value),
-            ShowOptions { global, name } => self.exec_show_options(global, name),
+            SetOption { global, window, append, unset, name, value } => self.exec_set_option(global, window, append, unset, name, value, None),
+            ShowOptions { global, window, quiet, value_only, name } => self.exec_show_options(global, window, quiet, value_only, name, None),
             BindKey { table, repeat, key, tail } => self.exec_bind_key(table, repeat, key, tail),
-            UnbindKey { all, table, key } => self.exec_unbind_key(all, table, key),
+            UnbindKey { all, table, key, quiet } => self.exec_unbind_key(all, table, key, quiet),
             ListKeys => Ok(self.bindings.list()),
             SourceFile { path } => self.execute_source_file_headless(&path),
             NewSession { detached, name, cols, rows } => self.exec_new_session(detached, name, cols, rows),
@@ -3115,7 +4377,7 @@ impl Server {
             KillServer => self.exec_kill_server(),
             CopyMode { .. } => Err("no current client".to_string()),
             CopyCmd(_) => Err("no current client".to_string()),
-            PasteBuffer { name, target, no_replace } => self.exec_paste_buffer(name, target, no_replace, None),
+            PasteBuffer { name, target, no_replace, bracket } => self.exec_paste_buffer(name, target, no_replace, bracket, None),
             ListBuffers => self.exec_list_buffers_headless(),
             DeleteBuffer { name } => self.exec_delete_buffer(name),
             SetBuffer { name, data } => self.exec_set_buffer(name, data),
@@ -3123,13 +4385,21 @@ impl Server {
             NextLayout { target } => self.exec_next_layout(target, None),
             SwapPane { dir, src, dst } => self.exec_swap_pane(dir, src, dst, None),
             RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
-            BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
+            BreakPane { detached, name, src, dst } => self.exec_break_pane(detached, name, src, dst, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
             SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst, detach, None),
-            FindWindow { pattern } => self.exec_find_window(pattern, None),
+            // SP7 Task 12 (closes #46/#54): opening a (possibly filtered)
+            // choose-tree is fundamentally a CLIENT-side mode -- same rule
+            // as `ChooseTree` below -- there is no more headless direct-jump
+            // path (that was the parity deviation being fixed).
+            FindWindow { .. } => Err("no current client".to_string()),
             ChooseTree { .. } => Err("no current client".to_string()),
+            ChooseBuffer => Err("no current client".to_string()),
+            ChooseClient => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
             ClockMode => Err("no current client".to_string()),
+            DisplayMenu { .. } => Err("no current client".to_string()),
+            SwitchClientTo { .. } => Err("switch-client: only from a client connection".to_string()),
         }
     }
 
@@ -3285,10 +4555,14 @@ impl Server {
                 client.key_machine.set_capture(true);
                 ExecOutcome::Ok(String::new())
             }
-            SetOption { global, window, append, unset, name, value } => wrap(self.exec_set_option(global, window, append, unset, name, value)),
-            ShowOptions { global, name } => wrap(self.exec_show_options(global, name)),
+            SetOption { global, window, append, unset, name, value } => {
+                wrap(self.exec_set_option(global, window, append, unset, name, value, Some(session_name.as_str())))
+            }
+            ShowOptions { global, window, quiet, value_only, name } => {
+                wrap(self.exec_show_options(global, window, quiet, value_only, name, Some(session_name.as_str())))
+            }
             BindKey { table, repeat, key, tail } => wrap(self.exec_bind_key(table, repeat, key, tail)),
-            UnbindKey { all, table, key } => wrap(self.exec_unbind_key(all, table, key)),
+            UnbindKey { all, table, key, quiet } => wrap(self.exec_unbind_key(all, table, key, quiet)),
             ListKeys => ExecOutcome::Ok(self.bindings.list()),
             SourceFile { path } => wrap(self.execute_source_file_headless(&path)),
             NewSession { detached, name, cols, rows } => wrap(self.exec_new_session(detached, name, cols, rows)),
@@ -3300,7 +4574,9 @@ impl Server {
             KillServer => wrap(self.exec_kill_server()),
             CopyMode { page_up, mouse } => self.exec_copy_mode(page_up, mouse, client, session_name),
             CopyCmd(action) => self.exec_copy_action(action, client),
-            PasteBuffer { name, target, no_replace } => wrap(self.exec_paste_buffer(name, target, no_replace, Some(session_name.as_str()))),
+            PasteBuffer { name, target, no_replace, bracket } => {
+                wrap(self.exec_paste_buffer(name, target, no_replace, bracket, Some(session_name.as_str())))
+            }
             ListBuffers => self.exec_list_buffers_client(),
             DeleteBuffer { name } => wrap(self.exec_delete_buffer(name)),
             SetBuffer { name, data } => wrap(self.exec_set_buffer(name, data)),
@@ -3308,13 +4584,22 @@ impl Server {
             NextLayout { target } => wrap(self.exec_next_layout(target, Some(session_name.as_str()))),
             SwapPane { dir, src, dst } => wrap(self.exec_swap_pane(dir, src, dst, Some(session_name.as_str()))),
             RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
-            BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
+            BreakPane { detached, name, src, dst } => wrap(self.exec_break_pane(detached, name, src, dst, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
             SwapWindow { src, dst, detach } => wrap(self.exec_swap_window(src, dst, detach, Some(session_name.as_str()))),
-            FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
+            FindWindow { pattern, by_content, by_name, by_title, regex, ignore_case } => {
+                self.exec_find_window_client(pattern, by_content, by_name, by_title, regex, ignore_case, client, session_name.as_str())
+            }
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
+            ChooseBuffer => self.exec_choose_buffer_client(client, session_name.as_str()),
+            ChooseClient => self.exec_choose_client_client(client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
             ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
+            DisplayMenu { target: _, x, y, title, stay_open: _, items } => self.exec_display_menu_client(x, y, title, items, client),
+            SwitchClientTo { target } => match super::switch_client_session_to(&mut self.registry, client, session_name, &target) {
+                Some((old, new)) => ExecOutcome::SwitchedSession(old, new),
+                None => ExecOutcome::Ok(String::new()),
+            },
         }
     }
 
@@ -3352,19 +4637,63 @@ impl Server {
                 return self.feed_copy_search_byte(client, b);
             }
         }
+        // SP7 Task 15 (closes #50's remainder): a choose overlay with an
+        // OPEN filter edit (`f` was pressed, `ChooseTreeState::filter_edit`)
+        // arms capture the same way, staying in `ClientMode::ChooseTree`
+        // for the exact same reason `CopyState::search_prompt` stays in
+        // `ClientMode::Copy` — see that field's own doc comment.
+        if let ClientMode::ChooseTree(state) = &client.mode {
+            if state.filter_edit.is_some() {
+                return self.feed_choose_filter_byte(client, b);
+            }
+        }
         match client.mode {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
             // Copy mode (Task 2) without an open search prompt, and
-            // choose-tree/display-panes/clock-mode (Tasks 8, 10), never arm
-            // raw capture (`set_capture`) — their keys flow through the
-            // normal `KeyInputEvent::Key`/`Forward` path with a table
-            // override (see `handle_stdin`), not `Captured` bytes. This arm
-            // exists only for match-exhaustiveness.
-            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => {
-                (true, None)
-            }
+            // choose-tree (without an open filter edit)/display-panes/
+            // clock-mode (Tasks 8, 10), never arm raw capture
+            // (`set_capture`) — their keys flow through the normal
+            // `KeyInputEvent::Key`/`Forward` path with a table override
+            // (see `handle_stdin`), not `Captured` bytes. This arm exists
+            // only for match-exhaustiveness.
+            ClientMode::Normal
+            | ClientMode::Copy(_)
+            | ClientMode::ChooseTree(_)
+            | ClientMode::DisplayPanes(_)
+            | ClientMode::Clock(_)
+            | ClientMode::Menu(_) => (true, None),
         }
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): route one byte of the `f`
+    /// filter prompt's line edit — same commit/cancel/printable/backspace
+    /// rules as `feed_prompt_byte`/`feed_copy_search_byte`, via the shared
+    /// `edit_line_buf` helper. Commit sets the ACTIVE `filter` (empty commit
+    /// clears it, mirroring `## 7.1`'s "empty input clears it"); cancel
+    /// (Esc/`C-c`/`C-g`) leaves the previously-active filter untouched.
+    fn feed_choose_filter_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>) {
+        let mut scratch = String::new();
+        let buf = match &mut client.mode {
+            ClientMode::ChooseTree(state) => state.filter_edit.as_mut().unwrap_or(&mut scratch),
+            _ => &mut scratch,
+        };
+        let edit = edit_line_buf(buf, b);
+        if matches!(edit, LineEdit::Editing) {
+            return (false, None);
+        }
+        client.key_machine.set_capture(false);
+        let ClientMode::ChooseTree(state) = &mut client.mode else {
+            return (true, None);
+        };
+        let Some(edited) = state.filter_edit.take() else {
+            return (true, None);
+        };
+        if matches!(edit, LineEdit::Cancel) {
+            return (true, None);
+        }
+        state.filter = if edited.is_empty() { None } else { Some(edited) };
+        (true, None)
     }
 
     /// Route one byte of a copy-mode search prompt's (Task 4) line edit:
@@ -3525,17 +4854,11 @@ impl Server {
                 }
                 (true, None)
             }
-            PromptKind::FindWindow => {
-                match self.exec_find_window(buf, Some(session_name.as_str())) {
-                    Ok(msg) => {
-                        if !msg.is_empty() {
-                            client.message = Some((msg, Instant::now()));
-                        }
-                    }
-                    Err(e) => client.message = Some((e, Instant::now())),
-                }
-                (true, None)
-            }
+            // The `f` prompt never supplies `-C`/`-N`/`-T`/`-r`/`-i` --
+            // `exec_find_window_client` treats all-false `by_*` as "match
+            // all three" (the doc's own default), matching this prompt's
+            // pre-Task-12 "search everything" behavior exactly.
+            PromptKind::FindWindow => (true, Some(self.exec_find_window_client(buf, false, false, false, false, false, client, session_name.as_str()))),
             // Task-7 review, Important finding #1: `buf` is raw, unfiltered
             // prompt text (see `edit_line_buf`) -- without this check, a
             // non-numeric commit fell through `resolve_window_target`'s
@@ -3598,11 +4921,35 @@ enum ChooseTreeAction {
     Expand,
     Collapse,
     TogglePreview,
+    /// SP7 Task 15 (closes #50's remainder): `t` toggle-tag current row.
+    ToggleTag,
+    /// `T` untag every row.
+    UntagAll,
+    /// `C-t` tag every currently-visible ROOT row (`## 7.1`: "all root
+    /// items" — depth-0 rows here, i.e. every currently-listed session
+    /// (`Sessions`) or the header row (`Windows`, a no-op target in
+    /// practice — its `x`/tag flow never targets it), or every buffer/
+    /// client row (`Buffers`/`Clients`, which are ENTIRELY root rows)).
+    TagAll,
+    /// `O` cycle to the next sort field in the view's sequence.
+    SortNext,
+    /// `r` flip the reverse flag.
+    SortReverse,
+    /// `f` open the filter edit prompt.
+    FilterOpen,
+    /// `c` clear the active filter.
+    FilterClear,
 }
 
 fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
     if key.ctrl && matches!(key.code, KeyCode::Char('c')) {
         return Some(ChooseTreeAction::Cancel);
+    }
+    // SP7 Task 15: `C-t` (tag all) is the one other ctrl-modified key this
+    // overlay recognizes -- checked before the blanket `key.ctrl ||
+    // key.meta => None` guard below, same pattern as `C-c` above.
+    if key.ctrl && matches!(key.code, KeyCode::Char('t')) {
+        return Some(ChooseTreeAction::TagAll);
     }
     if key.ctrl || key.meta {
         return None;
@@ -3623,7 +4970,48 @@ fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
         KeyCode::Char('h') => Some(ChooseTreeAction::Collapse),
         KeyCode::Char('-') => Some(ChooseTreeAction::Collapse),
         KeyCode::Char('v') => Some(ChooseTreeAction::TogglePreview),
+        KeyCode::Char('t') => Some(ChooseTreeAction::ToggleTag),
+        KeyCode::Char('T') => Some(ChooseTreeAction::UntagAll),
+        KeyCode::Char('O') => Some(ChooseTreeAction::SortNext),
+        KeyCode::Char('r') => Some(ChooseTreeAction::SortReverse),
+        KeyCode::Char('f') => Some(ChooseTreeAction::FilterOpen),
+        KeyCode::Char('c') => Some(ChooseTreeAction::FilterClear),
         _ => None,
+    }
+}
+
+/// SP7 Task 14 (#48/#49): the display identity for an attached client --
+/// winmux has no tty path, so the `ClientId` itself stands in for tmux's
+/// client name (`## 9`). Shared by row-building and title-building so they
+/// never disagree.
+fn client_label(id: ClientId) -> String {
+    format!("client-{id}")
+}
+
+/// SP7 Task 15 (closes #50's remainder): each view's `O`-cycle sequence,
+/// restricted vs. tmux's own (see [`SortKey`]'s doc comment for what's not
+/// modeled and why). The sequence's FIRST entry is also the view's default
+/// sort at overlay-open time (`Server::exec_choose_tree_client` et al.).
+fn sort_seq(view: ChooseTreeView) -> &'static [SortKey] {
+    match view {
+        ChooseTreeView::Windows | ChooseTreeView::Sessions => &[SortKey::Index, SortKey::Name],
+        ChooseTreeView::Buffers => &[SortKey::Creation, SortKey::Name, SortKey::Size],
+        ChooseTreeView::Clients => &[SortKey::Name, SortKey::Size, SortKey::Creation],
+    }
+}
+
+fn next_sort(view: ChooseTreeView, cur: SortKey) -> SortKey {
+    let seq = sort_seq(view);
+    let i = seq.iter().position(|k| *k == cur).unwrap_or(0);
+    seq[(i + 1) % seq.len()]
+}
+
+fn sort_key_name(k: SortKey) -> &'static str {
+    match k {
+        SortKey::Index => "index",
+        SortKey::Name => "name",
+        SortKey::Size => "size",
+        SortKey::Creation => "creation",
     }
 }
 
@@ -3649,7 +5037,33 @@ impl Server {
     /// the "current session's windows only" scope simplification this task
     /// deliberately leaves unchanged (real tmux's `-w` shows the whole
     /// multi-session tree; see `ChooseTreeView`'s doc comment).
-    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>) -> Vec<TreeRow> {
+    ///
+    /// `win_filter` (SP7 Task 12, closes follow-ups #46/#54): `Some(ids)`
+    /// restricts the `Windows` view's window rows to `ids` (the session
+    /// HEADER row is always emitted regardless, for context); `None` shows
+    /// every window, unchanged. `Sessions` ignores `win_filter` entirely --
+    /// `find-window` never opens that view.
+    ///
+    /// SP7 Task 14/15: `Buffers`/`Clients` are FLAT (`depth: 0`, `marker:
+    /// None` on every row -- `## 9`/`## 10`); `sort`/`reversed` (Task 15)
+    /// order every view's rows per [`sort_seq`]'s restricted sequence --
+    /// sessions/windows are sorted by NAME when `sort == Name` (`Index`
+    /// keeps the registry's natural creation/index order, already correct
+    /// with no work: `Registry::sessions()` is creation order and
+    /// `Session::windows` is kept index-sorted); buffers default to
+    /// NEWEST-first (`Buffers::list()` is oldest-first, so `Creation`
+    /// reverses it, matching `## 10`'s documented default direction) and
+    /// otherwise sort by name/byte-size; clients sort by their synthetic
+    /// [`client_label`] name, `cols*rows` area, or `attached_at`.
+    pub(super) fn build_tree_rows(
+        &self,
+        session_name: &str,
+        view: ChooseTreeView,
+        expanded: &HashSet<String>,
+        win_filter: Option<&HashSet<WindowId>>,
+        sort: SortKey,
+        reversed: bool,
+    ) -> Vec<TreeRow> {
         let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
         let session_text = |s: &Session| format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" });
         let window_row = |session: &Session, w: &Window| {
@@ -3667,10 +5081,27 @@ impl Server {
                 marker: None,
             }
         };
+        fn sorted_windows(session: &Session, sort: SortKey, reversed: bool) -> Vec<&Window> {
+            let mut ws: Vec<&Window> = session.windows.iter().collect();
+            if sort == SortKey::Name {
+                ws.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            if reversed {
+                ws.reverse();
+            }
+            ws
+        }
         match view {
             ChooseTreeView::Sessions => {
+                let mut sessions: Vec<&Session> = self.registry.sessions().iter().collect();
+                if sort == SortKey::Name {
+                    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                if reversed {
+                    sessions.reverse();
+                }
                 let mut rows = Vec::new();
-                for s in self.registry.sessions() {
+                for s in sessions {
                     let is_expanded = expanded.contains(&s.name);
                     rows.push(TreeRow {
                         text: session_text(s),
@@ -3679,7 +5110,7 @@ impl Server {
                         marker: Some(if is_expanded { '-' } else { '+' }),
                     });
                     if is_expanded {
-                        rows.extend(s.windows.iter().map(|w| window_row(s, w)));
+                        rows.extend(sorted_windows(s, sort, reversed).into_iter().map(|w| window_row(s, w)));
                     }
                 }
                 rows
@@ -3694,22 +5125,194 @@ impl Server {
                     depth: 0,
                     marker: Some('-'),
                 }];
-                rows.extend(session.windows.iter().map(|w| window_row(session, w)));
+                // Task 12's find-window match set narrows the leaf rows
+                // FIRST; Task 15's sort/reverse then orders what survived.
+                rows.extend(
+                    sorted_windows(session, sort, reversed)
+                        .into_iter()
+                        .filter(|w| win_filter.is_none_or(|f| f.contains(&w.id)))
+                        .map(|w| window_row(session, w)),
+                );
                 rows
+            }
+            ChooseTreeView::Buffers => {
+                let mut list = self.buffers.list(); // oldest-first
+                match sort {
+                    SortKey::Creation => list.reverse(), // default: newest-first
+                    SortKey::Name => list.sort_by(|a, b| a.0.cmp(&b.0)),
+                    SortKey::Size => list.sort_by_key(|(_, size, _)| *size),
+                    SortKey::Index => {}
+                }
+                if reversed {
+                    list.reverse();
+                }
+                list.into_iter()
+                    .map(|(name, size, sample)| TreeRow {
+                        text: format!("{name}: {size} bytes: \"{sample}\""),
+                        target: TreeTarget::Buffer(name),
+                        depth: 0,
+                        marker: None,
+                    })
+                    .collect()
+            }
+            ChooseTreeView::Clients => {
+                let mut entries: Vec<(ClientId, &ClientState)> = self.clients.iter().map(|(id, c)| (*id, c)).collect();
+                match sort {
+                    SortKey::Name => entries.sort_by_key(|(id, _)| client_label(*id)),
+                    SortKey::Size => entries.sort_by_key(|(_, c)| c.cols as u32 * c.rows as u32),
+                    SortKey::Creation => entries.sort_by_key(|(_, c)| c.attached_at),
+                    SortKey::Index => entries.sort_by_key(|(id, _)| *id),
+                }
+                if reversed {
+                    entries.reverse();
+                }
+                entries
+                    .into_iter()
+                    .map(|(id, c)| TreeRow {
+                        text: format!(
+                            "{}: session {} (attached {}s)",
+                            client_label(id),
+                            c.session.as_deref().unwrap_or(""),
+                            c.attached_at.elapsed().as_secs()
+                        ),
+                        target: TreeTarget::Client(id),
+                        depth: 0,
+                        marker: None,
+                    })
+                    .collect()
             }
         }
     }
 
+    /// SP7 Task 15 (closes #50's remainder; `docs/tmux-reference/
+    /// choose-tree.md` `## 7.1`/`## 2.2`): a substring, case-insensitive
+    /// filter over a row's already-formatted `text` -- a documented
+    /// simplification of tmux's real per-pane FORMAT filter. A depth-0 row
+    /// is ALSO kept when any of its immediately-following depth-1 children
+    /// matches (mirroring "rows whose whole subtree fails the filter
+    /// disappear" for this project's two-level tree); `Buffers`/`Clients`
+    /// rows are all depth-0 with no children, so only their own text match
+    /// applies. Returns the SUBSET that matched (possibly empty — callers
+    /// decide what "matched nothing" means, see [`Server::build_choose_rows`]).
+    fn apply_choose_filter(rows: Vec<TreeRow>, filter: &str) -> Vec<TreeRow> {
+        if filter.is_empty() {
+            return rows;
+        }
+        let needle = filter.to_lowercase();
+        let mut keep = vec![false; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            if r.text.to_lowercase().contains(&needle) {
+                keep[i] = true;
+            }
+        }
+        let mut i = 0;
+        while i < rows.len() {
+            if rows[i].depth == 0 {
+                let mut j = i + 1;
+                let mut any_child = false;
+                while j < rows.len() && rows[j].depth > 0 {
+                    if keep[j] {
+                        any_child = true;
+                    }
+                    j += 1;
+                }
+                if any_child {
+                    keep[i] = true;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        rows.into_iter().zip(keep).filter_map(|(r, k)| k.then_some(r)).collect()
+    }
+
+    /// SP7 Task 15: the one seam both `Server::build_render_overlay` and
+    /// `dispatch_choose_tree_key` go through to get this client's CURRENT
+    /// row list -- sort applied inside `build_tree_rows`, then the active
+    /// filter (if any) on top. Returns `(rows, filter_no_matches)`:
+    /// `filter_no_matches` is `true` when a non-empty filter is active but
+    /// matched nothing, in which case `rows` is the UNFILTERED list (`##
+    /// 2.2` point 4's "ignore an over-narrow filter" rule) — the title
+    /// (`build_choose_title`) is what actually tells the user their filter
+    /// matched nothing.
+    pub(super) fn build_choose_rows(&self, session_name: &str, state: &ChooseTreeState) -> (Vec<TreeRow>, bool) {
+        let rows = self.build_tree_rows(session_name, state.view, &state.expanded, state.win_filter.as_ref(), state.sort, state.reversed);
+        match state.filter.as_deref() {
+            Some(f) if !f.is_empty() => {
+                let filtered = Server::apply_choose_filter(rows, f);
+                if filtered.is_empty() {
+                    (self.build_tree_rows(session_name, state.view, &state.expanded, state.win_filter.as_ref(), state.sort, state.reversed), true)
+                } else {
+                    (filtered, false)
+                }
+            }
+            _ => (rows, false),
+        }
+    }
+
+    /// SP7 Task 15 (`## 3.2`): the box-title-shaped string painted on the
+    /// overlay's own first row — `" <item> (sort: <field>[, reversed])[
+    /// (filter: active|no matches)]"`. `<item>` is the CURRENTLY SELECTED
+    /// row's own display name (session name / `idx:name` / buffer name /
+    /// [`client_label`]), matching tmux's own title (its preview box's
+    /// title happens to be the same string, `## 3.2` — winmux paints this
+    /// version even when the preview itself is off/too small to show, a
+    /// harmless superset).
+    pub(super) fn build_choose_title(&self, rows: &[TreeRow], sel: usize, state: &ChooseTreeState, filter_no_matches: bool) -> String {
+        let item = match rows.get(sel) {
+            Some(r) => self.item_display_name(&r.target),
+            None => String::new(),
+        };
+        let mut title = format!(" {} (sort: {}{})", item, sort_key_name(state.sort), if state.reversed { ", reversed" } else { "" });
+        if filter_no_matches {
+            title.push_str(" (filter: no matches)");
+        } else if state.filter.as_deref().is_some_and(|f| !f.is_empty()) {
+            title.push_str(" (filter: active)");
+        }
+        title
+    }
+
+    fn item_display_name(&self, target: &TreeTarget) -> String {
+        match target {
+            TreeTarget::Session(n) => n.clone(),
+            TreeTarget::Window(sn, wid) => self
+                .registry
+                .sessions()
+                .iter()
+                .find(|s| s.name == *sn)
+                .and_then(|s| s.windows.iter().find(|w| w.id == *wid))
+                .map(|w| format!("{}:{}", w.index, w.name))
+                .unwrap_or_default(),
+            TreeTarget::Buffer(n) => n.clone(),
+            TreeTarget::Client(id) => client_label(*id),
+        }
+    }
+
     /// choose-tree preview sizing (SP6 wave 2, Task 8;
-    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`
-    /// plus `mode_tree_draw`'s own box-size guard): the ROW LIST's height in
-    /// panel rows -- the preview (if any) occupies every row below it, i.e.
-    /// `sy - h`. Returns `sy` itself (no preview at all) whenever the mode
-    /// is `Off`, the computed split would leave the list under 10 rows
-    /// (NORMAL) / the preview under 2 rows total (BIG, or the final `sy - h
-    /// < 2` guard), or the panel is too small in either axis for a sensible
-    /// box (`sy <= 4 || h < 2 || sy - h <= 4 || w <= 4`).
-    pub(super) fn choose_tree_list_height(sy: u16, w: u16, line_size: usize, mode: PreviewMode) -> u16 {
+    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`):
+    /// the ROW LIST's height in panel rows -- the preview (if any) occupies
+    /// every row below it, i.e. `sy - h`. Returns `sy` itself (no preview at
+    /// all, list gets the WHOLE panel) whenever the mode is `Off`, the
+    /// computed split would leave the list under 10 rows (NORMAL), or the
+    /// preview under 2 rows total (BIG, or the final `sy - h < 2` guard) --
+    /// these three collapses are `mode_tree_set_height`'s OWN formula
+    /// (mode-tree.c:626-654), reproduced verbatim.
+    ///
+    /// SP7 Task 15 fix (closes #73, mode-tree.c:980-981's box-size guard):
+    /// this function used to ALSO collapse `h` to `sy` whenever `mode_tree_
+    /// draw`'s SEPARATE paint-time guard (`sy <= 4 || h < 2 || sy - h <= 4 ||
+    /// w <= 4`) would fail -- conflating "the sizing formula legitimately
+    /// wants the list full-height" with "the box happens to be too small to
+    /// paint," which silently EXPANDED the row list into space a tiny
+    /// preview box would have occupied. Real tmux keeps the two concerns
+    /// separate: `h` is whatever the sizing formula above computed,
+    /// unconditionally; a genuinely-too-small preview just doesn't get
+    /// painted, and the leftover rows stay BLANK (see
+    /// [`Server::choose_tree_preview_paintable`], the paint-time guard now
+    /// checked independently by the caller). This function no longer
+    /// contains that guard at all.
+    pub(super) fn choose_tree_list_height(sy: u16, line_size: usize, mode: PreviewMode) -> u16 {
         let sy_i = sy as i32;
         let ls = line_size as i32;
         let mut h = match mode {
@@ -3738,10 +5341,131 @@ impl Server {
         if sy_i - h < 2 {
             h = sy_i; // preview must be >= 2 rows
         }
-        if sy_i <= 4 || h < 2 || sy_i - h <= 4 || w <= 4 {
-            h = sy_i; // mode_tree_draw's own box-size guard
-        }
         h.clamp(0, sy_i.max(0)) as u16
+    }
+
+    /// Map a choose-tree overlay click's screen row `y` to an index into
+    /// `rows` (already rebuilt fresh by the caller from LIVE registry
+    /// state, `build_choose_rows`), mirroring `server::render_one`'s
+    /// `RenderOverlay::Tree` -> `render::ListOverlay` layout EXACTLY (SP7
+    /// Task 10, closes follow-up #61) so a click always resolves to the row
+    /// actually drawn there: `list_height`/`preview`/`msg_reserved`/`top`
+    /// are all recomputed the SAME way `render_one`'s own `RenderOverlay::
+    /// Tree` arm does. **Updated by SP7 Task 15** (the sort/filter title
+    /// row, `build_choose_title`, is always non-empty and always painted as
+    /// the panel's first row): `title_reserved = 1` below accounts for that
+    /// header row exactly as `render_one` does, and a click landing on the
+    /// title row itself (`y < title_reserved`) is correctly a miss. `None`
+    /// on a click outside the row list (the title row, an empty list, the
+    /// preview box below it, a reserved kill-confirm-prompt row, or past
+    /// the last row).
+    fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        let ClientMode::ChooseTree(state) = &client.mode else { return None };
+        let sel = resolve_tree_sel(rows, &state.selected, state.sel);
+        let list_height = Server::choose_tree_list_height(client.rows, rows.len(), state.preview);
+        // SP7 Task 15 (#73) split sizing from paintability -- `list_height
+        // < client.rows` alone is no longer a reliable "is there a preview"
+        // test (a degenerate geometry can size a preview region that then
+        // fails the paint-time guard), so mirror `build_render_overlay`'s
+        // own `choose_tree_preview_paintable` check exactly.
+        let preview_shown = Server::choose_tree_preview_paintable(client.rows, list_height, client.cols);
+        // Mirrors `render_one`'s own `message` resolution for `ClientMode::
+        // ChooseTree`: the pending kill-confirm prompt takes priority over
+        // an ordinary transient `client.message`, but either one reserves
+        // the panel's last row exactly when no preview is showing.
+        let has_message = state.pending_kill.is_some() || client.message.is_some();
+        let msg_reserved: usize = if has_message && !preview_shown { 1 } else { 0 };
+        // SP7 Task 15: the sort/filter title row (always non-empty since
+        // `build_choose_title`) takes the panel's FIRST row before any list
+        // rows are painted -- same `title_reserved` `render_one`'s Tree arm
+        // applies, and clicks on the title row itself are a miss.
+        let title_reserved = 1usize;
+        let visible = (list_height as usize).saturating_sub(msg_reserved).saturating_sub(title_reserved);
+        if visible == 0 || (y as usize) < title_reserved {
+            return None;
+        }
+        let top = sel.saturating_sub(visible.saturating_sub(1));
+        let start = top.min(rows.len());
+        let end = (start + visible).min(rows.len());
+        let idx = start + (y as usize) - title_reserved;
+        if idx < end {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Route a `Down(1)` mouse event into the acting client's open
+    /// choose-tree overlay (SP7 Task 10, closes follow-up #61;
+    /// `docs/tmux-reference/choose-tree.md` §7.4): a click on a list row
+    /// selects it (`mode_tree_key`'s mouse branch: "Click (MouseDown1) on a
+    /// list row: select that row (no choose)"); a second click on the SAME
+    /// row/button within the click-run window (`advance_click_run`, the
+    /// SAME double/triple-click tracker `mouse_down` uses for pane clicks --
+    /// choose-tree isn't touching `client.mouse` for anything else while
+    /// open, since the overlay guard in `dispatch_mouse` clears any stale
+    /// drag before ever reaching here) COMMITS it (doc: "Double-click on a
+    /// list row: select + rewrite the key to `\r` -> Enter (choose)").
+    /// `dispatch_mouse`'s caller already filtered to `Down(1)` and to "no
+    /// kill-confirm pending" before calling this, so neither is re-checked
+    /// here. A click that misses every row (blank area, the preview box, a
+    /// reserved message row) is a no-op -- no selection change, matching
+    /// real tmux's `mode_tree_key` returning early when the click doesn't
+    /// land in the list rect at all.
+    fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome {
+        // Same row set the renderer draws — `build_choose_rows` applies
+        // Task 12's find-window `win_filter`, Task 15's sort/reverse, AND
+        // Task 15's text filter, so hit-testing here can never click a row
+        // the client isn't currently seeing.
+        let rows = match &client.mode {
+            ClientMode::ChooseTree(state) => self.build_choose_rows(session_name, state).0,
+            _ => return ExecOutcome::Ok(String::new()),
+        };
+        let Some(row_idx) = self.choose_tree_row_at(client, &rows, ev.y) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(target) = rows.get(row_idx).map(|r| r.target.clone()) else {
+            return ExecOutcome::Ok(String::new());
+        };
+
+        let run = advance_click_run(&mut client.mouse, Instant::now(), ev.x, ev.y, 1);
+        if let ClientMode::ChooseTree(state) = &mut client.mode {
+            state.sel = row_idx;
+            state.selected = Some(target.clone());
+        }
+        if run < 2 {
+            return ExecOutcome::Ok(String::new());
+        }
+        // Commit (double-click): mirrors `dispatch_choose_tree_key`'s
+        // `ChooseTreeAction::Commit` arm exactly (mode -> Normal, then
+        // `exec_tree_commit`). `exec_tree_commit` needs `&mut String` only
+        // to hand a `SwitchedSession`-producing target its OLD session name
+        // to mutate-and-restore locally -- this function only has `&str`
+        // (mirrors `dispatch_mouse_cmds`'s identical `let mut sn = ...`
+        // pattern just above in this same file), and the caller applies the
+        // real session switch from the returned `ExecOutcome::
+        // SwitchedSession` regardless, same as every other mouse dispatch
+        // path here.
+        client.mode = ClientMode::Normal;
+        let mut sn = session_name.to_string();
+        self.exec_tree_commit(target, client, &mut sn, acting_id)
+    }
+
+    /// `mode_tree_draw`'s SEPARATE paint-time box-size guard (SP7 Task 15,
+    /// closes #73; mode-tree.c:980-981): whether the preview BOX can be
+    /// painted at all, given the ALREADY-COMPUTED list height `h` from
+    /// [`Server::choose_tree_list_height`] -- independent of that function's
+    /// own sizing formula (see its doc comment for why the two were split
+    /// apart). `false` means "no box" — the caller must still use the SAME
+    /// (possibly tiny) `h` for the row list's visible height; it must NOT
+    /// fall back to a full-height list, or the #73 fix regresses.
+    pub(super) fn choose_tree_preview_paintable(sy: u16, h: u16, w: u16) -> bool {
+        let sy_i = sy as i32;
+        let h_i = h as i32;
+        !(sy_i <= 4 || h_i < 2 || sy_i - h_i <= 4 || w <= 4)
     }
 
     /// The selected tree row's live preview content (SP6 wave 2, Task 8;
@@ -3787,6 +5511,40 @@ impl Server {
                 let panes = window.layout.panes();
                 let slots = panes.iter().enumerate().map(|(idx, pid)| (*pid, format!("{idx}"))).collect();
                 (title, slots)
+            }
+            // SP7 Task 14 (#49): choose-client's preview is "what that
+            // client currently sees" (`## 9`) -- simplified here to that
+            // client's current window's ACTIVE pane content, one slot
+            // filling the whole interior (the existing single-slot path
+            // below already does that with no divider needed) -- no status-
+            // line-screen strip underneath (documented simplification vs.
+            // tmux's `window_client_draw`, `## 9`).
+            TreeTarget::Client(id) => {
+                let Some(c) = self.clients.get(id) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let Some(session) = c.session.as_deref().and_then(|n| self.registry.sessions().iter().find(|s| s.name == n)) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {} (sort: index)", client_label(*id));
+                (title, vec![(session.current_window().layout.focused(), String::new())])
+            }
+            // SP7 Task 14 (#48): choose-buffer's preview is the buffer's
+            // raw text content, clipped to the interior, control characters
+            // made visible as `?` (`## 10`; a documented simplification of
+            // tmux's `utf8_strvis` visible-escaping).
+            TreeTarget::Buffer(name) => {
+                let Some(data) = self.buffers.get(name) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {name} (sort: index)");
+                for (row, line) in data.lines().take(interior_h as usize).enumerate() {
+                    for (col, ch) in line.chars().take(interior_w as usize).enumerate() {
+                        let ch = if ch.is_control() { '?' } else { ch };
+                        content[row * interior_w as usize + col] = Cell { ch, style: Style::default() };
+                    }
+                }
+                return (title, interior_w, interior_h, content);
             }
         };
         let n = slots.len();
@@ -3854,6 +5612,24 @@ impl Server {
                     .unwrap_or_default();
                 format!("kill-window {name}? (y/n)")
             }
+            // Unreachable in practice — `Buffers`/`Clients` kills never go
+            // through the confirm flow (`## ChooseTreeState::pending_kill`
+            // doc comment) — kept for match exhaustiveness.
+            TreeTarget::Buffer(_) | TreeTarget::Client(_) => String::new(),
+        }
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): the `x` confirm prompt for a
+    /// (possibly tagged, `Sessions`/`Windows`-only) multi-target kill --
+    /// `"kill-session <name>? (y/n)"`/`"kill-window <name>? (y/n)"` for a
+    /// single target (delegates to [`Server::tree_kill_prompt`]), or `"kill
+    /// <N> tagged? (y/n)"` for more than one, per `## 7.2`'s `X` prompt
+    /// shape (winmux collapses `x`/`X` into one binding, see the task
+    /// brief).
+    fn tree_kill_prompt_many(&self, targets: &[TreeTarget]) -> String {
+        match targets {
+            [one] => self.tree_kill_prompt(one),
+            many => format!("kill {} tagged? (y/n)", many.len()),
         }
     }
 
@@ -3867,7 +5643,7 @@ impl Server {
     /// `exec_kill_window_client`/`exec_kill_pane_client`) — the overlay
     /// simply closes along with the rest of that client's exit, matching a
     /// normal kill-your-own-session flow.
-    fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str) -> ExecOutcome {
+    fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str, acting_id: ClientId) -> ExecOutcome {
         match target {
             TreeTarget::Session(name) => {
                 if self.registry.session_mut(&name).is_none() {
@@ -3892,7 +5668,41 @@ impl Server {
                     Err(e) => ExecOutcome::Err(e),
                 }
             }
+            // SP7 Task 14/15: never actually reached via the confirm flow
+            // (`Buffers`/`Clients` kills bypass `pending_kill` entirely, see
+            // `dispatch_choose_tree_key`'s `Kill` arm) — implemented for
+            // real anyway rather than left as a defensive no-op, so this
+            // stays correct if a future caller ever DOES route one through
+            // here.
+            TreeTarget::Buffer(name) => wrap(self.exec_delete_buffer(Some(name))),
+            TreeTarget::Client(id) => self.exec_client_detach(id, acting_id),
         }
+    }
+
+    /// SP7 Task 14 (#49): detach ONE specific client by identity (not by
+    /// session, unlike `exec_detach_client_client`'s `-s` — see that
+    /// function's own doc comment for why this is a separate helper).
+    /// `acting_id == id` (the acting client detaching itself via choose-
+    /// client) returns `ExecOutcome::Detach` WITHOUT touching `self.clients`
+    /// — the acting client was already removed from the map for the
+    /// duration of dispatch (see `handle_stdin`'s doc comment), so there is
+    /// nothing to remove here; the caller's `detach` flag does the rest.
+    /// Detaching any OTHER client removes it directly and messages it,
+    /// mirroring `exec_detach_client_client`'s own removal loop.
+    fn exec_client_detach(&mut self, id: ClientId, acting_id: ClientId) -> ExecOutcome {
+        if id == acting_id {
+            return ExecOutcome::Detach;
+        }
+        let Some(c) = self.clients.remove(&id) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let name = c.session.clone().unwrap_or_default();
+        send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: format!("[detached (from session {name})]") });
+        if !name.is_empty() {
+            self.recompute_session_size(&name);
+            self.apply_layout_for_session(&name);
+        }
+        ExecOutcome::Ok(String::new())
     }
 
     /// Commit choose-tree's selection (Task 8, Enter): re-validates the
@@ -3901,7 +5711,7 @@ impl Server {
     /// id) then switches this client to the session, or selects the window
     /// within its (always-current, per the `Windows` view's own scope) session
     /// — same underlying mutation as `switch-client -p/-n`/`select-window`.
-    fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+    fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> ExecOutcome {
         match target {
             TreeTarget::Session(name) => {
                 if self.registry.session_mut(&name).is_none() || name == *session_name {
@@ -3921,11 +5731,35 @@ impl Server {
                     if wid != session.current {
                         session.last = Some(session.current);
                         session.current = wid;
+                        session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
                     }
                 }
                 self.apply_layout_for_session(&sname);
                 ExecOutcome::Ok(String::new())
             }
+            // SP7 Task 14 (#48): choose-buffer's default template is
+            // `paste-buffer -p -b '%%'` (`## 10`) — paste into the acting
+            // client's focused pane and exit (the caller already sets
+            // `client.mode = Normal` before calling this, matching
+            // `Session`/`Window`'s own "commit switches, then the caller
+            // closes the overlay" shape). `-p` IS present in the real
+            // template (`docs/tmux-reference/choose-tree.md:790,820` and
+            // `copy-mode-and-buffers.md:849`), so `bracket` must be `true`
+            // here (final-gate correctness review MUST-FIX #1 — this was
+            // hardcoded `false` at merge time, contradicted by the cited
+            // docs and by `exec_paste_buffer`'s own three other call sites,
+            // which all thread the caller-supplied `-p` value through
+            // correctly). Note `maybe_bracket_paste` still gates the actual
+            // wrap on the TARGET pane's own DECSET 2004 state
+            // (`Grid::bracketed_paste()`), so passing `true` here only
+            // wraps when the receiving app actually asked for bracketed
+            // paste — it does not force-wrap unconditionally.
+            TreeTarget::Buffer(name) => wrap(self.exec_paste_buffer(Some(name), None, false, true, Some(session_name.as_str()))),
+            // SP7 Task 14 (#49): choose-client's default template is
+            // `detach-client -t '%%'` (`## 9`) — Enter DETACHES the
+            // selected client, same as its `x`/`d` extra key (`## 9`'s
+            // "Extra keys: d/x detach current").
+            TreeTarget::Client(id) => self.exec_client_detach(id, acting_id),
         }
     }
 
@@ -3933,7 +5767,13 @@ impl Server {
     /// (Task 8). `None` = the key was swallowed (unbound, or a navigation
     /// key while `pending_kill` absorbed it) with NO dispatch to report;
     /// `handle_stdin` only calls `route_outcome` on `Some`.
-    pub(super) fn dispatch_choose_tree_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> Option<ExecOutcome> {
+    pub(super) fn dispatch_choose_tree_key(
+        &mut self,
+        key: &Key,
+        client: &mut ClientState,
+        session_name: &mut String,
+        acting_id: ClientId,
+    ) -> Option<ExecOutcome> {
         // A pending kill-confirm (`x` was already pressed) absorbs the VERY
         // NEXT key as its y/n answer, taking priority over ordinary
         // navigation -- same y/Y/Enter-confirms, anything-else-cancels rule
@@ -3942,17 +5782,51 @@ impl Server {
             ClientMode::ChooseTree(state) => state.pending_kill.take(),
             _ => return None,
         };
-        if let Some((target, _prompt)) = pending {
+        if let Some((targets, _prompt)) = pending {
             let confirmed = matches!(key.code, KeyCode::Enter) || matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-            return Some(if confirmed { self.exec_tree_kill(target, session_name) } else { ExecOutcome::Ok(String::new()) });
+            if let ClientMode::ChooseTree(state) = &mut client.mode {
+                state.tagged.clear();
+            }
+            if !confirmed {
+                return Some(ExecOutcome::Ok(String::new()));
+            }
+            // SP7 Task 15: kill every confirmed target; if one destroys the
+            // acting client's own session, stop there (that client is about
+            // to be dropped) rather than acting on the rest.
+            let mut outcome = ExecOutcome::Ok(String::new());
+            for t in targets {
+                outcome = self.exec_tree_kill(t, session_name, acting_id);
+                if matches!(outcome, ExecOutcome::Destroy) {
+                    break;
+                }
+            }
+            return Some(outcome);
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let (view, expanded) = match &client.mode {
-            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone()),
+        let (view, expanded, tagged, sort, reversed, filter, win_filter) = match &client.mode {
+            ClientMode::ChooseTree(state) => {
+                (state.view, state.expanded.clone(), state.tagged.clone(), state.sort, state.reversed, state.filter.clone(), state.win_filter.clone())
+            }
             _ => return None,
         };
-        let rows = self.build_tree_rows(session_name, view, &expanded);
+        let unfiltered = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, reversed);
+        // SP7 Task 15: apply the active filter the SAME way
+        // `build_choose_rows` (the render path) does, so navigation/commit/
+        // kill never act on a row the client can't currently see -- see
+        // that function's doc comment for the "no matches -> fall back to
+        // unfiltered" rule.
+        let rows = match filter.as_deref() {
+            Some(f) if !f.is_empty() => {
+                let filtered = Server::apply_choose_filter(unfiltered, f);
+                if filtered.is_empty() {
+                    self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, reversed)
+                } else {
+                    filtered
+                }
+            }
+            _ => unfiltered,
+        };
 
         // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
         // IDENTITY against this freshly rebuilt `rows`, rather than trusting
@@ -3989,19 +5863,53 @@ impl Server {
                 client.mode = ClientMode::Normal;
                 Some(ExecOutcome::Ok(String::new()))
             }
+            // SP7 Task 15 (closes #50's remainder / brief's "kill applies
+            // to tagged when tags exist" rule): tagged targets (if any)
+            // instead of just the current row. `Sessions`/`Windows` still
+            // go through the `pending_kill` y/n confirm exactly as before
+            // (`## 7.2`'s `x`/`X` kill prompts); `Buffers`/`Clients` never
+            // confirm at all (`## 9`/`## 10`) -- deleted/detached
+            // immediately, since a `ChooseTreeState` is scoped to exactly
+            // one view, tagged targets are always homogeneous, so branching
+            // on `view` alone is sufficient (no need to inspect each
+            // target's own variant).
             ChooseTreeAction::Kill => {
-                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
-                let prompt = self.tree_kill_prompt(&row.target);
-                if let ClientMode::ChooseTree(state) = &mut client.mode {
-                    state.pending_kill = Some((row.target.clone(), prompt));
+                let targets: Vec<TreeTarget> = if !tagged.is_empty() {
+                    rows.iter().filter(|r| tagged.contains(&r.target)).map(|r| r.target.clone()).collect()
+                } else {
+                    rows.get(sel).map(|r| vec![r.target.clone()]).unwrap_or_default()
+                };
+                if targets.is_empty() {
+                    return Some(ExecOutcome::Ok(String::new()));
                 }
-                Some(ExecOutcome::Ok(String::new()))
+                match view {
+                    ChooseTreeView::Sessions | ChooseTreeView::Windows => {
+                        let prompt = self.tree_kill_prompt_many(&targets);
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.pending_kill = Some((targets, prompt));
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    ChooseTreeView::Buffers | ChooseTreeView::Clients => {
+                        let mut outcome = ExecOutcome::Ok(String::new());
+                        for t in targets {
+                            outcome = self.exec_tree_kill(t, session_name, acting_id);
+                            if matches!(outcome, ExecOutcome::Detach | ExecOutcome::Destroy) {
+                                break;
+                            }
+                        }
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.tagged.clear();
+                        }
+                        Some(outcome)
+                    }
+                }
             }
             ChooseTreeAction::Commit => {
                 let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
                 let target = row.target.clone();
                 client.mode = ClientMode::Normal;
-                Some(self.exec_tree_commit(target, client, session_name))
+                Some(self.exec_tree_commit(target, client, session_name, acting_id))
             }
             // SP6 wave 2, Task 8 (`docs/tmux-reference/choose-tree.md`
             // `## 5.1`/`## 7.1`): only session (depth-0) rows carry an
@@ -4030,6 +5938,9 @@ impl Server {
                         }
                         Some(ExecOutcome::Ok(String::new()))
                     }
+                    // `Buffers`/`Clients` rows are flat -- no expand/collapse
+                    // affordance (SP7 Task 14).
+                    TreeTarget::Buffer(_) | TreeTarget::Client(_) => Some(ExecOutcome::Ok(String::new())),
                 }
             }
             ChooseTreeAction::Expand => {
@@ -4042,7 +5953,7 @@ impl Server {
                         }
                         Some(ExecOutcome::Ok(String::new()))
                     }
-                    TreeTarget::Window(..) => {
+                    TreeTarget::Window(..) | TreeTarget::Buffer(_) | TreeTarget::Client(_) => {
                         let new_sel = (sel + 1).min(rows.len().saturating_sub(1));
                         if let ClientMode::ChooseTree(state) = &mut client.mode {
                             state.sel = new_sel;
@@ -4055,6 +5966,56 @@ impl Server {
             ChooseTreeAction::TogglePreview => {
                 if let ClientMode::ChooseTree(state) = &mut client.mode {
                     state.preview = state.preview.cycle();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            // ---- SP7 Task 15 (closes #50's remainder): tag/sort/filter ----
+            ChooseTreeAction::ToggleTag => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                let target = row.target.clone();
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    if !state.tagged.remove(&target) {
+                        state.tagged.insert(target);
+                    }
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::UntagAll => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.tagged.clear();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::TagAll => {
+                let roots: Vec<TreeTarget> = rows.iter().filter(|r| r.depth == 0).map(|r| r.target.clone()).collect();
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.tagged.extend(roots);
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::SortNext => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.sort = next_sort(state.view, state.sort);
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::SortReverse => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.reversed = !state.reversed;
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::FilterOpen => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.filter_edit = Some(state.filter.clone().unwrap_or_default());
+                }
+                client.key_machine.set_capture(true);
+                Some(ExecOutcome::Ok(String::new()))
+            }
+            ChooseTreeAction::FilterClear => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.filter = None;
+                    state.filter_edit = None;
                 }
                 Some(ExecOutcome::Ok(String::new()))
             }
@@ -4076,7 +6037,7 @@ impl Server {
             if !key.ctrl && !key.meta {
                 if let Some(d) = c.to_digit(10) {
                     if let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) {
-                        let entries = pane_digit_entries(session.current_window());
+                        let entries = pane_digit_entries(session.current_window(), &self.options);
                         if let Some((pane_id, _)) = entries.into_iter().find(|(_, dg)| *dg == d) {
                             self.mouse_focus_pane(session_name, pane_id);
                         }
@@ -4106,45 +6067,116 @@ impl Server {
     /// mode the client was previously in (matches copy mode's own entry
     /// behavior — no special-casing for "already in copy mode"/"prompt open"
     /// etc., since a prompt/confirm keeps capture armed and therefore can
-    /// never actually dispatch this command in the first place).
+    /// never actually dispatch this command in the first place). SP7 Task
+    /// 12: now a thin wrapper over the shared [`Self::open_choose_tree`]
+    /// (`filter: None` -- a plain `choose-tree` open is never filtered).
     fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
-        let expanded = HashSet::new();
-        // Task 8 review fix, Critical #1: seed `selected` with an IDENTITY
-        // (not just an index) so the very first Up/Down/Commit/Kill has one
-        // to re-resolve, same as every subsequent keypress.
-        //
-        // SP6 wave 2, Task 8 (mode-tree's "current-item" default start,
-        // `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions`
-        // defaults to the ACTING CLIENT's own current session's row (always
-        // present -- sessions view lists every session unconditionally, and
-        // a session's own row always exists even collapsed); `Windows`
-        // defaults to that session's CURRENT window's row (also always
-        // present -- the windows view always shows every window of the
-        // current session). Row 0 (the old behavior) is only a fallback for
-        // the structurally-unreachable case that lookup fails.
-        let rows = self.build_tree_rows(session_name, view, &expanded);
-        let default_target = match view {
-            ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
-            ChooseTreeView::Windows => self
-                .registry
-                .sessions()
-                .iter()
-                .find(|s| s.name == session_name)
-                .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+        self.open_choose_tree(view, None, client, session_name)
+    }
+
+    /// Shared choose-tree-opening logic (SP7 Task 12, extracted from the
+    /// pre-Task-12 `exec_choose_tree_client` so `find-window` can reuse it
+    /// with a window filter -- closes follow-ups #46/#54); since SP7 Task
+    /// 14 it is itself a thin default-selection layer over the even more
+    /// general [`Self::open_choose_mode`] (which `choose-buffer`/
+    /// `choose-client` call directly).
+    ///
+    /// Default selection: with `win_filter: Some(_)` (a `find-window`
+    /// open), the FIRST matching window row wins -- the session's CURRENT
+    /// window may not even be in the match set, so that default (used below
+    /// for a plain, unfiltered open) would be meaningless here. With
+    /// `win_filter: None`, the SP6 wave 2 "current-item default" rule
+    /// applies (mode-tree's "current-item" default start,
+    /// `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions` defaults
+    /// to the acting client's own current session's row (always present);
+    /// `Windows` defaults to that session's CURRENT window's row (also
+    /// always present). `open_choose_mode`'s row-0 fallback covers the
+    /// structurally-unreachable case that lookup fails.
+    fn open_choose_tree(&mut self, view: ChooseTreeView, win_filter: Option<HashSet<WindowId>>, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let default_target = if win_filter.is_some() {
+            let expanded = HashSet::new();
+            let rows = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort_seq(view)[0], false);
+            rows.iter().find(|r| matches!(r.target, TreeTarget::Window(..))).map(|r| r.target.clone())
+        } else {
+            match view {
+                ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
+                ChooseTreeView::Windows => self
+                    .registry
+                    .sessions()
+                    .iter()
+                    .find(|s| s.name == session_name)
+                    .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+                ChooseTreeView::Buffers | ChooseTreeView::Clients => None,
+            }
         };
+        self.open_choose_mode(view, default_target, win_filter, session_name, client)
+    }
+
+    /// `choose-buffer` (SP7 Task 14, closes #48): opens the same overlay
+    /// machinery scoped to `Buffers`. `cmd-choose-tree.c:122-125`: silently
+    /// does nothing if there are no buffers at all (`paste_is_empty()`).
+    fn exec_choose_buffer_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if self.buffers.list().is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        self.open_choose_mode(ChooseTreeView::Buffers, None, None, session_name, client)
+    }
+
+    /// `choose-client` (SP7 Task 14, closes #49): opens the same overlay
+    /// machinery scoped to `Clients`. `cmd-choose-tree.c:126-129`: silently
+    /// does nothing with no attached clients -- structurally unreachable
+    /// here (the client running this command IS attached), kept only for
+    /// parity/documentation. No special default selection is documented for
+    /// choose-client (`## 9`, unlike choose-tree's own `## 1.1` "current
+    /// item" rule) -- `open_choose_mode`'s row-0 fallback applies.
+    fn exec_choose_client_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        if self.clients.is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        self.open_choose_mode(ChooseTreeView::Clients, None, None, session_name, client)
+    }
+
+    /// Shared choose-overlay opener (SP7 Task 14): seeds `selected`/`sel`
+    /// from `default_target` (falling back to row 0 -- Task 8 review fix,
+    /// Critical #1: an IDENTITY, not a raw index, so the very first
+    /// Up/Down/Commit/Kill has one to re-resolve, same as every subsequent
+    /// keypress), and the view's default sort (`sort_seq(view)[0]`, SP7
+    /// Task 15).
+    fn open_choose_mode(&mut self, view: ChooseTreeView, default_target: Option<TreeTarget>, win_filter: Option<HashSet<WindowId>>, session_name: &str, client: &mut ClientState) -> ExecOutcome {
+        let expanded = HashSet::new();
+        let sort = sort_seq(view)[0];
+        let rows = self.build_tree_rows(session_name, view, &expanded, win_filter.as_ref(), sort, false);
         let selected = default_target
             .filter(|t| rows.iter().any(|r| &r.target == t))
             .or_else(|| rows.first().map(|r| r.target.clone()));
         let sel = selected.as_ref().and_then(|t| rows.iter().position(|r| &r.target == t)).unwrap_or(0);
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal });
+        client.mode = ClientMode::ChooseTree(ChooseTreeState {
+            view,
+            sel,
+            selected,
+            pending_kill: None,
+            expanded,
+            preview: PreviewMode::Normal,
+            win_filter,
+            tagged: HashSet::new(),
+            sort,
+            reversed: false,
+            filter: None,
+            filter_edit: None,
+        });
         ExecOutcome::Ok(String::new())
     }
 
     /// `display-panes [-d ms]` (Task 8): `ms` overrides `display-panes-time`
     /// for this invocation only (the option itself is untouched).
     fn exec_display_panes_client(&mut self, ms: Option<u32>, client: &mut ClientState) -> ExecOutcome {
-        let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or_else(|| self.options.display_panes_time());
+        // display-panes-time is session-scoped (#26).
+        let opt_dur = match client.session.as_deref().map(|n| self.acting_session_overlay(Some(n))) {
+            Some(Ok(ov)) => self.options.display_panes_time_for(ov),
+            _ => self.options.display_panes_time(),
+        };
+        let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or(opt_dur);
         client.mode = ClientMode::DisplayPanes(DisplayPanesState { deadline: Instant::now() + dur });
         ExecOutcome::Ok(String::new())
     }
@@ -4157,14 +6189,626 @@ impl Server {
     /// `format_clock`) so the very first render has something to draw
     /// rather than waiting for the next `Tick`.
     fn exec_clock_mode_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        let pane = match self.registry.session_mut(session_name) {
-            Some(s) => s.current_window().layout.focused(),
+        // clock-mode-style is window-scoped (#26): resolve through the
+        // window the clock is opening on (the session's current window).
+        let (pane, style12) = match self.registry.session_mut(session_name) {
+            Some(s) => {
+                let w = s.current_window();
+                (w.layout.focused(), self.options.clock_mode_style_12_for(&w.window_options))
+            }
             None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
         };
         let now = system_time_parts();
-        let text = format_clock(now.hour, now.min, self.options.clock_mode_style_12());
+        let text = format_clock(now.hour, now.min, style12);
         client.mode = ClientMode::Clock(ClockState { pane, text });
         ExecOutcome::Ok(String::new())
+    }
+
+    // ---- display-menu (SP7 Task 16, closes #51) ----
+
+    /// `display-menu|menu` from the CLI/`:` prompt/config (a client-mutating
+    /// command, never headless — see `execute_headless`'s arm). `target`
+    /// (`-t`) is accepted by `cmd::resolve` but has no effect here — see
+    /// `ParsedCmd::DisplayMenu`'s doc comment. `trigger: None` (no mouse
+    /// event context for a typed command): `MenuPos::Mouse` falls back to
+    /// `0` per `resolve_menu_axis`'s doc comment, mirroring real tmux's own
+    /// "`event->m.valid` false -> the mouse format variables are simply
+    /// unset -> `strtol("") == 0`" behavior for this exact case.
+    fn exec_display_menu_client(
+        &mut self,
+        x: cmd::MenuPos,
+        y: cmd::MenuPos,
+        title: Option<String>,
+        items: Vec<cmd::MenuEntry>,
+        client: &mut ClientState,
+    ) -> ExecOutcome {
+        let entries = menu_entries_from_parsed(&items);
+        self.open_menu(client, title.unwrap_or_default(), entries, x, y, None, None)
+    }
+
+    /// Build a [`ClientMode::Menu`] from an already-finalized entry list
+    /// (`(name, key notation, command)`; `command: None` = separator) and
+    /// switch the client into it. `trigger` is the mouse press position that
+    /// opened the menu, if any — consulted only when `x`/`y` is
+    /// [`cmd::MenuPos::Mouse`]. A no-op (menu never opens, `client.mode`
+    /// untouched) when `entries` is empty (mirrors tmux's own `if
+    /// (menu->count == 0) goto out;`) or the box — `content_w + 4` wide,
+    /// `rows.len() + 2` tall — doesn't fit the client's CURRENT size at all
+    /// (tmux's `cmd_display_menu_get_pos`: "if the popup is too big, stop
+    /// now"; `menu_prepare`'s own `c->tty.sx < menu->width+4` check is the
+    /// same guard restated).
+    #[allow(clippy::too_many_arguments)]
+    fn open_menu(
+        &mut self,
+        client: &mut ClientState,
+        title: String,
+        entries: Vec<(String, Option<String>, Option<String>)>,
+        x: cmd::MenuPos,
+        y: cmd::MenuPos,
+        trigger: Option<(u16, u16)>,
+        anchor: Option<MenuAnchor>,
+    ) -> ExecOutcome {
+        if entries.is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        let (rows, content_w) = build_menu_rows(&entries);
+        let w = content_w + 4;
+        let h = rows.len() as u16 + 2;
+        if client.cols < w || client.rows < h {
+            return ExecOutcome::Ok(String::new());
+        }
+        let px = resolve_menu_axis(x, w, client.cols, trigger.map(|(mx, _)| mx));
+        let py = resolve_menu_axis(y, h, client.rows, trigger.map(|(_, my)| my));
+        client.mode = ClientMode::Menu(MenuState { rect: Rect { x: px, y: py, w, h }, title, rows, sel: -1, anchor });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// Right-click default PANE context menu (`MouseDown3Pane`;
+    /// `docs/tmux-reference/mouse.md` §7.1, item contents abridged at that
+    /// doc's lines 717-721 — full triples verified against the cloned tmux
+    /// source's `key-bindings.c` `DEFAULT_PANE_MENU` macro). Built directly
+    /// in Rust from LIVE state (mirrors `build_tree_rows`'s own "no format-
+    /// engine loop, just iterate live data" precedent) rather than tmux's
+    /// `#{?...,X,}` conditional-item-name format strings — winmux's
+    /// `display-menu` doesn't expand formats inside item text at all (see
+    /// `ParsedCmd::DisplayMenu`'s doc comment), so a conditionally-shown
+    /// item is OMITTED outright here rather than drawn disabled-with-a-`-`-
+    /// prefix like tmux does (`MenuEntry`'s own doc comment).
+    ///
+    /// Item commands rely on winmux's normal "no `-t`/`-s` -> the acting
+    /// client's current pane/window" target defaulting, which is safe here
+    /// because `dispatch_mouse`'s `mouse_down` ALREADY focused `pane_id`
+    /// (`self.mouse_focus_pane`) before this function is ever called — a
+    /// documented substitution for tmux's OWN `MouseDown3Pane`, which does
+    /// NOT focus the pane before opening its menu (only on the "relay to
+    /// app" branch) — see the task report.
+    ///
+    /// Substitutions from tmux's `DEFAULT_PANE_MENU` (documented, not
+    /// oversights): no "Go To Top/Bottom" (only meaningful with the pane
+    /// already in copy mode, a state a right-click can never reach here —
+    /// copy-mode's own mouse handling intercepts first); no floating-pane
+    /// items (Move/Move & Resize/Tile/Float — winmux has no floating
+    /// panes); no Respawn/Mark (winmux implements neither `respawn-pane`
+    /// nor a marked-pane concept); no hyperlink items (`mouse_hyperlink` is
+    /// not tracked). Swap Up/Down and Zoom are OMITTED (not drawn disabled)
+    /// when the window has only one pane.
+    fn open_pane_menu(&mut self, pane_id: PaneId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let window = session.current_window();
+        let pane_count = window.layout.panes().len();
+        let zoomed = window.layout.is_zoomed();
+        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
+        let has_buffer = self.buffers.newest().is_some();
+
+        let mut b = MenuBuilder::new();
+        if has_buffer {
+            b.item("Paste", Some("p"), "paste-buffer");
+        }
+        b.sep();
+        b.item("Horizontal Split", Some("h"), "split-window -h");
+        b.item("Vertical Split", Some("v"), "split-window -v");
+        if pane_count > 1 {
+            b.sep();
+            b.item("Swap Up", Some("u"), "swap-pane -U");
+            b.item("Swap Down", Some("d"), "swap-pane -D");
+        }
+        b.sep();
+        b.item("Kill", Some("X"), "kill-pane");
+        if pane_count > 1 {
+            b.item(if zoomed { "Unzoom" } else { "Zoom" }, Some("z"), "resize-pane -Z");
+        }
+
+        let title = format!("Pane {pane_index}");
+        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)), Some(MenuAnchor::Pane(pane_id)))
+    }
+
+    /// Right-click default WINDOW context menu (`MouseDown3Status`, a
+    /// window-tab click). Item commands target the CLICKED window `wid`
+    /// explicitly via `-t`/`-s :<index>` (NOT the "current window"
+    /// default `open_pane_menu` relies on) since a status-row right-click
+    /// need not land on the acting client's currently-selected tab.
+    ///
+    /// "Rename" is the one exception: winmux's non-interactive `rename-
+    /// window` can only either open the (CURRENT-window-only) interactive
+    /// prompt (`rename-window` with no name argument, dispatch's `is_bare`
+    /// special case) or take a name UP FRONT — neither of which a static
+    /// menu item command can do for a NON-current window. The item command
+    /// is therefore `select-window -t :<index> ; rename-window`: the first
+    /// half switches the acting client onto the clicked window (a
+    /// documented side effect — real tmux's own Rename item has none), the
+    /// second half then opens the SAME prompt the `,` binding uses,
+    /// pre-filled with (now-current) window's name.
+    ///
+    /// Substitutions from tmux's `DEFAULT_WINDOW_MENU`: no "Swap Marked"
+    /// (no marked-pane concept); "New Window" replaces tmux's separate "New
+    /// After"/"New At End" (winmux's `new-window` has no `-a` insert-after
+    /// flag, so there is only one behavior — append at the end — to offer);
+    /// no Renumber (no `move-window -r` renumber-all equivalent). Swap
+    /// Left/Right are omitted when the session has only one window.
+    fn open_window_menu(&mut self, wid: WindowId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(pos) = session.windows.iter().position(|w| w.id == wid) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let window = &session.windows[pos];
+        let idx = window.index;
+        let title = format!("{}:{}", window.index, window.name);
+        let count = session.windows.len();
+
+        let mut b = MenuBuilder::new();
+        if count > 1 {
+            let left_pos = if pos == 0 { count - 1 } else { pos - 1 };
+            let right_pos = if pos + 1 == count { 0 } else { pos + 1 };
+            let left_idx = session.windows[left_pos].index;
+            let right_idx = session.windows[right_pos].index;
+            b.item("Swap Left", Some("l"), format!("swap-window -s :{idx} -t :{left_idx}"));
+            b.item("Swap Right", Some("r"), format!("swap-window -s :{idx} -t :{right_idx}"));
+            b.sep();
+        }
+        b.item("Kill", Some("X"), format!("kill-window -t :{idx}"));
+        b.sep();
+        b.item("Rename", Some("n"), format!("select-window -t :{idx} ; rename-window"));
+        b.sep();
+        b.item("New Window", Some("w"), "new-window");
+
+        self.open_menu(
+            client,
+            title,
+            b.into_entries(),
+            cmd::MenuPos::Mouse,
+            cmd::MenuPos::Mouse,
+            Some((mx, my)),
+            Some(MenuAnchor::Window(session_name.to_string(), wid)),
+        )
+    }
+
+    /// Right-click default SESSION context menu (`MouseDown3StatusLeft`).
+    /// Substitutions from tmux's `DEFAULT_SESSION_MENU`: the "Switch To
+    /// <session>" entries are built by iterating `self.registry.sessions()`
+    /// directly in Rust (up to 5, excluding the current one, in registry
+    /// order) rather than replicating tmux's `#{S/t:...}` format LOOP
+    /// modifier (`format.c`'s session-loop function, which generates
+    /// MULTIPLE menu items from a single templated item — not modeled by
+    /// winmux's `expand_format` subset at all); no Renumber (no `move-
+    /// window -r` equivalent).
+    fn open_session_menu(&mut self, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let others: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).filter(|n| n != session_name).take(5).collect();
+
+        let mut b = MenuBuilder::new();
+        for name in &others {
+            b.item(&format!("Switch To {name}"), None, format!("switch-client -t {name}"));
+        }
+        if !others.is_empty() {
+            b.sep();
+        }
+        b.item("Rename", Some("r"), "rename-session");
+        b.item("Detach", Some("d"), "detach-client");
+        b.sep();
+        b.item("New Session", Some("s"), "new-session");
+        b.item("New Window", Some("w"), "new-window");
+
+        self.open_menu(
+            client,
+            session_name.to_string(),
+            b.into_entries(),
+            cmd::MenuPos::Mouse,
+            cmd::MenuPos::Mouse,
+            Some((mx, my)),
+            Some(MenuAnchor::Session(session_name.to_string())),
+        )
+    }
+
+    /// Run one menu item's raw command TEXT: re-tokenized (`cmd::parse_line`
+    /// — supports a `;`-separated sequence, exactly like a config line) and
+    /// dispatched through the SAME `dispatch_client` pipeline every other
+    /// command entry point uses, so a menu item can reference `bind-key`-
+    /// rebindable commands / set options / anything else the dispatcher
+    /// knows about. Mirrors real tmux's `menu_key_cb`'s `chosen:` label
+    /// (`cmd_parse_and_append` + `cmdq_append`), which parses the stored
+    /// command string at CHOICE time, not at menu-open time.
+    fn exec_menu_command(&mut self, command: &str, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        match cmd::parse_line(command) {
+            Ok(cmds) => self.dispatch_client(&cmds, client, session_name),
+            Err(e) => ExecOutcome::Err(e),
+        }
+    }
+
+    /// Advance the open menu's selection by one row, WRAPPING and SKIPPING
+    /// separators — mirrors `menu.c`'s `KEYC_UP`/`KEYC_DOWN` cases exactly
+    /// (`down: true` = `KEYC_DOWN`/`j`, `false` = `KEYC_UP`/`k`/`KEYC_BTAB`).
+    /// A no-op if there are no rows, or if every OTHER row is a separator
+    /// (the scan wraps back to the untouched original selection).
+    ///
+    /// Correctness review MUST-FIX #3: this used to compute a "starting
+    /// point" sentinel as `let old = if state.sel == -1 { 0 } else {
+    /// state.sel };` and terminate the wrap/skip loop on `state.sel ==
+    /// old` — but `0` is ALSO the very first candidate index a `Down` press
+    /// from `sel == -1` (a freshly-opened menu) lands on, so if row 0
+    /// happened to be a separator (a legitimate, documented tmux idiom for
+    /// a leading header row via a user-authored `display-menu ""  ...`),
+    /// the loop's termination check fired on its very first iteration and
+    /// got permanently stuck on the separator, even with a real command on
+    /// row 1+. Fixed by bounding the scan at `count` iterations (enough to
+    /// visit every row exactly once) instead of aliasing "no previous
+    /// selection" to a real index; the true starting selection (`-1` or a
+    /// real index) is restored verbatim if the whole scan comes up empty
+    /// (every row is a separator).
+    fn menu_move(&mut self, client: &mut ClientState, down: bool) {
+        let ClientMode::Menu(state) = &mut client.mode else { return };
+        let count = state.rows.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let start = state.sel;
+        for _ in 0..count {
+            if state.sel == -1 || state.sel == if down { count - 1 } else { 0 } {
+                state.sel = if down { 0 } else { count - 1 };
+            } else {
+                state.sel += if down { 1 } else { -1 };
+            }
+            if state.rows[state.sel as usize].command.is_some() {
+                return;
+            }
+        }
+        // Every row is a separator -- restore the untouched starting
+        // selection instead of leaving `sel` wherever the bounded scan
+        // stopped.
+        state.sel = start;
+    }
+
+    /// Choose row `idx`: close the menu, then (unless it's a separator, or
+    /// the client is no longer in `ClientMode::Menu` at all — both no-ops)
+    /// run its command via [`Self::exec_menu_command`]. Mirrors `menu.c`'s
+    /// `chosen:` label: `client.mode` is reset to `Normal` BEFORE the
+    /// command runs (real tmux: the overlay is cleared via `server_client_
+    /// clear_overlay`-equivalent bookkeeping before `cmdq_append`), so a
+    /// menu item that itself opens another overlay (e.g. a nested `display-
+    /// menu`, or `choose-tree`) is never fighting the menu it was chosen
+    /// from.
+    fn menu_choose(&mut self, idx: usize, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(row) = state.rows.get(idx) else {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(command) = row.command.clone() else {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        };
+        client.mode = ClientMode::Normal;
+        self.exec_menu_command(&command, client, session_name)
+    }
+
+    /// Route one decoded key to the open menu (SP7 Task 16): a shortcut-key
+    /// match (checked FIRST, mirroring `menu_key_cb`'s own per-item loop
+    /// ahead of its `switch`) runs that item immediately regardless of the
+    /// current selection; otherwise Up/`k`/BTab and Down/`j` navigate,
+    /// Enter chooses the current selection (a no-op if nothing is selected
+    /// yet, `sel == -1`), and Escape/`q`/`C-c`/`C-g`/`C-[` cancel. Any other
+    /// key is swallowed (menu stays open, matches tmux's default `break`).
+    pub(super) fn dispatch_menu_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if let Some(idx) = state.rows.iter().position(|r| r.command.is_some() && r.key.as_ref() == Some(key)) {
+            return self.menu_choose(idx, client, session_name);
+        }
+        let is_up = matches!(key.code, KeyCode::Up | KeyCode::BTab) || (!key.ctrl && !key.meta && key.code == KeyCode::Char('k'));
+        let is_down = !key.ctrl && !key.meta && (key.code == KeyCode::Down || key.code == KeyCode::Char('j'));
+        let is_cancel = matches!(key.code, KeyCode::Escape | KeyCode::Char('q'))
+            || (key.ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('g') | KeyCode::Char('[')));
+        if is_up {
+            self.menu_move(client, false);
+            return ExecOutcome::Ok(String::new());
+        }
+        if is_down {
+            self.menu_move(client, true);
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(key.code, KeyCode::Enter) {
+            let ClientMode::Menu(state) = &client.mode else {
+                return ExecOutcome::Ok(String::new());
+            };
+            if state.sel == -1 {
+                client.mode = ClientMode::Normal;
+                return ExecOutcome::Ok(String::new());
+            }
+            return self.menu_choose(state.sel as usize, client, session_name);
+        }
+        if is_cancel {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// Route one mouse event to the open menu (SP7 Task 16; `menu.c`'s
+    /// `menu_key_cb` mouse branch): a PRESS (any button) outside the box
+    /// closes the menu with no action; a press INSIDE it, on a real item
+    /// row, chooses that row. A documented simplification vs. real tmux,
+    /// which commits on RELEASE-with-no-button-held and hover-highlights on
+    /// motion in between (winmux has no click-run/hover-tracking machinery
+    /// for a floating overlay) — winmux commits on PRESS instead; Drag/Up/
+    /// Wheel events are all no-ops (they neither move the selection nor
+    /// close the menu).
+    fn dispatch_menu_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let r = state.rect;
+        let inside = ev.x >= r.x && ev.x < r.x + r.w && ev.y >= r.y && ev.y < r.y + r.h;
+        let MouseKind::Down(_) = ev.kind else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if !inside {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
+        if ev.y == r.y || ev.y == r.y + r.h - 1 {
+            // Border row: not a choosable item.
+            return ExecOutcome::Ok(String::new());
+        }
+        let idx = (ev.y - r.y - 1) as usize;
+        self.menu_choose(idx, client, session_name)
+    }
+
+    /// `MouseDown3Pane` (SP7 Task 16): table-driven like every other Task-8
+    /// mouse default — unbound is a silent no-op, bound-to-a-user-override
+    /// runs it generically, bound-to-the-default sentinel runs the built-in
+    /// pane-menu builder.
+    fn mouse_down_pane_button3(&mut self, pane_id: PaneId, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::Pane) {
+            None => ExecOutcome::Ok(String::new()),
+            Some(cmds) if cmds == mouse_default_menu_pane() => self.open_pane_menu(pane_id, ev.x, ev.y, client, session_name),
+            Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+        }
+    }
+
+    /// `MouseDown3Status`/`MouseDown3StatusLeft` (SP7 Task 16): which of the
+    /// two applies is decided by [`Server::status_hit_at`] (the SAME hit-
+    /// test `mouse_status_click`'s Down(1) path uses), then routed through
+    /// the usual table-driven default/override/unbound triage.
+    fn mouse_status_button3(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        match self.status_hit_at(session_name, ev.x) {
+            StatusHit::Left => match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::StatusLeft) {
+                None => ExecOutcome::Ok(String::new()),
+                Some(cmds) if cmds == mouse_default_menu_status_left() => self.open_session_menu(ev.x, ev.y, client, session_name),
+                Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+            },
+            StatusHit::Window(wid) => match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::Status) {
+                None => ExecOutcome::Ok(String::new()),
+                Some(cmds) if cmds == mouse_default_menu_status() => self.open_window_menu(wid, ev.x, ev.y, client, session_name),
+                Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+            },
+            StatusHit::Other => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// Which status-row region column `x` falls in — mirrors `mouse_status_
+    /// click`'s own `left`/`columns` construction EXACTLY (same format
+    /// context, same option reads) so a right-click's hit-test always
+    /// agrees with a left-click's, and with what's actually drawn
+    /// (`render_one`'s status-row build). Duplicated rather than shared
+    /// with `mouse_status_click` (which also SELECTS the window as a side
+    /// effect, which a hit-test-only caller must not do) — see that
+    /// function's own doc comment for the fields being mirrored.
+    fn status_hit_at(&self, session_name: &str, x: u16) -> StatusHit {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return StatusHit::Other;
+        };
+        let window = session.current_window();
+        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
+        let mut window_flags = String::from("*");
+        if window.layout.is_zoomed() {
+            window_flags.push('Z');
+        }
+        let pane_title = self.panes.get(&window.layout.focused()).map(|p| p.title.clone()).unwrap_or_default();
+        let fctx = FormatCtx {
+            session: &session.name,
+            window_index: window.index,
+            window_name: &window.name,
+            window_flags: &window_flags,
+            pane_index,
+            hostname: &self.hostname,
+            now: system_time_parts(),
+            pane_title: &pane_title,
+        };
+        let left = crate::options::expand_format(self.options.status_left_for(&session.session_options), &fctx);
+        let left = status::truncate_visible(&left, self.options.status_left_length_for(&session.session_options));
+        if (x as usize) < left.chars().count() {
+            return StatusHit::Left;
+        }
+        let right_expanded = status::strip_style_markers(&crate::options::expand_format(
+            self.options.status_right_for(&session.session_options),
+            &fctx,
+        ));
+        let right_len =
+            truncate_chars(&right_expanded, self.options.status_right_length_for(&session.session_options)).chars().count();
+        let entries: Vec<status::WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    self.options.window_status_current_format_for(&w.window_options)
+                } else {
+                    self.options.window_status_format_for(&w.window_options)
+                };
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + self.options.pane_base_index_for(&w.window_options);
+                let w_pane_title = self.panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
+                status::WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
+                    format_override: Some(fmt.to_string()),
+                    style_override: None,
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
+                }
+            })
+            .collect();
+        let columns = status::status_tab_columns(
+            &left,
+            &entries,
+            &fctx,
+            self.options.window_status_format_for(&window.window_options),
+            self.options.window_status_current_format_for(&window.window_options),
+            self.options.window_status_separator_for(&window.window_options),
+            self.options.status_justify_for(&session.session_options),
+            session.size.0,
+            right_len,
+        );
+        match columns.iter().find(|c| x >= c.start && x < c.end).and_then(|c| session.windows.get(c.window_pos)) {
+            Some(w) => StatusHit::Window(w.id),
+            None => StatusHit::Other,
+        }
+    }
+}
+
+/// [`Server::status_hit_at`]'s result.
+enum StatusHit {
+    Left,
+    Window(WindowId),
+    Other,
+}
+
+/// Accumulates a default menu's item list with tmux's own separator de-dup
+/// rule (`menu.c`'s `menu_add_item`: a separator is dropped if it would be
+/// the very first item, or if the immediately preceding item was ALSO a
+/// separator) — reproduced here in Rust since winmux's default menus are
+/// built directly from live state rather than through `menu_add_item`
+/// itself.
+struct MenuBuilder {
+    entries: Vec<(String, Option<String>, Option<String>)>,
+}
+
+impl MenuBuilder {
+    fn new() -> Self {
+        MenuBuilder { entries: Vec::new() }
+    }
+    fn item(&mut self, name: &str, key: Option<&str>, command: impl Into<String>) {
+        self.entries.push((name.to_string(), key.map(|k| k.to_string()), Some(command.into())));
+    }
+    fn sep(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.entries.last().map(|e| e.2.is_none()).unwrap_or(false) {
+            return;
+        }
+        self.entries.push((String::new(), None, None));
+    }
+    fn into_entries(self) -> Vec<(String, Option<String>, Option<String>)> {
+        self.entries
+    }
+}
+
+/// [`cmd::MenuEntry`] list (a config/CLI-parsed `display-menu`'s items) ->
+/// [`open_menu`]'s generic `(name, key, command)` tuple shape.
+fn menu_entries_from_parsed(items: &[cmd::MenuEntry]) -> Vec<(String, Option<String>, Option<String>)> {
+    items
+        .iter()
+        .map(|e| match e {
+            cmd::MenuEntry::Separator => (String::new(), None, None),
+            cmd::MenuEntry::Item { name, key, command } => (name.clone(), key.clone(), Some(command.clone())),
+        })
+        .collect()
+}
+
+/// Finalize a menu's entry list into display-ready [`MenuRow`]s plus the
+/// box's CONTENT width (the widest row, name + `" (key)"` hint if any, or
+/// the item name alone with no key) — mirrors `menu.c`'s `menu_add_item`
+/// (`new_item->name` layout + `menu->width` tracking), minus the alignment-
+/// marker/truncation machinery real tmux applies for an overflowing item
+/// (winmux's menus are always built from short, known-fixed strings, so
+/// truncation is not needed here — a documented scope narrowing, not
+/// modeled at all). A separator row's `text` is always empty (unused by the
+/// renderer either way — see `render::MenuRowCell::separator`).
+fn build_menu_rows(entries: &[(String, Option<String>, Option<String>)]) -> (Vec<MenuRow>, u16) {
+    let content_w = entries
+        .iter()
+        .filter(|(_, _, cmd)| cmd.is_some())
+        .map(|(name, key, _)| {
+            let hint_len = key.as_ref().filter(|k| !k.is_empty()).map(|k| k.chars().count() + 3).unwrap_or(0); // " (" + key + ")"
+            name.chars().count() + hint_len
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let rows = entries
+        .iter()
+        .map(|(name, key, command)| {
+            if command.is_none() {
+                return MenuRow { text: String::new(), key: None, command: None };
+            }
+            let key = key.as_ref().filter(|k| !k.is_empty());
+            let hint = key.map(|k| format!(" ({k})")).unwrap_or_default();
+            let pad = (content_w as usize).saturating_sub(name.chars().count() + hint.chars().count());
+            let text = format!("{name}{}{hint}", " ".repeat(pad));
+            let parsed_key = key.and_then(|k| keys::parse_key(k));
+            MenuRow { text, key: parsed_key, command: command.clone() }
+        })
+        .collect();
+    (rows, content_w)
+}
+
+/// Resolve one axis (`px` or `py`) of a menu's top-left corner from its
+/// [`cmd::MenuPos`], the box's extent (width or height) on that axis, the
+/// client's available extent (cols or rows), and the triggering mouse
+/// coordinate on that axis (if any). `Centre` and an absent `mouse` for
+/// `Mouse` both fall back to the SAME formula real tmux's own `-x C`/`-y C`
+/// centering uses (`(avail - extent) / 2`, floor) — matching tmux's
+/// `cmd_display_menu_get_pos`'s `#{popup_centre_x}`/`#{popup_centre_y}`
+/// computation (`(tty->sx - 1) / 2 - w / 2`, which is the same floor-
+/// division centering up to the "-1" tmux subtracts for its own unrelated
+/// reason of reserving a column — not reproduced here, a documented minor
+/// divergence). The result is always clamped so the box fits ENTIRELY
+/// on-screen (`raw + extent > avail -> avail - extent`), mirroring `menu_
+/// prepare`'s own clamp.
+fn resolve_menu_axis(pos: cmd::MenuPos, extent: u16, avail: u16, mouse: Option<u16>) -> u16 {
+    let raw = match pos {
+        cmd::MenuPos::Centre => avail.saturating_sub(extent) / 2,
+        cmd::MenuPos::Mouse => mouse.unwrap_or(0),
+        cmd::MenuPos::Literal(n) => n.clamp(0, u16::MAX as i32) as u16,
+    };
+    if raw.saturating_add(extent) > avail {
+        avail.saturating_sub(extent)
+    } else {
+        raw
     }
 }
 
@@ -4235,11 +6879,14 @@ mod copy_search_tests {
 ///
 /// Per the brief's own documented fallback, this instead builds a real
 /// `Server` + `Registry` session/pane directly (no ConPTY, no background
-/// threads: `PaneRuntime.pty` is `None`, which is fine — `dispatch_mouse`'s
-/// alt-screen branch only ever calls `pty.write_input`, gated behind an `if
-/// let Some(pty) = ..`, so a `None` pty just makes the arrow-writes a silent
-/// no-op instead of a panic) and feeds `\x1b[?1049h` straight into the
-/// pane's `Grid` via its own public `feed` — exercising the EXACT same
+/// threads: `PaneRuntime.pty` is `None`, which is fine — any forwarding
+/// write goes through `pane.input_tx.send(..)` (`forward_mouse_to_pane`,
+/// final-fix-wave update: previously a direct `pty.write_input` call, now
+/// routed through the per-pane writer channel per follow-up #14), an
+/// unbounded `mpsc::Sender` that happily accepts sends with no receiver
+/// ever spawned, so a `None` pty/no writer thread just makes the write a
+/// silent no-op instead of a panic) and feeds `\x1b[?1049h` straight into
+/// the pane's `Grid` via its own public `feed` — exercising the EXACT same
 /// `p.grid.alt_screen()` check `mouse_wheel` branches on, with no
 /// ConPTY-passthrough uncertainty anywhere in the test.
 #[cfg(test)]
@@ -4265,6 +6912,7 @@ mod mouse_dispatch_tests {
             message: None,
             tx,
             mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
         }
     }
 
@@ -4281,7 +6929,8 @@ mod mouse_dispatch_tests {
             grid.feed(b"\x1b[?1049h");
             assert!(grid.alt_screen(), "test setup: grid must report alt_screen after CSI ?1049h");
         }
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
         let session_name = server
             .registry
             .create_session(Some("0"), pane_id, (20, 10), 0)
@@ -4295,12 +6944,85 @@ mod mouse_dispatch_tests {
         MouseEvent { kind: MouseKind::WheelUp, ctrl: false, meta: false, shift: false, x, y }
     }
 
+    /// SP7 Task 9 (closes follow-ups #35/#72): like `test_server_with_pane`,
+    /// but feeds `mouse_decset` (a raw DECSET/DECRST byte string, e.g.
+    /// `b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"`) into the pane's `Grid` before
+    /// returning, so `Grid::mouse_proto()`/`mouse_encoding()` report
+    /// whatever mode/encoding that sequence requests -- the SAME "feed
+    /// DECSET straight into the pane's `Grid`, no ConPTY involved" pattern
+    /// `test_server_with_pane`'s `alt_screen` flag already established for
+    /// `\x1b[?1049h`, applied to the mouse-mode DECSET bytes this task
+    /// tracks instead.
+    fn test_server_with_pane_mouse(mouse_decset: &[u8]) -> (Server, String, PaneId) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        server.options.set("mouse", Some("on"), false, false).unwrap();
+        let pane_id = server.mint_pane_id();
+        let mut grid = Grid::new(20, 10, 100);
+        grid.feed(mouse_decset);
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
+        let session_name = server
+            .registry
+            .create_session(Some("0"), pane_id, (20, 10), 0)
+            .expect("create_session")
+            .name
+            .clone();
+        (server, session_name, pane_id)
+    }
+
+    /// SP7 Task 9 (closes follow-ups #35/#72): a real 2-pane LEFT/RIGHT
+    /// split (`left` occupying columns 0..10, `right` 10..20 of a 20-wide,
+    /// 10-tall session), so a border-drag regression test
+    /// (`border_drag_still_resizes_when_pane_owns_mouse`) can prove actual
+    /// layout resize still happens -- `mouse_drag_border` reads the
+    /// session's LIVE layout directly, not any `rects` a caller passes in,
+    /// so a single-pane session (as `test_server_with_pane`/`_mouse` build)
+    /// can never exercise it. `left_decset` (if any) is fed into the LEFT
+    /// pane's `Grid` before the split, same as `test_server_with_pane_mouse`.
+    fn test_server_with_two_panes(left_decset: Option<&[u8]>) -> (Server, String, PaneId, PaneId) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        server.options.set("mouse", Some("on"), false, false).unwrap();
+
+        let left_id = server.mint_pane_id();
+        let mut left_grid = Grid::new(20, 10, 100);
+        if let Some(bytes) = left_decset {
+            left_grid.feed(bytes);
+        }
+        let (left_tx, _left_rx) = channel();
+        server.panes.insert(left_id, super::super::PaneRuntime { pty: None, grid: left_grid, dead: false, title: String::new(), input_tx: left_tx });
+
+        let session_name = server
+            .registry
+            .create_session(Some("0"), left_id, (20, 10), 0)
+            .expect("create_session")
+            .name
+            .clone();
+
+        let right_id = server.mint_pane_id();
+        let right_grid = Grid::new(10, 10, 100);
+        let (right_tx, _right_rx) = channel();
+        server.panes.insert(right_id, super::super::PaneRuntime { pty: None, grid: right_grid, dead: false, title: String::new(), input_tx: right_tx });
+
+        let area = Rect { x: 0, y: 0, w: 20, h: 10 };
+        if let Some(session) = server.registry.session_mut(&session_name) {
+            session
+                .current_window_mut()
+                .layout
+                .split(SplitDir::Horizontal, right_id, area)
+                .expect("test setup: 20-wide area must fit a left/right split");
+        }
+        server.apply_layout_for_session(&session_name);
+        (server, session_name, left_id, right_id)
+    }
+
     #[test]
     fn alt_screen_wheel_does_not_enter_copy_mode() {
         let (mut server, session_name, _pane_id) = test_server_with_pane(true);
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             matches!(client.mode, ClientMode::Normal),
@@ -4313,6 +7035,7 @@ mod mouse_dispatch_tests {
                 ClientMode::ChooseTree(_) => "ChooseTree",
                 ClientMode::DisplayPanes(_) => "DisplayPanes",
                 ClientMode::Clock(_) => "Clock",
+                ClientMode::Menu(_) => "Menu",
             }
         );
     }
@@ -4325,7 +7048,7 @@ mod mouse_dispatch_tests {
         let (mut server, session_name, _pane_id) = test_server_with_pane(false);
         let mut client = test_client(20, 10);
 
-        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(matches!(client.mode, ClientMode::Copy(_)), "wheel over a LIVE pane must enter copy mode");
     }
@@ -4400,11 +7123,199 @@ mod mouse_dispatch_tests {
         assert!(matches!(client.mode, ClientMode::DisplayPanes(_)), "test setup: overlay must be open");
 
         let up = MouseEvent { kind: MouseKind::Up(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
-        let outcome = server.dispatch_mouse(up, &mut client, &session_name);
+        let outcome = server.dispatch_mouse(up, &mut client, &session_name, 0);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         assert!(
             client.mouse.drag == super::super::MouseDrag::None,
             "overlay guard must clear stale drag state on a swallowed Up"
+        );
+    }
+
+    // ---- application mouse passthrough (SP7 Task 9, closes follow-ups #35/#72) ----
+
+    #[test]
+    fn mouse_forward_eligible_gates_by_proto_and_kind() {
+        // Down/Up/Wheel: any non-Off proto is eligible, INCLUDING legacy
+        // X10 -- Task 3's grid.rs doc comment explicitly tracks X10 "since
+        // Task 9's interface promise requires the X10 variant to exist":
+        // this is that promise, an app that only ever sent `CSI ?9h` still
+        // owns its own clicks (just legacy-wire-encoded, per
+        // `Grid::mouse_encoding`'s own `Default` fallback).
+        for proto in [MouseProto::X10, MouseProto::Normal, MouseProto::Button, MouseProto::Any] {
+            assert!(mouse_forward_eligible(proto, MouseKind::Down(1)), "{proto:?} must forward Down");
+            assert!(mouse_forward_eligible(proto, MouseKind::Up(1)), "{proto:?} must forward Up");
+            assert!(mouse_forward_eligible(proto, MouseKind::WheelUp), "{proto:?} must forward WheelUp");
+            assert!(mouse_forward_eligible(proto, MouseKind::WheelDown), "{proto:?} must forward WheelDown");
+        }
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::Down(1)), "Off must never forward");
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::WheelUp), "Off must never forward");
+
+        // Drag (pure motion): only Button/Any (`MOTION_MOUSE_MODES`) --
+        // X10/Normal never asked the terminal to report motion at all.
+        assert!(mouse_forward_eligible(MouseProto::Button, MouseKind::Drag(1)));
+        assert!(mouse_forward_eligible(MouseProto::Any, MouseKind::Drag(1)));
+        assert!(!mouse_forward_eligible(MouseProto::X10, MouseKind::Drag(1)), "X10 never reports motion");
+        assert!(!mouse_forward_eligible(MouseProto::Normal, MouseKind::Drag(1)), "Normal (1000) never reports motion");
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::Drag(1)));
+    }
+
+    #[test]
+    fn forward_mouse_to_pane_writes_when_pane_owns_mouse_click() {
+        let (mut server, _session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+        assert!(
+            server.forward_mouse_to_pane(pane_id, ev, rect),
+            "a pane requesting DECSET 1000+1006 must be eligible to receive a forwarded click"
+        );
+    }
+
+    #[test]
+    fn forward_mouse_to_pane_false_when_pane_does_not_own_mouse() {
+        let (mut server, _session_name, pane_id) = test_server_with_pane(false);
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+        assert!(
+            !server.forward_mouse_to_pane(pane_id, ev, rect),
+            "a pane that never sent a mouse-mode DECSET must not receive forwarded events"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §7.1: the root `MouseDown1Pane`
+    /// default is `select-pane -t=; send -M` -- UNGATED, both always
+    /// happen, unlike `MouseDrag1Pane`/`WheelUpPane`/`DoubleClick1Pane`/
+    /// `TripleClick1Pane`, which forward INSTEAD of their own default
+    /// action. A click on a mouse-owning pane that is NOT currently
+    /// focused must still move focus there (`forward_mouse_to_pane`'s own
+    /// unit coverage above already proves the SAME gate that `mouse_down`
+    /// calls would write bytes for this exact configuration).
+    #[test]
+    fn mouse_down_focuses_pane_that_owns_mouse() {
+        let (mut server, session_name, left_id, right_id) = test_server_with_two_panes(Some(b"\x1b[?1000h\x1b[?1006h"));
+        let mut client = test_client(20, 10);
+        let focused = |server: &Server| {
+            server.registry.sessions().iter().find(|s| s.name == session_name).unwrap().current_window().layout.focused()
+        };
+        assert_eq!(focused(&server), right_id, "test setup: split must focus the new (right) pane");
+
+        let (_area, rects) = server.mouse_pane_rects(&session_name).expect("session must exist");
+        let (_, left_rect) = *rects.iter().find(|(id, _)| *id == left_id).expect("left pane must have a rect");
+        let click = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: left_rect.x + 1, y: left_rect.y + 1 };
+
+        let outcome = server.dispatch_mouse(click, &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert_eq!(
+            focused(&server),
+            left_id,
+            "a click on a mouse-owning pane must still focus it (tmux's ungated MouseDown1Pane: select-pane AND send -M both always happen)"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §5.1/§7.1: root `MouseDrag1Pane` is
+    /// `if -F {mouse_any_flag} {send -M} {copy-mode -M}` -- when the pane
+    /// owns the mouse, the drag is forwarded INSTEAD of entering copy mode.
+    #[test]
+    fn drag_on_mouse_owning_pane_does_not_enter_copy_mode() {
+        let (mut server, session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: 6, y: 3 };
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        assert!(
+            matches!(client.mode, ClientMode::Normal),
+            "a drag over a pane whose app owns the mouse (1002 button-event tracking) must forward, not enter copy mode"
+        );
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::Forwarding { pane: pane_id },
+            "the drag state must record this drag is being forwarded, not driving a winmux selection"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §6/§7.1: root `WheelUpPane` is `if -F
+    /// {alternate_on || pane_in_mode || mouse_any_flag} {send -M} {copy-mode
+    /// -e}` -- when the pane owns the mouse, wheel forwards INSTEAD of
+    /// entering copy mode (replaces the old unconditional alt-screen
+    /// 3x-arrow-key translation this task removes; mirrors
+    /// `alt_screen_wheel_does_not_enter_copy_mode`'s pattern one section up,
+    /// but for a LIVE screen whose pane owns the mouse instead of an
+    /// alt-screen pane that doesn't).
+    #[test]
+    fn wheel_forwards_to_mouse_owning_pane_instead_of_copy_mode() {
+        let (mut server, session_name, _pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            matches!(client.mode, ClientMode::Normal),
+            "wheel over a pane whose app owns the mouse must forward, not enter copy mode"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §7.4 point 2: real tmux "ALWAYS
+    /// KEEPS: border drags, status-line clicks, ..." regardless of any
+    /// pane's own mouse ownership -- `MouseDown1Border`/`MouseDrag1Border`
+    /// have no `if -F mouse_any_flag` guard at all in tmux's own default
+    /// table. A real 2-pane split is required (unlike the other tests in
+    /// this section) because `mouse_drag_border` reads the session's LIVE
+    /// layout directly, so only an actual resize proves nothing regressed.
+    #[test]
+    fn border_drag_still_resizes_when_pane_owns_mouse() {
+        let (mut server, session_name, left_id, _right_id) = test_server_with_two_panes(Some(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"));
+        let mut client = test_client(20, 10);
+
+        let (_area, rects_before) = server.mouse_pane_rects(&session_name).unwrap();
+        let (_, left_rect_before) = *rects_before.iter().find(|(id, _)| *id == left_id).unwrap();
+        let border_x = left_rect_before.x + left_rect_before.w;
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: border_x, y: 3 };
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::Border { pane: left_id, vertical: true },
+            "test setup: press on the border must arm a border drag even though the left pane owns the mouse"
+        );
+
+        let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: border_x + 2, y: 3 };
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        let (_area, rects_after) = server.mouse_pane_rects(&session_name).unwrap();
+        let (_, left_rect_after) = *rects_after.iter().find(|(id, _)| *id == left_id).unwrap();
+        assert!(
+            left_rect_after.w > left_rect_before.w,
+            "border drag must still resize the pane even though it owns the mouse (mouse.md §7.4/§4: border drags are ALWAYS winmux's own)"
+        );
+    }
+
+    /// `Grid::mouse_proto`'s doc comment: RESET of any of the 4 mouse-mode
+    /// DECSET numbers clears unconditionally to `Off` -- proves the
+    /// forwarding gate is live/dynamic, not a one-time snapshot taken when
+    /// the pane first requested mouse mode.
+    #[test]
+    fn passthrough_stops_after_decrst() {
+        let (mut server, session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(matches!(client.mode, ClientMode::Normal), "test setup: pane must own the mouse before DECRST");
+
+        if let Some(pane) = server.panes.get_mut(&pane_id) {
+            pane.grid.feed(b"\x1b[?1000l");
+        }
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            matches!(client.mode, ClientMode::Copy(_)),
+            "after DECRST the pane no longer owns the mouse, so wheel must resume winmux's own copy-mode entry"
         );
     }
 }
@@ -4432,12 +7343,14 @@ mod choose_tree_dispatch_tests {
             message: None,
             tx,
             mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
         }
     }
 
     fn insert_blank_pane(server: &mut Server) -> PaneId {
         let pane_id = server.mint_pane_id();
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false, title: String::new(), input_tx });
         pane_id
     }
 
@@ -4501,7 +7414,7 @@ mod choose_tree_dispatch_tests {
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
         // Down: A's row (the default selection) -> B's row.
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname, 0).expect("Down dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
                 assert_eq!(state.selected, Some(TreeTarget::Window(session_name.clone(), b_id)), "test setup: selection must be window B before the concurrent kill")
@@ -4512,7 +7425,7 @@ mod choose_tree_dispatch_tests {
         // Same-batch concurrent kill of window A (bypasses dispatch/render).
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");
 
-        let outcome = server.dispatch_choose_tree_key(&key(KeyCode::Enter), &mut client, &mut sname).expect("Enter dispatches");
+        let outcome = server.dispatch_choose_tree_key(&key(KeyCode::Enter), &mut client, &mut sname, 0).expect("Enter dispatches");
         assert!(matches!(outcome, ExecOutcome::Ok(_)), "commit to a same-session window is a plain Ok, not SwitchedSession");
         let current = server.registry.session_mut(&session_name).unwrap().current;
         assert_eq!(
@@ -4532,17 +7445,17 @@ mod choose_tree_dispatch_tests {
         let mut sname = session_name.clone();
 
         server.exec_choose_tree_client(false, &mut client, &sname);
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname, 0).expect("Down dispatches");
 
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");
 
-        server.dispatch_choose_tree_key(&key(KeyCode::Char('x')), &mut client, &mut sname).expect("x dispatches");
+        server.dispatch_choose_tree_key(&key(KeyCode::Char('x')), &mut client, &mut sname, 0).expect("x dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let (target, _) = state.pending_kill.as_ref().expect("x must arm a pending kill");
+                let (targets, _) = state.pending_kill.as_ref().expect("x must arm a pending kill");
                 assert_eq!(
-                    target,
-                    &TreeTarget::Window(session_name.clone(), b_id),
+                    targets.as_slice(),
+                    &[TreeTarget::Window(session_name.clone(), b_id)],
                     "x must arm the kill-confirm on what the user actually selected (window B), not the stale index"
                 );
             }
@@ -4577,23 +7490,30 @@ mod sp6_config_compat_tests {
         assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_some());
 
         server
-            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()))
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()), false)
             .expect("unbind from copy-mode-vi");
         assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_none());
 
         // The user's actual fixture line: `unbind -T copy-mode-vi
-        // MouseDragEnd1Pane`. `MouseDragEnd1Pane` is a real tmux mouse
-        // pseudo-key, but winmux's mouse handling is hardcoded dispatch
-        // logic, not table-driven via named pseudo-keys, so `parse_key`
-        // rejects it -- unbinding it must still succeed as a silent no-op
-        // (nothing could ever have been bound there).
+        // MouseDragEnd1Pane`. Mouse pseudo-keys now parse for real (Task 8,
+        // SP7 wave 3, closes #57/#67(b)) -- this actually removes the real
+        // default `MouseDragEnd1Pane` binding (proven end to end, including
+        // the resulting behavior change, by
+        // `server_proto.rs::unbind_copy_mode_vi_dragend_disables_release_copy`).
+        let dragend = crate::keys::parse_key("MouseDragEnd1Pane").expect("mouse pseudo-key now parses");
+        assert!(
+            server.bindings.lookup(WhichTable::CopyModeVi, &dragend).is_some(),
+            "default MouseDragEnd1Pane binding must be present before unbind"
+        );
         server
-            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()))
-            .expect("unbind of an unparseable pseudo-key is a silent no-op, not an error");
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()), false)
+            .expect("unbind of a real mouse pseudo-key succeeds");
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &dragend).is_none());
 
-        // A copy-mode-vi bind still errors on a genuinely bad key.
+        // A copy-mode-vi bind still errors on a genuinely unparseable key
+        // (#67(a): errors unless `-q`).
         let tail2 = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
-        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "MouseDragEnd1Pane".to_string(), tail2).is_err());
+        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "Ct-x".to_string(), tail2).is_err());
     }
 
     /// `source-file ~/xyz.conf` expands the leading `~/` via `USERPROFILE`
@@ -4647,7 +7567,8 @@ mod focus_activity_fix_tests {
 
     fn insert_blank_pane(server: &mut Server) -> PaneId {
         let pane_id = server.mint_pane_id();
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new(), input_tx });
         pane_id
     }
 
@@ -4838,7 +7759,7 @@ mod focus_activity_fix_tests {
         let before_max = max_activity(&server);
         set_focus(&mut server, &session_name, wid, b);
 
-        server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
+        server.exec_break_pane(false, None, None, None, Some(&session_name)).expect("break-pane");
 
         let source_focus = focused_pane(&mut server, &session_name, wid);
         assert_eq!(source_focus, a, "test setup sanity: only A remains in the source window");
@@ -4908,5 +7829,130 @@ mod focus_activity_fix_tests {
 
         assert!(!server.pane_activity.contains_key(&other_pane), "the killed occupant's activity entry must be pruned");
         assert!(server.pane_activity.contains_key(&a), "the mover's own pane activity must be untouched");
+    }
+}
+
+/// SP7 Task 13 (closes follow-ups #53/#55/#56): the hand-rolled base64
+/// encoder, the OSC 52 wire form, cursor-to-EOL text extraction, and the
+/// `paste-buffer -p` bracket-wrap decision -- pure-function unit coverage.
+///
+/// `paste_p_brackets_when_pane_requested_2004`'s "pane DID request
+/// bracketed paste" case is deliberately NOT attempted as a
+/// `tests/server_proto.rs` real-ConPTY end-to-end test. Investigation during
+/// this task (empirical probes, since discarded) found the positive case
+/// fundamentally unprovable black-box over the wire protocol, for two
+/// independent reasons: (1) getting a REAL pane's grid to observe DECSET
+/// 2004 requires the child process to write `ESC[?2004h` to its own
+/// stdout, and Windows Console/ConPTY is known to intercept/re-synthesize
+/// certain VT private modes rather than relay them byte-for-byte (the same
+/// class of issue `mouse_dispatch_tests`' doc comment above documents for
+/// `?1049h` -- an empirical probe here observed the escape arriving
+/// mangled, not the well-formed `ESC[?2004h` PowerShell wrote); (2) even if
+/// delivery were reliable, a bracket-paste-AWARE reader (e.g. PSReadLine)
+/// is EXPECTED to consume/strip the `ESC[200~`/`ESC[201~` markers on a
+/// successful wrap, producing a client-visible result IDENTICAL to an
+/// unwrapped paste -- so even perfect delivery would not be distinguishable
+/// black-box from the "never requested, `-p` silently skipped" case. The
+/// negative case (`paste_p_plain_when_not_requested`) IS a genuine
+/// `tests/server_proto.rs` test (default state, no escape injection
+/// needed, fully reliable). The positive case's actual logic --
+/// `bracket && pane_bracketed_paste` both true -> wrap -- is proven here
+/// (`bracket_wraps_only_when_both_flag_and_pane_true`) plus
+/// `grid::tests::decset_2004_tracks_bracketed_paste` (the grid-state half).
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use crate::grid::Grid;
+
+    #[test]
+    fn base64_encode_rfc4648_vectors() {
+        // Classic RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn osc52_bytes_wraps_base64_with_c_selection_and_bel() {
+        assert_eq!(osc52_bytes("hi"), b"\x1b]52;c;aGk=\x07".to_vec());
+        assert_eq!(osc52_bytes(""), b"\x1b]52;c;\x07".to_vec());
+    }
+
+    #[test]
+    fn extract_end_of_line_trims_trailing_blanks_from_cursor() {
+        let mut g = Grid::new(10, 1, 0);
+        g.feed(b"hello");
+        // Row is "hello" + 5 trailing blank cells (10 cols total).
+        assert_eq!(extract_end_of_line_text(&g, 2, 0, 0), "llo");
+        assert_eq!(extract_end_of_line_text(&g, 0, 0, 0), "hello");
+        // Cursor past all real content -> empty (only blanks remain).
+        assert_eq!(extract_end_of_line_text(&g, 9, 0, 0), "");
+    }
+
+    #[test]
+    fn bracket_wraps_only_when_both_flag_and_pane_true() {
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), true, true), b"\x1b[200~hi\x1b[201~".to_vec());
+        // `-p` given but the pane never asked for it -> unchanged.
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), true, false), b"hi".to_vec());
+        // Pane DID ask for it, but `-p` wasn't given -> unchanged.
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, true), b"hi".to_vec());
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, false), b"hi".to_vec());
+    }
+
+    /// Final-gate correctness review MUST-FIX #1: `exec_tree_commit`'s
+    /// `TreeTarget::Buffer` arm (choose-buffer's Enter key) must run tmux's
+    /// real default template `paste-buffer -p -b '%%'` -- i.e. `-p` IS
+    /// present, so `bracket` must be `true`, not the `false` this shipped
+    /// with at merge time. Exercised end-to-end through `exec_tree_commit`
+    /// (not just `maybe_bracket_paste` in isolation, which was already
+    /// covered by `bracket_wraps_only_when_both_flag_and_pane_true` but
+    /// couldn't catch a caller passing the wrong constant) against a target
+    /// pane whose `Grid` has DECSET 2004 set (fed directly, no ConPTY --
+    /// same "grid state, no real pty" pattern `test_server_with_pane_mouse`
+    /// establishes, and the same reason the POSITIVE case can't be a real
+    /// `tests/server_proto.rs` end-to-end test: see this module's own doc
+    /// comment above for the ConPTY-DECSET-relay ceiling).
+    #[test]
+    fn choose_buffer_commit_pastes_bracketed_when_pane_requested_2004() {
+        use std::sync::mpsc::channel;
+
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        let pane_id = server.mint_pane_id();
+        let mut grid = Grid::new(20, 10, 100);
+        grid.feed(b"\x1b[?2004h");
+        assert!(grid.bracketed_paste(), "test setup: grid must report bracketed_paste after CSI ?2004h");
+        let (input_tx, input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
+        let mut session_name = server.registry.create_session(Some("0"), pane_id, (20, 10), 0).expect("create_session").name.clone();
+        server.buffers.set_named("buffer0", "hello".to_string());
+
+        let (client_tx, _client_rx) = channel::<Vec<u8>>();
+        let mut client = ClientState {
+            session: Some(session_name.clone()),
+            cols: 20,
+            rows: 10,
+            renderer: crate::render::Renderer::new(20, 10),
+            key_machine: crate::input::KeyMachine::new(crate::keys::parse_key("C-b").unwrap()),
+            mode: ClientMode::Normal,
+            message: None,
+            tx: client_tx,
+            mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
+        };
+
+        let outcome = server.exec_tree_commit(TreeTarget::Buffer("buffer0".to_string()), &mut client, &mut session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)), "expected Ok(_) from exec_tree_commit's Buffer arm");
+
+        let written = input_rx.try_recv().expect("exec_paste_buffer must write via the pane's input_tx");
+        // `-r` defaults off, so `\n`->`\r` replacement runs first, THEN the
+        // whole (replaced) payload is bracket-wrapped -- "hello" has no
+        // newline so the replacement is a no-op here, isolating the
+        // assertion to the bracket-wrap behavior under test.
+        assert_eq!(written, b"\x1b[200~hello\x1b[201~".to_vec());
     }
 }

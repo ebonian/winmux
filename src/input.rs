@@ -64,21 +64,30 @@ pub enum KeyInputEvent {
     /// NEVER routed through the prefix/table state machine or the repeat
     /// window — mouse "bindings" are hardcoded server-side (see the design
     /// spec's `## 4. Mouse` section), not looked up in
-    /// `crate::bindings::Bindings`. `raw` is kept for symmetry with `Key`
-    /// (currently unused: forwarding a click's raw SGR bytes to the pane's
-    /// own mouse-reporting mode is out of scope for v1, see the task brief's
-    /// documented deferral).
+    /// `crate::bindings::Bindings`. `raw` is kept for symmetry with `Key`,
+    /// still unused: SP7 Task 9 (closes follow-ups #35/#72) DOES now forward
+    /// mouse events to a pane whose own app requested mouse reporting, but
+    /// via `keys::encode_mouse` RE-ENCODING the already-decoded `event`
+    /// (rebased to the pane's own origin, in the pane's own requested
+    /// coordinate encoding) rather than replaying these CLIENT-terminal-
+    /// relative raw bytes verbatim — `server::handle_event`'s
+    /// `KeyInputEvent::Mouse { event, .. }` arm destructures and discards
+    /// `raw` before it ever reaches `dispatch_mouse`.
     Mouse { event: keys::MouseEvent, raw: Vec<u8> },
 }
 
 /// Keys that report directly as `Forward` in `Normal` state with no repeat
 /// window active, instead of `Key { table: Root, .. }` — a throughput
 /// simplification: plain runs of printable input become one coalesced
-/// `Forward` event instead of one `Key` event per keystroke. **Documented
-/// deviation** (see the `## input-v2` contract section): `bind -n` on a bare
-/// unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key is accepted by
-/// `cmd`/`bindings` but never fires in SP3 — only keys carrying a modifier,
-/// or a named/special key outside this set, can be bound in the root table.
+/// `Forward` event instead of one `Key` event per keystroke. **This is a
+/// coalescing-shape decision only, not the last word on bindability** (see
+/// the `## input-v2` contract section): as of SP7's follow-up #30 fix,
+/// `server.rs`'s `Forward`-blob consumption re-decodes and looks up every
+/// key in this blob against the LIVE root table before forwarding it, so a
+/// `bind -n` on a bare unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key
+/// DOES fire (it dispatches and is swallowed instead of forwarded) — this
+/// function no longer implies "never bindable," only "batched with its
+/// neighbors instead of decoded as its own `Key` event here."
 fn is_plain_forwardable(k: &keys::Key) -> bool {
     if k.ctrl || k.meta || k.shift {
         return false;
@@ -125,10 +134,15 @@ fn flush_key_forward(fwd: &mut Vec<u8>, out: &mut Vec<KeyInputEvent>) {
 ///   window) rather than being swallowed by it.
 /// - `set_capture(true)`: every byte, including the prefix byte and escape
 ///   sequences, passes through verbatim as `Captured`, bypassing prefix/
-///   repeat entirely (mirrors the legacy machine's `set_capture`). Turning
-///   capture on or off discards (does not re-emit) any incomplete decoder
-///   buffer from before the transition; turning off also resets to `Normal`
-///   table state.
+///   repeat entirely (mirrors the legacy machine's `set_capture`). Both
+///   directions of the transition discard (do not re-emit) any incomplete
+///   decoder buffer from before it. **Precise ON/OFF split (follow-up #20 —
+///   the previous wording here was vaguer about which direction does what):**
+///   turning capture ON leaves any already-armed `Prefixed`/repeat-window
+///   state untouched (irrelevant while capturing, since dispatch is bypassed
+///   entirely) — it is turning capture OFF that resets to `Normal` table
+///   state and clears the repeat window, so a `Prefixed` state armed before
+///   entering capture does NOT survive capture ending.
 pub struct KeyMachine {
     decoder: keys::KeyDecoder,
     prefix: keys::Key,
@@ -427,8 +441,14 @@ mod key_machine_tests {
         );
     }
 
+    /// Follow-up #20 (renamed from `capture_mode_clears_pending_prefix_state`,
+    /// a name left over from the sub-project 2 `InputMachine` this module
+    /// replaced — that exact name/test no longer exists post-rewrite, but the
+    /// naming-precision gap it flagged is worth closing here too): the name
+    /// now says exactly what's asserted — bypass DURING capture, plus OFF
+    /// (not ON) is what clears armed `Prefixed` state.
     #[test]
-    fn capture_bypasses_prefix() {
+    fn capture_bypasses_prefix_and_off_clears_prefix_state() {
         let now = Instant::now();
         let mut m = km();
         // Arm Prefixed, then flip into capture mode mid-sequence.

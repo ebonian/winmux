@@ -188,13 +188,35 @@ pub enum ParsedCmd {
     /// not tracked in SP3 -- passing `-l` is a `usage:` error like any other
     /// unrecognized flag).
     SwitchClient { next: bool },
+    /// `switch-client -t target-session` (SP7 Task 16, closes #51): switch
+    /// the acting client directly to a NAMED session, unlike [`ParsedCmd::
+    /// SwitchClient`]'s relative `-p`/`-n`. Kept as a SEPARATE variant
+    /// rather than folding `-t` into `SwitchClient` itself so every existing
+    /// `-p`/`-n` consumer (`server::switch_client_session`, the `(`/`)`
+    /// default bindings) is untouched -- both spellings share the real tmux
+    /// command name `switch-client`/`switchc` at the `resolve()` level, they
+    /// just produce different `ParsedCmd` shapes depending on which flag was
+    /// given (`-t` together with `-p`/`-n` is a usage error). Added for the
+    /// default session context menu's "Switch To <name>" entries, which have
+    /// no other way to target a specific session.
+    SwitchClientTo { target: String },
     DisplayMessage { text: Option<String> },
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
     SetOption { global: bool, window: bool, append: bool, unset: bool, name: String, value: Option<String> },
-    ShowOptions { global: bool, name: Option<String> },
+    /// `show-options`/`show`/`show-window-options`/`showw` (`-gwqv`, closes
+    /// follow-up #68): `window` mirrors `SetOption`'s (true when `-w` was
+    /// given OR the command word was `showw`/`show-window-options`); `quiet`
+    /// (`-q`) suppresses the unknown-option error (only meaningful for the
+    /// `@name` path today — see `Options::show_user_option`); `value_only`
+    /// (`-v`) prints just the value, no `name ` prefix.
+    ShowOptions { global: bool, window: bool, quiet: bool, value_only: bool, name: Option<String> },
     BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
-    UnbindKey { all: bool, table: String, key: Option<String> },
+    /// `quiet` (`-q`, follow-up #67(a)): suppresses the `unknown key: <tok>`
+    /// error an unparseable `key` token would otherwise produce -- matching
+    /// real tmux's `unbind-key -q` (`docs/tmux-reference/
+    /// commands-config-options-formats.md:442`).
+    UnbindKey { all: bool, table: String, key: Option<String>, quiet: bool },
     ListKeys,
     SourceFile { path: String },
     // SP2 CLI commands, folded into the same table.
@@ -216,14 +238,18 @@ pub enum ParsedCmd {
     /// reachable via tmux's `send-keys -X <name>` spelling (`resolve`'s
     /// `send-keys` arm maps the `-X` name to this).
     CopyCmd(CopyAction),
-    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3):
-    /// write a buffer's contents to a pane's pty. `name: None` = the newest
-    /// buffer. `no_replace` (`-r`, tmux "do not replace LF with CR") default
-    /// `false` -- the DEFAULT behavior replaces every `\n` in the buffer with
-    /// `\r` before writing (tmux's own default; shells expect `\r` to submit
-    /// a line). `-p` (bracketed-paste passthrough) is accepted and IGNORED
-    /// (v1 simplification, documented in the design spec's deferrals list).
-    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+    /// `paste-buffer|pasteb [-p] [-r] [-b name] [-t target-pane]` (Task 3;
+    /// `-p` wired up SP7 Task 13, closes follow-up #55): write a buffer's
+    /// contents to a pane's pty. `name: None` = the newest buffer.
+    /// `no_replace` (`-r`, tmux "do not replace LF with CR") default `false`
+    /// -- the DEFAULT behavior replaces every `\n` in the buffer with `\r`
+    /// before writing (tmux's own default; shells expect `\r` to submit a
+    /// line). `bracket` (`-p`): wrap the whole write in `ESC[200~`/`ESC[201~`
+    /// -- but ONLY if the TARGET pane's grid currently has bracketed-paste
+    /// mode set (DECSET 2004, `Grid::bracketed_paste`); otherwise `-p` stays
+    /// a silent no-op wrapper, exactly like real tmux
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5).
+    PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
     /// `list-buffers|lsb` (Task 3): `<name>: <size> bytes: "<sample>"` lines,
     /// oldest first. Full multi-line text via the CLI/headless path;
     /// dispatched from a CLIENT (a key binding, or the `:` prompt) instead
@@ -266,16 +292,21 @@ pub enum ParsedCmd {
     /// directions -- see `Layout::rotate`'s doc comment for the exact
     /// permutation each maps to.
     RotateWindow { down: bool, target: Option<String> },
-    /// `break-pane|breakp [-d] [-n name]` (Task 7, sub-project 4): the
-    /// target session/window's FOCUSED pane leaves its window and becomes a
-    /// new window (next free index >= the session's `base-index`), which
-    /// becomes current unless `-d` (`detached`) is given. `-n` names the new
-    /// window. No pane target flag: winmux's break-pane always acts on the
-    /// resolved current pane (matches the design spec's `## 6. Window ops`
-    /// section, which omits a `-s`/`-t` pane selector entirely -- smaller,
-    /// honest scope, same pattern as `swap-pane`'s own documented
-    /// deviations).
-    BreakPane { detached: bool, name: Option<String> },
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]` (Task 7, sub-
+    /// project 4; `-s`/`-t` added SP7 Task 11, closes follow-up #44): the
+    /// pane named by `-s` (default: the resolved current pane, same
+    /// `resolve_pane_target` fallback chain as `kill-pane -t`/`swap-pane
+    /// -s`/`-t`) leaves its window and becomes a new window, which becomes
+    /// current unless `-d` (`detached`) is given. `-n` names the new window.
+    /// `-t` is the DESTINATION -- a `[session:]index` window-index target
+    /// (real tmux's `-t` grammar for `break-pane`, distinct from `-s`'s
+    /// pane grammar): an explicit index places the new window there (error
+    /// if occupied); an absent index (or a bare `session:` with nothing
+    /// after the colon) falls back to the destination session's lowest free
+    /// slot. A `session:` prefix on `-t` moves the new window into a
+    /// DIFFERENT session entirely; no prefix keeps it in `-s`'s own
+    /// session (today's pre-Task-11 default).
+    BreakPane { detached: bool, name: Option<String>, src: Option<String>, dst: Option<String> },
     /// `move-window|movew [-k] -t index` (Task 7): re-index the CURRENT
     /// window (of the target session) to `target` (required -- there is
     /// nothing to do without one, unlike real tmux's fuller cross-session
@@ -303,14 +334,23 @@ pub enum ParsedCmd {
     /// swap -- see `Server::exec_swap_window`'s doc comment for the exact
     /// current/last bookkeeping this implies.
     SwapWindow { src: Option<String>, dst: Option<String>, detach: bool },
-    /// `find-window|findw <pattern>` (Task 7): case-insensitive substring
-    /// search (v1, no regex) over window NAMES and every pane's CURRENTLY
-    /// VISIBLE content (not scrollback) in the target session, in window-
-    /// index order; jumps to the first match (current window counts too).
-    /// No match -> `Ok` with a transient `no windows matching: <p>` message
-    /// (not an `Err` -- matches tmux, which never treats "nothing found" as
-    /// a command failure).
-    FindWindow { pattern: String },
+    /// `find-window|findw [-CNTirZ] <pattern>` (Task 7; SP7 Task 12 closes
+    /// follow-ups #46/#54): opens the (possibly filtered-to-nothing)
+    /// choose-tree overlay on the target session's windows -- selecting an
+    /// entry performs the actual jump (real tmux is sugar for `window-tree
+    /// (choose-tree) mode`, NOT a direct jump, even for exactly one match --
+    /// `docs/tmux-reference/windows-and-sessions.md` `### find-window`).
+    /// `by_content`/`by_name`/`by_title` are `-C`/`-N`/`-T`; when all three
+    /// are `false` (no flag given), `server::dispatch` treats that as "match
+    /// all three" (the doc's default). `regex` is `-r` (match-string is a
+    /// regex instead of an fnmatch-style glob substring-wrapped in `*...*`);
+    /// `ignore_case` is `-i`. `-Z` (keep the tree zoomed) is accepted for
+    /// config/CLI compatibility but not stored -- a documented no-op, see
+    /// the parity-polish contract's `find-window-and-main-pane-sizing`
+    /// section. No match -> `Ok` with a transient `no windows matching: <p>`
+    /// message (not an `Err`, and no tree opens -- documented scope
+    /// narrowing versus real tmux's empty-tree-opens behavior).
+    FindWindow { pattern: String, by_content: bool, by_name: bool, by_title: bool, regex: bool, ignore_case: bool },
     /// `choose-tree|choosetree [-s] [-w]` (Task 8, sub-project 4): open the
     /// choose-tree overlay on the acting client. `sessions: true` (`-s`)
     /// lists every session (one collapsed row each); `false` (bare, or the
@@ -320,6 +360,16 @@ pub enum ParsedCmd {
     /// and the documented "windows of the current session only" scope
     /// simplification. `-s`/`-w` together is a usage error.
     ChooseTree { sessions: bool },
+    /// `choose-buffer|chooseb` (SP7 Task 14, closes #48): open the choose-
+    /// buffer overlay on the acting client (paste buffers, `docs/tmux-
+    /// reference/choose-tree.md` `## 10`). No flags modeled (real tmux's
+    /// `-F`/`-f`/`-K`/`-N`/`-O`/`-r`/`-t`/`-y`/`-Z` are out of scope, same
+    /// precedent as `ChooseTree` above not modeling most of its own flags).
+    ChooseBuffer,
+    /// `choose-client` (SP7 Task 14, closes #49): open the choose-client
+    /// overlay on the acting client (attached clients, `## 9`). Same "no
+    /// flags modeled" precedent as `ChooseBuffer`.
+    ChooseClient,
     /// `display-panes|displayp [-d ms]` (Task 8): show a per-pane digit
     /// overlay on the acting client's current window; `ms: None` uses the
     /// `display-panes-time` option's current value (resolved at dispatch
@@ -335,13 +385,93 @@ pub enum ParsedCmd {
     /// winmux's overlay lives in per-CLIENT state, not addressable by an
     /// arbitrary target pane.
     ClockMode,
+    /// `display-menu|menu [-O] [-T title] [-t target-pane] [-x pos] [-y pos]
+    /// name [key command] ...` (SP7 Task 16, closes #51): open a menu
+    /// overlay on the acting client. Grammar per tmux's own `cmd-display-
+    /// menu.c` (`cmd_display_menu_args_parse`/`cmd_display_menu_exec`,
+    /// tmux master commit db115c6, verified against the cloned C source):
+    /// each item is either a single EMPTY-STRING token (a separator line —
+    /// `menu_add_item(menu, NULL, ...)` when `*name == '\0'`) or a NAME/KEY/
+    /// COMMAND triple. `key` is `""` for "no shortcut key" (tmux's
+    /// `KEYC_NONE`, used by items only reachable via navigation — e.g. the
+    /// default pane menu has none, but a config/CLI-authored menu can);
+    /// `command` is stored as RAW TEXT, not parsed here — exactly like real
+    /// tmux's `menu_item.command`, which is only `cmd_parse_and_append`-ed
+    /// when the item is actually chosen (`menu.c`'s `menu_key_cb` `chosen:`
+    /// label) — so a stored menu can reference a command winmux doesn't
+    /// parse until that specific item is picked.
+    ///
+    /// `target`/`stay_open` (`-t`/`-O`) are ACCEPTED AND STORED but not
+    /// wired to behavior (documented narrowing, matching this project's
+    /// existing precedent for accepted-but-inert flags like `find-window
+    /// -Z`): winmux's `display-menu` does not expand `#{...}`/`-t=` format
+    /// tokens inside item command text at all -- every item command must
+    /// name any target explicitly -- so `target` has nothing left to
+    /// influence; `stay_open` (tmux's `MENU_STAYOPEN`, "menu survives a
+    /// separator/disabled-item click") has no effect because winmux's menu
+    /// rows are never disabled-but-visible (see `title`'s sibling doc note
+    /// on `MenuEntry` below) and a separator is never independently
+    /// selectable to begin with.
+    ///
+    /// `x`/`y` ([`MenuPos`]) support only `C` (centre, the default), `M`
+    /// (the triggering mouse position), and a literal column/row -- tmux's
+    /// `R`/`P`/`W`/`L` relative-position letters (pane-right-edge, pane-
+    /// left-edge, window-status-line-column, "same as the last menu") are
+    /// NOT modeled: winmux has no format engine computing those positions
+    /// outside a live mouse click. winmux's OWN default context menus
+    /// (`Bindings::default()`'s `MouseDown3Pane`/`MouseDown3Status`/
+    /// `MouseDown3StatusLeft` sentinels) use `Mouse` for both `x` and `y`
+    /// on ALL THREE menus, including window/session -- a documented
+    /// substitution for tmux's own `-xW -yW` (window-status-line-relative)
+    /// on those two: since winmux's defaults are always mouse-triggered,
+    /// positioning at the click itself is visually equivalent and needs no
+    /// extra per-status-segment column math.
+    DisplayMenu {
+        target: Option<String>,
+        x: MenuPos,
+        y: MenuPos,
+        title: Option<String>,
+        stay_open: bool,
+        items: Vec<MenuEntry>,
+    },
+}
+
+/// `-x`/`-y` position argument for [`ParsedCmd::DisplayMenu`] -- see that
+/// variant's doc comment for exactly which of tmux's position letters are
+/// (and are not) modeled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPos {
+    Literal(i32),
+    Centre,
+    Mouse,
+}
+
+/// One row of a [`ParsedCmd::DisplayMenu`] item list: either a separator
+/// line (tmux: an item whose name is the empty string) or a real, choosable
+/// item. `key: None` is tmux's `KEYC_NONE` ("no direct-jump shortcut for
+/// this item" — still reachable via Up/Down navigation). There is no
+/// "disabled" variant: real tmux draws a name-prefixed-with-`-` item as
+/// visible-but-unselectable (`menu.c`'s `*name == '-'` checks throughout
+/// `menu_key_cb`); winmux's default menu BUILDERS (`server::dispatch`'s
+/// `open_pane_menu`/`open_window_menu`/`open_session_menu`) instead OMIT an
+/// item outright when its tmux equivalent would be disabled (e.g. "Zoom"
+/// when the window has only one pane) — a documented simplification, see
+/// those functions' doc comments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuEntry {
+    Separator,
+    Item { name: String, key: Option<String>, command: String },
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
 /// `send-keys -X` command set. See the design spec's `## 2. Copy mode`
 /// section and the `## copy-mode` contract section for the exact per-name
 /// mapping (`copy_action_name`/`copy_action_from_x_name` below).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// NOT `Copy` (SP7 Task 13): `CopyPipe`/`CopyPipeAndCancel` carry an
+/// optional shell-command argument (`Option<String>`), so every other
+/// (still data-free) variant rides along as `Clone` instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyAction {
     CursorLeft,
     CursorRight,
@@ -397,11 +527,54 @@ pub enum CopyAction {
     /// (`N`). A no-op if no search has ever been committed in this copy-mode
     /// session.
     SearchReverse,
+    /// SP7 Task 13 (closes follow-up #56): first non-blank column of the
+    /// current (view) line -- emacs `M-m`. v1 simplification consistent with
+    /// `NextWord`/`PreviousWord`'s doc comment: operates on the current view
+    /// ROW only, no wrapped-line crossing.
+    BackToIndentation,
+    /// SP7 Task 13 (closes follow-up #56): copy cursor-to-end-of-line into a
+    /// new automatic buffer (+ OSC 52 if `set-clipboard` emits), then cancel
+    /// -- emacs `C-k`. This is winmux's OWN naming choice (documented
+    /// deviation): real tmux's *master*-branch default for `C-k` is
+    /// `copy-pipe-end-of-line-and-cancel` (always pipes to `copy-command`),
+    /// but classic tmux (<=3.5) bound `C-k` to plain `copy-end-of-line` (no
+    /// pipe, stays in copy mode) -- see `docs/tmux-reference/
+    /// copy-mode-and-buffers.md` §3.1's note. winmux's task brief calls for
+    /// a `-and-cancel` variant with NO pipe, splitting the difference: like
+    /// `copy-selection-and-cancel` (Task 3) but the extraction is
+    /// cursor-to-EOL instead of the active selection, and there is no
+    /// `command` argument (use `copy-pipe-and-cancel` -- below -- if a piped
+    /// EOL copy is ever wanted). tmux's own X-name for the real
+    /// `copy-end-of-line-and-cancel` command already carries the `copy-`
+    /// prefix as part of its own name (same precedent as
+    /// `SelectionAndCancel`'s `copy-selection-and-cancel`), so the canonical
+    /// AND -X spellings are identical here too.
+    EndOfLineAndCancel,
+    /// `copy-pipe [command]` (SP7 Task 13, closes follow-ups #53/#56): copy
+    /// the active selection (nothing, if none -- same "no selection -> no-op"
+    /// rule as `SelectionAndCancel`) into a new automatic buffer (+ OSC 52 if
+    /// `set-clipboard` emits) AND, if `command` is `Some`, spawn it (detached,
+    /// no console window) with the copied text on its stdin. Stays in copy
+    /// mode (`copy-pipe-and-cancel`, below, additionally exits). `command:
+    /// None` (bare `copy-pipe`/no positional arg) still creates the buffer
+    /// and emits OSC 52 as normal, it just never spawns anything -- real
+    /// tmux would fall back to the `copy-command` server option in that case
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §5.4 point 3); winmux
+    /// has no `copy-command` option (out of this task's scope, documented
+    /// narrowing), so an absent `command` here is simply "no pipe".
+    CopyPipe(Option<String>),
+    /// `copy-pipe-and-cancel [command]` (SP7 Task 13): same as [`CopyAction::
+    /// CopyPipe`], then exits copy mode. The default binding for emacs
+    /// `C-w`/`M-w` stays on `copy-selection-and-cancel` (unchanged --
+    /// behaviorally identical to this command with `command: None`, per the
+    /// reference doc's own note that the historic and pipe variants "behave
+    /// identically when copy-command is empty").
+    CopyPipeAndCancel(Option<String>),
 }
 
 /// `copy-<action>` canonical command name for one [`CopyAction`] (bindings
 /// table storage, `list-keys` output).
-fn copy_action_name(a: CopyAction) -> &'static str {
+fn copy_action_name(a: &CopyAction) -> &'static str {
     match a {
         CopyAction::CursorLeft => "copy-cursor-left",
         CopyAction::CursorRight => "copy-cursor-right",
@@ -433,6 +606,12 @@ fn copy_action_name(a: CopyAction) -> &'static str {
         CopyAction::SearchBackward => "copy-search-backward",
         CopyAction::SearchAgain => "copy-search-again",
         CopyAction::SearchReverse => "copy-search-reverse",
+        CopyAction::BackToIndentation => "copy-back-to-indentation",
+        // Real tmux's own command name already carries the "copy-" prefix
+        // (same precedent as `SelectionAndCancel`, see its doc comment).
+        CopyAction::EndOfLineAndCancel => "copy-end-of-line-and-cancel",
+        CopyAction::CopyPipe(_) => "copy-pipe",
+        CopyAction::CopyPipeAndCancel(_) => "copy-pipe-and-cancel",
     }
 }
 
@@ -469,10 +648,19 @@ const COPY_ACTIONS: &[CopyAction] = &[
     CopyAction::SearchBackward,
     CopyAction::SearchAgain,
     CopyAction::SearchReverse,
+    CopyAction::BackToIndentation,
+    CopyAction::EndOfLineAndCancel,
+    // `None` command here is fine: this table is only used for NAME
+    // recognition (`copy_action_from_canonical`) -- the real command
+    // argument (if any) is parsed separately by `resolve`'s dedicated
+    // `copy-pipe`/`copy-pipe-and-cancel` arm below, never read off this
+    // const.
+    CopyAction::CopyPipe(None),
+    CopyAction::CopyPipeAndCancel(None),
 ];
 
 fn copy_action_from_canonical(name: &str) -> Option<CopyAction> {
-    COPY_ACTIONS.iter().copied().find(|a| copy_action_name(*a) == name)
+    COPY_ACTIONS.iter().find(|a| copy_action_name(a) == name).cloned()
 }
 
 /// `send-keys -X <name>` spelling -> [`CopyAction`] (tmux's copy-mode
@@ -512,6 +700,14 @@ fn copy_action_from_x_name(name: &str) -> Option<CopyAction> {
         "search-backward" => CopyAction::SearchBackward,
         "search-again" => CopyAction::SearchAgain,
         "search-reverse" => CopyAction::SearchReverse,
+        "back-to-indentation" => CopyAction::BackToIndentation,
+        // Same "-X name keeps the copy- prefix" precedent as
+        // `copy-selection-and-cancel` above. `command` is `None` here --
+        // `resolve`'s `send-keys -X` arm fills it in from the next
+        // positional token, if any (see the dedicated handling there).
+        "copy-end-of-line-and-cancel" => CopyAction::EndOfLineAndCancel,
+        "copy-pipe" => CopyAction::CopyPipe(None),
+        "copy-pipe-and-cancel" => CopyAction::CopyPipeAndCancel(None),
         _ => return None,
     })
 }
@@ -525,7 +721,7 @@ fn canonical(name: &str) -> Option<&'static str> {
     // Internal copy-* commands: bindable and resolvable but their canonical
     // name IS the alias (no separate short form).
     if let Some(a) = copy_action_from_canonical(name) {
-        return Some(copy_action_name(a));
+        return Some(copy_action_name(&a));
     }
     Some(match name {
         "split-window" | "splitw" => "split-window",
@@ -555,7 +751,13 @@ fn canonical(name: &str) -> Option<&'static str> {
         // below, which infers `window: true` from `raw.name` for these two
         // spellings even without an explicit `-w` flag.
         "setw" | "set-window-option" => "set-option",
-        "show-options" | "show" => "show-options",
+        // `showw`/`show-window-options` mirrors `setw`'s real-separate-
+        // command-entry relationship to `set-option`
+        // (`commands-config-options-formats.md`: "Same for
+        // `show-window-options`/`showw`" — `cmd-show-options.c:54-65`):
+        // shares `show-options`'s exec function with an implied `-w`, see
+        // the "show-options" resolve arm below.
+        "show-options" | "show" | "show-window-options" | "showw" => "show-options",
         "bind-key" | "bind" => "bind-key",
         "unbind-key" | "unbind" => "unbind-key",
         "list-keys" | "lsk" => "list-keys",
@@ -580,8 +782,11 @@ fn canonical(name: &str) -> Option<&'static str> {
         "swap-window" | "swapw" => "swap-window",
         "find-window" | "findw" => "find-window",
         "choose-tree" | "choosetree" => "choose-tree",
+        "choose-buffer" | "chooseb" => "choose-buffer",
+        "choose-client" => "choose-client",
         "display-panes" | "displayp" => "display-panes",
         "clock-mode" => "clock-mode",
+        "display-menu" | "menu" => "display-menu",
         _ => return None,
     })
 }
@@ -597,6 +802,16 @@ pub fn usage(name: &str) -> Option<&'static str> {
     let canon = canonical(name)?;
     if canon == "copy-mode" {
         return Some("usage: copy-mode [-u] [-e]");
+    }
+    // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13) take an OPTIONAL
+    // positional shell-command argument -- must be checked before the
+    // generic "copy-<action> (no arguments)" fallback below, which is only
+    // true for every OTHER `copy-*` action.
+    if canon == "copy-pipe" {
+        return Some("usage: copy-pipe [command]");
+    }
+    if canon == "copy-pipe-and-cancel" {
+        return Some("usage: copy-pipe-and-cancel [command]");
     }
     if copy_action_from_canonical(canon).is_some() {
         return Some("usage: copy-<action> (no arguments)");
@@ -618,14 +833,14 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "detach-client" => "usage: detach-client -s target",
         "send-keys" => "usage: send-keys [-l] [-t target] key ...",
         "send-prefix" => "usage: send-prefix",
-        "switch-client" => "usage: switch-client [-p] [-n]",
+        "switch-client" => "usage: switch-client [-p] [-n] [-t target-session]",
         "display-message" => "usage: display-message [text]",
         "confirm-before" => "usage: confirm-before [-p prompt] command ...",
         "command-prompt" => "usage: command-prompt [-I initial]",
         "set-option" => "usage: set-option [-g] [-w] [-a] [-u] option [value]",
-        "show-options" => "usage: show-options [-g] [option]",
+        "show-options" => "usage: show-options [-g] [-w] [-q] [-v] [option]",
         "bind-key" => "usage: bind-key [-n] [-r] [-T table] key command ...",
-        "unbind-key" => "usage: unbind-key [-a] [-n] [-T table] [key]",
+        "unbind-key" => "usage: unbind-key [-aq] [-n] [-T table] [key]",
         "list-keys" => "usage: list-keys",
         "source-file" => "usage: source-file path",
         "new-session" => "usage: new-session [-d] [-s name] [-x cols] [-y rows]",
@@ -643,13 +858,16 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "next-layout" => "usage: next-layout [-t target]",
         "swap-pane" => "usage: swap-pane [-U] [-D] [-s src] [-t dst]",
         "rotate-window" => "usage: rotate-window [-D] [-t target]",
-        "break-pane" => "usage: break-pane [-d] [-n name]",
+        "break-pane" => "usage: break-pane [-d] [-n name] [-s src] [-t dst]",
         "move-window" => "usage: move-window [-k] -t index",
         "swap-window" => "usage: swap-window [-d] [-s src] -t dst",
-        "find-window" => "usage: find-window pattern",
+        "find-window" => "usage: find-window [-CNTirZ] pattern",
         "choose-tree" => "usage: choose-tree [-s] [-w]",
+        "choose-buffer" => "usage: choose-buffer",
+        "choose-client" => "usage: choose-client",
         "display-panes" => "usage: display-panes [-d ms]",
         "clock-mode" => "usage: clock-mode",
+        "display-menu" => "usage: display-menu [-O] [-T title] [-t target] [-x pos] [-y pos] name [key command] ...",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -721,6 +939,17 @@ fn split_tail(tokens: &[String]) -> Vec<RawCmd> {
     out
 }
 
+/// Parse a [`MenuPos`] `-x`/`-y` token -- see [`ParsedCmd::DisplayMenu`]'s
+/// doc comment for which of tmux's letters are modeled. `None` for anything
+/// else (an unrecognized letter, or a non-numeric non-letter token).
+fn parse_menu_pos(s: &str) -> Option<MenuPos> {
+    match s {
+        "C" => Some(MenuPos::Centre),
+        "M" => Some(MenuPos::Mouse),
+        _ => s.parse::<i32>().ok().map(MenuPos::Literal),
+    }
+}
+
 fn direction_of(hits: &[String]) -> Option<Direction> {
     if has(hits, "-L") {
         Some(Direction::Left)
@@ -753,6 +982,19 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             return Err(bad());
         }
         return Ok(ParsedCmd::CopyMode { page_up: has(&b, "-u"), mouse: has(&b, "-e") });
+    }
+    // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13): a single OPTIONAL
+    // positional shell-command token -- must run before the generic
+    // zero-args `copy_action_from_canonical` arm below, which would
+    // otherwise reject any argument at all.
+    if canon == "copy-pipe" || canon == "copy-pipe-and-cancel" {
+        if raw.args.len() > 1 {
+            return Err(bad());
+        }
+        let command = raw.args.first().cloned();
+        let action =
+            if canon == "copy-pipe" { CopyAction::CopyPipe(command) } else { CopyAction::CopyPipeAndCancel(command) };
+        return Ok(ParsedCmd::CopyCmd(action));
     }
     if let Some(action) = copy_action_from_canonical(canon) {
         if !raw.args.is_empty() {
@@ -879,6 +1121,17 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 let Some(action) = copy_action_from_x_name(xname) else {
                     return Err(format!("unknown -X command: {xname}"));
                 };
+                // `copy-pipe`/`copy-pipe-and-cancel` (SP7 Task 13) take the
+                // NEXT positional token as their optional command argument
+                // (`copy_action_from_x_name` always returns `None`'s worth
+                // of command for these two names -- fill it in here from
+                // `p[1]`, if present). Every other action ignores any extra
+                // positional tokens, same as before this task.
+                let action = match action {
+                    CopyAction::CopyPipe(_) => CopyAction::CopyPipe(p.get(1).cloned()),
+                    CopyAction::CopyPipeAndCancel(_) => CopyAction::CopyPipeAndCancel(p.get(1).cloned()),
+                    other => other,
+                };
                 return Ok(ParsedCmd::CopyCmd(action));
             }
             if p.is_empty() {
@@ -893,12 +1146,22 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SendPrefix)
         }
         "switch-client" => {
-            let Ok((b, _, p)) = scan_flags(&raw.args, &["-p", "-n"], &[]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-p", "-n"], &["-t"]) else { return Err(bad()) };
             if !p.is_empty() {
                 return Err(bad());
             }
             let has_p = has(&b, "-p");
             let has_n = has(&b, "-n");
+            // SP7 Task 16 (closes #51): `-t target-session` is a THIRD,
+            // mutually exclusive form (`ParsedCmd::SwitchClientTo`) --
+            // combining it with `-p`/`-n` is a usage error, same as
+            // combining `-p` and `-n` with each other below.
+            if let Some(target) = value_of(&v, "-t") {
+                if has_p || has_n {
+                    return Err(bad());
+                }
+                return Ok(ParsedCmd::SwitchClientTo { target });
+            }
             if has_p == has_n {
                 // Neither given, or both given: SP3 requires exactly one.
                 return Err(bad());
@@ -976,11 +1239,43 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SetOption { global, window, append, unset, name: name.clone(), value })
         }
         "show-options" => {
-            let Ok((b, _, p)) = scan_flags(&raw.args, &["-g"], &[]) else { return Err(bad()) };
-            if p.len() > 1 {
+            // All four flags are boolean-only (no value-taking flag in this
+            // command), so unlike `scan_flags` (shared by commands that DO
+            // mix bool/value flags, and therefore never split a clump —
+            // see its doc comment) this arm can safely support real tmux
+            // clump bundling (`-gqv` == `-g -q -v`, `arguments.c:205-252`)
+            // with a plain per-character scan: the exact TPM rung-1 idiom
+            // `show -gqv "@foo"` (#68) parses. `-w` mirrors `set-option`'s
+            // "table decides scope, flag only picks global-vs-local within
+            // it" rule, and `showw`/`show-window-options` imply it exactly
+            // like `setw`/`set-window-option` do for `set-option` (see that
+            // arm's comment) -- recovered from `raw.name` since
+            // `canonical()` already collapsed both spellings onto
+            // "show-options".
+            let mut global = false;
+            let mut window = matches!(raw.name.as_str(), "showw" | "show-window-options");
+            let mut quiet = false;
+            let mut value_only = false;
+            let mut positional = Vec::new();
+            for tok in &raw.args {
+                if tok.len() > 1 && tok.starts_with('-') {
+                    for c in tok[1..].chars() {
+                        match c {
+                            'g' => global = true,
+                            'w' => window = true,
+                            'q' => quiet = true,
+                            'v' => value_only = true,
+                            _ => return Err(bad()),
+                        }
+                    }
+                } else {
+                    positional.push(tok.clone());
+                }
+            }
+            if positional.len() > 1 {
                 return Err(bad());
             }
-            Ok(ParsedCmd::ShowOptions { global: has(&b, "-g"), name: p.into_iter().next() })
+            Ok(ParsedCmd::ShowOptions { global, window, quiet, value_only, name: positional.into_iter().next() })
         }
         "bind-key" => {
             let mut table: Option<String> = None;
@@ -1022,12 +1317,17 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
         }
         "unbind-key" => {
             let mut all = false;
+            let mut quiet = false;
             let mut table: Option<String> = None;
             let mut i = 0;
             while i < raw.args.len() {
                 match raw.args[i].as_str() {
                     "-a" => {
                         all = true;
+                        i += 1;
+                    }
+                    "-q" => {
+                        quiet = true;
                         i += 1;
                     }
                     "-n" => {
@@ -1054,7 +1354,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             if !all && key.is_none() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::UnbindKey { all, table: table.unwrap_or_else(|| "prefix".to_string()), key })
+            Ok(ParsedCmd::UnbindKey { all, table: table.unwrap_or_else(|| "prefix".to_string()), key, quiet })
         }
         "list-keys" => {
             if !raw.args.is_empty() {
@@ -1127,7 +1427,12 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             if !p.is_empty() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::PasteBuffer { name: value_of(&v, "-b"), target: value_of(&v, "-t"), no_replace: has(&b, "-r") })
+            Ok(ParsedCmd::PasteBuffer {
+                name: value_of(&v, "-b"),
+                target: value_of(&v, "-t"),
+                no_replace: has(&b, "-r"),
+                bracket: has(&b, "-p"),
+            })
         }
         "list-buffers" => {
             if !raw.args.is_empty() {
@@ -1184,11 +1489,16 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::RotateWindow { down: has(&b, "-D"), target: value_of(&v, "-t") })
         }
         "break-pane" => {
-            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-n"]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-n", "-s", "-t"]) else { return Err(bad()) };
             if !p.is_empty() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::BreakPane { detached: has(&b, "-d"), name: value_of(&v, "-n") })
+            Ok(ParsedCmd::BreakPane {
+                detached: has(&b, "-d"),
+                name: value_of(&v, "-n"),
+                src: value_of(&v, "-s"),
+                dst: value_of(&v, "-t"),
+            })
         }
         "move-window" => {
             let Ok((b, v, p)) = scan_flags(&raw.args, &["-k"], &["-t"]) else { return Err(bad()) };
@@ -1207,11 +1517,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SwapWindow { src: value_of(&v, "-s"), dst: Some(dst), detach: has(&b, "-d") })
         }
         "find-window" => {
-            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            let Ok((b, _, p)) = scan_flags(&raw.args, &["-C", "-N", "-T", "-i", "-r", "-Z"], &[]) else { return Err(bad()) };
             if p.len() != 1 {
                 return Err(bad());
             }
-            Ok(ParsedCmd::FindWindow { pattern: p[0].clone() })
+            Ok(ParsedCmd::FindWindow {
+                pattern: p[0].clone(),
+                by_content: has(&b, "-C"),
+                by_name: has(&b, "-N"),
+                by_title: has(&b, "-T"),
+                regex: has(&b, "-r"),
+                ignore_case: has(&b, "-i"),
+                // `-Z` accepted (see `ParsedCmd::FindWindow`'s doc comment)
+                // but deliberately not stored -- documented no-op.
+            })
         }
         "choose-tree" => {
             let Ok((b, _, p)) = scan_flags(&raw.args, &["-s", "-w"], &[]) else { return Err(bad()) };
@@ -1219,6 +1538,20 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 return Err(bad());
             }
             Ok(ParsedCmd::ChooseTree { sessions: has(&b, "-s") })
+        }
+        "choose-buffer" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseBuffer)
+        }
+        "choose-client" => {
+            let Ok((_, _, p)) = scan_flags(&raw.args, &[], &[]) else { return Err(bad()) };
+            if !p.is_empty() {
+                return Err(bad());
+            }
+            Ok(ParsedCmd::ChooseClient)
         }
         "display-panes" => {
             let Ok((_, v, p)) = scan_flags(&raw.args, &[], &["-d"]) else { return Err(bad()) };
@@ -1237,6 +1570,87 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 return Err(bad());
             }
             Ok(ParsedCmd::ClockMode)
+        }
+        "display-menu" => {
+            // Manual flag loop (not `scan_flags`): unlike every other
+            // command, everything AFTER the recognized flags is the
+            // positional item-triple list, which legitimately starts with
+            // tokens that could themselves look like flags (an item named
+            // e.g. "-foo") -- `scan_flags` would misclassify those. Mirrors
+            // `bind-key`/`set-option`'s own manual-loop-then-break pattern.
+            let mut target: Option<String> = None;
+            let mut title: Option<String> = None;
+            let mut x = MenuPos::Centre;
+            let mut y = MenuPos::Centre;
+            let mut stay_open = false;
+            let mut i = 0;
+            while i < raw.args.len() {
+                match raw.args[i].as_str() {
+                    "-t" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        target = Some(v.clone());
+                        i += 1;
+                    }
+                    "-T" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        title = Some(v.clone());
+                        i += 1;
+                    }
+                    "-x" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        let Some(pos) = parse_menu_pos(v) else { return Err(format!("invalid position: {v}")) };
+                        x = pos;
+                        i += 1;
+                    }
+                    "-y" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        let Some(pos) = parse_menu_pos(v) else { return Err(format!("invalid position: {v}")) };
+                        y = pos;
+                        i += 1;
+                    }
+                    "-O" => {
+                        stay_open = true;
+                        i += 1;
+                    }
+                    "-M" => {
+                        // Real tmux's "menu may be dismissed by mouse
+                        // movement" flag -- accepted for compatibility with
+                        // the default-menu argument strings this project's
+                        // own `Bindings::default()` builds, but winmux's
+                        // menu is always mouse-eligible once open (there is
+                        // no `MENU_NOMOUSE` distinction here), so this is a
+                        // documented no-op, same treatment as `-O`.
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let rest = &raw.args[i..];
+            if rest.is_empty() {
+                return Err(bad());
+            }
+            let mut items = Vec::new();
+            let mut j = 0;
+            while j < rest.len() {
+                let name = &rest[j];
+                if name.is_empty() {
+                    items.push(MenuEntry::Separator);
+                    j += 1;
+                    continue;
+                }
+                if rest.len() - j < 3 {
+                    return Err("not enough arguments".to_string());
+                }
+                let key = rest[j + 1].clone();
+                let command = rest[j + 2].clone();
+                items.push(MenuEntry::Item { name: name.clone(), key: if key.is_empty() { None } else { Some(key) }, command });
+                j += 3;
+            }
+            Ok(ParsedCmd::DisplayMenu { target, x, y, title, stay_open, items })
         }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
@@ -1497,9 +1911,22 @@ mod tests {
         );
         assert_eq!(
             resolve(&raw("unbind-key", &["-a"])).unwrap(),
-            ParsedCmd::UnbindKey { all: true, table: "prefix".to_string(), key: None }
+            ParsedCmd::UnbindKey { all: true, table: "prefix".to_string(), key: None, quiet: false }
         );
         assert_eq!(resolve(&raw("unbind-key", &[])).unwrap_err(), usage("unbind-key").unwrap());
+    }
+
+    /// #67(a): `-q` parses and is threaded through, independent of `-a`.
+    #[test]
+    fn unbind_key_quiet_flag_parses() {
+        assert_eq!(
+            resolve(&raw("unbind-key", &["-q", "x"])).unwrap(),
+            ParsedCmd::UnbindKey { all: false, table: "prefix".to_string(), key: Some("x".to_string()), quiet: true }
+        );
+        assert_eq!(
+            resolve(&raw("unbind-key", &["-n", "-q", "x"])).unwrap(),
+            ParsedCmd::UnbindKey { all: false, table: "root".to_string(), key: Some("x".to_string()), quiet: true }
+        );
     }
 
     #[test]
@@ -1587,20 +2014,46 @@ mod tests {
 
     #[test]
     fn break_pane_flags() {
-        assert_eq!(resolve(&raw("break-pane", &[])).unwrap(), ParsedCmd::BreakPane { detached: false, name: None });
+        assert_eq!(
+            resolve(&raw("break-pane", &[])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: None, dst: None }
+        );
         assert_eq!(
             resolve(&raw("breakp", &["-d"])).unwrap(),
-            ParsedCmd::BreakPane { detached: true, name: None }
+            ParsedCmd::BreakPane { detached: true, name: None, src: None, dst: None }
         );
         assert_eq!(
             resolve(&raw("break-pane", &["-n", "logs"])).unwrap(),
-            ParsedCmd::BreakPane { detached: false, name: Some("logs".to_string()) }
+            ParsedCmd::BreakPane { detached: false, name: Some("logs".to_string()), src: None, dst: None }
         );
         assert_eq!(
             resolve(&raw("break-pane", &["-d", "-n", "logs"])).unwrap(),
-            ParsedCmd::BreakPane { detached: true, name: Some("logs".to_string()) }
+            ParsedCmd::BreakPane { detached: true, name: Some("logs".to_string()), src: None, dst: None }
         );
         assert_eq!(resolve(&raw("break-pane", &["extra"])).unwrap_err(), usage("break-pane").unwrap());
+    }
+
+    /// SP7 Task 11 (closes follow-up #44): `-s`/`-t` parse as plain optional
+    /// string flags, same shape `swap-pane`'s `-s`/`-t` already use.
+    #[test]
+    fn break_pane_src_dst_flags() {
+        assert_eq!(
+            resolve(&raw("break-pane", &["-s", "0.1"])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: Some("0.1".to_string()), dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-t", "other:3"])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: None, dst: Some("other:3".to_string()) }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-s", "0.1", "-t", "other:3", "-d"])).unwrap(),
+            ParsedCmd::BreakPane {
+                detached: true,
+                name: None,
+                src: Some("0.1".to_string()),
+                dst: Some("other:3".to_string())
+            }
+        );
     }
 
     #[test]
@@ -1643,14 +2096,32 @@ mod tests {
     fn find_window_pattern() {
         assert_eq!(
             resolve(&raw("find-window", &["logs"])).unwrap(),
-            ParsedCmd::FindWindow { pattern: "logs".to_string() }
+            ParsedCmd::FindWindow { pattern: "logs".to_string(), by_content: false, by_name: false, by_title: false, regex: false, ignore_case: false }
         );
         assert_eq!(
             resolve(&raw("findw", &["with space"])).unwrap(),
-            ParsedCmd::FindWindow { pattern: "with space".to_string() }
+            ParsedCmd::FindWindow { pattern: "with space".to_string(), by_content: false, by_name: false, by_title: false, regex: false, ignore_case: false }
         );
         assert_eq!(resolve(&raw("find-window", &[])).unwrap_err(), usage("find-window").unwrap());
         assert_eq!(resolve(&raw("find-window", &["a", "b"])).unwrap_err(), usage("find-window").unwrap());
+    }
+
+    /// SP7 Task 12: `-C`/`-N`/`-T`/`-i`/`-r`/`-Z` all parse; `-Z` is accepted
+    /// but not part of the parsed shape (documented no-op).
+    #[test]
+    fn find_window_flags_parse() {
+        assert_eq!(
+            resolve(&raw("find-window", &["-r", "-i", "^foo"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "^foo".to_string(), by_content: false, by_name: false, by_title: false, regex: true, ignore_case: true }
+        );
+        assert_eq!(
+            resolve(&raw("find-window", &["-N", "-T", "webby"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "webby".to_string(), by_content: false, by_name: true, by_title: true, regex: false, ignore_case: false }
+        );
+        assert_eq!(
+            resolve(&raw("find-window", &["-C", "-Z", "logs"])).unwrap(),
+            ParsedCmd::FindWindow { pattern: "logs".to_string(), by_content: true, by_name: false, by_title: false, regex: false, ignore_case: false }
+        );
     }
 
     // ---- overlays (Task 8, sub-project 4) ----------------------------------
@@ -1662,6 +2133,15 @@ mod tests {
         assert_eq!(resolve(&raw("choosetree", &["-s"])).unwrap(), ParsedCmd::ChooseTree { sessions: true });
         assert_eq!(resolve(&raw("choose-tree", &["-s", "-w"])).unwrap_err(), usage("choose-tree").unwrap());
         assert_eq!(resolve(&raw("choose-tree", &["extra"])).unwrap_err(), usage("choose-tree").unwrap());
+    }
+
+    #[test]
+    fn choose_buffer_and_choose_client() {
+        assert_eq!(resolve(&raw("choose-buffer", &[])).unwrap(), ParsedCmd::ChooseBuffer);
+        assert_eq!(resolve(&raw("chooseb", &[])).unwrap(), ParsedCmd::ChooseBuffer);
+        assert_eq!(resolve(&raw("choose-buffer", &["extra"])).unwrap_err(), usage("choose-buffer").unwrap());
+        assert_eq!(resolve(&raw("choose-client", &[])).unwrap(), ParsedCmd::ChooseClient);
+        assert_eq!(resolve(&raw("choose-client", &["extra"])).unwrap_err(), usage("choose-client").unwrap());
     }
 
     #[test]
@@ -1685,6 +2165,97 @@ mod tests {
         assert_eq!(resolve(&raw("clock-mode", &["-t", "1"])).unwrap_err(), usage("clock-mode").unwrap());
         assert_eq!(resolve(&raw("clock-mode", &["extra"])).unwrap_err(), usage("clock-mode").unwrap());
         assert_eq!(usage("clock-mode").unwrap(), "usage: clock-mode");
+    }
+
+    // ---- display-menu (SP7 Task 16, closes #51) ----
+
+    #[test]
+    fn display_menu_parses_name_key_command_triples() {
+        assert_eq!(
+            resolve(&raw("display-menu", &["Kill", "X", "kill-pane", "Zoom", "z", "resize-pane -Z"])).unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: None,
+                x: MenuPos::Centre,
+                y: MenuPos::Centre,
+                title: None,
+                stay_open: false,
+                items: vec![
+                    MenuEntry::Item { name: "Kill".to_string(), key: Some("X".to_string()), command: "kill-pane".to_string() },
+                    MenuEntry::Item {
+                        name: "Zoom".to_string(),
+                        key: Some("z".to_string()),
+                        command: "resize-pane -Z".to_string(),
+                    },
+                ],
+            }
+        );
+        // `menu` is the tmux alias.
+        assert_eq!(
+            resolve(&raw("menu", &["Kill", "X", "kill-pane"])).unwrap(),
+            resolve(&raw("display-menu", &["Kill", "X", "kill-pane"])).unwrap()
+        );
+    }
+
+    #[test]
+    fn display_menu_empty_name_is_separator() {
+        assert_eq!(
+            resolve(&raw("display-menu", &["A", "a", "cmd-a", "", "B", "b", "cmd-b"])).unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: None,
+                x: MenuPos::Centre,
+                y: MenuPos::Centre,
+                title: None,
+                stay_open: false,
+                items: vec![
+                    MenuEntry::Item { name: "A".to_string(), key: Some("a".to_string()), command: "cmd-a".to_string() },
+                    MenuEntry::Separator,
+                    MenuEntry::Item { name: "B".to_string(), key: Some("b".to_string()), command: "cmd-b".to_string() },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn display_menu_empty_key_is_no_shortcut() {
+        let ParsedCmd::DisplayMenu { items, .. } = resolve(&raw("display-menu", &["Move", "", "move-pane"])).unwrap() else {
+            panic!("expected DisplayMenu");
+        };
+        assert_eq!(items, vec![MenuEntry::Item { name: "Move".to_string(), key: None, command: "move-pane".to_string() }]);
+    }
+
+    #[test]
+    fn display_menu_flags_and_title() {
+        assert_eq!(
+            resolve(&raw(
+                "display-menu",
+                &["-T", "My Title", "-x", "M", "-y", "10", "-t", "work", "-O", "A", "a", "cmd-a"]
+            ))
+            .unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: Some("work".to_string()),
+                x: MenuPos::Mouse,
+                y: MenuPos::Literal(10),
+                title: Some("My Title".to_string()),
+                stay_open: true,
+                items: vec![MenuEntry::Item { name: "A".to_string(), key: Some("a".to_string()), command: "cmd-a".to_string() }],
+            }
+        );
+    }
+
+    #[test]
+    fn display_menu_requires_at_least_one_item_and_full_triples() {
+        assert_eq!(resolve(&raw("display-menu", &[])).unwrap_err(), usage("display-menu").unwrap());
+        assert!(resolve(&raw("display-menu", &["A", "a"])).is_err());
+    }
+
+    #[test]
+    fn switch_client_to_named_session() {
+        assert_eq!(
+            resolve(&raw("switch-client", &["-t", "work"])).unwrap(),
+            ParsedCmd::SwitchClientTo { target: "work".to_string() }
+        );
+        // `-t` combined with `-p`/`-n` is a usage error.
+        assert!(resolve(&raw("switch-client", &["-t", "work", "-p"])).is_err());
     }
 
     #[test]
@@ -1885,19 +2456,92 @@ mod tests {
         );
     }
 
+    // ---- clipboard: copy-pipe / bracketed paste / emacs C-k, M-m
+    // (SP7 Task 13, closes follow-ups #53/#55/#56) ----
+
+    #[test]
+    fn back_to_indentation_and_end_of_line_and_cancel_resolve() {
+        assert_eq!(
+            resolve(&raw("copy-back-to-indentation", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BackToIndentation)
+        );
+        assert_eq!(
+            resolve(&raw("copy-end-of-line-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::EndOfLineAndCancel)
+        );
+        // No arguments accepted (same rule as every other zero-arg copy-*
+        // command).
+        assert_eq!(
+            resolve(&raw("copy-back-to-indentation", &["x"])).unwrap_err(),
+            usage("copy-back-to-indentation").unwrap()
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "back-to-indentation"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::BackToIndentation)
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-end-of-line-and-cancel"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::EndOfLineAndCancel)
+        );
+    }
+
+    #[test]
+    fn copy_pipe_resolves_with_and_without_command() {
+        assert_eq!(resolve(&raw("copy-pipe", &[])).unwrap(), ParsedCmd::CopyCmd(CopyAction::CopyPipe(None)));
+        assert_eq!(
+            resolve(&raw("copy-pipe", &["clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(Some("clip.exe".to_string())))
+        );
+        assert_eq!(
+            resolve(&raw("copy-pipe-and-cancel", &[])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(None))
+        );
+        assert_eq!(
+            resolve(&raw("copy-pipe-and-cancel", &["clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(Some("clip.exe".to_string())))
+        );
+        // Too many positional args -> usage error.
+        assert_eq!(
+            resolve(&raw("copy-pipe", &["a", "b"])).unwrap_err(),
+            usage("copy-pipe").unwrap()
+        );
+    }
+
+    #[test]
+    fn send_keys_dash_x_copy_pipe_captures_command_arg() {
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe", "clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(Some("clip.exe".to_string())))
+        );
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe-and-cancel", "clip.exe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipeAndCancel(Some("clip.exe".to_string())))
+        );
+        // No trailing token -> command is `None`.
+        assert_eq!(
+            resolve(&raw("send-keys", &["-X", "copy-pipe"])).unwrap(),
+            ParsedCmd::CopyCmd(CopyAction::CopyPipe(None))
+        );
+    }
+
     #[test]
     fn paste_buffer_flags() {
         assert_eq!(
             resolve(&raw("paste-buffer", &[])).unwrap(),
-            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false }
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: false, bracket: false }
         );
         assert_eq!(
             resolve(&raw("pasteb", &["-p", "-b", "foo", "-t", "work"])).unwrap(),
-            ParsedCmd::PasteBuffer { name: Some("foo".to_string()), target: Some("work".to_string()), no_replace: false }
+            ParsedCmd::PasteBuffer {
+                name: Some("foo".to_string()),
+                target: Some("work".to_string()),
+                no_replace: false,
+                bracket: true,
+            }
         );
         assert_eq!(
             resolve(&raw("paste-buffer", &["-r"])).unwrap(),
-            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true }
+            ParsedCmd::PasteBuffer { name: None, target: None, no_replace: true, bracket: false }
         );
         assert_eq!(resolve(&raw("paste-buffer", &["bogus"])).unwrap_err(), usage("paste-buffer").unwrap());
     }
@@ -1934,14 +2578,44 @@ mod tests {
     fn show_options_and_display_message() {
         assert_eq!(
             resolve(&raw("show", &["-g", "status-left"])).unwrap(),
-            ParsedCmd::ShowOptions { global: true, name: Some("status-left".to_string()) }
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: false, value_only: false, name: Some("status-left".to_string()) }
         );
-        assert_eq!(resolve(&raw("show", &[])).unwrap(), ParsedCmd::ShowOptions { global: false, name: None });
+        assert_eq!(
+            resolve(&raw("show", &[])).unwrap(),
+            ParsedCmd::ShowOptions { global: false, window: false, quiet: false, value_only: false, name: None }
+        );
         assert_eq!(
             resolve(&raw("display", &["hello", "world"])).unwrap(),
             ParsedCmd::DisplayMessage { text: Some("hello world".to_string()) }
         );
         assert_eq!(resolve(&raw("display-message", &[])).unwrap(), ParsedCmd::DisplayMessage { text: None });
+    }
+
+    /// #68: `show -gqv "@foo"` (the TPM rung-1 primitive) must parse `-q`
+    /// and `-v` (bundled with `-g` in one clump, tmux's real boolean-flag
+    /// bundling rule, `arguments.c:205-252`) alongside the pre-existing
+    /// `-g`. Also covers `-w`/`showw`/`show-window-options` implying
+    /// `window: true`, mirroring `setw_is_set_option_alias` above.
+    #[test]
+    fn show_options_parses_v_and_q_flags() {
+        assert_eq!(
+            resolve(&raw("show", &["-gqv", "@foo"])).unwrap(),
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: true, value_only: true, name: Some("@foo".to_string()) }
+        );
+        // Un-bundled, same result.
+        assert_eq!(
+            resolve(&raw("show-options", &["-g", "-q", "-v", "@foo"])).unwrap(),
+            ParsedCmd::ShowOptions { global: true, window: false, quiet: true, value_only: true, name: Some("@foo".to_string()) }
+        );
+        // `-w` explicit.
+        assert_eq!(
+            resolve(&raw("show", &["-w", "mode-keys"])).unwrap(),
+            ParsedCmd::ShowOptions { global: false, window: true, quiet: false, value_only: false, name: Some("mode-keys".to_string()) }
+        );
+        // `showw`/`show-window-options` imply `-w` with no explicit flag.
+        let want_w = ParsedCmd::ShowOptions { global: false, window: true, quiet: false, value_only: false, name: None };
+        assert_eq!(resolve(&raw("showw", &[])).unwrap(), want_w);
+        assert_eq!(resolve(&raw("show-window-options", &[])).unwrap(), want_w);
     }
 
     /// SP6 Task 2: `setw`/`set-window-option` are real tmux command entries

@@ -33,6 +33,7 @@
 //! `GetOverlappedResult(..., bWait: TRUE)` until its own operation
 //! completes, never interfering with another duplicate's pending call).
 
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -41,7 +42,13 @@ use std::sync::Mutex;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE,
+    HANDLE,
+};
+use windows::Win32::Security::{
+    AddAccessAllowedAce, InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
+    GetTokenInformation, TokenUser, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -51,7 +58,7 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::CreateEventW;
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::WindowsProgramming::GetUserNameW;
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
@@ -61,6 +68,14 @@ const BUFFER_SIZE: u32 = 64 * 1024;
 /// `CreateFileW` once (`ERROR_PIPE_BUSY` handling, per Win32 named-pipe
 /// client convention).
 const PIPE_BUSY_WAIT_MS: u32 = 2000;
+
+/// Windows' documented maximum username length (`UNLEN`, `lmcons.h`); the
+/// buffer must be `UNLEN + 1` u16s to leave room for the trailing NUL
+/// `GetUserNameW` writes even at the documented worst case (follow-up #8 —
+/// the previous `256` was one `u16` short of that worst case; unreachable in
+/// practice since real usernames are far shorter, but worth sizing to the
+/// documented constant rather than a round number).
+const UNLEN: usize = 256;
 
 /// Build the full pipe path for a given logical socket name:
 /// `\\.\pipe\winmux-<username>-<socket_name>`. Both the username and the
@@ -89,7 +104,7 @@ fn sanitize(s: &str) -> String {
 /// Current Windows username via `GetUserNameW`; `"unknown"` if unavailable.
 fn current_username() -> String {
     unsafe {
-        let mut buf = [0u16; 256];
+        let mut buf = [0u16; UNLEN + 1];
         let mut len = buf.len() as u32;
         match GetUserNameW(PWSTR(buf.as_mut_ptr()), &mut len) {
             // `len` on success includes the trailing NUL.
@@ -160,6 +175,80 @@ impl Drop for OwnedEvent {
     }
 }
 
+/// Owner-only DACL for `CreateNamedPipeW` (follow-up #15): grants the
+/// CURRENT PROCESS's owner SID `GENERIC_ALL` and nothing else, in place of
+/// relying on the platform default DACL. Low-risk even before this (the
+/// default DACL grants Everyone read-only connect at most, and pipe names
+/// are already per-username), but an explicit posture is more defensible.
+/// Every buffer the built `SECURITY_DESCRIPTOR`/`ACL`/`SID` point into must
+/// outlive the `CreateNamedPipeW` call that consumes `attrs()` — that's this
+/// struct's only job; nothing here needs to survive past that one call.
+struct OwnerDacl {
+    _token_info: Vec<u8>,
+    _acl: Vec<u8>,
+    _sd: Vec<u8>,
+    attrs: SECURITY_ATTRIBUTES,
+}
+
+impl OwnerDacl {
+    fn build() -> io::Result<OwnerDacl> {
+        unsafe {
+            // 1. The current process's token, just long enough to query its
+            //    owner SID.
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(win_err)?;
+            let token_result: io::Result<Vec<u8>> = (|| {
+                // Two-call pattern: the first call is EXPECTED to fail with
+                // ERROR_INSUFFICIENT_BUFFER and only fills in the required
+                // length.
+                let mut len: u32 = 0;
+                let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+                let mut buf = vec![0u8; len as usize];
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    Some(buf.as_mut_ptr() as *mut c_void),
+                    len,
+                    &mut len,
+                )
+                .map_err(win_err)?;
+                Ok(buf)
+            })();
+            let _ = CloseHandle(token);
+            let token_info = token_result?;
+            let sid = (*(token_info.as_ptr() as *const TOKEN_USER)).User.Sid;
+
+            // 2. A one-ACE ACL: owner SID, GENERIC_ALL, nothing else. 256
+            //    bytes comfortably covers the largest real SID plus the ACL/
+            //    ACE headers.
+            let mut acl = vec![0u8; 256];
+            let acl_ptr = acl.as_mut_ptr() as *mut ACL;
+            InitializeAcl(acl_ptr, acl.len() as u32, ACL_REVISION).map_err(win_err)?;
+            AddAccessAllowedAce(acl_ptr, ACL_REVISION, GENERIC_ALL.0, sid).map_err(win_err)?;
+
+            // 3. A self-relative-free SECURITY_DESCRIPTOR wrapping that ACL
+            //    as its DACL (`bDaclPresent = TRUE`, not defaulted).
+            let mut sd = vec![0u8; std::mem::size_of::<windows::Win32::Security::SECURITY_DESCRIPTOR>()];
+            let psd = PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut c_void);
+            InitializeSecurityDescriptor(psd, 1 /* SECURITY_DESCRIPTOR_REVISION */)
+                .map_err(win_err)?;
+            SetSecurityDescriptorDacl(psd, true, Some(acl_ptr as *const ACL), false)
+                .map_err(win_err)?;
+
+            let attrs = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0,
+                bInheritHandle: false.into(),
+            };
+            Ok(OwnerDacl { _token_info: token_info, _acl: acl, _sd: sd, attrs })
+        }
+    }
+
+    fn attrs(&self) -> &SECURITY_ATTRIBUTES {
+        &self.attrs
+    }
+}
+
 /// Create one named-pipe server instance (duplex, byte mode, blocking from
 /// the caller's point of view, overlapped-capable underneath).
 ///
@@ -175,11 +264,16 @@ impl Drop for OwnedEvent {
 /// loser's `bind` must FAIL so its process exits and the winner alone owns
 /// the pipe. Subsequent `accept`-time instances must NOT set the flag (the
 /// name legitimately exists then — it's the same server adding instances).
+///
+/// Every instance (this call, `first` or not) is created with an explicit
+/// owner-only DACL (follow-up #15, `OwnerDacl`) rather than `None` (the
+/// platform default) — see that type's doc comment.
 fn create_instance(wide_name: &[u16], first: bool) -> io::Result<HANDLE> {
     let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
+    let dacl = OwnerDacl::build()?;
     unsafe {
         let handle = CreateNamedPipeW(
             PCWSTR(wide_name.as_ptr()),
@@ -189,7 +283,7 @@ fn create_instance(wide_name: &[u16], first: bool) -> io::Result<HANDLE> {
             BUFFER_SIZE,
             BUFFER_SIZE,
             0,
-            None,
+            Some(dacl.attrs() as *const SECURITY_ATTRIBUTES),
         );
         if handle.is_invalid() {
             Err(win32_code_error(GetLastError().0))
@@ -247,17 +341,27 @@ impl PipeListener {
         let event = OwnedEvent::new()?;
         let mut overlapped = OVERLAPPED { hEvent: event.0, ..Default::default() };
         unsafe {
+            // `handle` is always opened with `FILE_FLAG_OVERLAPPED`
+            // (`create_instance`), and Win32's documented contract for
+            // `ConnectNamedPipe` on an overlapped handle is that it NEVER
+            // returns success synchronously — only `ERROR_IO_PENDING`
+            // (connect still in flight) or `ERROR_PIPE_CONNECTED` (a client
+            // raced in before this call) — so there is no `Ok(())` arm here
+            // (follow-up #21: the old version had one, unreachable given this
+            // module's exclusively-overlapped usage).
             match ConnectNamedPipe(handle, Some(&mut overlapped)) {
                 // A client may already have connected in the window between
                 // this instance's creation and this call: reported
                 // synchronously as ERROR_PIPE_CONNECTED, not a real failure.
-                Ok(()) => {}
                 Err(e) if raw_win32_code(&e) == ERROR_PIPE_CONNECTED.0 => {}
                 Err(e) if raw_win32_code(&e) == ERROR_IO_PENDING.0 => {
                     let mut transferred = 0u32;
                     GetOverlappedResult(handle, &overlapped, &mut transferred, true).map_err(win_err)?;
                 }
                 Err(e) => return Err(win_err(e)),
+                Ok(()) => unreachable!(
+                    "ConnectNamedPipe returned Ok(()) synchronously on an overlapped handle"
+                ),
             }
         }
         Ok(PipeConn { file, event })
@@ -407,5 +511,25 @@ mod tests {
     #[test]
     fn sanitize_replaces_illegal_chars() {
         assert_eq!(sanitize("a b\\c/d:e"), "a_b_c_d_e");
+    }
+
+    /// Follow-up #8: `current_username`'s buffer is sized to the documented
+    /// `UNLEN + 1` (257 `u16`s — room for `UNLEN` characters plus the
+    /// trailing NUL `GetUserNameW` writes), not an arbitrary round number.
+    /// This is a compile-time/constant pin (the buffer size isn't otherwise
+    /// observable from a real username, which is always far shorter) rather
+    /// than a behavioral test.
+    #[test]
+    fn unlen_plus_one_is_257() {
+        assert_eq!(UNLEN, 256);
+        assert_eq!(UNLEN + 1, 257);
+    }
+
+    /// `current_username` never panics/truncates oddly regardless of the
+    /// real environment's username length — a smoke check that the buffer
+    /// resize didn't break the happy path.
+    #[test]
+    fn current_username_is_nonempty() {
+        assert!(!current_username().is_empty());
     }
 }

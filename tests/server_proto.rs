@@ -203,6 +203,38 @@ impl Client {
     }
 }
 
+/// Like [`Client::recv_output_until`], but widens the margin against a real
+/// race in `selection_survives_concurrent_output`/
+/// `other_end_survives_concurrent_output` (#58, task-10-closeout
+/// flakiness): a background `send-keys` triggers a multi-line shell
+/// echo+execute+reprompt that can arrive as SEVERAL separate `Output`
+/// frames, so the FIRST frame where `pred` happens to hold (e.g. the moment
+/// the anchored line has scrolled up by exactly one row, or the highlight's
+/// leftmost column has repainted) is not necessarily the FINAL settled
+/// state the rest of the test's assertions assume — under full-parallelism
+/// `cargo test` scheduling delay, more output/redraw frames can still be
+/// in flight when `pred` first flips true. This keeps draining any further
+/// `Output` frames that arrive within a short settle window after `pred`
+/// first holds, then re-asserts `pred` still holds on the settled grid —
+/// closing that race without weakening what either test actually checks
+/// (the settled grid still has to satisfy the exact same predicate; this
+/// only refuses to trust the FIRST instant it does).
+fn recv_output_settled(client: &Client, grid: &mut Grid, pred: impl Fn(&Grid) -> bool) {
+    client.recv_output_until(grid, &pred);
+    let settle_deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        let remaining = settle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match client.rx.recv_timeout(remaining) {
+            Ok(ServerMsg::Output(bytes)) => grid.feed(&bytes),
+            Ok(_) | Err(_) => break,
+        }
+    }
+    assert!(pred(grid), "predicate held transiently but not after settling; screen:\n{}", screen_text(grid).join("\n"));
+}
+
 fn attach(client: &mut Client, mode: AttachMode, name: &str, cols: u16, rows: u16) {
     client.send(&ClientMsg::Attach {
         mode,
@@ -466,6 +498,41 @@ fn two_clients_smallest_size_wins() {
     a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     // Either client observing the session end is fine; both are attached.
     a.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Follow-up #17: an `attach -d` (steal) evicts every OTHER client already
+/// attached to the target session with `Exit{0, "[detached (from session
+/// <name>)]"}` — previously a bare `[detached]` with no session name,
+/// inconsistent with every other detach exit path (`d`-key/`Detach` frame,
+/// `detach-client` CLI) which already name the session.
+#[test]
+fn steal_attach_eviction_message_names_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "steal-me", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // B attaches with detach_others = true (`attach -d`): A must be evicted
+    // with the session-naming message, not a bare "[detached]".
+    let mut b = Client::connect(&name);
+    b.send(&ClientMsg::Attach {
+        mode: AttachMode::Existing,
+        detach_others: true,
+        cols: 80,
+        rows: 24,
+        name: "steal-me".to_string(),
+    });
+    a.expect_exit(0, "[detached (from session steal-me)]");
+
+    // B is now the sole attached client and can drive the session normally.
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    b.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
 
@@ -1405,6 +1472,83 @@ fn show_options_output() {
     cli.send(&ClientMsg::Cli(vec!["show".into(), "prefix".into()]));
     let (out, _) = expect_cli_done(&cli, 0);
     assert_eq!(out, "prefix C-b\n");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Follow-up #14: the server's main-loop pane-input writes must never block
+/// on one pane's stalled stdin. `default-command` is set to a shell that
+/// NEVER reads stdin at all (`Start-Sleep`, unlike even a hung interactive
+/// shell which at least occasionally drains some bytes) before creating
+/// session B, whose one pane runs it; B is then flooded with a large volume
+/// of raw `Stdin` frames (a "huge paste onto a hung app", per the ticket's
+/// own framing). Concurrently, a trivial CLI round trip (`list-sessions`)
+/// against the SAME server shares the identical single-threaded main event
+/// loop. Before the per-pane writer-thread fix, every one of B's flooded
+/// frames dispatched `pty.write_input` INLINE on the main loop; with enough
+/// queued frames against a non-draining child, this could stall the loop for
+/// a real, measurable stretch, delaying the concurrent CLI reply. With the
+/// fix, B's writes hand off to its own writer thread (non-blocking channel
+/// sends), so the CLI reply stays fast regardless of how much is queued for
+/// B.
+#[test]
+fn stalled_pane_stdin_does_not_block_other_sessions() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut setup = cli_client(&name);
+    setup.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "default-command".into(),
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        "Start-Sleep".into(),
+        "-Seconds".into(),
+        "60".into(),
+    ]));
+    expect_cli_done(&setup, 0);
+
+    // B: a session whose one pane never reads stdin at all. Nothing to wait
+    // for on-screen (Start-Sleep prints nothing) -- give the pane a moment to
+    // actually spawn before flooding it.
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "stalled", 80, 24);
+    thread::sleep(Duration::from_millis(300));
+
+    // Flood B with a large volume of raw stdin bytes across many frames, all
+    // sent (and, per this test's timing, already read off the wire by the
+    // server's per-client reader thread) before the concurrent CLI request
+    // below even connects.
+    let chunk = vec![b'a'; 4096];
+    for _ in 0..1500 {
+        b.send(&ClientMsg::Stdin(chunk.clone()));
+    }
+
+    // A trivial CLI round trip against the SAME server, sharing the SAME
+    // single main-loop thread B's flood is contending for.
+    let cli_start = Instant::now();
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-sessions".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    let elapsed = cli_start.elapsed();
+    assert!(out.contains("stalled"), "out: {out:?}");
+    // Tests report (final-gate review): the pre-fix (blocked-main-loop) RED
+    // baseline is ~3.8-4s, GREEN (fixed) is ~1s -- a >3x gap that leaves
+    // comfortable discriminating power well above 3s. The original `< 3s`
+    // threshold had near-zero margin under load (observed failing by 46ms
+    // at 3.045s on a contended machine during that review) despite this
+    // test having nothing to do with the actual regression; widened to 6s,
+    // still far below the RED baseline, to make this robust under full-
+    // parallelism `cargo test` contention without weakening what it proves.
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "CLI round trip took {elapsed:?} -- main loop was blocked by pane B's stalled stdin"
+    );
 
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
@@ -2578,6 +2722,248 @@ fn copy_selection_to_buffer_and_paste() {
     server.join().expect("server exits after kill-server");
 }
 
+// ---- clipboard: copy-pipe / OSC 52 / bracketed paste / emacs C-k, M-m
+// (SP7 Task 13, closes follow-ups #53/#55/#56) ----
+
+/// Select a printed line's whole content in copy mode via the EMACS default
+/// table (`C-a` start-of-line, `C-Space` begin-selection, `C-e`
+/// end-of-line), leaving the client still IN copy mode with the selection
+/// live -- shared setup for `copy_pipe_runs_command_with_selection_stdin`
+/// and `osc52_emitted_to_client_on_copy`. `text` must already be on screen
+/// (trailing-blank-trimmed match) before calling.
+fn enter_copy_mode_and_select_line(c: &mut Client, grid: &mut Grid, text: &str) {
+    c.recv_output_until(grid, |g| screen_text(g).iter().any(|l| l.trim_end() == text));
+    let target_row = screen_text(grid).iter().position(|l| l.trim_end() == text).unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n: cursor-up
+        c.recv_output_until(grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line
+    c.send(&ClientMsg::Stdin(vec![0x00])); // C-Space: begin-selection
+    c.send(&ClientMsg::Stdin(vec![0x05])); // C-e: end-of-line
+    c.recv_output_until(grid, |g| g.cursor().1 == target_row);
+}
+
+/// `copy-pipe-and-cancel <command>` (SP7 Task 13, closes follow-ups
+/// #53/#56): the selection is piped to a real spawned command with the
+/// selection text on its stdin, which writes it to a scratch file --
+/// proves both the selection extraction AND the real `cmd.exe /C`
+/// subprocess plumbing (`spawn_copy_pipe`, `src/server/dispatch.rs`).
+///
+/// Driven via a TEMPORARY `bind-key -T copy-mode` binding rather than
+/// `send-keys -X copy-pipe-and-cancel` over a headless CLI frame: copy-mode
+/// commands require an ACTING CLIENT (`CopyCmd(_) => Err("no current
+/// client")` on the headless path in `dispatch.rs`), so the command must be
+/// fired by a real keystroke from the attached client actually sitting in
+/// copy mode.
+#[test]
+fn copy_pipe_runs_command_with_selection_stdin() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+
+    let out_path = std::env::temp_dir().join(format!(
+        "winmux-test-copypipe-{}-{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&out_path);
+    // No `|` (cmd.exe pipe metacharacter) or embedded `"` anywhere in this
+    // command -- both would be re-parsed by the `cmd.exe /C` wrapper
+    // `spawn_copy_pipe` runs it through, since Rust's own Windows arg
+    // quoting wraps the WHOLE string in exactly one pair of `"..."` that
+    // cmd.exe's `/C` then strips before re-lexing the contents.
+    let command = format!(
+        "powershell -NoProfile -Command Set-Content -NoNewline -Path '{}' -Value ([Console]::In.ReadToEnd())",
+        out_path.display()
+    );
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind-key".into(),
+        "-T".into(),
+        "copy-mode".into(),
+        "P".into(), // unbound by default in the emacs copy-mode table
+        "copy-pipe-and-cancel".into(),
+        command,
+    ]));
+    expect_cli_done(&cli, 0);
+
+    enter_copy_mode_and_select_line(&mut c, &mut grid, "hello123");
+    c.send(&ClientMsg::Stdin(b"P".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let content = loop {
+        if let Ok(s) = std::fs::read_to_string(&out_path) {
+            if !s.is_empty() {
+                break s;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for copy-pipe command to write {out_path:?}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(content, "hello123");
+    let _ = std::fs::remove_file(&out_path);
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// OSC 52 (SP7 Task 13, closes follow-up #53): with `set-clipboard on`, an
+/// ordinary copy (default emacs `C-w` = `copy-selection-and-cancel`) emits
+/// `\x1b]52;c;<base64>\x07` to the ATTACHED CLIENT's own output stream --
+/// not just `copy-pipe`, every copy destination. `base64("hello123")` ==
+/// `"aGVsbG8xMjM="`, verified independently (`printf 'hello123' | base64`).
+#[test]
+fn osc52_emitted_to_client_on_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "set-clipboard".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    enter_copy_mode_and_select_line(&mut c, &mut grid, "hello123");
+    c.send(&ClientMsg::Stdin(vec![0x17])); // C-w: copy-selection-and-cancel
+
+    let _ = c.recv_output_bytes_until_contains(b"\x1b]52;c;aGVsbG8xMjM=\x07");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `paste-buffer -p` (SP7 Task 13, closes follow-up #55): when the target
+/// pane never requested bracketed-paste mode (DECSET 2004 -- the default,
+/// untouched state here), `-p` is a silent no-op wrapper: the buffer lands
+/// exactly as a plain unwrapped paste would, no `ESC[200~`/`ESC[201~`
+/// artifacts. (The complementary "pane DID request it" case is covered at
+/// the unit level -- `server::dispatch::clipboard_tests::
+/// bracket_wraps_only_when_both_flag_and_pane_true` plus `grid::tests::
+/// decset_2004_tracks_bracketed_paste` -- see that test module's doc
+/// comment in `src/server/dispatch.rs` for why the positive case isn't
+/// provable black-box over a real ConPTY pane.)
+#[test]
+fn paste_p_plain_when_not_requested() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "plainmark".into()]));
+    expect_cli_done(&cli, 0);
+
+    let baseline = screen_text(&grid).iter().filter(|l| l.contains("plainmark")).count();
+    cli.send(&ClientMsg::Cli(vec!["paste-buffer".into(), "-p".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().filter(|l| l.contains("plainmark")).count() > baseline);
+
+    let line = screen_text(&grid).into_iter().find(|l| l.contains("plainmark")).expect("pasted marker line");
+    // No stray control-sequence garbage from a marker that should never
+    // have been added (`~` is otherwise not part of the pasted text or the
+    // prompt).
+    assert!(!line.contains('~'), "must not contain a stray bracket-paste marker artifact: {line:?}");
+
+    // The pasted text is unsubmitted, invalid-command input on the prompt
+    // line -- kill the server directly (same cleanup as
+    // `copy_selection_to_buffer_and_paste`).
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Emacs `C-k` (SP7 Task 13, closes follow-up #56): `copy-end-of-line-and-
+/// cancel` -- copies from the cursor to the end of the (view) line into a
+/// new automatic buffer, then exits copy mode. Deliberately winmux's OWN
+/// naming choice, NOT tmux master's pipe-always `copy-pipe-end-of-line-and-
+/// cancel` -- see `CopyAction::EndOfLineAndCancel`'s doc comment
+/// (`src/cmd.rs`).
+#[test]
+fn emacs_c_k_copies_to_eol_and_cancels() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo abcdefgh\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "abcdefgh"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "abcdefgh").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n
+        c.recv_output_until(&mut grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line
+    c.send(&ClientMsg::Stdin(vec![0x06, 0x06, 0x06])); // C-f x3 -> column 3 ('d')
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, target_row));
+
+    c.send(&ClientMsg::Stdin(vec![0x0b])); // C-k: copy-end-of-line-and-cancel
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("buffer0: 5 bytes: \"defgh\""), "unexpected list-buffers output: {out:?}");
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Emacs `M-m` (SP7 Task 13, closes follow-up #56): `back-to-indentation`
+/// moves the cursor to the first non-blank column of the current view line
+/// (does NOT copy/select anything, stays in copy mode).
+#[test]
+fn emacs_m_m_moves_to_first_nonblank() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"Write-Output \"   xyz\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "   xyz"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "   xyz").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n
+        c.recv_output_until(&mut grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line -> column 0
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, target_row));
+
+    c.send(&ClientMsg::Stdin(vec![0x1b, b'm'])); // M-m: back-to-indentation
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, target_row));
+    assert!(has_indicator(&grid, "[0/"), "back-to-indentation must not cancel copy mode");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn rectangle_selection() {
     let name = unique_pipe_name();
@@ -2673,9 +3059,14 @@ fn selection_survives_concurrent_output() {
     // (a) The highlight must FOLLOW the anchored content to its new view
     // row: the row that now holds "anchor777" is highlighted from col 0
     // (it's the selection's first row), and it moved up from target_row.
+    // (#58 fix) `recv_output_settled`, not a plain `recv_output_until`: the
+    // background echo+execute+reprompt can arrive as several `Output`
+    // frames, and the FIRST one where this predicate flips true isn't
+    // necessarily the settled final state the column loop below assumes —
+    // see the helper's doc comment for the full race description.
     let find_anchor_row =
         |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
-    c.recv_output_until(&mut grid, |g| {
+    recv_output_settled(&c, &mut grid, |g| {
         screen_text(g).iter().any(|l| l.contains("extra999"))
             && match find_anchor_row(g) {
                 Some(r) => r < target_row && g.cell(0, r).style.bg == Color::Idx(3),
@@ -2742,9 +3133,13 @@ fn other_end_survives_concurrent_output() {
     let mut cli2 = cli_client(&name);
     cli2.send(&ClientMsg::Cli(vec!["send-keys".into(), "echo extra888".into(), "Enter".into()]));
     expect_cli_done(&cli2, 0);
+    // (#58 fix) `recv_output_settled`, same reasoning as
+    // `selection_survives_concurrent_output` above: don't trust the FIRST
+    // frame where the anchor row has moved, in case more scroll/redraw
+    // frames from the same background command are still in flight.
     let find_anchor_row =
         |g: &Grid| screen_text(g).iter().position(|l| l.trim_end() == "anchor777").map(|r| r as u16);
-    c.recv_output_until(&mut grid, |g| {
+    recv_output_settled(&c, &mut grid, |g| {
         screen_text(g).iter().any(|l| l.contains("extra888")) && find_anchor_row(g).is_some_and(|r| r < target_row)
     });
     let new_row = find_anchor_row(&grid).unwrap();
@@ -3279,6 +3674,7 @@ fn sgr_mouse(cb: u8, x: u16, y: u16, release: bool) -> Vec<u8> {
 }
 
 const CB_LEFT: u8 = 0; // button 1, plain press/release (no motion, no modifiers)
+const CB_RIGHT: u8 = 2; // button 3, plain press/release (SP7 Task 16, closes #51)
 const CB_LEFT_DRAG: u8 = 0x20; // button 1 + motion bit
 const CB_WHEEL_UP: u8 = 0x40;
 const CB_WHEEL_DOWN: u8 = 0x41;
@@ -3958,6 +4354,95 @@ fn drag_after_double_click_extends_by_words() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Coverage gap closed (follow-up #37): the `word-separators` option is
+/// USED by `select_word_at`/`word_bounds_at` (see their doc comments'
+/// `CharClass` model — a character is `Separator` iff it's in the live
+/// `word-separators` string, `Word` otherwise) but had no test proving a
+/// NON-DEFAULT value actually moves a double-click word boundary. Follows
+/// `drag_after_double_click_extends_by_words`'s harness pattern above
+/// (press, release, press = the double-click sequence installing the word
+/// anchor on the second press; one more `Drag` at the SAME column flips
+/// `MouseDrag::Selecting` to `moved: true` so `mouse_up` actually copies,
+/// without extending the selection to a different word).
+///
+/// Text is `foo_bar` (no spaces): tmux's real default `word-separators`
+/// (`!"#$%&'()*+,-./:;<=>?@[\]^`{|}~`) does NOT include `_`, so `_` is in
+/// the `Word` class along with alphanumerics — double-clicking anywhere in
+/// `foo_bar` with the DEFAULT selects the WHOLE string as one word. Setting
+/// `word-separators` to that same default PLUS `_` reclassifies `_` as
+/// `Separator`; double-clicking column 5 (`'a'` of `bar`) now stops the run
+/// at the `_` boundary, selecting only `bar` (a DIFFERENT column than the
+/// first phase's click 1, deliberately: `advance_click_run`'s multi-click
+/// window keys off `(x, y)` matching the PRIOR click too, so reusing the
+/// exact same column across the two phases — with the CLI round-trips in
+/// between taking negligible wall-clock time — would keep incrementing the
+/// SAME click run into a triple-click/line-select instead of starting a
+/// fresh double-click).
+#[test]
+fn word_separators_option_moves_double_click_word_boundary() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo foo_bar\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "foo_bar"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "foo_bar").unwrap() as u16;
+
+    // ---- default word-separators: double-click col 1 ('o') selects the
+    // WHOLE "foo_bar" (`_` is in the Word class by default). ----
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("\"foo_bar\""),
+        "default word-separators must NOT split on '_': {out:?}"
+    );
+
+    // ---- word-separators = default + '_': same double-click now stops at
+    // the '_' boundary, selecting only "foo". ----
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "word-separators".into(),
+        "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~_".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    let newest = out.lines().last().unwrap_or("");
+    assert!(
+        newest.contains("\"bar\"") && !newest.contains("foo_bar"),
+        "word-separators including '_' must stop the double-click word run at the boundary: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `docs/tmux-reference/mouse.md` :636-640 (SEL_LINE branch) /
 /// `copy-mode-and-buffers.md` :440-447: after TripleClick installs a
 /// `SelKind::Line` anchor (`select_line_at`), continuing to drag snaps the
@@ -4059,6 +4544,182 @@ fn mouse_status_click_selects_window() {
         let row = row_text(g, status_row);
         row.contains("0:w0*") && row.contains("1:w1-")
     });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// TDD regression test for a review finding on 128cfc0: `mouse_status_click`
+/// (`src/server/dispatch.rs`) computed tab hit-boxes by walking
+/// `session.windows` in original order starting right after `status-left`,
+/// assuming an unscrolled, full-width window list. `status::status_spans`'s
+/// NEW window-list overflow scrolling (128cfc0, closes follow-up #69a) can
+/// scroll that list and prepend a `<` marker, so the two disagree the moment
+/// the list actually scrolls -- a click on the visually-current tab could
+/// select the WRONG window.
+///
+/// Every width-affecting option is pinned to something exactly
+/// hand-computable: `status-left`/`status-right` cleared (0 columns each),
+/// `window-status-format` set to the bare `#I` (each NON-current tab is
+/// exactly 1 column: just its digit), `window-status-current-format` set to
+/// `#I*` (the CURRENT tab is 2 columns -- a literal `*` distinguishes it
+/// on-screen without needing `#F`/conditionals), default
+/// `window-status-separator` (one space) left alone. 5 windows (indices
+/// 0-4, current = 4, the last one `c` creates) at terminal width 8:
+///
+/// - unclipped tab+separator sequence (widths 1,1,1,1,2 + 4 separators):
+///   window i's raw span is `[2i, 2i+1)` for i=0..3, window 4's is `[8,10)`.
+///   `list_width` = 10.
+/// - `list_avail` = width(8) - left(0) - right(0) = 8; 10 > 8 -> overflow.
+/// - focus (window 4) = [8,10), `focus_centre` = 8 + (10-8)/2 = 9.
+/// - fixed-point marker search: pass 1 (both markers assumed) finds
+///   `content_w=6, start=4, end=10` -> `new_right=false` (disagrees with the
+///   assumption) -> pass 2 (`marker_left` only) finds `content_w=7,
+///   start=3, end=10`, which agrees -> converged: `start=3, end=10,
+///   marker_left=true, marker_right=false`.
+/// - visible slice = raw columns [3,10): window 0 ([0,1)) and window 1
+///   ([2,3)) are fully scrolled off (window 1's span ends exactly at the
+///   clip start -> zero overlap); the content is `<sep><'2'><sep><'3'><sep>
+///   <'4'><'*'>` = `" 2 3 4*"` (7 cols) with `<` prepended (marker_left)
+///   and nothing appended (marker_right false) -> row = `"< 2 3 4*"` (8
+///   cols, exactly the terminal width).
+/// - absolute columns (`content_start_col` = left(0) + marker_left(1) = 1):
+///   window 2's `'2'` = col 2, window 3's `'3'` = col 4, window 4's `'4*'`
+///   = cols 6-7.
+///
+/// Clicking column 4 (window 3's ONLY visible column) must select window 3.
+/// The OLD reconstruction — `cursor` starting at `left_len`(0) and walking
+/// `session.windows` in order using ITS OWN hardcoded `"{index}:{name}
+/// {flags}"` text-length guess (which doesn't even match the REAL
+/// `window-status-format` this test set, let alone the scroll) — resolves
+/// column 4 to some other window entirely (empirically window 0, since its
+/// wrongly-guessed width already covers column 4), so the pre-fix server
+/// leaves window 4 current instead of switching to window 3: the second
+/// `recv_output_until` below times out pre-fix and passes post-fix.
+///
+/// After the switch, window 3 becomes current (2-column `"3*"` tab, widths
+/// now 1,1,1,2,1) and the scroll re-centers on it: `raw_spans` = w0[0,1)
+/// w1[2,3) w2[4,5) w3[6,8) w4[9,10), `list_width`=10, `list_avail`=8,
+/// `focus_centre` = 6+(8-6)/2 = 7. Pass 1 (both markers) gives
+/// `start=4,end=10` -> `new_right=false` (disagrees) -> pass 2
+/// (`marker_left` only) gives `content_w=7, start=3, end=10`, which agrees
+/// -> converged. Visible raw `[3,10)` = sep,'2',sep,'3','*',sep,'4' =
+/// `" 2 3* 4"` (7 cols); `<` prepended, nothing appended -> final row =
+/// `"< 2 3* 4"` (8 cols).
+#[test]
+fn status_click_selects_correct_window_when_list_scrolled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 8, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-left".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-format".into(), "#I".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-current-format".into(), "#I*".into()]));
+    expect_cli_done(&cli, 0);
+
+    // 4 more windows on top of the initial one -> indices 0-4, current = 4.
+    for _ in 0..4 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    }
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3 4*");
+
+    // Column 4 = window 3's visible tab (see doc comment's column table).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 4, status_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 4, status_row, true)));
+
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3* 4");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 10 (#39, status hit-test truncation): `mouse_status_click`
+/// hit-tests through `status::status_tab_columns` -- the SAME `plan_tab_
+/// layout` core `status_spans`/`render_one`/`compose_back` draw the status
+/// row from (SP7 Task 7's fix, closes follow-up #69a). A `<`/`>` overflow
+/// marker is drawn OUTSIDE every window's `TabColumn` range (only
+/// `layout.raw_spans` entries become clickable hitboxes -- see
+/// `status_tab_columns`'s doc comment), so a click that lands ON the marker
+/// character itself must resolve to no window at all, not the nearest
+/// visible tab. Same setup as `status_click_selects_correct_window_when_
+/// list_scrolled` above (`< 2 3 4*` at 8 columns; see that test's doc
+/// comment for the exact column table) -- column 0 is the `<` marker.
+///
+/// Verify-and-mark note (this task): investigated whether
+/// `mouse_status_click` still has a genuine gap vs. `render::compose_back`'s
+/// final width-based right-truncation step (the literal concern #39's
+/// original text raised, predating SP7 Task 7's `status_tab_columns` fix).
+/// It does not: `compose_back`'s truncation is `right_len = right.len().
+/// min(cols_u - left_len)` where `left_len` is the ACTUAL drawn width of
+/// everything before `right`; `plan_tab_layout`'s own math (shared by both
+/// `status_tab_columns` and `status_spans`) already guarantees `left_width +
+/// list_avail == width - right_len` whenever the list FITS, and produces NO
+/// tab hitboxes at all whenever it doesn't (`content_w` saturates to 0) --
+/// so under the ONE `width`/`right_len`/`left_width` both call sites already
+/// share (confirmed identical by direct comparison of `mouse_status_click`
+/// vs. `render_one`'s status-row construction), `compose_back`'s own
+/// truncation step is a provable no-op, not a residual gap. The overflow-
+/// marker case this test exercises is the one place a NEW server-side
+/// hitbox bug (not `compose_back` truncation specifically) could plausibly
+/// hide, and it doesn't.
+#[test]
+fn status_click_past_truncation_is_noop() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 8, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-left".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-format".into(), "#I".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-current-format".into(), "#I*".into()]));
+    expect_cli_done(&cli, 0);
+
+    // 4 more windows on top of the initial one -> indices 0-4, current = 4.
+    for _ in 0..4 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    }
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3 4*");
+
+    // Column 0 is the `<` overflow marker itself -- not any window's tab.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, status_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, status_row, true)));
+
+    // Synchronize on the same connection (`list-buffers`, a clean exit-0
+    // no-op) so the click has been fully processed server-side, then prove
+    // the negative: the status row is byte-for-byte unchanged.
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(
+        row_text(&grid, status_row).trim_end(),
+        "< 2 3 4*",
+        "a click on the overflow marker itself must be a no-op, not resolve to the nearest window"
+    );
 
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
@@ -4485,6 +5146,49 @@ fn main_pane_width_option_respected() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP7 Task 12 (closes follow-up #43): a `main-vertical` preset's
+/// `main-pane-width` survives a REAL client Resize frame -- the border stays
+/// at the exact configured column instead of scaling proportionally with
+/// the new width (the pre-Task-12 behavior: `layout::Node`'s ratio-only
+/// representation baked the width in as a fraction of the AT-APPLY-TIME
+/// area, so a later resize would have moved the border to a different
+/// column -- see `layout::tests::main_pane_width_survives_window_resize`
+/// for the exact unit-level math this end-to-end test exercises for real).
+#[test]
+fn main_pane_width_survives_window_resize() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "main-pane-width".into(), "20".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["select-layout".into(), "main-vertical".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+
+    // Grow the terminal: a ratio-only implementation would move the border
+    // proportionally (20/79 of 80 cols -> roughly 20/79 * 119 ~= 30 at 120
+    // cols); the fix keeps it at the literal configured 20.
+    c.send(&ClientMsg::Resize { cols: 120, rows: 24 });
+    grid.resize(120, 24);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+    assert!(!has_vertical_border_at(&grid, 30), "must not have scaled proportionally with the wider window");
+
+    // Shrink it back down too.
+    c.send(&ClientMsg::Resize { cols: 60, rows: 24 });
+    grid.resize(60, 24);
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, 20));
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn swap_pane_braces() {
     let name = unique_pipe_name();
@@ -4571,12 +5275,16 @@ fn rotate_window_ctrl_o() {
 
 // ---- Task 6 fix round: swap-pane review findings --------------------------
 
-/// Review finding #1: cross-window `swap-pane -s`/`-t` used to silently
-/// no-op (exit 0, nothing changed). Must now be an explicit, honest error --
-/// winmux does not (yet) support moving a pane between windows via
-/// `swap-pane`, unlike real tmux.
+/// SP7 Task 11 (closes follow-up #41): `swap-pane -s`/`-t` resolving to
+/// DIFFERENT windows used to be an honest error ("swap-pane: can only swap
+/// panes within the same window"). It's now a real cross-window swap --
+/// panes keep their own ids, only their tree/screen SLOTS trade places, so
+/// window 1 (the client's current window, unchanged) ends up showing window
+/// 0's OLD content, and vice versa. This replaces the old
+/// `swap_pane_cross_window_errors` test (same setup) now that the behavior
+/// it pinned is gone.
 #[test]
-fn swap_pane_cross_window_errors() {
+fn swap_pane_between_windows_swaps_content() {
     let name = unique_pipe_name();
     let server = start_server(&name);
     let mut c = Client::connect(&name);
@@ -4593,18 +5301,21 @@ fn swap_pane_cross_window_errors() {
     c.recv_output_until(&mut grid, |g| marker_col(g, "win1mark").is_some());
 
     // `swap-pane -s 0.0 -t 1.0` targets window 0's pane and window 1's pane
-    // -- a cross-window pair. Must fail loudly, not silently succeed.
+    // -- a cross-window pair. Must actually swap now.
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-s".into(), "0.0".into(), "-t".into(), "1.0".into()]));
-    let (_, err) = expect_cli_done(&cli, 1);
-    assert_eq!(err, "swap-pane: can only swap panes within the same window");
+    expect_cli_done(&cli, 0);
 
-    // Both panes are untouched: window 1 (still current) still shows
-    // win1mark, and switching back to window 0 still shows win0mark.
-    assert!(marker_col(&grid, "win1mark").is_some(), "window 1's pane must be unchanged after the rejected swap");
+    // Window 1 (still current, tree/geometry unchanged) now shows window 0's
+    // OLD content -- win1mark is gone, win0mark has arrived.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+    assert!(marker_col(&grid, "win1mark").is_none(), "window 1's pane must show window 0's content after the swap, not its own");
+
+    // Switching to window 0 shows the opposite: win1mark's content moved in.
     c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
-    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win1mark").is_some());
+    assert!(marker_col(&grid, "win0mark").is_none(), "window 0's pane must show window 1's content after the swap, not its own");
 
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
@@ -4962,6 +5673,13 @@ fn swap_window_without_d_keeps_focus_on_index() {
 /// `f` (find-window): matches by window NAME, matches by visible pane
 /// CONTENT, and shows a transient `no windows matching: <p>` message (and
 /// switches nothing) when neither matches.
+///
+/// SP7 Task 12 (closes #46): real tmux's `find-window` is sugar for opening
+/// `window-tree` (choose-tree) mode FILTERED to the matches -- selecting the
+/// entry performs the jump -- it is NOT a direct jump, even for exactly one
+/// match. This inverts the pre-Task-12 version of this test (which asserted
+/// a direct jump on commit); computed comment: the old assertion was itself
+/// the parity deviation follow-up #46 tracked, now fixed.
 #[test]
 fn find_window_f_prompt() {
     let name = unique_pipe_name();
@@ -4982,19 +5700,32 @@ fn find_window_f_prompt() {
     c.send(&ClientMsg::Stdin(b"echo findme123\r".to_vec()));
     c.recv_output_until(&mut grid, |g| marker_col(g, "findme123").is_some());
 
-    // Currently on window 1: find-window by NAME jumps back to window 0.
+    // Currently on window 1: find-window by NAME opens a tree filtered to
+    // JUST window 0 (webby) -- window 1's row must NOT appear.
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"webby\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: webby-")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("1: powershell")),
+        "the tree must be FILTERED to only the matching window"
+    );
+    // Default selection is the (only) match; Enter commits the jump.
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby* 1:powershell-")));
 
-    // Now on window 0: find-window by CONTENT jumps to window 1.
+    // Now on window 0: find-window by CONTENT opens a tree filtered to JUST
+    // window 1 (the content match) -- window 0's row must NOT appear.
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"findme123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: powershell-")));
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: webby")), "the tree must be FILTERED to only the matching window");
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:webby- 1:powershell*")));
 
-    // No match: transient message, nothing moves.
+    // No match: transient message, no tree opens, nothing moves (documented
+    // scope narrowing versus real tmux's empty-tree-opens behavior).
     c.send(&ClientMsg::Stdin(vec![0x02, b'f']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("(find-window) ")));
     c.send(&ClientMsg::Stdin(b"zzznomatch\r".to_vec()));
@@ -5009,6 +5740,111 @@ fn find_window_f_prompt() {
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+/// SP7 Task 12 (closes #46): TWO windows match the same pattern -- the
+/// filtered tree must show BOTH rows (not just the first, as the retired
+/// direct-jump behavior effectively did), and committing a NON-default row
+/// (`Down` then `Enter`) jumps to that specific one, proving the tree is
+/// really driving the choice rather than some other pre-selected default.
+#[test]
+fn find_window_multi_match_opens_choose_list() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Two more windows, both named with a "log" substring.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n applog\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:applog*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n syslog\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:syslog*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window log\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("1: applog")) && lines.iter().any(|l| l.contains("2: syslog"))
+    });
+    // The unrelated window 0 must be filtered OUT.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: powershell")));
+
+    // Default selection is the FIRST match (window 1, applog); move Down to
+    // the second (window 2, syslog) and commit that one specifically.
+    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:syslog*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 12 (closes #46): even EXACTLY ONE match still opens the tree
+/// rather than jumping directly -- driven here through the bare
+/// `find-window` CLI command (not the `f` binding) for an independent code
+/// path from `find_window_f_prompt`'s prefix-key coverage.
+#[test]
+fn find_window_single_match_opens_choose_list_too() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n onlyme\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:onlyme*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window onlyme\r".to_vec()));
+    // The tree opens (row visible) rather than an immediate silent jump --
+    // still on window 1 (already current) with the tree overlay showing.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: onlyme")));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:onlyme*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 12 (closes #54): `-r '^foo'` is a real anchored regex, not a
+/// glob substring -- "foobar" (starts with "foo") matches, "barfoo"
+/// (contains but doesn't START WITH "foo") does not, proving `-r` isn't
+/// silently degrading to the same `*pattern*` substring wrapping the
+/// default (non-`-r`) path uses.
+#[test]
+fn find_window_regex_flag_matches_anchor() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n foobar\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:foobar*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"new-window -n barfoo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:barfoo*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"find-window -r ^foo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1: foobar")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("2: barfoo")),
+        "anchored regex must not match a window whose name only CONTAINS foo"
+    );
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:foobar*")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
 }
 
 /// `'` opens the `index` prompt (label verbatim per the design spec, no
@@ -5393,14 +6229,21 @@ fn choose_tree_escape_cancels() {
     server.join().expect("server exits after last session dies");
 }
 
-/// Final SP4 review, MUST-FIX NEW-1: mouse events must be swallowed while
-/// an overlay (choose-tree or display-panes) is open, exactly like the
-/// pre-existing `ConfirmCmd`/`Prompt` guard -- a click landing on a HIDDEN
-/// pane underneath the overlay must never focus it. Splits the window so
-/// the right pane is focused and a left pane exists to be mis-focused by a
-/// leaking click; opens choose-tree (which draws full-screen, hiding the
-/// split); clicks where the left pane would be; then dismisses the overlay
-/// with `q` and asserts focus is STILL the right pane.
+/// Final SP4 review, MUST-FIX NEW-1: mouse events must never leak through
+/// to a HIDDEN pane underneath a full-screen overlay (choose-tree or
+/// display-panes), exactly like the pre-existing `ConfirmCmd`/`Prompt`
+/// guard. Splits the window so the right pane is focused and a left pane
+/// exists to be mis-focused by a leaking click; opens choose-tree (which
+/// draws full-screen, hiding the split); clicks where the left pane would
+/// be; then dismisses the overlay with `q` and asserts focus is STILL the
+/// right pane. SP7 Task 10 (closes follow-up #61) note: choose-tree itself
+/// now DOES react to a `Down(1)` click (selecting whichever tree row is
+/// under the pointer, see `choose_tree_click_selects_row`) -- this test's
+/// claim is narrower than its original "mouse events must be swallowed"
+/// title suggests: the click here lands on a blank/no-row area of the
+/// choose-tree panel (only one window exists, so most of an 80x24 panel is
+/// empty), so it's STILL a no-op for row selection too, and the pane-leak
+/// assertion below is unaffected either way.
 #[test]
 fn mouse_ignored_under_choose_tree_overlay() {
     let name = unique_pipe_name();
@@ -5464,6 +6307,227 @@ fn mouse_ignored_under_display_panes_overlay() {
 
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.recv_output_until(&mut grid, |g| !has_vertical_border(g));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+// ---- choose-tree mouse (SP7 Task 10, closes follow-up #61) ----------------
+
+/// `docs/tmux-reference/choose-tree.md` §7.4: "Click (MouseDown1) on a list
+/// row: select that row (no choose)". Same `w`-list setup as
+/// `choose_tree_w_lists_and_switches`: after `prefix c` (new window 1) +
+/// `prefix w`, the panel is the sort/filter title row (y=0, SP7 Task 15 --
+/// always painted, shifting every list row down one), `- 0: 2 windows
+/// (attached)` (y=1), `  0: powershell-` (y=2), `  1: powershell*` (y=3,
+/// CURRENT -- default selection per SP6 wave 2's "current item" default).
+/// Clicking window 0's row (y=2) must SELECT it without committing --
+/// proven indirectly: a
+/// plain keyboard Enter right after the click switches to window 0 (if the
+/// click had no effect, Enter would instead re-commit the already-current
+/// window 1, a silent same-window no-op the status line would never
+/// visibly change to).
+#[test]
+fn choose_tree_click_selects_row() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("0: 2 windows (attached)"))
+            && lines.iter().any(|l| l.contains("  0: powershell-"))
+            && lines.iter().any(|l| l.contains("  1: powershell*"))
+    });
+
+    // A single click (Down then Up, no second press) on window 0's row
+    // (y=2: one below the Task-15 title row + the session header row).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, true)));
+
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `docs/tmux-reference/choose-tree.md` §7.4: "Double-click on a list row:
+/// select + rewrite the key to `\r` -> Enter (choose)". Same setup as
+/// `choose_tree_click_selects_row`, but two presses on window 0's row
+/// within the click-run window commit it directly -- no keyboard Enter at
+/// all.
+#[test]
+fn choose_tree_double_click_commits_switch() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    // Window 0's row is y=2 (below the Task-15 title row + session header).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 2, true)));
+
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Semantics decision (this task, deviating from the task brief's literal
+/// "wheel scrolls/moves selection" wording in favor of the authoritative
+/// tmux-reference doc): `docs/tmux-reference/choose-tree.md` §7.4 states
+/// real tmux's `mode_tree_key` mouse branch swallows every mouse key
+/// EXCEPT the three click types before its key switch is even reached, so
+/// wheel is a no-op with `mouse on` there -- "matching tmux exactly means
+/// click/double-click/right-click only" (the doc explicitly calls
+/// wheel-moves-selection "a (defensible) divergence", not tmux's own
+/// behavior). Given this project's stated guiding principle ("be exactly
+/// like tmux"), wheel over the choose-tree list is implemented as a no-op
+/// here too. Same setup as the tests above (default selection = window 1's
+/// row, the current item): wheel events, then a bare keyboard Enter with NO
+/// navigation -- if wheel had (incorrectly) moved the selection, Enter
+/// would commit window 0 instead and the status line would show window 0
+/// current; asserting it's STILL window 1 proves wheel was a true no-op.
+#[test]
+fn choose_tree_wheel_is_noop_matching_tmux() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_DOWN, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 10 (closes follow-up #61): a click on window 0's row while a
+/// kill-confirm prompt (`x` was already pressed) is pending must be
+/// swallowed entirely -- exactly like `ConfirmCmd`/`Prompt` -- rather than
+/// silently changing the selection out from under the pending y/n answer.
+#[test]
+fn choose_tree_click_swallowed_during_pending_kill_confirm() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    // `x` arms a kill-confirm on the default-selected row (window 1).
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window")));
+
+    // A click on window 0's row must NOT change the selection while the
+    // prompt is pending -- confirmed via `n` (cancel) staying on the
+    // overlay with window 1 still current afterward (had the click somehow
+    // re-armed selection to window 0 and the confirm miraculously still
+    // applied to the right target, this would be indistinguishable; the
+    // real proof is architectural -- `dispatch_mouse`'s guard checks
+    // `pending_kill.is_none()` before ever calling `dispatch_choose_tree_
+    // mouse` -- but this end-to-end check at least proves the confirm
+    // prompt itself survives a click without visibly corrupting).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, true)));
+    c.send(&ClientMsg::Stdin(b"n".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")) && !screen_text(g).iter().any(|l| l.contains("kill-window")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 7 (closes follow-up #29): `status-interval` must drive a
+/// periodic status re-render on its own configured cadence, independent of
+/// the server's coarse minute-granularity clock change-detector -- a
+/// `status-right` with sub-minute-sensitive content (here, a bare `%S`
+/// wrapped in a unique marker so the exact two digits are easy to locate on
+/// the bottom row) must visibly update well before a full minute elapses.
+/// `status-interval` is shrunk to 1 second (still far above the server's
+/// 50ms `Tick` granularity) so the test doesn't need to wait anywhere near a
+/// real minute boundary; a `%S` value that happens not to change across a
+/// short real-time sleep would be a false negative for the OLD (pre-fix)
+/// behavior too, so this is the same class of small residual timing
+/// sensitivity as the project's other real-clock tests (see
+/// `docs/follow-ups.md` #58's flakiness note) rather than a new risk.
+#[test]
+fn status_interval_refreshes_seconds_format() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-interval".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "SECTAG%SEND".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Wait for the new format to actually render at least once, then read
+    // off its current two-digit seconds value.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("SECTAG")));
+    let read_seconds = |g: &Grid| -> String {
+        screen_text(g)
+            .iter()
+            .find_map(|l| l.find("SECTAG").map(|i| l[i + 6..i + 8].to_string()))
+            .expect("SECTAG marker present")
+    };
+    let first = read_seconds(&grid);
+
+    // Real wall-clock sleep, comfortably longer than one status-interval
+    // tick (1s) but short enough that a minute boundary is very unlikely to
+    // be crossed coincidentally.
+    thread::sleep(Duration::from_millis(1300));
+
+    // Drain whatever Output frames arrived during the sleep (status-interval
+    // ticks, if wired up) until the seconds value visibly differs from the
+    // first read -- pre-fix, nothing re-renders `status-right` on this
+    // cadence at all (only a minute-boundary flip of the coarse `HH:MM`
+    // clock would), so this times out RED against the old behavior.
+    c.recv_output_until(&mut grid, |g| read_seconds(g) != first);
+
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
@@ -5894,6 +6958,390 @@ fn choose_tree_v_toggles_preview() {
     server.join().expect("server exits after last session dies");
 }
 
+// ---- SP7 Task 14: choose-buffer (`=`) + choose-client (`D`) overlays,
+// closes #48/#49 -- reuse the choose-tree overlay machinery (generalized
+// `TreeTarget`/`ChooseTreeView`), see `docs/tmux-reference/choose-tree.md`
+// `## 9`/`## 10`. ----------------------------------------------------------
+
+/// `## 10`: choose-buffer's default template is `paste-buffer -p -b '%%'` --
+/// Enter pastes the selected buffer into the acting client's focused pane
+/// and closes the overlay.
+#[test]
+fn choose_buffer_lists_buffers_enter_pastes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "BUFPASTE123".into()]));
+    expect_cli_done(&cli, 0);
+    let baseline = screen_text(&grid).iter().filter(|l| l.contains("BUFPASTE123")).count();
+
+    // `=` (choose-buffer): the row shows the buffer's name + sample text.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'=']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("buffer0") && l.contains("BUFPASTE123")));
+
+    // Enter runs the default template and exits -- the pasted text has no
+    // embedded newline, so it lands as pending, unsubmitted input on the
+    // prompt line (same verification style as `copy_selection_to_buffer_
+    // and_paste`): one more on-screen line now contains it, and the overlay
+    // is closed (status bar visible again).
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*"))
+            && screen_text(g).iter().filter(|l| l.contains("BUFPASTE123")).count() > baseline
+    });
+
+    // The pasted text is pending, unsubmitted input -- no shell-specific
+    // line-editing assumptions needed for cleanup, kill the server directly.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 10`: `x` deletes the selected buffer IMMEDIATELY, no confirm prompt
+/// (unlike choose-tree's session/window `x`, which always confirms) -- and
+/// the deletion is real (`delete-buffer`), not just cosmetic to the row
+/// list.
+#[test]
+fn choose_buffer_x_deletes_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "DELETEME456".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'=']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("DELETEME456")));
+
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("DELETEME456")));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert_eq!(out, "", "buffer must be gone from the store, not just the row list: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `## 9`: a flat row per ATTACHED client (winmux has no tty path, so the
+/// row identity/name is the synthetic `client-<id>` label, `dispatch::
+/// client_label`), each naming the session it's attached to.
+#[test]
+fn choose_client_lists_attached_clients() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "cliA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "cliB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // `D` (choose-client) from A.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'D']));
+    a.recv_output_until(&mut grid_a, |g| {
+        // `.contains(": session ")` (not just "client-") -- the box title
+        // (SP7 Task 15) also embeds the selected item's `client-<id>` name,
+        // so a bare "client-" count would over-count by one.
+        let lines = screen_text(g);
+        lines.iter().filter(|l| l.contains(": session ")).count() == 2
+            && lines.iter().any(|l| l.contains("session cliA"))
+            && lines.iter().any(|l| l.contains("session cliB"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 9`: `x`/Enter both detach the selected client IMMEDIATELY, no
+/// confirm ("No confirm prompts"). Detaching an OTHER client (not the
+/// acting one) sends IT the `[detached (from session ...)]` exit and
+/// leaves the acting client attached, with its row list shrunk by one.
+#[test]
+fn choose_client_x_detaches_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "cliA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "cliB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    a.send(&ClientMsg::Stdin(vec![0x02, b'D']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().filter(|l| l.contains(": session ")).count() == 2);
+
+    // Default sort is by NAME (`client-<id>`); A connected first so its id
+    // is lower and its row sorts first -- Down selects B's row.
+    a.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    a.send(&ClientMsg::Stdin(b"x".to_vec()));
+    b.expect_exit(0, "[detached (from session cliB)]");
+
+    // A remains attached; the row list shrank to just its own row.
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().filter(|l| l.contains(": session ")).count() == 1);
+
+    a.send(&ClientMsg::Stdin(b"q".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[cliA]")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- SP7 Task 15: choose-tree tagging, sort, filter + tiny-pane parity,
+// closes #50 (remainder) / #73. -------------------------------------------
+
+/// `## 7.1`: `t` toggles a tag on the current row (visible as a leading `*`
+/// marker, `## 3.3`); when any row is tagged, `x` applies to EVERY tagged
+/// row instead of just the current one (winmux's collapsed `x`/`X`, per the
+/// task brief) -- confirmed with a single `"kill N tagged?"` prompt, `y`
+/// kills them all.
+#[test]
+fn choose_tree_t_tags_row_and_x_kills_all_tagged() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell  1:powershell- 2:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2: powershell*")));
+
+    // Tag the default selection (window 2, current) and window 1.
+    c.send(&ClientMsg::Stdin(b"t".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("* 2: powershell*")));
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec())); // Up -> window 1's row
+    c.send(&ClientMsg::Stdin(b"t".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("* 1: powershell-")));
+
+    // `x` with two tagged rows: the confirm covers BOTH, not just the
+    // current row.
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill 2 tagged? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("0: powershell"))
+            && !lines.iter().any(|l| l.contains("1: powershell"))
+            && !lines.iter().any(|l| l.contains("2: powershell"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `## 4.1`: `O` cycles the sort field (choose-tree's restricted sequence
+/// is `index` -> `name`, `dispatch::sort_seq`); `r` reverses it. Three
+/// windows renamed out of index order (`0:ccc`, `1:aaa`, `2:bbb`) make the
+/// reordering directly observable in the row list.
+#[test]
+fn choose_tree_o_cycles_sort_r_reverses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "ccc".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:ccc*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:")));
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "aaa".into()]));
+    expect_cli_done(&cli2, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:aaa*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:")));
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["rename-window".into(), "bbb".into()]));
+    expect_cli_done(&cli3, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:bbb*")));
+
+    // A row's ORDER (not just presence) matters here, so find each window's
+    // position by NAME rather than assuming a fixed row index (robust to
+    // the SP7 Task 15 title row now always occupying the panel's own first
+    // line).
+    // Skip row 0: the SP7 Task 15 title row embeds the CURRENTLY SELECTED
+    // item's own name (e.g. "2:bbb"), which would otherwise falsely match
+    // whichever window happens to be selected regardless of its row
+    // position in the list.
+    let pos = |g: &Grid, needle: &str| screen_text(g).iter().skip(1).position(|l| l.contains(needle));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    // Default sort is Index: creation order ccc, aaa, bbb.
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "ccc"), pos(g, "aaa"), pos(g, "bbb")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    // `O` -> Name: alphabetical aaa, bbb, ccc.
+    c.send(&ClientMsg::Stdin(b"O".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "aaa"), pos(g, "bbb"), pos(g, "ccc")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    // `r` -> reversed Name: ccc, bbb, aaa.
+    c.send(&ClientMsg::Stdin(b"r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        matches!((pos(g, "ccc"), pos(g, "bbb"), pos(g, "aaa")), (Some(a), Some(b), Some(c)) if a < b && b < c)
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:bbb*")));
+
+    let mut cli4 = cli_client(&name);
+    cli4.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli4, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `## 7.1`: `f` opens a filter prompt; committing it narrows the row list
+/// to rows whose text (or, for a session/header row, ANY child's text)
+/// matches, case-insensitively (a documented substring simplification of
+/// tmux's real per-pane FORMAT filter). `c` clears the filter.
+#[test]
+fn choose_tree_filter_narrows_rows() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "apple".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:apple*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:")));
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "cherry".into()]));
+    expect_cli_done(&cli2, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:cherry*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("apple")) && lines.iter().any(|l| l.contains("cherry"))
+    });
+
+    // `f`, type "cherry", Enter commits the filter.
+    c.send(&ClientMsg::Stdin(b"f".to_vec()));
+    c.send(&ClientMsg::Stdin(b"cherry\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("cherry"))
+            && !lines.iter().any(|l| l.contains("apple"))
+            && !lines.iter().any(|l| l.contains("powershell"))
+            && lines.iter().any(|l| l.contains("(filter: active)"))
+    });
+
+    // `c` clears the filter -- every row is back.
+    c.send(&ClientMsg::Stdin(b"c".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("apple")) && lines.iter().any(|l| l.contains("cherry")) && lines.iter().any(|l| l.contains("powershell"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:cherry*")));
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #73 (mode-tree.c:980-981's SEPARATE paint-time box-size guard): in a
+/// pane too small for the preview BOX to be drawn at all, the row list must
+/// keep its own (small) computed height rather than silently expanding to
+/// fill the freed rows -- those stay blank, matching real tmux (see
+/// `dispatch::Server::choose_tree_preview_paintable`'s doc comment). A
+/// 80x6 client with 4 windows (5 total rows of tree content) in BIG preview
+/// mode: `sy=6, h` clamps to 2, but `sy - h = 4 <= 4` fails the paint-time
+/// guard, so no box is painted -- yet only `list_height` (2, minus 1 for
+/// the always-shown title row) worth of list content should appear; the
+/// remaining rows must be blank, not more window rows.
+#[test]
+fn choose_tree_tiny_pane_keeps_short_list_blank_remainder() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    // Attach at a normal size first (window creation is more reliable with
+    // real screen space), THEN shrink to the tiny 80x6 geometry -- a real
+    // terminal resizes independent of window count, so this reaches the
+    // same degenerate-geometry state a genuinely tiny terminal would.
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    for _ in 0..3 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+        c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    }
+
+    c.send(&ClientMsg::Resize { cols: 80, rows: 6 });
+    grid.resize(80, 6);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("windows")));
+
+    // v -> OFF, v -> BIG (the degenerate case above).
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[2].trim().is_empty());
+
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains('┌') || l.contains('│') || l.contains('└')),
+        "no preview box should be painted in degenerate geometry: {lines:?}"
+    );
+    for (row, line) in lines.iter().enumerate().take(6).skip(2) {
+        assert!(
+            line.trim().is_empty(),
+            "row {row} should be blank (the list must not expand into the freed preview space): {line:?}"
+        );
+    }
+
+    // Cleanup via a fresh CLI connection (avoids any further interaction
+    // with the deliberately tiny/degenerate pane).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// automatic-rename (Task 9, sub-project 4): PowerShell's
 /// `$Host.UI.RawUI.WindowTitle` assignment round-trips through ConPTY as an
 /// OSC 0/2 title, which `Grid` captures (`grid-v2`, Task 1) and the server
@@ -6039,4 +7487,2004 @@ fn pane_title_format_expands() {
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+// ---- SP7 Task 5: Space-key normalization + `bind -n` printable verification
+// (closes follow-ups #34, #30) -----------------------------------------------
+
+/// #34: a config-loaded `bind Space ...` line must fire on a REAL spacebar
+/// keypress (raw byte `0x20`, which decodes as `Key{code: Char(' ')}` per
+/// `keys::classify_single_byte` -- NEVER `KeyCode::Space`, see the follow-up).
+/// Prior to the `Bindings` canonicalization fix, the config line stored the
+/// binding under `Key{code: Space, ..}`, which a real spacebar press could
+/// never look up successfully.
+#[test]
+fn config_bind_space_reachable_by_real_spacebar() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("bind-space");
+    std::fs::write(&conf_path, "bind Space split-window -h\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+
+    let _server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Default prefix (C-b) + a literal 0x20 (real spacebar byte, NOT the
+    // "Space" key-notation string) must resolve the config's `Space`
+    // binding and split the window.
+    c.send(&ClientMsg::Stdin(vec![0x02, 0x20]));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// #30: real tmux `bind -n <printable>` shadows normal typing in that pane
+/// entirely -- the bound command fires and the character never reaches the
+/// shell. Verifies winmux's root-table dispatch order does the same for a
+/// bare, unmodified printable character (previously unexercised by any
+/// test -- follow-up #30 flagged this as "unverified", then confirmed a
+/// real gap by this same test's earlier `#[ignore]`d form in SP7 Task 5).
+///
+/// FIXED (SP7 Wave 2 opener): `process_key_events`'s live-pane `Forward`
+/// arm in `src/server.rs` now re-decodes the coalesced blob and consults
+/// `self.bindings.lookup(WhichTable::Root, ..)` for every key, exactly
+/// mirroring the pre-existing `Copy`/`ChooseTree` arms just above it. Bound
+/// keys dispatch and are swallowed; unbound runs are still batched into one
+/// `input_tx.send` to preserve typing throughput.
+#[test]
+fn bind_dash_n_printable_shadows_typing() {
+    let name = unique_pipe_name();
+    let _server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "x".into(),
+        "split-window".into(),
+        "-h".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    // A bare "x" keypress with NO prefix must fire the -n binding (a split)
+    // -- NOT get typed onto the shell's command line.
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.trim_end().ends_with("> x")),
+        "the bound 'x' must not have been typed onto either pane's prompt; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Unbind now so the rest of this test -- which needs to type text
+    // containing the letter 'x' (the marker below, and `exit`) -- is not
+    // itself intercepted by a still-armed `-n x` binding (that would split
+    // AGAIN on every 'x' typed, which is correct tmux behavior but not what
+    // this test is checking). A separate test,
+    // `unbind_n_restores_plain_forwarding`, exercises the unbind path
+    // itself end to end.
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "x".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Prove "x" never reached either pane's shell: an "echo" run in the
+    // now-focused (new, right-hand) pane must echo cleanly, not as a
+    // mangled "xecho ..." command line that a leaked "x" would have
+    // produced.
+    c.send(&ClientMsg::Stdin(b"echo after-x-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("after-x-marker")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("xecho") || l.contains("is not recognized")),
+        "a leaked 'x' must not have reached the shell; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    // Deliberately no `exit`/`expect_exit` here: two panes are live (the
+    // split from earlier), so exiting only the focused (right) pane's shell
+    // would just close that one pane and reflow the layout -- the CLIENT
+    // stays attached and never receives a ServerMsg::Exit, so
+    // `expect_exit` would hang. `start_server` runs the server as an
+    // in-process background thread (a detached `JoinHandle`, never
+    // joined) -- leaving it running past test end is this file's existing
+    // convention for tests that don't need to prove full shutdown.
+}
+
+/// Regression guard for the #34 canonicalization fix: with NO binding
+/// registered anywhere for Space (the default root table is empty), a real
+/// spacebar keypress must still forward as ordinary typed input to the
+/// focused pane, exactly as before the fix.
+#[test]
+fn unbound_space_still_forwards_to_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo a".to_vec()));
+    c.send(&ClientMsg::Stdin(vec![0x20])); // a real spacebar byte
+    c.send(&ClientMsg::Stdin(b"b\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("a b")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #30 fix: a runtime `bind -n <printable>` (no config file, no server
+/// restart) must shadow typing IMMEDIATELY -- the fix consults the CURRENT
+/// `self.bindings` at dispatch time (`Server::forward_raw_to_focused_pane`'s
+/// caller, `process_key_events`'s `Forward` arm), not a snapshot taken
+/// somewhere earlier. Uses `rename-window` (rather than `split-window`, as
+/// the main repro test does) so the assertion is a single-pane status-line
+/// check with no multi-pane exit complications.
+#[test]
+fn bind_n_printable_shadows_typing_runtime() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "z".into(),
+        "rename-window".into(),
+        "zoomed".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    // A bare "z" keypress with no prefix must fire the runtime binding.
+    c.send(&ClientMsg::Stdin(b"z".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("zoomed")));
+
+    // Prove "z" itself never reached the shell: subsequent typing must echo
+    // cleanly, not as a leaked "zecho ...".
+    c.send(&ClientMsg::Stdin(b"echo runtime-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("runtime-marker")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("zecho")),
+        "the bound 'z' must not have leaked into the shell; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #30 fix, other direction: `unbind -n` on a previously-shadowed printable
+/// must restore plain forwarding immediately -- proving the dispatch path
+/// re-checks CURRENT bindings on every keystroke rather than caching
+/// "this key is bound" once.
+#[test]
+fn unbind_n_restores_plain_forwarding() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "z".into(),
+        "rename-window".into(),
+        "zoomed".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "z".into()]));
+    expect_cli_done(&cli, 0);
+
+    // With the binding removed again, "z" must forward as ordinary typed
+    // input, batched with the rest of the line exactly as if it had never
+    // been bound.
+    c.send(&ClientMsg::Stdin(b"echo before-z-after\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("before-z-after")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("zoomed")),
+        "unbound 'z' must not still fire the removed binding; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Regression guard for the #30 fix: a long burst of ordinary (fully
+/// unbound) printable typing sent in a SINGLE `Stdin` frame must still
+/// arrive at the pane intact as one piece of text -- the new per-key
+/// root-table lookup in `process_key_events`'s `Forward` arm re-decodes the
+/// blob, but unbound runs must still be batched into one `input_tx.send`
+/// rather than regressing to one send per keystroke.
+#[test]
+fn long_unbound_typing_burst_forwards_intact() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let burst = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let cmd = format!("echo {burst}\r");
+    c.send(&ClientMsg::Stdin(cmd.into_bytes()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains(burst)));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// SP7 review fix: a width-changing resize while a copy-mode selection is
+/// active must CLEAR the selection, not silently keep it pointing at
+/// whatever content its (now-stale) anchor resolves to. `Grid`'s
+/// `history_total()` shift invariant (used by `anchor_key_now` to keep a
+/// selection anchor pinned to content) only holds across mutations that
+/// don't change the grid's width -- `reflow_to_width` restructures rows
+/// non-uniformly and never bumps `history_total` to match, so there is no
+/// corrected shift count that could repair a stored anchor after such a
+/// resize.
+///
+/// Verified against real tmux (`window-copy.c`): `window_pane_resize`
+/// (`window.c:1362-1388`) calls the active mode's `resize` callback whenever
+/// a pane's width OR height actually changes; for copy mode that's
+/// `window_copy_resize` (`window-copy.c:1196-1227`), which unconditionally
+/// ends by calling `window_copy_size_changed` (`window-copy.c:1174-1193`) --
+/// and THAT unconditionally clears the selection
+/// (`window_copy_clear_selection`, `window-copy.c:5914-5929`) regardless of
+/// whether the resize actually reflowed anything (the cursor is separately
+/// remapped/preserved via `grid_wrap_position`/`grid_unwrap_position`, only
+/// when width changed, but the clear itself is unconditional). winmux's
+/// `Server::apply_layout_for_session` mirrors this: it clears `cs.sel`
+/// whenever a pane bound to an active copy-mode selection is actually
+/// resized, but leaves copy mode itself active and the copy cursor
+/// (`scroll`/`cx`/`cy`) untouched.
+///
+/// This test builds a selection over known non-blank text ("selmark4"),
+/// resizes the client's terminal width (80 -> 60, rows unchanged -- a pure
+/// width-changing resize, the exact case that breaks the anchor), then
+/// tries to copy the selection (`Enter`, vi table's
+/// `copy-selection-and-cancel`). If the selection had survived the resize
+/// (the pre-fix bug), this would extract SOME text (right or wrong -- the
+/// point of the bug is the anchor can't be trusted either way) into a new
+/// automatic paste buffer; `list-buffers` reporting "no buffers" instead
+/// proves the selection was cleared rather than silently carried across the
+/// reflow.
+#[test]
+fn copy_mode_selection_clears_on_width_resize() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Known non-blank marker lines to select against.
+    c.send(&ClientMsg::Stdin(b"1..5 | ForEach-Object { \"selmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("selmark5")));
+
+    // Enter copy mode (cursor seeds from the live cursor -- the fresh
+    // prompt row just below the marker lines).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // vi table: move up 2 rows onto a marker line ("selmark4"), jump to
+    // start-of-line (`0`), begin a selection (`Space`), then extend right
+    // 5 columns across the marker text (`l` x5) -- all in one Stdin frame,
+    // same coalesced-Forward-blob pattern as the existing `KKK`/vi tests.
+    c.send(&ClientMsg::Stdin(b"kk0 lllll".to_vec()));
+
+    // Pure WIDTH-changing resize (rows unchanged) -- the exact case that
+    // breaks the selection anchor. The local mirror grid is resized
+    // in lockstep (a real terminal resizes itself instantly, independent of
+    // the server's re-render), and frame ordering on this single connection
+    // guarantees the server has fully processed the selection keys above
+    // before it sees this Resize frame.
+    c.send(&ClientMsg::Resize { cols: 60, rows: 24 });
+    grid.resize(60, 24);
+
+    // Try to copy the (should now be cleared) selection and exit copy mode.
+    c.send(&ClientMsg::Stdin(vec![b'\r']));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, ""));
+
+    // No buffer should have been created: query via a separate headless CLI
+    // connection (`list-buffers`'s headless path returns an EMPTY string
+    // when there are no buffers -- see `exec_list_buffers_headless` -- a
+    // deterministic assertion, unlike waiting on the attached client's
+    // transient status-line message).
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, err) = expect_cli_done(&cli2, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "", "a buffer was created from a selection that should have been cleared by the width resize");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Tests report SHOULD-FIX (final-gate review): the only pre-existing
+/// resize-adjacent server_proto coverage either resizes window LAYOUT
+/// geometry (`main_pane_width_survives_window_resize`, a split-border
+/// position, not pane content) or asserts a SIDE EFFECT of a width resize
+/// (`copy_mode_selection_clears_on_width_resize`, selection invalidation) --
+/// neither actually proves a real, already-wrapped shell line RE-WRAPS
+/// correctly through a live client-driven `ClientMsg::Resize`.
+/// `Grid::reflow_to_width`'s algorithm itself is exhaustively unit-tested in
+/// isolation (`src/grid.rs`), but the WIRING (server pane -> real ConPTY
+/// output -> `Server::handle_resize` -> `reflow_to_width` -> composited
+/// client output) had zero behavioral proof. Prints a known 140-char line
+/// through a real PowerShell pane at 80 cols (autowraps into exactly 2
+/// physical rows: 80 + 60 chars), resizes the client to 40 cols, and
+/// asserts the EXACT re-wrapped 4-row (40+40+40+20) content byte-for-byte.
+/// The pattern is a monotonic zero-padded counter (`"000102...69"`), NOT a
+/// short repeating unit like `"0123456789"` -- a periodic pattern would
+/// make every 40-char-aligned chunk byte-identical to every other, so a
+/// mis-wrapped/shifted split could still accidentally satisfy an
+/// `assert_eq!` against the wrong chunk. The command itself stays short
+/// (a PowerShell range+format expression) so only the ECHOED OUTPUT wraps
+/// -- the typed command line never does, avoiding any ambiguity about
+/// which wrapped text is which.
+#[test]
+fn resize_rewraps_real_pane_content() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // "000102030405...69" -- 70 zero-padded 2-digit numbers, 140 chars,
+    // non-periodic (every substring is globally unique) so a corrupted/
+    // shifted reflow can't accidentally satisfy an equality assertion.
+    let pattern: String = (0..70u32).map(|i| format!("{i:02}")).collect();
+    assert_eq!(pattern.len(), 140);
+    c.send(&ClientMsg::Stdin(b"echo ((0..69|%{$_.ToString('00')}) -join '')\r".to_vec()));
+
+    // At 80 cols (single, unsplit pane -- full client width), the echoed
+    // 140-char line autowraps into exactly 2 physical rows: chars[0..80]
+    // (wrapped) then chars[80..140] (60 chars, terminal). Wait for the
+    // second (trailing, terminal) chunk to land, proving the whole line
+    // arrived.
+    let tail60 = pattern[80..140].to_string();
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == tail60));
+    let before = screen_text(&grid);
+    let row0 = before.iter().position(|l| l == &pattern[0..80]).expect("first 80-char physical row must be on screen, unmangled");
+    assert_eq!(before[row0 + 1].trim_end(), tail60, "second physical row must hold exactly the trailing 60 chars, nothing else");
+
+    // Resize to 40 cols: reflow must re-split the SAME logical 140-char
+    // line into 40+40+40+20 with exact content -- no phantom blank cells
+    // spliced in, no lost/duplicated characters.
+    c.send(&ClientMsg::Resize { cols: 40, rows: 24 });
+    grid.resize(40, 24);
+    let last20 = pattern[120..140].to_string();
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == last20));
+    let after = screen_text(&grid);
+    let r0 = after
+        .iter()
+        .position(|l| l == &pattern[0..40])
+        .expect("first 40-char physical row must be on screen after reflow, unmangled");
+    assert_eq!(after[r0], pattern[0..40]);
+    assert_eq!(after[r0 + 1], pattern[40..80]);
+    assert_eq!(after[r0 + 2], pattern[80..120]);
+    assert_eq!(after[r0 + 3].trim_end(), last20);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `allow-rename` (SP7 Task 3, closes follow-up #52): default is OFF (tmux
+/// since 2.6), and it gates ONLY the historical `ESC k <name> ESC \` rename
+/// escape -- the OSC 0/2 path (`pane_title_updates_window_name`, above)
+/// stays unconditional. With the default `allow-rename off`, the window
+/// must stay named "powershell" (its startup default) -- NOT "esckname".
+///
+/// **Command shape -- verified against real ConPTY, not just guessed:** a
+/// standalone `Pty`-level probe (bypassing grid/server entirely) proved
+/// Windows conhost's OWN legacy title-escape support silently drops the
+/// literal 2-byte `ESC \` (ST) terminator from a child process's `ESC k
+/// ... ESC \` output before it ever reaches the pty client's `ReadFile` --
+/// conhost recognizes and consumes the ST for its OWN internal
+/// `SetConsoleTitle`-equivalent handling but does not relay it, so a
+/// single statement that emits `ESC k <name> ESC \` arrives at winmux's
+/// grid missing its terminator and (correctly, matching tmux parity --
+/// `EscKScan`'s doc comment: BEL never terminates a title either) never
+/// commits. The same probe proved an *unrelated* real escape sequence
+/// emitted by a SEPARATE, later statement (e.g. `Write-Host
+/// -ForegroundColor`'s own SGR `ESC[...m`) DOES survive intact and lands
+/// right after the ESC-k content -- so two separate `Write-Host` calls
+/// (title escape, then ANY statement that emits its own real escape) is
+/// what reliably round-trips a committed ESC-k title through a live pane
+/// on this platform; PowerShell has no purpose-built cmdlet for the
+/// escape itself, hence the raw `[char]27` construction.
+#[test]
+fn allow_rename_off_ignores_esc_k_title_rename() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-esck-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:powershell*")),
+        "allow-rename off must ignore an ESC-k rename escape; screen:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "the ESC-k title must not have renamed the window; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Mirror of `allow_rename_off_ignores_esc_k_title_rename` with `allow-rename`
+/// turned on: the SAME `ESC k` escape now DOES rename the window, through
+/// `Server::rename_window_from_esc_k` (SP7-B review fix of cae6af2) -- a
+/// path SEPARATE from `maybe_auto_rename`/`derive_auto_name`, which uses the
+/// captured name as-is (`model::validate_name`-gated only, no
+/// basename/extension derivation), matching real tmux's literal direct
+/// `window_set_name` call in `input_exit_rename`. `allow-rename on` is
+/// loaded from a STARTUP config file (rather than a live `set` command after
+/// attaching) purely to keep the test shape minimal; see the sibling test's
+/// doc comment for the verified reason behind the two-statement command
+/// shape.
+#[test]
+fn allow_rename_on_esc_k_renames_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename` must gate `ESC k`
+/// INDEPENDENTLY of `automatic-rename` -- real tmux's `input_exit_rename`
+/// never reads `automatic-rename` before renaming
+/// (`docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what it
+/// actually gates", lines 358-374). Both options are set from a STARTUP
+/// config file: `allow-rename on` (so `ESC k` is honored) AND
+/// `automatic-rename off` (which would previously have blocked the rename,
+/// back when this path wrongly funneled through `maybe_auto_rename`, whose
+/// very first check is `automatic_rename()`).
+#[test]
+fn allow_rename_on_with_automatic_rename_off_still_renames_via_esc_k() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-auto-off");
+    std::fs::write(&conf_path, "set -g allow-rename on\nset -g automatic-rename off\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: an `ESC k` rename must clear the window's
+/// `auto_rename` flag exactly like a manual `rename-window`, so a LATER OSC
+/// 0/2 title change does not silently override it -- mirrors
+/// `manual_rename_disables_auto`, except the initial rename is the `ESC k`
+/// escape (`allow-rename on`) instead of a CLI `rename-window`. The
+/// title-setting command and the `done-osc-check` marker run as ONE
+/// PowerShell statement list so the marker appearing on screen proves the
+/// OSC has already had its chance to reach and be processed by the server
+/// before the assertion below runs.
+#[test]
+fn esc_k_rename_clears_window_auto_rename_flag() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-clears-flag");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"$Host.UI.RawUI.WindowTitle='mytool'; echo done-osc-check\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-osc-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "an ESC-k rename must survive a later OSC title change, same as a manual rename; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename`-gated `ESC k` must rename the
+/// window even if it was PREVIOUSLY manually renamed -- real tmux's
+/// `input_exit_rename` never consults any "has this window been manually
+/// renamed before" history, unlike the old (buggy) implementation, which
+/// funneled `ESC k` through `maybe_auto_rename` and was therefore blocked by
+/// `!window.auto_rename` the instant any manual rename (CLI, `,` prompt, or
+/// a prior `ESC k`) had ever happened.
+#[test]
+fn allow_rename_on_renames_previously_manually_renamed_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-after-manual");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "manual".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:manual*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:manual*")),
+        "an allow-rename ESC-k must override a prior manual rename, not be blocked by it; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+// ---- SP7 Task 6: per-session/per-window option scopes + pane-base-index +
+// show -gqv (closes follow-ups #26, #32, #68) ----
+
+/// #26 (window scope): `setw window-status-current-format` with no `-g`
+/// targets the ACTING client's CURRENT window only. Proof of per-window
+/// divergence: window 1 (current at set time) renders the custom tab
+/// format; after switching back to window 0, window 0's current-tab format
+/// is still the DEFAULT (`0:powershell*`) -- the override stayed pinned to
+/// window 1, it never followed "whichever window is current".
+#[test]
+fn setw_status_style_on_one_window_only_styles_that_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Second window (index 1), becomes current.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // Per-window set via the ':' prompt (an ACTING-client context -- a
+    // headless CLI `setw` with no client would fall back to the global
+    // table, see exec_set_option's documented narrowing).
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    // Quoted, as in real tmux -- an unquoted `#` starts a config-line
+    // comment in the shared tokenizer (`cmd::parse_line`).
+    c.send(&ClientMsg::Stdin(b"setw window-status-current-format \"<<#I>>\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- <<1>>"))
+    });
+
+    // Switch back to window 0: window 0 is now current and must render the
+    // DEFAULT current format (its own overlay is empty), proving the
+    // override didn't land at the global-window level.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*"))
+    });
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains("<<0>>")),
+        "window 0 must not inherit window 1's per-window format override; screen:\n{}",
+        lines.join("\n")
+    );
+
+    // And the global level is untouched: `show -g` still prints the default.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-g".into(), "window-status-current-format".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        !out.contains("<<#I>>"),
+        "global window-status-current-format must be unchanged by a windowed setw: {out:?}"
+    );
+
+    // Kill window 1 (not current; kill by target), then exit.
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-window".into(), "-t".into(), "1".into()]));
+    expect_cli_done(&cli2, 0);
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #26 (session scope): unprefixed `set` from an attached client targets
+/// THAT client's session only -- a second session's status bar keeps the
+/// default `status-left`, and the global table (`show -g`) is unchanged.
+#[test]
+fn set_without_g_targets_current_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "sA", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[sA]")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    // Session-scoped set from client A (no -g).
+    a.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    a.send(&ClientMsg::Stdin(b"set status-left AAA_\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("AAA_")));
+
+    // Session B is untouched: force a fresh frame via a rename (any
+    // re-render) and confirm its status still shows the default-expanded
+    // left prefix, never AAA_.
+    b.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    b.send(&ClientMsg::Stdin(b"rename-window wB\r".to_vec()));
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("0:wB*")));
+    let lines_b = screen_text(&grid_b);
+    assert!(
+        lines_b.iter().any(|l| l.contains("[sB]")),
+        "session B must keep the default status-left; screen:\n{}",
+        lines_b.join("\n")
+    );
+    assert!(
+        !lines_b.iter().any(|l| l.contains("AAA_")),
+        "session A's unprefixed set must not leak into session B; screen:\n{}",
+        lines_b.join("\n")
+    );
+
+    // Global table unchanged.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-g".into(), "status-left".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "status-left \"[#S] \"\n", "global status-left must be the default");
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #68: `show -gqv "@foo"` -- the exact TPM rung-1 primitive. Set: prints
+/// the bare value only (no `@foo ` prefix). Unset + `-q`: prints nothing,
+/// exit 0. Unset without `-q`: `invalid option` error, exit 1.
+#[test]
+fn show_gqv_user_option_prints_value_only() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    // Keep the server alive across CLI calls.
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "kq".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "@foo".into(), "bar".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@foo".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "bar\n", "-v prints the value only");
+    assert_eq!(err, "");
+
+    // Unset user option, quiet: silent success (TPM's "empty if unset").
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@never_set".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "", "unset @-option with -q prints nothing");
+    assert_eq!(err, "");
+
+    // Unset user option, NOT quiet: tmux's invalid-option error.
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "-gv".into(), "@never_set".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "invalid option: @never_set");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #32: `pane-base-index` shifts every user-visible pane index. With
+/// `setw -g pane-base-index 1` and two panes: `#P` (display-message)
+/// reports 2 for the focused second pane, and a display-panes digit
+/// keypress `1` focuses the FIRST pane (digit = base + position, so `1`
+/// names position 0 -- the same mapping the drawn digit overlay used).
+#[test]
+fn pane_base_index_shifts_display_panes_digits_and_hash_p() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "pane-base-index".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Two panes; split-window focuses the NEW (right) pane = position 1.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    // #P for the focused (second) pane: base 1 + position 1 = 2.
+    let mut cli_p = cli_client(&name);
+    cli_p.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (out, _) = expect_cli_done(&cli_p, 0);
+    assert_eq!(out, "2", "#P must reflect pane-base-index 1 for the second pane");
+
+    // display-panes: digit `1` = base + position 0 = the FIRST pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'q']));
+    c.send(&ClientMsg::Stdin(b"1".to_vec()));
+    c.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "1", "display-panes digit 1 must focus the first pane (index base+0)");
+
+    // And the pane target grammar agrees: `select-pane -t :.2` names the
+    // SECOND pane under base 1.
+    c.send(&ClientMsg::Cli(vec!["select-pane".into(), "-t".into(), ":.2".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    c.send(&ClientMsg::Cli(vec!["display-message".into(), "#P".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "2", "select-pane -t :.2 must resolve to the second pane under pane-base-index 1");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- SP7 Task 18: test-debt batch (closes #11, #12, #22, #23, #58, #60) ---
+
+/// #11/#22: kill the last pane of a NON-last window (via `Ctrl-b x`
+/// confirm) in a session that has OTHER windows besides it, distinct from
+/// the two pre-existing cases (`kill_only_pane_confirm_destroys_session`:
+/// the only window in the only session; `kill_window_confirm_text`: `&`
+/// window-kill, not the pane-kill cascade). Three windows (0, 1, 2); window
+/// 1 (neither first nor last) is killed. Asserts: the window is destroyed,
+/// focus lands on a REMAINING window (2, per `Session::kill_window`'s
+/// `last`-fallback rule -- window 2 was `current` right before the client
+/// stepped back to window 1, so it's `last` at the moment window 1 dies),
+/// and window 0 -- entirely unrelated to the kill -- is undisturbed.
+#[test]
+fn kill_last_pane_of_non_last_window_destroys_window_and_refocuses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 0: mark it so we can prove it's undisturbed later.
+    c.send(&ClientMsg::Stdin(b"echo win0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+
+    // prefix-c twice builds windows 1 and 2 (creation order 0, 1, 2); window
+    // 2 ends up current, window 1 "last" (it was current right before
+    // window 2 was created).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("2:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo win2mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win2mark").is_some());
+
+    // prefix-p (previous-window) steps back to window 1 -- the NON-last
+    // window here: both window 0 and window 2 remain alive when it dies.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'p']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+
+    // Kill window 1's only pane via Ctrl-b x confirm.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'x']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-pane 0? (y/n)")));
+    c.send(&ClientMsg::Stdin(b"y".to_vec()));
+
+    // Window 1 is destroyed; focus falls back to window 2 (NOT window 0),
+    // and window 2's content survives untouched (no reset/re-render of its
+    // pane's grid).
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("2:powershell*")) && !lines.iter().any(|l| l.contains("1:powershell"))
+    });
+    assert!(marker_col(&grid, "win2mark").is_some(), "window 2's content must survive the kill undisturbed");
+
+    // Window 0 -- entirely unrelated to the kill -- is still there with its
+    // own content intact.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0:powershell*")));
+    assert!(marker_col(&grid, "win0mark").is_some(), "window 0's content must be undisturbed by window 1's death");
+
+    // Clean up: exit window 0's shell (window 2 still alive -> just
+    // destroys window 0, focus falls to window 2), then exit window 2's
+    // shell (now the only window -> destroys the session).
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("2:powershell*")) && !lines.iter().any(|l| l.contains("0:powershell"))
+    });
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `rename-session` must propagate to OTHER attached clients, not
+/// just the one that issued it. Two clients attached to the same session;
+/// client A renames it via the `prefix-$` prompt, and client B -- which
+/// never touched the rename -- must independently see its own status-left
+/// `[name]` update.
+#[test]
+fn rename_session_propagates_to_other_attached_clients() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "orig", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::Existing, "orig", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // A renames the session via prefix-$; "orig" is 4 chars, wipe then type.
+    a.send(&ClientMsg::Stdin(vec![0x02, b'$']));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("(rename-session) orig")));
+    a.send(&ClientMsg::Stdin(vec![0x7f, 0x7f, 0x7f, 0x7f]));
+    a.send(&ClientMsg::Stdin(b"renamed\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("[renamed]")));
+
+    // Client B, which never issued the rename, must also see the new name
+    // -- without any input of its own.
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("[renamed]")));
+
+    a.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    a.expect_exit(0, "[exited]");
+    b.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `switch-client -p` (`prefix-(`) must be a true no-op when the
+/// registry has only one session -- `switch_client_session`'s own
+/// neighbor-equals-self guard, exercised end to end here for the first
+/// time (`switch_client_next_cycles_sessions` only ever covers the 2+
+/// session case). No visible change, and the client keeps rendering/routing
+/// input normally afterward (proves it wasn't left in some half-switched
+/// state).
+#[test]
+fn switch_client_prev_is_noop_with_single_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "solo", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[solo]")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'(']));
+
+    c.send(&ClientMsg::Stdin(b"echo still-solo\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "still-solo").is_some());
+    assert!(
+        screen_text(&grid).iter().any(|l| l.contains("[solo]")),
+        "session name must be unchanged after a no-op switch-client -p"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #11/#22: `list-windows` with no `-t` defaults to the most RECENTLY
+/// created session (`exec_list_windows`'s `self.registry.sessions().last()`
+/// fallback), not the first one created and not an error. `lwA` (renamed to
+/// distinguish it) is created first; `lwB` (left at the default window
+/// name) second -- the no-target listing must show `lwB`'s window, not
+/// `lwA`'s.
+#[test]
+fn list_windows_no_target_defaults_to_most_recent_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "lwA".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "-t".into(), "lwA".into(), "winA".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "lwB".into()]));
+    expect_cli_done(&cli, 0);
+
+    // No -t: must default to lwB (most recently created), still showing its
+    // untouched default window name -- not lwA's renamed one.
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "0: powershell* (1 panes) [80x24] (active)\n");
+    assert!(!out.contains("winA"), "must not default to lwA (the older session): {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "lwA".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["kill-session".into(), "-t".into(), "lwB".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after last session dies");
+}
+
+/// #60: `swap-pane -U`/`-D` wraparound at the two ends of a 3+-pane window.
+/// The wrap arithmetic (`(pos+n-1)%n` for `-U`, `(pos+1)%n` for `-D`,
+/// `src/server/dispatch.rs::exec_swap_pane`) was already pretested via
+/// `rotate`, but had no dedicated coverage of its own -- this drives BOTH
+/// ends with n=3. Window 0 covers `-U` at position 0 (must wrap to the LAST
+/// pane, position 2); window 1 (a fresh layout, so leaf order == creation
+/// order again) covers `-D` at position 2 (must wrap to position 0).
+#[test]
+fn swap_pane_wraps_at_ends() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // ---- Window 0: `-U` at position 0 wraps to the LAST pane (n=3). ----
+    // H(1, V(2,3)): pane1 {0,0,40,24} (leaf 0), pane2 {41,0,39,12} (leaf 1),
+    // pane3 {41,13,39,11} (leaf 2, focused after the second split) -- same
+    // construction as `swap_pane_updown_with_target`.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "0".into(), "echo one111".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "one111").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1".into(), "echo two222".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "2".into(), "echo three333".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").is_some());
+
+    // `swap-pane -U -t 0`: position 0 is the FIRST pane (n=3, no
+    // predecessor) -- the wrap arithmetic `(pos+n-1)%n` must land on
+    // position n-1=2 (pane3, bottom-right), not silently no-op or panic.
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-U".into(), "-t".into(), "0".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Position 0 (left) now shows pane3's content; position 2 (bottom-right)
+    // now shows pane1's content. Position 1 (top-right) is untouched.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "one111", 13, 24).is_some());
+    assert!(marker_col_in_rows(&grid, "two222", 0, 12).is_some(), "position 1 (top-right) must be untouched by the -U wrap");
+
+    // ---- Window 1: `-D` at position n-1 (2) wraps to position 0. ----
+    // prefix-c creates window 1 and switches the client to it -- a FRESH
+    // window, so leaf order == creation order again (no prior swap to
+    // account for).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.0".into(), "echo alpha1".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "alpha1").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.1".into(), "echo beta2".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "beta2").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1.2".into(), "echo gamma3".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "gamma3").is_some());
+
+    // `swap-pane -D -t 1.2`: position 2 is the LAST pane (n=3, no
+    // successor) -- the wrap arithmetic `(pos+1)%n` must land on position 0
+    // (pane at leaf 0, alpha1), not silently no-op or panic.
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-D".into(), "-t".into(), "1.2".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.recv_output_until(&mut grid, |g| marker_col(g, "gamma3").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "alpha1", 13, 24).is_some());
+    assert!(marker_col_in_rows(&grid, "beta2", 0, 12).is_some(), "position 1 (top-right) must be untouched by the -D wrap");
+
+    let mut kill_cli = cli_client(&name);
+    kill_cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&kill_cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- Task 8, SP7 wave 3: table-driven mouse bindings (closes #57, #67) ----
+
+/// The user's real conf idiom (`unbind -T copy-mode-vi MouseDragEnd1Pane`,
+/// follow-up #67(b)) must now actually disable release-copy in vi copy mode:
+/// a full press-drag-release across known text creates NO paste buffer and
+/// leaves copy mode active, because `MouseDragEnd1Pane` -- now a real,
+/// table-resolved binding -- has been removed from the copy-mode-vi table.
+#[test]
+fn unbind_copy_mode_vi_dragend_disables_release_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-T".into(), "copy-mode-vi".into(), "MouseDragEnd1Pane".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Full drag-select over "hello123" (columns 0..=7) and release -- would
+    // copy under the default binding (see `mouse_drag_selects_and_release_copies`).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "unbound MouseDragEnd1Pane must not create a paste buffer: {out:?}");
+
+    assert!(has_indicator(&grid, "[0/"), "unbound MouseDragEnd1Pane must leave copy mode active");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `bind -n WheelUpPane <cmd>` replaces the DEFAULT root wheel-up-enters-
+/// copy-mode behavior with the user's own command: the custom command runs
+/// (proven via a `@`-user-option side effect) and copy mode is never
+/// entered.
+#[test]
+fn bind_wheelup_pane_custom_command_overrides_default() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "WheelUpPane".into(),
+        "set".into(),
+        "-g".into(),
+        "@wheelmark".into(),
+        "yes".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 5, 5, false)));
+
+    c.send(&ClientMsg::Cli(vec!["show".into(), "-gqv".into(), "@wheelmark".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(out, "yes\n", "the custom WheelUpPane binding must have run: {out:?}");
+
+    assert!(!has_indicator(&grid, "["), "the DEFAULT wheel-up-enters-copy-mode behavior must NOT have run");
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #67(a): `unbind` on a token `keys::parse_key` rejects now errors
+/// `unknown key: <tok>` (real tmux behavior) instead of silently no-oping.
+#[test]
+fn unbind_unknown_key_errors_without_q() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "Ct-x".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "unknown key: Ct-x");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// #67(a): `-q` suppresses the same error, restoring the old silent-no-op
+/// behavior on request.
+#[test]
+fn unbind_unknown_key_quiet_with_q() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "s1".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-q".into(), "-n".into(), "Ct-x".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- SP7 Task 17: alerts subsystem (closes follow-up #74) -----------------
+//
+// `send-keys -t ":<index>."` (a leading `:` + window index + trailing `.`
+// with an empty pane spec) targets a WINDOW's focused pane directly, without
+// switching the client's own focus there first -- unlike the bare-numeric
+// `-t 0`/`-t 1` targets used elsewhere in this file (which name a PANE
+// POSITION within the client's CURRENT window; see `resolve_pane_target`'s
+// doc comment). This lets these tests drive a BACKGROUND window's shell
+// while a different window stays current, exactly the scenario the alerts
+// subsystem exists to flag.
+//
+// A raw BEL byte is produced by having the target pane's real PowerShell
+// process run `Write-Host -NoNewline ([char]7)` -- the same "let the shell
+// emit the exact byte, don't try to inject a synthetic escape sequence"
+// pattern already established by the ESC-k rename tests
+// (`pane_title_updates_window_name`'s neighbors, `[char]27` construction);
+// seen the alt-screen-wheel test's doc comment for why a synthetic
+// `Write-Host`-emitted sequence is the one paths that DIDN'T reliably survive
+// real ConPTY transit (`\x1b[?1049h`), a bare 1-byte BEL is not that.
+
+#[test]
+fn bel_in_unfocused_window_sets_bang_flag_and_bell_style() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Second window (current); window 0 goes to the background.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // BEL into the BACKGROUND window (0); `monitor-bell` defaults ON and
+    // `bell-action` defaults `any`, so no config needed.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+
+    // `window-status-bell-style` defaults to `reverse` -- layered over
+    // window 0's tab now that it's bell-flagged.
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, status_row);
+        match row.find("0:powershell!") {
+            Some(col) => g.cell(col as u16, status_row).style.reverse,
+            None => false,
+        }
+    });
+    // The still-current window's tab is untouched.
+    assert!(
+        !g_cell_reverse_at(&grid, status_row, "1:powershell*"),
+        "the current window's own tab must not pick up the bell style"
+    );
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Small helper for the assertion above: `true` iff `marker` is found in
+/// `row` and its FIRST cell has `style.reverse` set.
+fn g_cell_reverse_at(g: &Grid, row: u16, marker: &str) -> bool {
+    match row_text(g, row).find(marker) {
+        Some(col) => g.cell(col as u16, row).style.reverse,
+        None => false,
+    }
+}
+
+#[test]
+fn activity_flag_hash_when_monitor_activity_on() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // `monitor-activity` defaults OFF -- must be turned on for the `#` flag
+    // to ever appear.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "monitor-activity".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "echo activity-marker".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell#"));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn flags_clear_on_selecting_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+
+    // Select window 0 (tmux clear-on-visit): its own `!` flag must clear
+    // the moment it becomes current.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, status_row);
+        row.contains("0:powershell*") && !row.contains("0:powershell!")
+    });
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `bell-action none` suppresses the notify/visual-bell REACTION only --
+/// the `!` window-flag detection is a SEPARATE gate (`monitor-bell` alone),
+/// per `docs/tmux-reference/status-line-and-messages.md` §4.4 /
+/// `alerts_check_bell` (alerts.c:182-218, which never consults `bell-action`
+/// before setting the flag). This test proves both halves at once: the flag
+/// still appears, but with `visual-bell on` armed, no "Bell in window 0"
+/// message ever shows.
+#[test]
+fn bell_action_none_suppresses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "bell-action".into(), "none".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "visual-bell".into(), "on".into()]));
+    expect_cli_done(&cli2, 0);
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli3, 0);
+
+    let status_row = grid.rows() - 1;
+    // The flag still appears (monitor-bell alone gates it)...
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+    // ...but no reaction message ever shows, `bell-action none` suppressed
+    // it entirely.
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("Bell in window")),
+        "bell-action none must suppress the visual-bell reaction; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn visual_bell_on_shows_message_instead_of_passthrough() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "visual-bell".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Bell on the CURRENT (only) window: `bell-action` defaults `any`, so
+    // the reaction fires here too, with the "current window" wording.
+    c.send(&ClientMsg::Stdin(b"Write-Host -NoNewline ([char]7)\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Bell in current window")));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `monitor-silence <secs>`, checked on the server's existing 50ms Tick: a
+/// window with no output for the configured interval gets the `~` flag.
+/// Set to 1s (comfortably above the 50ms tick granularity, well below the
+/// harness's 10s `recv_output_until` timeout) and no keys are ever sent to
+/// either window -- the flag must appear on its own, driven purely by the
+/// Tick handler re-rendering once `check_silence` reports dirty.
+#[test]
+fn monitor_silence_flags_after_interval() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "monitor-silence".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell~"));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+// ---- SP7 Task 11: cross-window/session structure ops --------------------
+// (closes follow-ups #41, #42, #44, #45)
+
+/// Closes follow-up #42: `swap-pane -U`/`-D` combined with `-s` computes
+/// the neighbor relative to `-s`'s pane, not `-t`'s (nor the acting
+/// client's focus) -- previously any `-s` co-supplied with a direction was
+/// a usage error. Mirrors `swap_pane_updown_with_target`'s 3-pane setup,
+/// but supplies BOTH `-s 0` and a DIFFERENT `-t 2`: the resulting swap must
+/// follow `-s` (position 0, pane1) and its `-D` neighbor (position 1,
+/// pane2), proving `-t`'s different pane (position 2, pane3 -- also the
+/// focused/current pane) played no part.
+#[test]
+fn swap_pane_dash_s_with_direction_resolves_relative_to_s() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // H(1, V(2,3)): pane1 {0,0,40,24} (leaf 0), pane2 {41,0,39,12} (leaf 1),
+    // pane3 {41,13,39,11} (leaf 2, focused after the second split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "0".into(), "echo one111".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "one111").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1".into(), "echo two222".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "2".into(), "echo three333".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").is_some());
+
+    // Focus (pane3, position 2) must stay exactly where it is: the pivot is
+    // `-s 0` (pane1), NOT the active pane, and NOT `-t 2` (which also names
+    // pane3).
+    let cursor_before = grid.cursor();
+    assert!(cursor_before.0 > 40 && cursor_before.1 >= 13, "sanity: cursor starts in pane3 (bottom-right)");
+
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-D".into(), "-s".into(), "0".into(), "-t".into(), "2".into()]));
+    expect_cli_done(&cli, 0);
+
+    // pane1 (position 0, left) now shows pane2's content ("two222");
+    // pane2's old spot (position 1, top-right) now shows pane1's content
+    // ("one111") -- pane3's spot (position 2, bottom-right) is untouched,
+    // proving `-t 2` (which ALSO names pane3) was ignored once `-s` was
+    // present.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "one111", 0, 12).is_some());
+    assert!(marker_col_in_rows(&grid, "three333", 13, 24).is_some(), "pane3's content must stay in the bottom-right pane");
+    assert_eq!(grid.cursor(), cursor_before, "focus/cursor must not move: the pivot was -s (position 0), not the active pane");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Closes follow-up #44: `break-pane -s <target>` selects WHICH pane
+/// breaks out -- previously break-pane always acted on the resolved
+/// CURRENT (focused) pane, with no `-s` selector at all. This test focuses
+/// pane1 (left) but targets pane2 (right, `-s 1`) explicitly: the pane
+/// that leaves must be pane2's content, not pane1's (the focused one).
+#[test]
+fn break_pane_dash_s_moves_named_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Split: pane1 (left, leaf 0) | pane2 (right, leaf 1, focused --
+    // split-window gives the new pane focus).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    c.send(&ClientMsg::Stdin(b"echo rightmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "rightmark").is_some());
+
+    // Click into pane1 (left) to focus it -- the DEFAULT target (no `-s`)
+    // would now be pane1, proving `-s` is doing the selecting below.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+    c.send(&ClientMsg::Stdin(b"echo leftmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "leftmark").is_some());
+
+    // `break-pane -s 1` (leaf-order index 1 = the right pane) -- NOT the
+    // focused pane (index 0, left).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["break-pane".into(), "-s".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // The new (current) window shows the RIGHT pane's content, and both
+    // windows are back down to a single pane.
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")) && !has_vertical_border(g)
+    });
+    c.recv_output_until(&mut grid, |g| marker_col(g, "rightmark").is_some());
+
+    // Window 0 (source) kept the LEFT pane -- its own single remaining pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "leftmark").is_some());
+    assert!(!has_vertical_border(&grid), "source window must be back to a single pane");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Regression for a self-caught atomicity bug in the `-t` destination-index
+/// occupancy check: an OCCUPIED explicit `-t` index must fail the WHOLE
+/// command before the source pane is touched, not partway through (which
+/// would otherwise orphan the pane -- detached from its source window's
+/// layout, but never landing anywhere else either). Targets `-t :0` --
+/// window 0's OWN index, still occupied by window 0 itself (only a PANE is
+/// being removed from it, not the whole window) -- from a single-window,
+/// two-pane session.
+#[test]
+fn break_pane_occupied_dst_index_does_not_orphan_source_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(b"echo bothmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "bothmark").is_some());
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["break-pane".into(), "-t".into(), ":0".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "index in use: 0");
+
+    // Nothing changed: still one window, still two panes, both echoed
+    // markers survive in place (the source pane was never removed).
+    assert!(has_vertical_border(&grid), "the split must survive the rejected break-pane intact");
+    assert!(marker_col(&grid, "bothmark").is_some());
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert_eq!(out.lines().count(), 1, "still exactly one window -- break-pane must not have partially executed");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Closes follow-up #45: `move-window -t <session>:<index>` relocates a
+/// window ACROSS sessions -- previously any `session:` prefix on
+/// move-window's `-t` was silently discarded (same-session re-indexing
+/// only). Session "srcS" starts with two windows (0 default, 1 created via
+/// prefix-c); window 1 is moved into session "dstS" at index 5. Afterward:
+/// a fresh client attaching to "dstS" sees the moved window (its content,
+/// at index 5, and CURRENT there -- real tmux's "without -d, the new
+/// window becomes the destination's current window"); the acting client
+/// (still attached to "srcS") falls back to window 0 automatically (its own
+/// current window just left), proving the source session SURVIVED with its
+/// remaining window intact ("leaves source").
+#[test]
+fn move_window_to_other_session_appears_there_and_leaves_source() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "srcS", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    c.send(&ClientMsg::Stdin(b"echo srcw0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw0mark").is_some());
+
+    // prefix-c creates window 1 and switches the client to it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[srcS] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo srcw1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw1mark").is_some());
+
+    // A second, independent session "dstS" already exists with its own
+    // window (index 0) -- proving the move doesn't disturb it.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "dstS".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Move window 1 (current, "srcw1mark") from srcS into dstS at index 5,
+    // via the attached client's `prefix-:` command prompt (NOT a plain
+    // headless `ClientMsg::Cli` -- unlike the interactive prompt/keybinding
+    // path, a headless CLI invocation resolves its acting session via
+    // "most recently created", not this client's own attached session,
+    // which would target the WRONG session here since "dstS" was created
+    // more recently than "srcS").
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"move-window -t dstS:5\r".to_vec()));
+
+    // srcS's client falls back to window 0 automatically -- the window it
+    // was looking at just left.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[srcS] 0:powershell*")));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw0mark").is_some());
+
+    // A fresh client attaching to dstS sees the moved window: it's CURRENT
+    // there (index 5, alongside dstS's own original window 0), and its
+    // content (srcw1mark) is on screen.
+    let mut c2 = Client::connect(&name);
+    attach(&mut c2, AttachMode::Existing, "dstS", 80, 24);
+    let mut grid2 = Grid::new(80, 24, 0);
+    c2.recv_output_until(&mut grid2, |g| screen_text(g).iter().any(|l| l.contains("[dstS] 0:powershell- 5:powershell*")));
+    c2.recv_output_until(&mut grid2, |g| marker_col(g, "srcw1mark").is_some());
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- display-menu (SP7 Task 16, closes #51) ----
+
+/// `display-menu` opened generically via the `prefix-:` command prompt (the
+/// same dispatcher path a config/CLI `display-menu` line uses): navigating
+/// with `j` (Down) selects the FIRST item (`sel` starts at `-1`, one Down
+/// press lands on row 0 -- `menu.c`'s own `KEYC_DOWN` case), Enter runs its
+/// command. Proves the whole `ParsedCmd::DisplayMenu` parse -> open -> key
+/// navigate -> commit pipeline end to end, independent of any default
+/// right-click binding.
+#[test]
+fn display_menu_opens_and_enter_runs_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // setup_two_named_windows leaves window 1 ("w1") current.
+    assert!(row_text(&grid, grid.rows() - 1).contains("1:w1*"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(
+        b"display-menu -T MenuTest First f \"select-window -t :=0\" Second s \"select-window -t :=1\"\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("MenuTest")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("First")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("Second")));
+
+    c.send(&ClientMsg::Stdin(b"j".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+    // The menu box is gone.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("MenuTest")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Correctness review MUST-FIX #3 regression test: a user-authored
+/// `display-menu` whose FIRST row is a separator (a documented, legitimate
+/// tmux idiom for a leading header/divider -- an empty-string name token,
+/// `cmd.rs`'s `MenuEntry::Separator` parse) must not get `Down` navigation
+/// stuck on that separator. Pre-fix, `menu_move`'s "starting point"
+/// sentinel aliased "no previous selection" (`sel == -1`) to the SAME index
+/// (`0`) a single `Down` press from a fresh menu lands on, so if row 0 was
+/// a separator the wrap/skip loop's termination check fired on its very
+/// first iteration and got stuck there -- Enter would then silently close
+/// the menu (a separator row runs no command) instead of running "First"'s
+/// `select-window`. This test sends exactly ONE `j` then Enter and asserts
+/// the switch actually happened, which only passes if `j` skipped past the
+/// leading separator onto "First".
+#[test]
+fn display_menu_leading_separator_does_not_stick_down_navigation() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // setup_two_named_windows leaves window 1 ("w1") current.
+    assert!(row_text(&grid, grid.rows() - 1).contains("1:w1*"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(
+        b"display-menu -T MenuTest \"\" First f \"select-window -t :=0\" Second s \"select-window -t :=1\"\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("MenuTest")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("First")));
+
+    // ONE Down press: pre-fix, this got stuck on the leading separator row
+    // (index 0); post-fix, it must skip straight to "First" (index 1).
+    c.send(&ClientMsg::Stdin(b"j".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+    // The menu box is gone -- a command actually ran (a stuck-on-separator
+    // Enter would ALSO close the menu, so this alone wouldn't discriminate
+    // -- the window-switch assertion above is the discriminating one).
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("MenuTest")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3Pane` (the default right-click binding, table-driven since
+/// Task 8): a press on a live pane opens winmux's default PANE context
+/// menu — asserts the box renders with the expected item text.
+#[test]
+fn right_click_on_pane_opens_default_menu() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("Horizontal Split")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("Vertical Split")), "got: {text:?}");
+    // Single pane: Swap Up/Down and Zoom are omitted (see `open_pane_menu`'s
+    // doc comment).
+    assert!(!text.iter().any(|l| l.contains("Swap Up")));
+    assert!(!text.iter().any(|l| l.contains("Zoom")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// A press OUTSIDE the open menu's box closes it with NO action taken —
+/// proven by there being no vertical border immediately after the outside
+/// click (nothing was accidentally triggered by it) and by a real binding
+/// working again afterward (the client is back in `ClientMode::Normal`).
+#[test]
+fn menu_click_outside_closes_without_action() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 40, 12, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // Top-left corner is well outside a menu opened around (40, 12).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+    assert!(!has_vertical_border(&grid), "outside click must not have triggered any action");
+
+    // The client is back in Normal mode: a real binding works again.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Escape cancels an open menu with no action, same as a click outside.
+#[test]
+fn menu_escape_closes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+    assert!(!has_vertical_border(&grid), "Escape must not have triggered any action");
+
+    // Back in Normal mode.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// A menu item's own shortcut key runs it IMMEDIATELY, regardless of the
+/// current navigation selection (`menu.c`'s per-item key loop, checked
+/// BEFORE Up/Down/Enter) — pressing `v` (the default pane menu's "Vertical
+/// Split" shortcut) with no prior navigation splits the pane and closes the
+/// menu in one keystroke.
+#[test]
+fn menu_shortcut_key_runs_item_immediately() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Horizontal Split")));
+
+    // "Horizontal Split" (`split-window -h`) divides the pane left/right,
+    // i.e. a VERTICAL divider line -- tmux's own (counterintuitive) naming:
+    // `-h`/"horizontal" describes the two resulting panes' side-by-side
+    // ARRANGEMENT, not the divider's orientation.
+    c.send(&ClientMsg::Stdin(b"h".to_vec()));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    // The menu closed as part of running the item.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("Horizontal Split")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3Status` (right-click on a window tab, including a
+/// NON-current one) opens winmux's default WINDOW context menu; choosing
+/// "Kill" (via its own shortcut key `X`) kills THAT window, not the
+/// client's current one.
+#[test]
+fn right_click_on_window_tab_opens_menu_and_kills_that_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // Window 1 ("w1") is current; window 0 ("w0") is not.
+    let status_row = grid.rows() - 1;
+    let line = row_text(&grid, status_row);
+    let tab0_col = line.find("0:w0-").expect("window 0 tab must be on the status line") as u16;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, tab0_col, status_row, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("0:w0")), "window menu title should name window 0: {text:?}");
+
+    c.send(&ClientMsg::Stdin(b"X".to_vec()));
+    // Window 0 is gone; only window 1 remains, and it's current.
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, g.rows() - 1);
+        row.contains("1:w1*") && !row.contains("0:w0")
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Correctness review SHOULD-FIX #6 regression test: `ClientMode::Menu` had
+/// no equivalent to `cancel_stale_confirms`/`_copy_modes`/`_clock_modes`/
+/// `_choose_trees` -- an open menu anchored to a pane/window/session that
+/// gets killed by a DIFFERENT client while the menu is still showing stayed
+/// open on stale state. Mirrors `stale_confirm_after_pane_exit_is_
+/// canceled`'s two-client pattern for the analogous confirm-prompt case:
+/// client A opens the default WINDOW context menu on window 0 (right-click
+/// its tab); client B (same session) kills window 0 out from under it via
+/// the `:` prompt. Proves the new `Server::cancel_stale_menus` sweep.
+#[test]
+fn stale_window_menu_after_other_client_kills_window_is_canceled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "stalemenu", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    enable_mouse(&name, &mut a);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "w0".into()]));
+    expect_cli_done(&cli, 0);
+    a.recv_output_until(&mut grid_a, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+
+    a.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    a.recv_output_until(&mut grid_a, |g| row_text(g, g.rows() - 1).contains("1:"));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "w1".into()]));
+    expect_cli_done(&cli2, 0);
+    a.recv_output_until(&mut grid_a, |g| {
+        let row = row_text(g, g.rows() - 1);
+        row.contains("1:w1*") && row.contains("0:w0-")
+    });
+
+    // Second client, SAME session, so a `:` command it types acts on the
+    // same shared registry state A's menu is anchored into.
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::Existing, "stalemenu", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // A right-clicks window 0's tab, opening the default WINDOW menu
+    // (anchored to `(session, window0's id)`).
+    let status_row = grid_a.rows() - 1;
+    let line = row_text(&grid_a, status_row);
+    let tab0_col = line.find("0:w0-").expect("window 0 tab must be on the status line") as u16;
+    a.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, tab0_col, status_row, false)));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // B kills window 0 out from under A's still-open menu, via the `:`
+    // command prompt -- a Stdin-driven dispatch, which is where the
+    // staleness sweep runs (it re-checks EVERY attached client, not just
+    // the one that issued the kill).
+    b.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    b.send(&ClientMsg::Stdin(b"kill-window -t :0\r".to_vec()));
+    b.recv_output_until(&mut grid_b, |g| !row_text(g, g.rows() - 1).contains("0:w0"));
+
+    // A's menu must now be gone: the anchor window died out from under it.
+    a.recv_output_until(&mut grid_a, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // A's subsequent input must be treated as NORMAL input (forwarded to
+    // the pane), not stale menu navigation -- prove the session is still
+    // alive and responsive end to end.
+    a.send(&ClientMsg::Stdin(b"echo stillalive\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("stillalive")));
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3StatusLeft` (right-click on the session-name segment) opens
+/// winmux's default SESSION context menu.
+#[test]
+fn right_click_on_status_left_opens_session_menu() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // status-left's default format starts at column 0 with `[<session>]`.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 0, grid.rows() - 1, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Rename")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("Detach")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("New Session")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("New Window")), "got: {text:?}");
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Rename")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Rebinding `MouseDown3Pane` (`bind -n`) replaces the default pane-menu
+/// behavior entirely, generically — table-driven exactly like every other
+/// Task-8 mouse default. A right-click now runs the user's own command
+/// (here, a horizontal split) instead of opening any menu.
+#[test]
+fn mouse_down3_pane_user_override_runs_generically() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["bind-key".into(), "-n".into(), "MouseDown3Pane".into(), "split-window".into(), "-h".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("Kill")), "the default menu must not have opened");
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
 }

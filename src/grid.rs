@@ -47,12 +47,124 @@ impl Default for Cell {
     }
 }
 
+/// A pane application's requested mouse REPORTING protocol, tracked from
+/// DECSET/DECRST 9 (X10 compatibility) / 1000 (VT200 "normal"/click-only) /
+/// 1002 ("button-event"/drag) / 1003 ("any-event"/all motion) (SP7 Task 3;
+/// `Task 9` consumes this to decide what to forward/re-encode to the pane
+/// app). Verified against tmux's own pane-mode tracking
+/// (`input_csi_dispatch_sm_private`/`_rm_private`, tmux `input.c`): SET of
+/// ANY of 1000/1002/1003 first clears every other mouse-mode bit
+/// (`ALL_MOUSE_MODES`) before setting its own, i.e. these modes are
+/// mutually exclusive and the LAST one SET simply wins outright (not a
+/// priority order among simultaneously-set bits — only one is ever set at
+/// a time); RESET of any of them clears unconditionally to `Off`,
+/// regardless of which mode number is named in the reset or which one was
+/// actually active. Modern tmux has no `MODE_MOUSE_X10` bit at all (mode 9
+/// is legacy/unimplemented pane-side in current tmux), but winmux tracks it
+/// with the same mutual-exclusion rule as 1000/1002/1003 since a later
+/// task's interface promise requires the `X10` variant to exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProto {
+    #[default]
+    Off,
+    X10,
+    Normal,
+    Button,
+    Any,
+}
+
+/// A pane application's requested mouse COORDINATE ENCODING, tracked from
+/// DECSET/DECRST 1005 (UTF-8) / 1006 (SGR) -- independent bits in real tmux
+/// (`MODE_MOUSE_UTF8`/`MODE_MOUSE_SGR`, tmux.h), not mutually exclusive with
+/// each other or with [`MouseProto`]. [`Grid::mouse_encoding`] resolves both
+/// bits to tmux's own forwarding precedence (`input-keys.c`
+/// `input_key_get_mouse`): SGR wins if both are set, else UTF-8, else the
+/// legacy X10-style default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+/// Which escape sequence last set [`TermState::title`] -- OSC 0/2 (always
+/// participates in automatic-rename) or the historical `ESC k <name> ESC \`
+/// rename escape (participates only when `allow-rename` is on; see
+/// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what it
+/// actually gates"). Read via [`Grid::title_from_esc_k`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TitleSource {
+    Osc,
+    EscK,
+}
+
+/// Pre-scan state for the historical `ESC k <name> (ESC \ | ESC)` rename
+/// escape (SP7 Task 3). The `vte` crate has no string-capturing path for
+/// `ESC k` -- in its `Escape` state, byte `k` falls in the generic
+/// `0x60..=0x7e -> (Ground, EscDispatch)` bucket, so `esc_dispatch` fires
+/// once and every subsequent title byte would `Print`-leak into the pane's
+/// visible cells. `Grid::feed` therefore strips this sequence out of the
+/// raw byte stream BEFORE it ever reaches `vte::Parser::advance`, committing
+/// the captured title into the same slot `osc_dispatch` writes. This state
+/// persists on `Grid` (not `TermState`) across `feed` calls so a sequence
+/// split across chunk boundaries -- including a lone trailing `ESC` -- is
+/// still captured correctly.
+///
+/// Verified against tmux's real state machine (`input.c`
+/// `input_state_rename_string_table` reached via the `esc_enter` table's
+/// `{0x6b,0x6b,NULL,&input_state_rename_string}` transition): the rename is
+/// actually committed by `input_exit_rename`, the STATE's `exit` callback,
+/// which `input_set_state` invokes the INSTANT the state changes away from
+/// `rename_string` -- i.e. on the bare `ESC` byte itself, before the
+/// following byte (the expected `\`) is even read. `PostTitle` below
+/// reproduces this: the title is committed when `ESC` is seen, and the
+/// following byte is only checked to decide among three outcomes: swallow
+/// it as the completing `\` of the ST; re-enter `Title` if it's `k` (the
+/// committing `ESC` was doing double duty as the opener of a SECOND,
+/// back-to-back `ESC k` -- the realistic pattern under conhost, which eats
+/// `ESC \`, per follow-up #52; SP7-B critical fix); or replay it (plus the
+/// ESC) as ordinary input for anything else. Also per that same table:
+/// `BEL` (0x07) inside the title is mapped to a no-op (0x00-0x17 ->
+/// `NULL,NULL`), unlike OSC's dedicated
+/// `{0x07,0x07,input_end_bel,&input_state_ground}` arm -- so BEL is
+/// dropped, never accumulated and never a terminator, while inside a title.
+enum EscKScan {
+    Idle,
+    Esc,
+    Title(Vec<u8>),
+    PostTitle,
+}
+
+/// Cap on `EscKScan::Title`'s in-progress capture buffer (correctness
+/// review SHOULD-FIX #7): the COMMITTED title is already capped at 256
+/// chars by `clean_title`, but the capture buffer itself had no bound while
+/// accumulating -- a pane program that emits `ESC k` and then never sends a
+/// terminator (`ESC \` or a fresh `ESC k`) while continuing to produce
+/// output would grow `buf` unboundedly for the rest of the pane's lifetime.
+/// Matches `clean_title`'s cap (tmux itself also caps window names); once
+/// the buffer reaches this many bytes, further bytes are silently dropped
+/// (not accumulated) until a terminator is seen, exactly like `clean_title`
+/// truncates a too-long committed title rather than erroring.
+const ESC_K_TITLE_CAP: usize = 256;
+
 #[derive(Clone, Copy)]
 struct SavedCursor {
     col: u16,
     row: u16,
     style: Style,
     autowrap: bool,
+}
+
+/// One captured scrollback line: cells at the width in effect when last
+/// (re)captured, plus whether it soft-wraps onto the line below it (tmux's
+/// `GRID_LINE_WRAPPED`). See `TermState::row_wrapped` for how the flag is
+/// set/cleared, and `TermState::reflow_to_width` for how chains of these are
+/// rejoined/re-split on a column-width resize.
+#[derive(Clone)]
+struct HistLine {
+    cells: Vec<Cell>,
+    wrapped: bool,
 }
 
 /// Emulator state; the vte performer. Separate from the Parser so `feed`
@@ -75,14 +187,27 @@ struct TermState {
     /// The primary screen's cells + cursor state (position, SGR pen,
     /// autowrap -- DECSC/DECRC scope, per xterm's documentation of 1049),
     /// saved on entering the alt screen and restored on leaving it.
-    /// `None` when not in alt-screen mode.
-    saved_primary: Option<(Vec<Cell>, SavedCursor)>,
+    /// `None` when not in alt-screen mode. The saved primary's own
+    /// per-row wrapped flags travel alongside it (second tuple element) so
+    /// a later leave-alt restores a primary screen with correct wrap chains.
+    saved_primary: Option<(Vec<Cell>, Vec<bool>, SavedCursor)>,
     /// Scrollback: oldest line at the front. Each line is exactly `cols`
-    /// wide AT CAPTURE TIME -- width changes since capture are clipped/
-    /// padded lazily on read (`view_cell`), not reflowed.
-    history: VecDeque<Vec<Cell>>,
+    /// wide AT THE CURRENT WIDTH -- a column-width resize reflows every
+    /// history line (and the live screen) to the new width via
+    /// `TermState::reflow_to_width`, so lines are never stale-width between
+    /// reflows; row-count-only resizes leave history untouched (see
+    /// `resize`).
+    history: VecDeque<HistLine>,
     /// 0 = scrollback disabled (nothing is ever captured).
     history_limit: u32,
+    /// Per-live-screen-row soft-wrap flag, parallel to `cells` (indexed by
+    /// row): `true` iff this row's content continues onto the row below it
+    /// with no real newline in between (tmux's `GRID_LINE_WRAPPED`). Set
+    /// only at the instant the cursor auto-wraps off the right margin
+    /// (`Perform::print`, consuming `wrap_pending`); cleared on an explicit
+    /// linefeed (`Perform::execute` on `0x0A`). Reflow (`reflow_to_width`)
+    /// walks these chains to rejoin/re-split logical lines at a new width.
+    row_wrapped: Vec<bool>,
     /// Monotonic count of lines EVER pushed into scrollback (never
     /// decremented by eviction) — the stable "lines-ever-captured"
     /// coordinate system copy-mode selection anchors are pinned to (Task 3
@@ -90,11 +215,37 @@ struct TermState {
     /// shifted between two moments, because chunked eviction lowers it
     /// without moving any surviving line's view position.
     history_total: u64,
-    /// Pane title captured from OSC 0/2, if any has ever been set.
+    /// Pane title captured from OSC 0/2 or `ESC k` (see [`TitleSource`]), if
+    /// any has ever been set.
     title: Option<String>,
     /// Edge-triggered flag: set whenever `title` changes, cleared by
     /// `Grid::take_title_changed`.
     title_changed: bool,
+    /// Which escape sequence last set `title` -- read via
+    /// `Grid::title_from_esc_k` (SP7 Task 3).
+    title_source: TitleSource,
+    /// Mouse reporting protocol requested by the pane app via DECSET/DECRST
+    /// 9/1000/1002/1003 (SP7 Task 3; `MouseProto` doc comment has the tmux
+    /// mutual-exclusion ruling).
+    mouse_proto: MouseProto,
+    /// DECSET/DECRST 1005 (UTF-8 mouse coordinate encoding) -- independent
+    /// of `mouse_sgr` and `mouse_proto` (SP7 Task 3).
+    mouse_utf8: bool,
+    /// DECSET/DECRST 1006 (SGR mouse coordinate encoding) -- independent of
+    /// `mouse_utf8` and `mouse_proto` (SP7 Task 3).
+    mouse_sgr: bool,
+    /// Edge-triggered: set by a BEL (`\x07`) byte in `execute`, cleared by
+    /// `Grid::take_bell` (SP7 Task 3; `Task 17` consumes this for bell
+    /// alerts).
+    bell: bool,
+    /// DECSET/DECRST 2004 (bracketed paste): `true` once the pane app has
+    /// requested bracketed-paste mode, `false` initially/after a DECRST
+    /// (SP7 Task 13, closes follow-up #55). Read via `Grid::bracketed_paste`
+    /// -- `paste-buffer -p` only wraps in `ESC[200~`/`ESC[201~` when this is
+    /// set on the TARGET pane (`docs/tmux-reference/copy-mode-and-buffers.md`
+    /// §9.4 point 5: "only if the target pane's screen has MODE_BRACKETPASTE
+    /// set... otherwise -p is a silent no-op wrapper").
+    bracketed_paste: bool,
 }
 
 impl TermState {
@@ -118,10 +269,29 @@ impl TermState {
             saved_primary: None,
             history: VecDeque::new(),
             history_limit,
+            row_wrapped: vec![false; rows as usize],
             history_total: 0,
             title: None,
             title_changed: false,
+            title_source: TitleSource::Osc,
+            mouse_proto: MouseProto::Off,
+            mouse_utf8: false,
+            mouse_sgr: false,
+            bell: false,
+            bracketed_paste: false,
         }
+    }
+
+    /// Commit a captured `ESC k <name>` rename-escape title into the same
+    /// slot `osc_dispatch` writes (SP7 Task 3). Cleaning matches
+    /// `osc_dispatch` exactly: UTF-8 (lossy), control characters stripped,
+    /// capped at 256 chars. Always marks `title_changed`, same as OSC (the
+    /// gate on whether this actually renames anything is the server's job,
+    /// keyed off `title_source`).
+    fn set_title_from_esc_k(&mut self, raw: &[u8]) {
+        self.title = Some(clean_title(raw));
+        self.title_source = TitleSource::EscK;
+        self.title_changed = true;
     }
 
     fn idx(&self, col: u16, row: u16) -> usize {
@@ -134,12 +304,12 @@ impl TermState {
     /// disabled (`history_limit == 0`). Degenerate `history_limit == 1`:
     /// every push immediately hits the limit and evicts the line just
     /// pushed, so `history_len()` stays 0 -- effectively disabled.
-    fn push_history(&mut self, line: Vec<Cell>) {
+    fn push_history(&mut self, line: Vec<Cell>, wrapped: bool) {
         if self.history_limit == 0 {
             return;
         }
         self.history_total += 1;
-        self.history.push_back(line);
+        self.history.push_back(HistLine { cells: line, wrapped });
         if self.history.len() as u32 >= self.history_limit {
             let chunk = (self.history_limit / 10).max(1) as usize;
             for _ in 0..chunk.min(self.history.len()) {
@@ -164,7 +334,11 @@ impl TermState {
         // screen; `combined_index` is where view row `row` lands in it.
         let combined_index = history_len - scroll_back + row as u32;
         if combined_index < history_len {
-            self.history[combined_index as usize].get(col as usize).copied().unwrap_or_default()
+            self.history[combined_index as usize]
+                .cells
+                .get(col as usize)
+                .copied()
+                .unwrap_or_default()
         } else {
             let live_row = (combined_index - history_len) as u16;
             self.cells[self.idx(col, live_row)]
@@ -189,7 +363,8 @@ impl TermState {
             for row in 0..capture_n {
                 let start = row * cols;
                 let line = self.cells[start..start + cols].to_vec();
-                self.push_history(line);
+                let wrapped = self.row_wrapped[row];
+                self.push_history(line, wrapped);
             }
         }
         for row in top..=bottom {
@@ -198,10 +373,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -219,10 +396,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -236,9 +415,35 @@ impl TermState {
         }
     }
 
+    /// Correctness review MUST-FIX #2: `erase_chars`/`erase_line`/
+    /// `erase_display`/`insert_chars`/`delete_chars` mutate a row's cells
+    /// in place without touching `row_wrapped`, which can leave a
+    /// previously-`true` ("this row is fully used, its content continues
+    /// onto the next row with no real newline") flag stale after the row's
+    /// true last column has been blanked out from underneath it --
+    /// `reflow_to_width` trusts a `true` flag to mean "don't trim trailing
+    /// blanks", so a stale flag splices phantom blank cells into the
+    /// reflowed text on the next width-changing resize. Call this after any
+    /// in-place cell mutation that could leave `row`'s LAST column blank;
+    /// it only clears the flag (never sets a false one back to true), and
+    /// is a no-op (already false, or the last column is still genuinely
+    /// non-blank -- e.g. a partial `insert_chars`/`erase_chars` whose
+    /// blanking didn't reach the true end of the row) the rest of the time.
+    fn clear_wrapped_if_tail_blank(&mut self, row: usize) {
+        if !self.row_wrapped[row] {
+            return;
+        }
+        let cols = self.cols as usize;
+        let last = row * cols + cols - 1;
+        if self.cells[last] == Cell::default() {
+            self.row_wrapped[row] = false;
+        }
+    }
+
     fn insert_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let n = (n as usize).min(cols - col);
         for c in (col..cols).rev() {
@@ -248,11 +453,13 @@ impl TermState {
                 self.cells[start + c] = Cell::default();
             }
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn delete_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let n = (n as usize).min(cols - col);
         for c in col..cols {
@@ -262,16 +469,19 @@ impl TermState {
                 self.cells[start + c] = Cell::default();
             }
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn erase_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let end = (col + n as usize).min(cols);
         for c in col..end {
             self.cells[start + c] = Cell::default();
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn insert_lines(&mut self, n: u16) {
@@ -288,10 +498,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -310,10 +522,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -348,21 +562,38 @@ impl TermState {
 
     fn erase_display(&mut self, mode: u16) {
         let total = self.cols as usize * self.rows as usize;
+        let rows = self.rows as usize;
+        let cursor_row = self.cursor_row as usize;
         let cur = self.idx(self.cursor_col, self.cursor_row);
         match mode {
             0 => {
                 for i in cur..total {
                     self.cells[i] = Cell::default();
                 }
+                // MUST-FIX #2: rows strictly below the cursor are now
+                // ENTIRELY blank -- never "fully used" -- and the cursor's
+                // own row was blanked from its column to the true end, so
+                // both need the same staleness treatment as `erase_line`.
+                for r in (cursor_row + 1)..rows {
+                    self.row_wrapped[r] = false;
+                }
+                self.clear_wrapped_if_tail_blank(cursor_row);
             }
             1 => {
                 for i in 0..=cur {
                     self.cells[i] = Cell::default();
                 }
+                for r in 0..cursor_row {
+                    self.row_wrapped[r] = false;
+                }
+                self.clear_wrapped_if_tail_blank(cursor_row);
             }
             _ => {
                 for i in 0..total {
                     self.cells[i] = Cell::default();
+                }
+                for r in 0..rows {
+                    self.row_wrapped[r] = false;
                 }
             }
         }
@@ -370,7 +601,8 @@ impl TermState {
 
     fn erase_line(&mut self, mode: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         match mode {
             0 => {
@@ -389,6 +621,11 @@ impl TermState {
                 }
             }
         }
+        // MUST-FIX #2: any of the three modes can blank the row's true last
+        // column (mode 0/2 always do; mode 1 does iff `col == cols - 1`) --
+        // `clear_wrapped_if_tail_blank` re-examines that one cell rather
+        // than assuming which mode did it.
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -484,26 +721,211 @@ impl TermState {
         }
     }
 
-    /// Resize the active buffer, clipping/padding cell content. While in
-    /// alt-screen mode the saved primary buffer is ALSO resized (clipped/
-    /// padded) in lockstep, per spec, so a subsequent leave-alt restores a
+    /// Resize the active buffer. On the (non-alt-screen) PRIMARY screen, a
+    /// column-WIDTH change reflows scrollback + the live screen to the new
+    /// width like tmux >= 1.9 (`reflow_to_width`: long lines wrap into more
+    /// rows, soft-wrapped pairs rejoin when there's room); a row-COUNT-only
+    /// change keeps the original clip (shrink)/pad (grow) behavior,
+    /// preserving the overlapping top-left region and leaving history
+    /// untouched. The alternate screen NEVER reflows (tmux clears/redraws
+    /// it) -- any resize while `alt_screen` is active keeps the original
+    /// clip/pad behavior for both axes, and the saved primary buffer is
+    /// ALSO clipped/padded in lockstep, so a subsequent leave-alt restores a
     /// primary screen consistent with the new dimensions.
     fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
-        if let Some((primary, saved)) = &mut self.saved_primary {
-            *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
-            saved.col = saved.col.min(cols.saturating_sub(1));
-            saved.row = saved.row.min(rows.saturating_sub(1));
+        if self.alt_screen {
+            self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
+            self.row_wrapped = resize_row_flags(&self.row_wrapped, self.rows, rows);
+            if let Some((primary, primary_wrapped, saved)) = &mut self.saved_primary {
+                *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
+                *primary_wrapped = resize_row_flags(primary_wrapped, self.rows, rows);
+                saved.col = saved.col.min(cols.saturating_sub(1));
+                saved.row = saved.row.min(rows.saturating_sub(1));
+            }
+            self.cols = cols;
+            self.rows = rows;
+        } else {
+            if cols != self.cols {
+                self.reflow_to_width(cols);
+            }
+            if rows != self.rows {
+                self.cells = resize_cells(&self.cells, self.cols, self.rows, self.cols, rows);
+                self.row_wrapped = resize_row_flags(&self.row_wrapped, self.rows, rows);
+                self.rows = rows;
+            }
         }
-        self.cols = cols;
-        self.rows = rows;
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
         self.wrap_pending = false;
+    }
+
+    /// Reflow scrollback + the live screen to a new column width, tmux
+    /// (`grid_reflow`) style. Rows are grouped into "logical lines" by
+    /// following `row_wrapped`/`HistLine::wrapped` chains: a run of
+    /// wrapped=true rows (always fully used at the OLD width -- a row is
+    /// only ever marked wrapped at the instant it was filled edge-to-edge
+    /// and the cursor auto-wrapped off it) followed by exactly one
+    /// wrapped=false terminal row, whose trailing never-written cells are
+    /// trimmed. Each logical line's content is then re-split at the new
+    /// width into `ceil(len / new_cols)` rows (1 row for an empty line),
+    /// every row but the last marked wrapped. Row COUNT (`self.rows`) is
+    /// untouched here -- see the `resize` caller for the separate row-count
+    /// axis.
+    ///
+    /// Cursor mapping follows tmux's `grid_wrap_position`/
+    /// `grid_unwrap_position`: the cursor's offset within its OWN logical
+    /// line is preserved; a cursor sitting past that row's real content (in
+    /// trailing blank padding -- e.g. after `CUP` into blank space)
+    /// collapses to "end of the logical line", matching tmux's own
+    /// `UINT_MAX` sentinel. If the mapped position ends up scrolled into
+    /// history (only possible when eviction drops the cursor's own line),
+    /// the cursor resets to (0, 0) -- again matching tmux
+    /// (`screen_resize_cursor`).
+    fn reflow_to_width(&mut self, new_cols: u16) {
+        let old_cols = self.cols as usize;
+        let old_rows = self.rows as usize;
+        let new_cols_usz = (new_cols as usize).max(1);
+
+        // 1. Combined physical-row source: history (oldest first), then the
+        //    live screen, each paired with its wrapped flag.
+        let mut phys: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(self.history.len() + old_rows);
+        for h in &self.history {
+            phys.push((h.cells.clone(), h.wrapped));
+        }
+        for r in 0..old_rows {
+            let start = r * old_cols;
+            phys.push((self.cells[start..start + old_cols].to_vec(), self.row_wrapped[r]));
+        }
+
+        // 2. Group into logical lines: concatenate a wrapped=true chain,
+        //    trimming only the final (wrapped=false) row of each chain.
+        struct Logical {
+            content: Vec<Cell>,
+            phys_start: usize,
+            phys_end: usize, // exclusive
+        }
+        let mut logicals: Vec<Logical> = Vec::new();
+        let mut i = 0;
+        while i < phys.len() {
+            let start = i;
+            let mut content: Vec<Cell> = Vec::new();
+            loop {
+                let (row, wrapped) = &phys[i];
+                if *wrapped {
+                    content.extend_from_slice(row);
+                } else {
+                    let used = trimmed_len(row);
+                    content.extend_from_slice(&row[..used]);
+                }
+                let was_wrapped = *wrapped;
+                i += 1;
+                if !was_wrapped || i >= phys.len() {
+                    break;
+                }
+            }
+            logicals.push(Logical { content, phys_start: start, phys_end: i });
+        }
+
+        // 3. Locate the cursor's logical line + its offset within it.
+        let cursor_abs_row = self.history.len() + self.cursor_row as usize;
+        let cursor_li = logicals
+            .iter()
+            .position(|l| cursor_abs_row >= l.phys_start && cursor_abs_row < l.phys_end)
+            .unwrap_or(logicals.len() - 1);
+        let cursor_line_len = logicals[cursor_li].content.len();
+        let cursor_ax = {
+            let l = &logicals[cursor_li];
+            let offset_rows = cursor_abs_row - l.phys_start;
+            let is_terminal_row = cursor_abs_row + 1 == l.phys_end;
+            let accumulated = offset_rows * old_cols;
+            let row_len =
+                if is_terminal_row { trimmed_len(&phys[cursor_abs_row].0) } else { old_cols };
+            let cursor_col = self.cursor_col as usize;
+            if cursor_col >= row_len {
+                cursor_line_len
+            } else {
+                accumulated + cursor_col
+            }
+        };
+
+        // 4. Re-split every logical line's content at the new width,
+        //    recording the cursor's new absolute (row, col) along the way.
+        let mut new_phys: Vec<(Vec<Cell>, bool)> = Vec::new();
+        let mut new_cursor_row_abs = 0usize;
+        let mut new_cursor_col = 0u16;
+        for (li, l) in logicals.iter().enumerate() {
+            let len = l.content.len();
+            let num_rows = if len == 0 { 1 } else { 1 + (len - 1) / new_cols_usz };
+            let base = new_phys.len();
+            for r in 0..num_rows {
+                let s = r * new_cols_usz;
+                let e = (s + new_cols_usz).min(len);
+                let mut row = vec![Cell::default(); new_cols_usz];
+                row[..e - s].copy_from_slice(&l.content[s..e]);
+                new_phys.push((row, r + 1 < num_rows));
+            }
+            if li == cursor_li {
+                let idx = cursor_ax.min(len);
+                let mut row_local = idx / new_cols_usz;
+                let mut col_local = idx % new_cols_usz;
+                // Exact multiple of the new width: land on the LAST column
+                // of the last existing row rather than the first column of
+                // a row that doesn't exist.
+                if col_local == 0 && idx == len && len > 0 && row_local > 0 {
+                    row_local -= 1;
+                    col_local = new_cols_usz - 1;
+                }
+                row_local = row_local.min(num_rows - 1);
+                new_cursor_row_abs = base + row_local;
+                new_cursor_col = col_local as u16;
+            }
+        }
+
+        // 5. Pad with blank rows at the tail if reflow produced fewer total
+        //    rows than the screen needs (tmux: `grid_reflow_add` at the end).
+        while new_phys.len() < old_rows {
+            new_phys.push((vec![Cell::default(); new_cols_usz], false));
+        }
+        let hsize = new_phys.len() - old_rows;
+        let (new_history, new_screen) = new_phys.split_at(hsize);
+
+        // 6. Store history (capped at history_limit, keeping the NEWEST
+        //    entries; discarded entirely when scrollback is disabled, same
+        //    as `push_history`).
+        self.history.clear();
+        if self.history_limit > 0 {
+            let cap = self.history_limit as usize;
+            let start = new_history.len().saturating_sub(cap);
+            for (cells, wrapped) in &new_history[start..] {
+                self.history.push_back(HistLine { cells: cells.clone(), wrapped: *wrapped });
+            }
+        }
+
+        // 7. Store the live screen + its wrapped flags.
+        self.cells = vec![Cell::default(); new_cols_usz * old_rows];
+        self.row_wrapped = vec![false; old_rows];
+        for (r, (cells, wrapped)) in new_screen.iter().enumerate() {
+            let start = r * new_cols_usz;
+            self.cells[start..start + new_cols_usz].copy_from_slice(cells);
+            self.row_wrapped[r] = *wrapped;
+        }
+
+        // 8. Map the cursor: if it landed within the visible screen, carry
+        //    its position across; if reflow pushed its own line out into
+        //    history/eviction, reset to (0, 0) (tmux `screen_resize_cursor`).
+        if new_cursor_row_abs >= hsize {
+            self.cursor_row = (new_cursor_row_abs - hsize) as u16;
+            self.cursor_col = new_cursor_col;
+        } else {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
+
+        self.cols = new_cols;
     }
 }
 
@@ -523,6 +945,38 @@ fn resize_cells(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_r
     new_cells
 }
 
+/// Crop/pad a per-row boolean flag vector -- the `resize_cells` analog for
+/// `row_wrapped`/a saved primary's wrapped flags (one bool per row, not
+/// `cols` cells per row). Used only on the row-COUNT axis and for
+/// alt-screen resizes (the wrapped flags of newly-added rows are `false`);
+/// width-driven changes go through `reflow_to_width` instead.
+fn resize_row_flags(old: &[bool], old_rows: u16, new_rows: u16) -> Vec<bool> {
+    let mut v = vec![false; new_rows as usize];
+    let copy_rows = new_rows.min(old_rows) as usize;
+    v[..copy_rows].copy_from_slice(&old[..copy_rows]);
+    v
+}
+
+/// Length of `row` with trailing default (never-written) cells trimmed off
+/// -- lets reflow tell real printed content on a logical line's terminal
+/// row apart from unwritten padding. Non-terminal (wrapped) rows are never
+/// trimmed: by construction they were filled edge-to-edge before the cursor
+/// auto-wrapped off them.
+fn trimmed_len(row: &[Cell]) -> usize {
+    let mut n = row.len();
+    while n > 0 && row[n - 1] == Cell::default() {
+        n -= 1;
+    }
+    n
+}
+
+/// Shared title-cleaning rule for both the OSC 0/2 and `ESC k` capture
+/// paths: UTF-8 (lossy), control characters stripped, capped at 256 chars.
+fn clean_title(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.chars().filter(|c| !c.is_control()).take(256).collect()
+}
+
 /// Read subparameter 0 of CSI param `idx`, or `default` if absent/empty.
 /// Does NOT map an explicit 0 to the default — callers apply `.max(1)`
 /// for movement commands.
@@ -536,6 +990,10 @@ fn param_or(params: &Params, idx: usize, default: u16) -> u16 {
 impl Perform for TermState {
     fn print(&mut self, c: char) {
         if self.wrap_pending && self.autowrap {
+            // The row we're leaving soft-wraps onto the row we're about to
+            // land on (tmux `GRID_LINE_WRAPPED`) -- mark it BEFORE
+            // `line_feed` moves `cursor_row` off it.
+            self.row_wrapped[self.cursor_row as usize] = true;
             self.cursor_col = 0;
             self.line_feed();
         }
@@ -567,8 +1025,11 @@ impl Perform for TermState {
                 self.cursor_col = next.min(self.cols.saturating_sub(1));
             }
             0x0A => {
-                // LF
+                // LF: an explicit (hard) newline is never a soft wrap --
+                // clear the outgoing row's wrapped flag even if it was
+                // (stale-)true, so reflow never joins it to the next row.
                 self.wrap_pending = false;
+                self.row_wrapped[self.cursor_row as usize] = false;
                 self.line_feed();
             }
             0x0D => {
@@ -576,7 +1037,13 @@ impl Perform for TermState {
                 self.wrap_pending = false;
                 self.cursor_col = 0;
             }
-            // BEL (0x07) and all other C0 are ignored.
+            0x07 => {
+                // BEL: never printed -- just an edge-triggered flag (SP7
+                // Task 3) surfaced via `Grid::take_bell` for a later alerts
+                // task. Does not affect cursor/wrap state.
+                self.bell = true;
+            }
+            // All other C0 are ignored.
             _ => {}
         }
     }
@@ -601,9 +1068,8 @@ impl Perform for TermState {
             return;
         }
         let joined: Vec<u8> = params[1..].join(&b';');
-        let raw = String::from_utf8_lossy(&joined);
-        let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(256).collect();
-        self.title = Some(cleaned);
+        self.title = Some(clean_title(&joined));
+        self.title_source = TitleSource::Osc;
         self.title_changed = true;
     }
 
@@ -635,6 +1101,7 @@ impl Perform for TermState {
                                 if !self.alt_screen {
                                     self.saved_primary = Some((
                                         self.cells.clone(),
+                                        self.row_wrapped.clone(),
                                         SavedCursor {
                                             col: self.cursor_col,
                                             row: self.cursor_row,
@@ -645,6 +1112,7 @@ impl Perform for TermState {
                                     self.alt_screen = true;
                                 }
                                 self.erase_display(2);
+                                self.row_wrapped = vec![false; self.rows as usize];
                                 self.cursor_col = 0;
                                 self.cursor_row = 0;
                                 self.wrap_pending = false;
@@ -653,8 +1121,11 @@ impl Perform for TermState {
                                 // (cells + cursor position/pen/autowrap),
                                 // no clearing. A spurious ?1049l while not
                                 // in alt mode is a no-op.
-                                if let Some((primary, saved)) = self.saved_primary.take() {
+                                if let Some((primary, primary_wrapped, saved)) =
+                                    self.saved_primary.take()
+                                {
                                     self.cells = primary;
+                                    self.row_wrapped = primary_wrapped;
                                     self.cursor_col = saved.col.min(self.cols.saturating_sub(1));
                                     self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
                                     self.style = saved.style;
@@ -664,6 +1135,39 @@ impl Perform for TermState {
                                 self.wrap_pending = false;
                             }
                         }
+                        // Mouse reporting protocol (SP7 Task 3): 9/1000/
+                        // 1002/1003 are mutually exclusive in real tmux --
+                        // SET unconditionally overwrites to the new mode,
+                        // RESET of any of the four unconditionally clears
+                        // to `Off` (see `MouseProto`'s doc comment for the
+                        // `input.c` source citation).
+                        Some(9) => {
+                            self.mouse_proto = if set { MouseProto::X10 } else { MouseProto::Off };
+                        }
+                        Some(1000) => {
+                            self.mouse_proto =
+                                if set { MouseProto::Normal } else { MouseProto::Off };
+                        }
+                        Some(1002) => {
+                            self.mouse_proto =
+                                if set { MouseProto::Button } else { MouseProto::Off };
+                        }
+                        Some(1003) => {
+                            self.mouse_proto = if set { MouseProto::Any } else { MouseProto::Off };
+                        }
+                        // Mouse coordinate encoding (SP7 Task 3): 1005/1006
+                        // are independent bits, both of each other and of
+                        // the protocol mode above.
+                        Some(1005) => self.mouse_utf8 = set,
+                        Some(1006) => self.mouse_sgr = set,
+                        // Bracketed paste (SP7 Task 13): tracked purely so
+                        // `paste-buffer -p` knows whether to wrap the write
+                        // in ESC[200~/ESC[201~ -- winmux never emits the
+                        // input-side ESC[200~...ESC[201~ framing itself
+                        // (that's real terminal-side paste detection, out of
+                        // scope; here we're the "terminal" from the pane
+                        // app's point of view).
+                        Some(2004) => self.bracketed_paste = set,
                         _ => {}
                     }
                 }
@@ -763,6 +1267,9 @@ impl Perform for TermState {
 pub struct Grid {
     parser: Parser,
     state: TermState,
+    /// Cross-`feed`-call pre-scan state for the `ESC k` rename escape (SP7
+    /// Task 3) -- see [`EscKScan`]'s doc comment.
+    esck_scan: EscKScan,
 }
 
 impl Grid {
@@ -770,13 +1277,99 @@ impl Grid {
     /// never zero-sized. `history_limit` caps the scrollback line count;
     /// 0 disables scrollback entirely (nothing is ever captured).
     pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self {
-        Grid { parser: Parser::new(), state: TermState::new(cols, rows, history_limit) }
+        Grid {
+            parser: Parser::new(),
+            state: TermState::new(cols, rows, history_limit),
+            esck_scan: EscKScan::Idle,
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        let filtered = self.strip_esc_k(bytes);
+        for b in filtered {
             self.parser.advance(&mut self.state, b);
         }
+    }
+
+    /// Pre-scan `bytes` for the historical `ESC k <name> (ESC \ | ESC)`
+    /// rename escape and strip it out, returning everything else unchanged
+    /// (byte-for-byte, in order) for `vte::Parser::advance`. See
+    /// [`EscKScan`]'s doc comment for why this must happen before `vte` ever
+    /// sees these bytes, and for the exact tmux-verified terminator rules
+    /// this reproduces (title commits on the bare `ESC`; `BEL` is dropped,
+    /// not a terminator, while inside a title).
+    fn strip_esc_k(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            match std::mem::replace(&mut self.esck_scan, EscKScan::Idle) {
+                EscKScan::Idle => {
+                    if b == 0x1b {
+                        self.esck_scan = EscKScan::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                EscKScan::Esc => {
+                    if b == b'k' {
+                        self.esck_scan = EscKScan::Title(Vec::new());
+                    } else {
+                        // Not `ESC k` -- replay both bytes untouched; state
+                        // is already back to `Idle` via the `mem::replace`
+                        // default above.
+                        out.push(0x1b);
+                        out.push(b);
+                    }
+                }
+                EscKScan::Title(mut buf) => {
+                    if b == 0x1b {
+                        // Commit NOW, on the bare ESC -- matches tmux's
+                        // `input_exit_rename` firing as the `rename_string`
+                        // state's `exit` callback the instant the state
+                        // changes away, before the following byte (the
+                        // expected `\`) is even read.
+                        self.state.set_title_from_esc_k(&buf);
+                        self.esck_scan = EscKScan::PostTitle;
+                    } else if b == 0x07 {
+                        // BEL inside a title: dropped, not accumulated, not
+                        // a terminator (tmux's rename_string state table has
+                        // no BEL arm, unlike OSC's).
+                        self.esck_scan = EscKScan::Title(buf);
+                    } else {
+                        if buf.len() < ESC_K_TITLE_CAP {
+                            buf.push(b);
+                        }
+                        self.esck_scan = EscKScan::Title(buf);
+                    }
+                }
+                EscKScan::PostTitle => {
+                    if b == b'\\' {
+                        // ST fully consumed; the title already committed.
+                        self.esck_scan = EscKScan::Idle;
+                    } else if b == b'k' {
+                        // The committing ESC was doing double duty: it also
+                        // opens a SECOND `ESC k` capture (back-to-back
+                        // unterminated titles -- the realistic pattern under
+                        // conhost, which eats `ESC \`, per follow-up #52).
+                        // Start capturing the next title instead of
+                        // replaying `k...` as ordinary input.
+                        self.esck_scan = EscKScan::Title(Vec::new());
+                    } else if b == 0x1b {
+                        // Another bare ESC instead of the expected `\` --
+                        // keep waiting rather than replaying (the title is
+                        // already committed either way; this only affects
+                        // whether a stray non-`\` byte here leaks through).
+                        self.esck_scan = EscKScan::PostTitle;
+                    } else {
+                        // Not `ESC \` (nor a new `ESC k`) after all --
+                        // replay the consumed ESC plus this byte as
+                        // ordinary input.
+                        out.push(0x1b);
+                        out.push(b);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Number of scrollback lines currently captured (<= the `history_limit`
@@ -792,6 +1385,26 @@ impl Grid {
     /// the view by one; eviction shifts nothing) — the coordinate system
     /// copy-mode selection anchors are pinned to (Task 3 review fix; see
     /// the `## grid-v2` contract amendment).
+    ///
+    /// **Caveat (SP7 review fix):** this invariant holds only across
+    /// mutations that do NOT change the grid's WIDTH. `reflow_to_width`
+    /// (called from `resize` on a column-width change) rewrites the
+    /// combined history+screen buffer by re-splitting logical lines at the
+    /// new width — a non-uniform restructuring — and does NOT go through
+    /// `push_history`, so it never bumps `history_total` to match. A
+    /// width-changing resize can therefore make `history_total`'s delta
+    /// undercount (or simply not correspond to) how far content actually
+    /// moved, and there is no single corrected shift count that could
+    /// repair a coordinate pinned before such a resize (the reflow can
+    /// split/merge lines, not just shift them). Consumers pinning
+    /// coordinates across grid mutations (copy-mode selection anchors) must
+    /// treat a width-changing resize of the bound pane as invalidating any
+    /// stored anchor, not just re-shift it — see
+    /// `Server::apply_layout_for_session` in `src/server.rs`, which clears
+    /// a client's active copy-mode selection whenever its pane is actually
+    /// resized (matching real tmux's `window_copy_size_changed`, which
+    /// unconditionally clears the copy-mode selection on ANY resize of the
+    /// pane, width or height).
     pub fn history_total(&self) -> u64 {
         self.state.history_total
     }
@@ -820,6 +1433,58 @@ impl Grid {
         let changed = self.state.title_changed;
         self.state.title_changed = false;
         changed
+    }
+
+    /// `true` if the pane's CURRENT `title()` was last set by the historical
+    /// `ESC k <name> ESC \` rename escape rather than OSC 0/2 (SP7 Task 3).
+    /// Not edge-triggered -- reflects the source of whatever `title()`
+    /// currently holds. Lets the server gate ESC-k-sourced automatic-rename
+    /// behind the `allow-rename` option while leaving the OSC 0/2 path
+    /// unconditional, matching real tmux (`allow-rename` gates ONLY
+    /// `ESC k` -- see `docs/tmux-reference/windows-and-sessions.md`
+    /// "allow-rename -- what it actually gates").
+    pub fn title_from_esc_k(&self) -> bool {
+        matches!(self.state.title_source, TitleSource::EscK)
+    }
+
+    /// The pane app's requested mouse reporting protocol (SP7 Task 3), or
+    /// `MouseProto::Off` if it has never sent a mouse-mode DECSET. See
+    /// [`MouseProto`]'s doc comment for the tmux-verified mutual-exclusion
+    /// rule among 9/1000/1002/1003.
+    pub fn mouse_proto(&self) -> MouseProto {
+        self.state.mouse_proto
+    }
+
+    /// The pane app's requested mouse coordinate encoding (SP7 Task 3):
+    /// SGR (1006) wins if both SGR and UTF-8 (1005) are set, else UTF-8,
+    /// else the legacy default -- matching tmux's own forwarding precedence
+    /// (`input-keys.c` `input_key_get_mouse`; see [`MouseEncoding`]'s doc
+    /// comment).
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        if self.state.mouse_sgr {
+            MouseEncoding::Sgr
+        } else if self.state.mouse_utf8 {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Default
+        }
+    }
+
+    /// Edge-triggered: true the first time this is called after a BEL
+    /// (`\x07`) byte has been fed, then false until another BEL arrives
+    /// (SP7 Task 3; a later alerts task consumes this).
+    pub fn take_bell(&mut self) -> bool {
+        let bell = self.state.bell;
+        self.state.bell = false;
+        bell
+    }
+
+    /// `true` once the pane app has requested bracketed-paste mode (DECSET
+    /// 2004), `false` after a matching DECRST or if it was never requested
+    /// (SP7 Task 13, closes follow-up #55). NOT edge-triggered -- reflects
+    /// current mode, same shape as `mouse_proto`/`alt_screen`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.state.bracketed_paste
     }
 
     /// Resize the grid, preserving the overlapping region. Dimensions are
@@ -856,12 +1521,20 @@ impl Grid {
 
     /// `true` while the pane's application has switched to the alternate
     /// screen (`CSI ?1049h`/`?47h`/`?1047h`), `false` on the primary screen.
-    /// Mouse wheel routing (Task 5, sub-project 4) uses this to decide
-    /// whether a wheel event should scroll winmux's own scrollback/copy-mode
-    /// (primary screen) or be translated into synthesized arrow-key presses
-    /// sent to the pane (alt screen — tmux's own wheel-in-alt-screen
-    /// behavior, since alt-screen apps like `less`/vim have no scrollback of
-    /// their own to reveal).
+    /// Mouse wheel routing (`Server::mouse_wheel`, `src/server/dispatch.rs`)
+    /// uses this to decide how to handle a wheel event over this pane: on
+    /// the PRIMARY screen, wheel-up enters/scrolls winmux's own copy-mode
+    /// scrollback. On the ALT screen, SP7 Task 9 (closes follow-ups #35/
+    /// #72) replaced an earlier unconditional "translate the wheel into 3
+    /// synthesized arrow-key presses" behavior (a SP6-era hack) with real
+    /// tmux parity: `docs/tmux-reference/mouse.md` §9 states tmux never
+    /// converts wheel to arrow keys at all. Current behavior: if the pane
+    /// has requested mouse reporting (`mouse_proto()` != `Off`, e.g. an
+    /// alt-screen app like `less -M`/`vim`/tmux-inside-tmux that called
+    /// DECSET 1000/1002/1003), the wheel event is forwarded to the app
+    /// as a real mouse escape sequence (`forward_mouse_to_pane`); otherwise
+    /// it is silently swallowed — no bytes written, no copy-mode entry,
+    /// no arrow-key synthesis.
     pub fn alt_screen(&self) -> bool {
         self.state.alt_screen
     }
@@ -1032,6 +1705,114 @@ mod tests {
         g.feed(b"abcde");
         g.feed(b"\x1b[2K");
         assert_eq!(row_str(&g, 0), "     ");
+    }
+
+    // ---- correctness review MUST-FIX #2: row_wrapped must not go stale
+    // under in-place erase, or a later width-reflow splices stale content
+    // into the middle of a logical line. Each test below hand-derives the
+    // WRONG (pre-fix) result in a comment alongside the correct one, so a
+    // regression is easy to recognize if it reappears. ------------------
+
+    #[test]
+    fn erase_line_all_clears_row_wrapped_before_reflow() {
+        // 10 cols: 11 chars ("abcdefghijk") autowraps once -- row0 = "abcdefghij"
+        // (wrapped=true), row1 = "k" (wrapped=false). CUP back to row0 col0,
+        // `CSI 2K` blanks the whole of row0 (all 10 cells) but must ALSO
+        // clear row_wrapped[0] now that row0's true last column is blank.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        assert!(!g.state.row_wrapped[1]);
+        g.feed(b"\x1b[1;1H\x1b[2K"); // CUP row0 col0, erase whole line
+        assert!(!g.state.row_wrapped[0], "row_wrapped[0] must clear once its true last column is blank");
+        g.feed(b"xy"); // row0 now "xy" + 8 blanks; too short to re-autowrap
+
+        // Reflow to 5 cols. FIXED behavior: row0 ("xy") and row1 ("k") are
+        // two separate logical lines (row_wrapped[0] is false), so they
+        // re-split independently: "xy" -> 1 row of "xy   "; "k" -> 1 row of
+        // "k    ". (Pre-fix BUG: row_wrapped[0] stays stale-true, so reflow
+        // treats row0+row1 as ONE logical line = untrimmed row0 (10 chars:
+        // "xy" + 8 literal blanks) + trimmed row1 ("k") = "xy" + 8 spaces +
+        // "k" (11 chars) -- which at 5 cols re-splits into 3 rows:
+        // "xy   ", "     ", "k    ", spuriously pushing "k" onto a THIRD
+        // row instead of the second.)
+        g.resize(5, 3);
+        assert_eq!(row_str(&g, 0).trim_end(), "xy");
+        assert_eq!(row_str(&g, 1).trim_end(), "k");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_chars_full_tail_clears_row_wrapped_before_reflow() {
+        // Same 10-col autowrap setup as above, but this time `CSI nX`
+        // (erase-chars) blanks row0 from its current column to the true end
+        // instead of `CSI 2K`. Cursor placed at col2 of row0, then `CSI 8X`
+        // erases exactly the remaining 8 cells (col2..=col9) -- the whole
+        // tail, so row0's true last column goes blank too.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        g.feed(b"\x1b[1;3H\x1b[8X"); // CUP row0 col2 (1-based col3), erase 8 chars
+        assert_eq!(row_str(&g, 0), "ab        ");
+        assert!(!g.state.row_wrapped[0], "row_wrapped[0] must clear once erase_chars blanks its true last column");
+
+        // Reflow to 5 cols: row0 ("ab") and row1 ("k") stay two separate
+        // logical lines. (Pre-fix BUG: same 3-row splice as the CSI-2K case
+        // above, with "ab" in place of "xy".)
+        g.resize(5, 3);
+        assert_eq!(row_str(&g, 0).trim_end(), "ab");
+        assert_eq!(row_str(&g, 1).trim_end(), "k");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_chars_partial_tail_keeps_row_wrapped_true() {
+        // Negative case: `CSI nX` that does NOT reach the row's true last
+        // column must NOT clear row_wrapped -- the row is still genuinely
+        // "fully used" (the blanked cells are in the middle, not the tail),
+        // so reflow must still join it with the next physical row.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk"); // row0 = "abcdefghij" (wrapped=true), row1 = "k"
+        g.feed(b"\x1b[1;3H\x1b[3X"); // CUP row0 col2, erase 3 chars (col2..=col4 only)
+        assert_eq!(row_str(&g, 0), "ab   fghij");
+        assert!(g.state.row_wrapped[0], "row_wrapped[0] must stay true -- the true last column ('j') is still non-blank");
+
+        // Reflow to 6 cols: row0+row1 are still correctly ONE logical line
+        // ("ab   fghij" + "k" = "ab   fghijk", 11 chars) -> ceil(11/6)=2
+        // rows ("ab   f", "ghijk "), leaving room for row2's separate blank
+        // logical line within the unchanged 3-row screen (no scrollback
+        // eviction to account for, unlike a narrower target width would
+        // need -- this test is about the row_wrapped flag, not eviction).
+        g.resize(6, 3);
+        assert_eq!(row_str(&g, 0), "ab   f");
+        assert_eq!(row_str(&g, 1).trim_end(), "ghijk");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_display_below_clears_row_wrapped_for_fully_blanked_rows() {
+        // 5 cols, 4 rows, history disabled. Fill row0 (wrapped, "abcde"),
+        // row1 (wrapped, "fghij"), row2 ("k" + 4 blanks, terminal) -- 11
+        // chars total autowrap across 3 rows, row3 left untouched/blank.
+        let mut g = Grid::new(5, 4, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        assert!(g.state.row_wrapped[1]);
+        assert!(!g.state.row_wrapped[2]);
+        // CUP to row0 col0, `CSI 0J` (erase cursor..end of screen): blanks
+        // ALL of row0 (cursor is at its very start) plus every row below.
+        g.feed(b"\x1b[1;1H\x1b[0J");
+        assert!(!g.state.row_wrapped[0], "row0 fully blanked -- must clear");
+        assert!(!g.state.row_wrapped[1], "row1 fully blanked -- must clear");
+        g.feed(b"z"); // row0 now "z" + 4 blanks
+
+        // Reflow to 3 cols: row0 ("z") is now its OWN logical line, not
+        // chained into row1 (blank) or beyond. (Pre-fix BUG: row_wrapped[0]
+        // and [1] would stay stale-true, splicing "z" + 4 blanks + 4 blanks
+        // + ... into one long phantom-padded logical line.)
+        g.resize(3, 4);
+        assert_eq!(row_str(&g, 0).trim_end(), "z");
+        assert_eq!(row_str(&g, 1).trim_end(), "");
     }
 
     #[test]
@@ -1387,6 +2168,221 @@ mod tests {
     }
 
     #[test]
+    fn decset_1000_sets_normal_mouse_1006_sets_sgr_encoding() {
+        let mut g = Grid::new(10, 2, 0);
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Default);
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        g.feed(b"\x1b[?1006h");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Sgr);
+        // Setting the encoding mode must not disturb the protocol mode.
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+    }
+
+    #[test]
+    fn decset_2004_tracks_bracketed_paste() {
+        let mut g = Grid::new(10, 2, 0);
+        assert!(!g.bracketed_paste());
+        g.feed(b"\x1b[?2004h");
+        assert!(g.bracketed_paste());
+        g.feed(b"\x1b[?2004l");
+        assert!(!g.bracketed_paste());
+        // Independent of mouse mode tracking -- setting/resetting 2004 must
+        // not disturb an unrelated DECSET/DECRST bit.
+        g.feed(b"\x1b[?1000h\x1b[?2004h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        assert!(g.bracketed_paste());
+    }
+
+    #[test]
+    fn decrst_clears_mouse_mode() {
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"\x1b[?1002h");
+        assert_eq!(g.mouse_proto(), MouseProto::Button);
+        g.feed(b"\x1b[?1002l");
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+
+        // A DECRST of any of the 4 protocol mode numbers clears unconditionally
+        // to Off, even naming a DIFFERENT mode from the one actually active --
+        // matches tmux's `input_csi_dispatch_rm_private` (case 1000/1002/1003
+        // all clear ALL_MOUSE_MODES regardless of which is set).
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(g.mouse_proto(), MouseProto::Any);
+        g.feed(b"\x1b[?1000l");
+        assert_eq!(g.mouse_proto(), MouseProto::Off);
+
+        g.feed(b"\x1b[?1005h");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Utf8);
+        g.feed(b"\x1b[?1005l");
+        assert_eq!(g.mouse_encoding(), MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mode_1003_any_motion_wins_over_1000() {
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(g.mouse_proto(), MouseProto::Any);
+        // And the reverse also holds: these 4 modes are mutually exclusive
+        // (last SET wins outright), not priority-ordered -- a later 1000
+        // supersedes an active 1003 too.
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_proto(), MouseProto::Normal);
+    }
+
+    #[test]
+    fn bel_byte_sets_bell_flag_take_bell_clears() {
+        let mut g = Grid::new(10, 2, 0);
+        assert!(!g.take_bell());
+        g.feed(b"abc\x07def");
+        assert!(g.take_bell());
+        assert!(!g.take_bell()); // edge-triggered: cleared on read
+        // BEL must never print as a visible character.
+        assert_eq!(row_str(&g, 0), "abcdef    ");
+    }
+
+    #[test]
+    fn esc_k_sets_title() {
+        let mut g = Grid::new(20, 1, 0);
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1bkmy-title\x1b\\");
+        assert_eq!(g.title(), Some("my-title"));
+        assert!(g.take_title_changed());
+        assert!(g.title_from_esc_k());
+    }
+
+    #[test]
+    fn esc_k_title_bytes_do_not_leak_into_cells() {
+        // The `vte` crate has no string-capturing path for `ESC k` -- without
+        // the `Grid::feed` pre-scan/strip, every title byte after the first
+        // would `Print`-leak into the pane's visible cells. Prove it doesn't.
+        let mut g = Grid::new(20, 2, 0);
+        g.feed(b"\x1bkfoo\x1b\\");
+        g.feed(b"bar");
+        assert_eq!(row_str(&g, 0).trim_end(), "bar");
+        assert_eq!(g.title(), Some("foo"));
+    }
+
+    #[test]
+    fn esc_k_split_across_feed_chunks() {
+        // The sequence -- including the ESC/backslash terminator itself --
+        // arrives split over several `feed` calls; the pre-scan state must
+        // persist on `Grid` across calls, and (verified against tmux's
+        // `input_exit_rename` firing as the `rename_string` state's `exit`
+        // callback) the title commits on the bare ESC, one call before the
+        // completing backslash even arrives.
+        let mut g = Grid::new(20, 2, 0);
+        g.feed(b"\x1bkhel");
+        assert_eq!(g.title(), None);
+        g.feed(b"lo");
+        assert_eq!(g.title(), None);
+        g.feed(b"\x1b");
+        assert_eq!(g.title(), Some("hello"));
+        assert!(g.take_title_changed());
+        g.feed(b"\\");
+        assert_eq!(g.title(), Some("hello")); // ST consumed; no further change
+        assert!(!g.take_title_changed());
+        // No title bytes leaked into the visible grid at any point.
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn esc_k_title_capture_buffer_is_capped() {
+        // Correctness review SHOULD-FIX #7: an in-progress `ESC k` capture
+        // (no terminator sent yet) must not grow its buffer unboundedly.
+        // Feed well past `ESC_K_TITLE_CAP` (256) bytes with no terminator,
+        // then commit -- the committed title must be exactly capped-length,
+        // not the full uncapped input.
+        let mut g = Grid::new(20, 1, 0);
+        g.feed(b"\x1bk");
+        g.feed(&vec![b'x'; 1000]); // way past the 256-byte cap, no terminator yet
+        g.feed(b"\x1b\\"); // now commit
+        let title = g.title().expect("title must have committed");
+        assert_eq!(title.len(), 256, "capture buffer must stop growing past the cap");
+        assert!(title.chars().all(|c| c == 'x'));
+
+        // Still correctly captures a SHORT title (cap is an upper bound,
+        // not a fixed/padded length).
+        let mut g2 = Grid::new(20, 1, 0);
+        g2.feed(b"\x1bkshort\x1b\\");
+        assert_eq!(g2.title(), Some("short"));
+
+        // No title bytes leaked into visible cells despite the overflow.
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn back_to_back_esc_k_titles_update_without_leak() {
+        // Critical fix (SP7-B review of cae6af2): when the ESC that commits
+        // a title is ALSO the opening ESC of a second `ESC k`, the old
+        // `PostTitle` arm replayed the following `k` as ordinary input --
+        // leaking `title2` into the visible grid and leaving `title()`
+        // stuck on `title1`. The committing ESC must be recognized as
+        // double duty: title-terminator AND next-title-opener.
+        let mut g = Grid::new(30, 2, 0);
+        g.feed(b"\x1bktitle1\x1bktitle2\x1b\\");
+        assert_eq!(g.title(), Some("title2"));
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+        assert_eq!(row_str(&g, 1).trim_end(), "");
+
+        // Full chain: t1 -> t2 -> t3, ending on a real ST. Zero leaked cells
+        // and the final title is the last one committed.
+        let mut g2 = Grid::new(30, 2, 0);
+        g2.feed(b"\x1bkt1\x1bkt2\x1bkt3\x1b\\");
+        assert_eq!(g2.title(), Some("t3"));
+        assert_eq!(row_str(&g2, 0).trim_end(), "");
+        assert_eq!(row_str(&g2, 1).trim_end(), "");
+    }
+
+    #[test]
+    fn pending_esc_then_non_k_escape_passes_through_intact() {
+        // A lone trailing ESC at the end of one `feed` chunk, followed by a
+        // CSI sequence (NOT `k`) starting the next chunk, must be replayed
+        // byte-for-byte to `vte` rather than swallowed -- proving the
+        // `Esc`-state passthrough survives a chunk boundary.
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"ab\x1b");
+        g.feed(b"[31mcd");
+        assert_eq!(row_str(&g, 0).trim_end(), "abcd");
+        assert_eq!(g.title(), None);
+    }
+
+    #[test]
+    fn literal_k_inside_csi_or_osc_passes_through() {
+        // A `k` byte that is NOT immediately preceded by a bare ESC (i.e.
+        // it's a parameter/data byte inside some other escape sequence)
+        // must never be mistaken for an `ESC k` opener.
+        let mut g = Grid::new(20, 2, 0);
+        // 'k' as an ordinary printable character after a CSI SGR sequence.
+        g.feed(b"\x1b[31mk\x1b[0m");
+        assert_eq!(row_str(&g, 0).trim_end(), "k");
+        assert_eq!(g.title(), None);
+
+        // 'k' inside an OSC 2 (set-title) string -- handled entirely by
+        // `vte`'s own OSC accumulation, not the ESC-k pre-scan, since the
+        // OSC's opening ESC is immediately followed by ']' not 'k'.
+        let mut g2 = Grid::new(20, 2, 0);
+        g2.feed(b"\x1b]2;kite\x07");
+        assert_eq!(g2.title(), Some("kite"));
+        assert_eq!(row_str(&g2, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn bel_mid_title_is_silent_noop() {
+        // BEL inside an `ESC k` title must neither ring the bell nor leak
+        // into the buffer -- tmux's `rename_string` state table has no BEL
+        // arm (unlike OSC's dedicated bell-terminator arm).
+        let mut g = Grid::new(20, 2, 0);
+        assert!(!g.take_bell());
+        g.feed(b"\x1bkfoo\x07bar\x1b\\");
+        assert_eq!(g.title(), Some("foobar"));
+        assert!(!g.take_bell());
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+    }
+
+    #[test]
     fn scrollback_captures_scrolled_lines() {
         // 3 cols x 2 rows: each of the three CRLFs but the first triggers a
         // full-screen (scroll_top == 0) scroll, capturing the row pushed
@@ -1504,23 +2500,183 @@ mod tests {
 
     #[test]
     fn resize_clips_and_clamps() {
+        // A column-width change now REFLOWS (follow-up #47) instead of
+        // clipping -- this test was originally written for the pre-reflow
+        // clip/pad behavior and is updated here to the tmux-faithful
+        // result, hand-derived:
+        //
+        // Grid::new(5, 3, 0): row0 = "abc  " (terminal, unwrapped,
+        // trimmed_len=3), row1/row2 blank. history_limit=0 so no
+        // scrollback capture ever happens.
+        //
+        // resize(2, 2): width 5->2 triggers reflow (using the OLD row
+        // count, 3, before the row-count axis is touched):
+        //   logical line0 = "abc" (len 3) -> at width 2: ceil(3/2)=2 rows:
+        //     "ab" (wrapped=true), "c " (wrapped=false)
+        //   logical line1 = ""  (len 0) -> 1 row ""
+        //   logical line2 = ""  (len 0) -> 1 row ""
+        //   total = 4 physical rows, old_rows(3) needed -> hsize = 4-3 = 1:
+        //   the OLDEST row ("ab") overflows into history -- but
+        //   history_limit==0 discards it (matches "scrollback disabled"
+        //   semantics elsewhere: overflow that would scroll off is lost).
+        //   Remaining screen (3 rows) = ["c ", "", ""].
+        // Cursor was at (col=3, row=0); row0's cellused (terminal, trimmed)
+        // is 3, so col(3) >= cellused -> "end of logical line" (tmux's
+        // UINT_MAX sentinel) -> maps to local row 1 ("c " row), col 1 of
+        // line0's own 2 new rows -> global row 1 -> screen-local row 0
+        // (since hsize=1) -> post-reflow cursor = (col=1, row=0).
+        //
+        // Then the row-count axis (3->2) applies its OWN simple
+        // (non-history-aware) top-left clip: keep rows 0,1 ("c ", "  "),
+        // drop row2; cursor row 0 stays valid.
         let mut g = Grid::new(5, 3, 0);
         g.feed(b"abc"); // cursor at (3,0)
         g.resize(2, 2);
         assert_eq!(g.cols(), 2);
         assert_eq!(g.rows(), 2);
-        assert_eq!(g.cell(0, 0).ch, 'a');
-        assert_eq!(g.cell(1, 0).ch, 'b'); // 'c' clipped
-        assert_eq!(g.cursor(), (1, 0));   // clamped from (3,0)
+        assert_eq!(g.cell(0, 0).ch, 'c'); // "ab" scrolled off (history disabled: lost)
+        assert_eq!(g.cell(1, 0).ch, ' ');
+        assert_eq!(g.cursor(), (1, 0));
     }
 
     #[test]
     fn resize_grows_and_pads() {
+        // Widening also goes through reflow now (width changed 2->4), but
+        // "ab" never wrapped (row0 is a single terminal row, unwrapped) and
+        // the reflowed content (1 row, "ab" + padding) still fits inside
+        // the unchanged 2-row screen, so the visible result is identical to
+        // plain clip/pad padding.
         let mut g = Grid::new(2, 2, 0);
         g.feed(b"ab");
         g.resize(4, 3);
         assert_eq!(g.cell(0, 0).ch, 'a');
         assert_eq!(g.cell(1, 0).ch, 'b');
         assert_eq!(g.cell(3, 2).ch, ' '); // padded
+    }
+
+    /// Set only when the cursor auto-wraps at the right margin; cleared on
+    /// an explicit linefeed (RED test per the SP7 Task 2 brief).
+    #[test]
+    fn autowrap_sets_wrapped_flag_hard_newline_clears_it() {
+        let mut g = Grid::new(3, 3, 0);
+        // Fill row0 exactly (3 cols) -- wrap_pending is set but NOT yet
+        // consumed, so the flag isn't set until the NEXT print.
+        g.feed(b"abc");
+        assert!(!g.state.row_wrapped[0]);
+        // One more printable char consumes the pending wrap: row0 becomes a
+        // soft-wrap row, cursor lands on row1 col0.
+        g.feed(b"d");
+        assert!(g.state.row_wrapped[0]);
+        assert_eq!(g.cursor(), (1, 1));
+        assert_eq!(g.cell(0, 1).ch, 'd');
+
+        // Now force row1 to also look wrapped (as if from earlier content),
+        // then send a HARD newline from it: the flag must be cleared, not
+        // left stale.
+        g.state.row_wrapped[1] = true;
+        g.feed(b"\r\n");
+        assert!(!g.state.row_wrapped[1]);
+        // row0's wrap (a different row, from a real auto-wrap) is untouched.
+        assert!(g.state.row_wrapped[0]);
+    }
+
+    #[test]
+    fn narrow_resize_rewraps_long_line() {
+        // 80-col grid, one 100-char line: autowraps into exactly one
+        // wrapped pair -- row0 (80 chars, wrapped=true), row1 (20 chars,
+        // wrapped=false). 3 more blank rows below it (rows=5 total).
+        let mut g = Grid::new(80, 5, 100);
+        let line: String = (0..100).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        g.feed(line.as_bytes());
+        assert_eq!(g.history_len(), 0);
+        assert!(g.state.row_wrapped[0]);
+        assert!(!g.state.row_wrapped[1]);
+        assert_eq!(g.cursor(), (20, 1));
+
+        // Resize to 40 cols: logical line len=100 -> ceil(100/40)=3 rows:
+        // 40, 40, 20 chars (first 2 wrapped=true, last wrapped=false). But
+        // the 5 original physical rows (2 real + 3 blank) can't hold the
+        // now-3-row real content plus the 3 still-blank logical lines (6
+        // rows needed > 5 available), so the OLDEST row -- the line's
+        // first 40-char chunk -- overflows into scrollback history
+        // (captured since history_limit=100 is large enough).
+        g.resize(40, 5);
+        assert_eq!(g.cols(), 40);
+        assert_eq!(g.history_len(), 1);
+        assert!(g.state.history[0].wrapped); // chunk0 -> chunk1
+        assert!(g.state.row_wrapped[0]); // chunk1 (screen row0) -> chunk2
+        assert!(!g.state.row_wrapped[1]); // chunk2 (screen row1), terminal
+
+        let concatenated = g.view_row_text(1, 0).trim_end().to_string()
+            + g.view_row_text(0, 0).trim_end()
+            + g.view_row_text(0, 1).trim_end();
+        assert_eq!(concatenated, line);
+        // Cursor was at the end of the 100-char content -> still the end:
+        // chunk2 (screen row1, since chunk0 is now in history), col 20
+        // (100 - 2*40).
+        assert_eq!(g.cursor(), (20, 1));
+    }
+
+    #[test]
+    fn widen_resize_rejoins_soft_wrapped_rows() {
+        // A soft-wrapped pair rejoins into one row when widened enough.
+        let mut g = Grid::new(5, 4, 100);
+        g.feed(b"abcdefg"); // "abcde" (wrapped) + "fg" (terminal)
+        assert!(g.state.row_wrapped[0]);
+        g.resize(10, 4);
+        assert_eq!(row_str(&g, 0).trim_end(), "abcdefg");
+        assert!(!g.state.row_wrapped[0]); // single row now, not wrapped
+
+        // A HARD-newline pair must NOT rejoin, even though it also fits.
+        let mut h = Grid::new(5, 4, 100);
+        h.feed(b"abc\r\nde");
+        assert!(!h.state.row_wrapped[0]);
+        h.resize(10, 4);
+        assert_eq!(row_str(&h, 0).trim_end(), "abc");
+        assert_eq!(row_str(&h, 1).trim_end(), "de");
+    }
+
+    #[test]
+    fn reflow_preserves_scrollback_content_across_shrink_and_grow() {
+        // Round-trip 80 -> 40 -> 80 restores the original visible text
+        // exactly. Hand-derived: at 40 cols the 100-char line needs 3 rows
+        // instead of 2, overflowing its first 40-char chunk into
+        // scrollback (history_limit=1000, so it's captured, not
+        // discarded); widening back to 80 re-joins it into 2 rows again,
+        // exactly filling the original 5-row screen with zero left over in
+        // history -- narrowing then widening are exact inverses here.
+        let mut g = Grid::new(80, 5, 1000);
+        let line: String = (0..100).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        g.feed(line.as_bytes());
+        g.feed(b"\r\nsecond line\r\nthird");
+
+        g.resize(40, 5);
+        assert_eq!(g.history_len(), 1); // the 100-char line's first chunk
+
+        g.resize(80, 5);
+
+        assert_eq!(g.cols(), 80);
+        assert_eq!(g.history_len(), 0);
+        assert_eq!(row_str(&g, 0), line[0..80]);
+        assert_eq!(row_str(&g, 1).trim_end(), &line[80..100]);
+        assert_eq!(row_str(&g, 2).trim_end(), "second line");
+        assert_eq!(row_str(&g, 3).trim_end(), "third");
+        assert_eq!(g.cursor(), (5, 3));
+    }
+
+    #[test]
+    fn alt_screen_resize_does_not_reflow() {
+        // While showing the alternate screen, a column-width resize keeps
+        // the original clip/pad behavior (no reflow) -- content that would
+        // otherwise wrap into another row is simply clipped.
+        let mut g = Grid::new(5, 3, 100);
+        g.feed(b"\x1b[?1049h"); // enter alt screen
+        g.feed(b"abc");
+        g.resize(2, 3);
+        assert_eq!(g.cols(), 2);
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(1, 0).ch, 'b'); // 'c' clipped, NOT reflowed to row1
+        assert_eq!(g.cell(0, 1).ch, ' ');
+        assert_eq!(g.cell(1, 1).ch, ' ');
     }
 }

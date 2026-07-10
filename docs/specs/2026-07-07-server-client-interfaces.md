@@ -216,6 +216,23 @@ pub struct Window {
     pub index: u32,          // tmux window index (lowest unused >= 0 at creation)
     pub name: String,        // default "powershell"
     pub layout: crate::layout::Layout,
+    // AMENDED (SP7 Task 6, closes follow-up #26): this window's local
+    // window-scoped option overrides (`setw`/`set -w`, no `-g`), starting
+    // empty (inherits the global table). See the `## option-scopes` section
+    // of 2026-07-07-command-config-interfaces.md for `options::Overlay`.
+    pub window_options: crate::options::Overlay,
+    // AMENDED (SP7 Task 17, closes follow-up #74): alerts subsystem flags,
+    // tmux's WINLINK_BELL/_ACTIVITY/_SILENCE collapsed onto the window
+    // (winmux windows belong to exactly one session). `last_output` is
+    // tmux's `activity_time`, the silence-monitor clock. New methods:
+    // `clear_alerts(&mut self)`, `mark_bell(&mut self, is_current: bool)`,
+    // `mark_activity`/`mark_silence(&mut self, is_current: bool) -> bool`
+    // (edge-triggered; see 2026-07-07-command-config-interfaces.md's
+    // "Task 17" section for the full contract).
+    pub alert_bell: bool,
+    pub alert_activity: bool,
+    pub alert_silence: bool,
+    pub last_output: std::time::Instant,
 }
 pub struct Session {
     pub name: String,
@@ -225,6 +242,10 @@ pub struct Session {
     pub last: Option<WindowId>,
     pub size: (u16, u16),            // current window size (smallest attached client)
     // base_index: u32,              // NOT pub (Task 7 amendment, see below)
+    // AMENDED (SP7 Task 6, closes follow-up #26): this session's local
+    // session-scoped option overrides (unprefixed `set`, no `-g`),
+    // starting empty. Same `options::Overlay` type as Window's.
+    pub session_options: crate::options::Overlay,
 }
 pub struct Registry { /* sessions: Vec<Session> in creation order, next_window_id */ }
 impl Registry {
@@ -234,11 +255,15 @@ impl Registry {
     pub fn find(&mut self, target: &str) -> Result<&mut Session, String>; // tmux -t rules: "=x" exact only; else exact, then unambiguous prefix; Err("can't find session: <t>")
     pub fn kill_session(&mut self, name: &str) -> bool;
     pub fn sessions(&self) -> &[Session];
+    pub fn sessions_mut(&mut self) -> &mut [Session]; // AMENDED (SP7 Task 17, #74): the silence-check Tick handler's one-pass walk
     pub fn session_mut(&mut self, name: &str) -> Option<&mut Session>;
     pub fn is_empty(&self) -> bool;
     pub fn auto_name(&self) -> String;                      // lowest unused non-negative integer as string
     pub fn neighbor_session(&self, current: &str, next: bool) -> Option<&str>; // for ( / ) switch-client, wraps
     pub fn mint_window_id(&mut self) -> WindowId;           // fresh id from the SAME counter create_session uses internally
+    // Amendment (SP7 Task 11, cross-window/session structure ops) -- see below.
+    pub fn move_window_to_session(&mut self, src_name: &str, id: WindowId, dst_name: &str, index: Option<u32>, kill: bool, select: bool) -> Result<(), String>;
+    pub fn insert_new_window(&mut self, session_name: &str, id: WindowId, first_pane: crate::layout::PaneId, index: Option<u32>) -> Result<WindowId, String>;
 }
 impl Session {
     pub fn new_window(&mut self, id: WindowId, first_pane: crate::layout::PaneId) -> &mut Window; // index = lowest unused, becomes current, updates last
@@ -251,6 +276,13 @@ impl Session {
     // Amendment (sub-project 6, Task 5, `swap-window`) -- see below.
     pub fn window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>;
     pub fn swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool;
+    // AMENDED (SP7 Task 17, closes follow-up #74): `pub(crate)`, not `pub`
+    // — called by every `Session` method above that reassigns `current`,
+    // AND by every `server/dispatch.rs` call site that mutates
+    // `session.current` directly instead of through one of these methods
+    // (`exec_select_window`, `find-window`, the status-row window click,
+    // choose-tree's Enter commit, `break-pane -d`).
+    pub(crate) fn clear_alerts_for(&mut self, id: WindowId);
 }
 ```
 
@@ -427,6 +459,71 @@ impl Session {
     end to end, `tests/server_proto.rs`'s
     `swap_window_relative_target_moves_current_window` /
     `swap_window_without_d_keeps_focus_on_index`.
+- **Amendment (SP7 Task 11, cross-window/session structure ops, closes
+  follow-up #45):** `Registry` gains a cross-session `move-window`
+  primitive, plus two supporting building blocks (one on `Registry`, two
+  new PRIVATE `Session` methods that are NOT part of this locked contract
+  — listed here only for context, since `move_window_to_session` is
+  implemented in terms of them):
+
+  ```rust
+  impl Registry {
+      /// Lift window `id` wholesale out of session `src_name` and insert it
+      /// into session `dst_name` at `index` (explicit) or `dst_name`'s
+      /// lowest free slot. The `Window` OBJECT (id, name, layout, every
+      /// pane) moves untouched -- `WindowId`s are global, never re-minted.
+      /// `select: true` makes the moved window `dst_name`'s new `current`
+      /// (mirrors `move-window`'s "no -d" default; `last` becomes whatever
+      /// WAS current there). `kill: true` removes an occupied `index`'s
+      /// occupant first (same `-k` contract `Session::move_window` already
+      /// has for the same-session case) -- the CALLER is responsible for
+      /// cleaning up the killed occupant's pane runtime state (same
+      /// pre-snapshot-then-remove pattern `server/dispatch.rs::exec_move_
+      /// window` already follows for the same-session `-k` case).
+      /// **Narrowing** (documented, follow-up #45's own honest-scope note):
+      /// refuses (`"can't move the only window out of its session"`) rather
+      /// than destroying an emptied source session the way real tmux does
+      /// -- avoids this task also solving session-teardown client-eviction
+      /// semantics for a case with no bearing on the required behavior.
+      /// Errors: `"can't find session: <name>"` (either session missing),
+      /// `"window not found"`, `"can't move the only window out of its
+      /// session"`, `"index in use: <i>"` (explicit index occupied, `kill:
+      /// false`), `"move-window: source and destination sessions are the
+      /// same"` (route a same-session move through `Session::move_window`
+      /// instead -- this method does not duplicate it).
+      pub fn move_window_to_session(&mut self, src_name: &str, id: WindowId, dst_name: &str, index: Option<u32>, kill: bool, select: bool) -> Result<(), String>;
+
+      /// Build a fresh single-pane `Window` (same defaults as `Session::
+      /// new_window`) and insert it into session `session_name` at `index`
+      /// (explicit) or its lowest free slot -- `break-pane -t
+      /// <session[:index]>`'s primitive (closes follow-up #44), since
+      /// `Session::new_window` itself only ever targets its OWN session and
+      /// always forces focus onto the new window. Does NOT touch
+      /// `current`/`last`. `id` must come from `mint_window_id`. Errors:
+      /// `"can't find session: <session_name>"` / `"index in use: <i>"`.
+      pub fn insert_new_window(&mut self, session_name: &str, id: WindowId, first_pane: crate::layout::PaneId, index: Option<u32>) -> Result<WindowId, String>;
+  }
+  ```
+
+  Both delegate to two new PRIVATE `Session` methods (`insert_window`,
+  `take_window`) plus a private `Session::build_window` associated
+  function that `new_window` was refactored to share — `new_window`'s own
+  signature/behavior is UNCHANGED (still index = lowest unused, becomes
+  current, updates last). Full spec:
+  `docs/tmux-reference/windows-and-sessions.md` §move-window/link-window,
+  §break-pane. `server::dispatch`'s consumers
+  (`exec_move_window`'s cross-session branch, `exec_break_pane`) are
+  documented in the `## Cross-window/session structure ops` section of
+  [`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md).
+  Tests: `model.rs`'s `move_window_across_sessions_reindexes_destination`,
+  `move_window_across_sessions_explicit_index`,
+  `move_window_across_sessions_occupied_index_errors`,
+  `move_window_across_sessions_kill_occupant`,
+  `move_window_across_sessions_refuses_to_empty_source`,
+  `move_window_across_sessions_unknown_session_or_window_errors`,
+  `move_window_across_sessions_same_name_errors`; end to end,
+  `tests/server_proto.rs`'s
+  `move_window_to_other_session_appears_there_and_leaves_source`.
 
 **Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
 APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends
@@ -450,7 +547,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4, SP7 Task 7, SP7 parity wave 3 fix)
 
 ```rust
 // status.rs
@@ -460,6 +557,37 @@ pub struct WindowEntry {
     pub current: bool,
     pub last: bool,
     pub zoomed: bool,
+    // AMENDED (SP7 Task 17, closes follow-up #74): tmux's WINLINK_ACTIVITY/
+    // _BELL/_SILENCE display flags (`model::Window::alert_activity`/
+    // `alert_bell`/`alert_silence`, resolved by the caller). Feed
+    // `status::flags`'s (private) `#`/`!`/`~` chars, tmux's fixed
+    // `window_printable_flags` order (ahead of `*`/`-`/`Z`). Every
+    // pre-Task-17 caller/test defaults these to `false` (no earlier
+    // expected flags string changes).
+    pub activity: bool,
+    pub bell: bool,
+    pub silence: bool,
+    // AMENDED (SP7 Task 6, closes follow-up #26): per-window EFFECTIVE
+    // window-status-format/-current-format and -style/-current-style,
+    // resolved by the CALLER through that window's own options overlay
+    // (`Options::window_status_*_for`). `None` falls back to the shared
+    // `window_format`/`window_current_format`/`win_style`/
+    // `win_current_style` arguments below — byte-identical to pre-SP7
+    // behavior, which is what keeps every earlier status test green
+    // unmodified. `server::render_one` always passes `Some(..)` (the
+    // `_for` getters already fold in the global fallback).
+    pub format_override: Option<String>,
+    pub style_override: Option<crate::style::PartialStyle>,
+    // AMENDED (SP7 Task 7, closes follow-up #71): THIS window's own active
+    // pane's `#P`/`pane_index` value, already `pane-base-index`-shifted by
+    // the caller (same rule `render_one` applies for the shared `ctx`
+    // argument to `status_spans` below). Every pre-Task-7 caller/test gets
+    // `0` here (the correct value for a lone default pane), so every
+    // earlier test's expected spans are unchanged.
+    pub pane_index: u32,
+    // THIS window's own active pane's `#T`/`pane_title` value. Empty string
+    // for every pre-Task-7 caller/test.
+    pub pane_title: String,
 }
 
 // SP6 Task 4 signature (status-justify, per-side styles, per-window
@@ -487,7 +615,74 @@ pub fn status_spans(
 /// multiple inline-styled sub-runs the way `status_spans`'s returned `Vec`
 /// has for `left`/the window list).
 pub fn strip_style_markers(text: &str) -> String;
+
+/// NEW (SP7 Task 7, closes follow-up #69b). Truncate `text` (already
+/// `expand_format`-expanded, so it may still carry literal `#[...]` markers)
+/// to `max` VISIBLE characters: markers themselves count as zero width and
+/// are never bisected (emitted whole if the visible budget isn't exhausted
+/// yet when reached, otherwise dropped whole along with everything after).
+/// Used for `status-left` (which — unlike `status-right` — keeps its
+/// markers all the way through so `status_spans`'s `styled_runs` can still
+/// split it into differently-styled runs); `status-right` keeps its
+/// existing `strip_style_markers`-then-plain-char-count-cap treatment
+/// unchanged (no markers survive to bisect by the time it's capped).
+pub fn truncate_visible(text: &str, max: u16) -> String;
+
+/// NEW (SP7 parity wave 3 fix, review of 128cfc0). One window's tab column
+/// span in the FINAL rendered status row (0-based, `end` exclusive).
+/// `window_pos` is the window's position in the `windows` slice passed to
+/// `status_tab_columns`/`status_spans` — NOT its tmux `#I` index. A window
+/// scrolled fully off-screen under overflow scrolling has no entry.
+pub struct TabColumn {
+    pub window_pos: usize,
+    pub start: u16,
+    pub end: u16,
+}
+
+/// NEW (SP7 parity wave 3 fix, review of 128cfc0, closes the `mouse_status_
+/// click` hit-test regression). Column ranges a status-row click hit-test
+/// can map through: mirrors `status_spans`'s layout exactly (same private
+/// `window_tab_texts`/`plan_tab_layout` core, so it's byte-for-byte what's
+/// actually drawn, including window-list overflow scrolling and its `<`/`>`
+/// markers) but skips style resolution entirely, since a click doesn't care
+/// what color a tab is.
+pub fn status_tab_columns(
+    left: &str,
+    windows: &[WindowEntry],
+    ctx: &crate::options::FormatCtx,
+    window_format: &str,
+    window_current_format: &str,
+    separator: &str,
+    justify: &str,
+    width: u16,
+    right_len: usize,
+) -> Vec<TabColumn>;
 ```
+
+**AMENDMENT (SP7 parity wave 3 fix — review of 128cfc0):** `mouse_status_click`
+(`src/server/dispatch.rs`, see `## server-dispatch` below) used to
+reconstruct the tab hit-boxes ITSELF — walking `session.windows` in original
+order starting right after `status-left`, using its own hardcoded
+`"{index}:{name}{flags}"` text-length guess — which predated (and was left
+untouched by) SP7 Task 7's window-list overflow scrolling in `status_spans`.
+Once a real window list actually scrolled, the two disagreed: a click on the
+visually-current tab could resolve to the WRONG window. The fix factors the
+LAYOUT MATH (not the styling) out of `status_spans` into two private
+helpers — `window_tab_texts` (per-window expanded text + visible width,
+format-override-aware) and `plan_tab_layout` (the justify/scroll/marker
+decision, given only widths) — that `status_spans` and the new public
+`status_tab_columns` both call, so there is exactly one place that decides
+what's visible where. `status_spans`'s own behavior/output is byte-for-byte
+unchanged (every pre-existing test still passes unmodified); only its
+internal structure changed. Two new unit tests close a documented edge-case
+gap: `overflow_boundary_exactly_fits_no_markers_no_scroll` (`list_width ==
+list_avail` exactly must take the fit branch, not overflow) and
+`single_window_wider_than_budget_overflows_with_both_markers` (a single tab
+wider than the entire budget still overflows correctly with both markers
+when the visible sliver lands strictly inside it). A third,
+`status_tab_columns_matches_rendered_overflow_scroll`, proves the new
+function's columns agree with `status_spans`'s rendered row for the exact
+same fixture as `window_list_scrolls_to_keep_current_visible_with_markers`.
 
 **AMENDMENT (SP3 Task 8, historical):** the original Task 5 signature was
 `status_spans(session_name: &str, windows: &[WindowEntry]) ->
@@ -505,10 +700,15 @@ still pure (no I/O), `expand_format` is pure too.
 - **Per-window format expansion:** for each window, `window_current_format`
   (if `current`) else `window_format` is expanded via `options::
   expand_format` against a `FormatCtx` built from `ctx`'s
-  session/pane_index/hostname/now/pane_title fields, with `window_index`/
-  `window_name`/`window_flags` overridden to that window's own values
-  (`window_flags` uses the SAME flags-string rule as before — see below,
-  now fed through `#F` rather than hardcoded string concatenation).
+  session/hostname/now fields, with `window_index`/`window_name`/
+  `window_flags` overridden to that window's own values (`window_flags`
+  uses the SAME flags-string rule as before — see below, now fed through
+  `#F` rather than hardcoded string concatenation) and, as of **SP7 Task 7**
+  (closes follow-up #71), `pane_index`/`pane_title` ALSO overridden to that
+  window's own `WindowEntry::pane_index`/`pane_title` rather than `ctx`'s
+  (which only ever carried the acting client's focused pane in the CURRENT
+  window — reused for every other window's tab before this fix, so `#P`/`#T`
+  in a per-window format used to misrender for every non-focused window).
 - **Inline `#[...]` style markers:** `expand_format` (SP6 Task 4 addition,
   see the command-config contract amendment) passes `#[...]` blocks through
   VERBATIM rather than interpreting them. `status.rs`'s private
@@ -520,21 +720,40 @@ still pure (no I/O), `expand_format` is pure too.
   yields exactly one span, byte-identical to the pre-Task-4 output. A
   malformed marker (no closing `]`, or content `parse_style` rejects) is a
   no-op/literal-text fallback, never a panic.
-- **`status-justify` positioning:** the window-list group's start column is
-  computed by a private `list_offset` helper per
-  `docs/tmux-reference/status-line-and-messages.md` §1.4's closed-form
-  offsets (winmux has no user-configurable centre/after content, so the
-  general 8-screen trim-order engine collapses to `left`/`centre`/`right`/
-  `absolute-centre` formulas keyed off `left`'s width, `right_len`, and the
-  list's own total width). The gap between `left` and the list start is
-  realized as a literal run of `base`-styled padding spaces inserted into
+- **`status-justify` positioning (fits case):** when the window list fits
+  its allotted budget (`list_width <= width - left_width - right_len`), the
+  window-list group's start column is computed by a private `list_offset`
+  helper per `docs/tmux-reference/status-line-and-messages.md` §1.4's
+  closed-form offsets (winmux has no user-configurable centre/after content,
+  so the general 8-screen trim-order engine collapses to `left`/`centre`/
+  `right`/`absolute-centre` formulas keyed off `left`'s width, `right_len`,
+  and the list's own total width). The gap between `left` and the list start
+  is realized as a literal run of `base`-styled padding spaces inserted into
   the returned `Vec` — `render::compose_back` is UNCHANGED, it still just
   draws spans sequentially from column 0 (see `## render-styles`); this is
-  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task. An
-  offset that would require NEGATIVE padding (overflow: `left` + list +
-  `right` wider than the terminal) clamps to zero pad rather than
-  overlapping — a documented simplification vs. tmux's `<`/`>` scroll
-  markers (out of scope).
+  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task.
+- **Window-list overflow scrolling (SP7 Task 7, closes follow-up #69a):**
+  when the list does NOT fit (`list_width > list_avail`, where `list_avail =
+  width - left_width - right_len`), `status_spans` no longer clamps to
+  zero pad and overlaps/overruns. Instead it flattens the full unclipped
+  tab+separator sequence to one `(char, Style)` per column, locates the
+  CURRENT window's column range (`focus_start`/`focus_end`) within it,
+  computes `focus_centre = focus_start + (focus_end - focus_start) / 2`, and
+  scrolls a `content_w`-wide window (`content_w = list_avail` minus 1 column
+  per marker actually needed) centered on `focus_centre`, clamped so it
+  never runs past either end of the full list. Whether the left/right marker
+  is needed is resolved by a capped (4-pass) fixed-point search — reserving
+  a marker shrinks `content_w`, which can flip whether the OTHER end is
+  still off-screen. `<` is prepended when content is scrolled off the left
+  (`start > 0`); `>` is appended when content remains beyond the right
+  (`start + content_w < list_width`); both markers are drawn in the row's
+  plain `base` style. This is a documented simplification of tmux's own
+  eight-screen `format_draw` model (winmux scrolls the whole
+  left/list/right block as one fixed budget rather than reproducing every
+  justify mode's own trim order for the overflow case specifically) — see
+  the SP7 Task 7 report for the exact ruling. No padding is ever inserted in
+  this branch: an overflowing list, by definition, consumes its entire
+  allotted budget.
 - **`window-status-separator`** replaces the old hardcoded `" "` between
   tabs (still omitted after the last one).
 - **`status-right`'s style** is resolved by the SERVER directly
@@ -543,6 +762,16 @@ still pure (no I/O), `expand_format` is pure too.
   any `#[...]` markers `expand_format` leaves in the expanded `status-right`
   text are removed via `strip_style_markers` before length-capping and
   assignment, rather than leaking literal `#[...]` bytes onto the screen.
+- **`status-left`'s length cap (SP7 Task 7, closes follow-up #69b):**
+  `server::render_one` caps `status-left` with the NEW `status::
+  truncate_visible` instead of a plain char-count `truncate_chars` — it
+  counts only characters outside a `#[...]` marker toward
+  `status-left-length`'s budget and never bisects a marker (whole-marker
+  in-or-out, never partial), so `status-left` (which keeps its markers,
+  unlike `status-right`) can't have its visible-width budget miscounted by
+  bytes that draw zero columns. `status-right` is unaffected — it strips
+  markers BEFORE capping, so there's nothing left to bisect by the time its
+  existing `truncate_chars` cap runs.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
 between "else a literal space" and "else empty" phrasings that circulated
@@ -581,7 +810,18 @@ span vectors (mirrors `render.rs`'s exact-VT-bytes test style), including
 expands_per_tab`/`window_status_current_format_used_for_current` (per-window
 expansion + format selection), `side_styles_layer_over_status_style`,
 `window_status_separator_respected`, and `inline_style_marker_in_window_
-format` (SP6 Task 4).
+format` (SP6 Task 4). **SP7 Task 7** adds
+`window_list_scrolls_to_keep_current_visible_with_markers`/
+`overflow_markers_absent_when_list_fits` (window-list overflow, closes
+#69a), `per_tab_ctx_uses_that_windows_active_pane_title` (per-window pane
+context, closes #71), `status_left_length_cap_ignores_style_marker_bytes`
+(`truncate_visible`, closes #69b), and
+`status_left_inline_style_marker_splits_spans` (verify-and-mark evidence for
+follow-up #31 — `status-left`'s own text, not just a window tab's, really
+does split into multiple styled spans on an inline `#[...]` marker).
+`tests/server_proto.rs::status_interval_refreshes_seconds_format` is the
+end-to-end proof for `status-interval`-driven refresh (closes #29, in
+`## server` below).
 
 ## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 
@@ -614,6 +854,26 @@ various free helper functions) is private to the module.
   rendering once (follow-up #4's coalescing). Every attached client is
   re-rendered on any dirty turn (see "Design choices" below) — not a
   per-session dirty set.
+- **`status-interval`-driven status refresh (SP7 Task 7, closes follow-up
+  #29):** `Server` gained a `last_status_render: Instant` field (init
+  `Instant::now()`). On every `Tick`, in addition to the pre-existing
+  minute-granularity `clock`-changed check, `handle_event` now ALSO checks
+  `options.status_interval() > Duration::ZERO && deadline.duration_since
+  (last_status_render) >= options.status_interval()`; if true, it sets
+  `last_status_render = deadline` and `dirty = true`. This is a periodic
+  refresh independent of whether the status TEXT actually changed —
+  matching real tmux's own per-client status timer
+  (`docs/tmux-reference/status-line-and-messages.md` §8), so a custom
+  `status-right` with sub-minute-sensitive content (`%S`, a fast-changing
+  pane title, etc.) now re-renders on the configured cadence rather than
+  only when the coarse `HH:MM` clock string happens to flip. One
+  server-global timer, not per-session/per-client (`status-interval` has no
+  `_for` scope-resolving getter yet, consistent with several other
+  session-scoped options that stayed global-only through SP7 Task 6 — see
+  follow-up #75/#76's framing). `status_interval() == 0` means "never
+  re-arm" (tmux's documented "0 = no periodic refresh"), so it never sets
+  `dirty` on its own in that case. Test:
+  `tests/server_proto.rs::status_interval_refreshes_seconds_format`.
 - **Startup config loading (Task 7, SP3 config loading):** after binding the
   pipe and spawning the accept thread, but BEFORE entering the event loop
   (so no attach is ever served against an unconfigured `Options`/`Bindings`),
@@ -640,9 +900,11 @@ various free helper functions) is private to the module.
   spawning a pane, and rolls the pane back if `Registry::create_session`
   still rejects the name (bad chars); `Existing` resolves the name via
   `Registry::find` (tmux `-t` prefix rules) and — when `detach_others` is
-  set — sends every OTHER client currently attached to that session a plain
-  `Exit{0, "[detached]"}` (distinct from the named `Detach`-action/-frame
-  message) before attaching the new one. First window is always index 0,
+  set — sends every OTHER client currently attached to that session
+  `Exit{0, "[detached (from session <name>)]"}` (follow-up #17, SP7 Task 4:
+  previously a bare `[detached]` with no session name; now identical text to
+  the named `Detach`-action/-frame message) before attaching the new one.
+  First window is always index 0,
   name `powershell`; shell is `powershell.exe -NoLogo`. A fresh `Renderer`
   is constructed and immediately `resize()`d to its own dimensions (forcing
   `force_full`) so the very first `compose()` is a guaranteed full repaint.
@@ -878,6 +1140,37 @@ Task 7's review-fix passes, and Task 8's
 `attach_empty_target_picks_most_recent` covering the empty-target
 `Existing` attach amendment above.
 
+**LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #14, per-pane writer
+thread architecture note):** `PaneRuntime` (private; current shape per the
+table-driven SP3+ rewrite, superseding the `{pty, grid, dead}` sketch in the
+historical "Internal shape" paragraph above) gains one field:
+`input_tx: Sender<Vec<u8>>`. `spawn_pane` now ALSO spawns a dedicated
+per-pane writer thread — owning an independent duplicate of the pty's input
+write handle via the new `Pty::try_clone_writer` (see
+`2026-07-06-mvp-interfaces.md`'s sibling `## pty` amendment) — that drains
+this channel, mirroring the existing per-client `spawn_writer` design
+EXACTLY (same unbounded `mpsc<Vec<u8>>`-drained-by-a-dedicated-thread shape).
+The server's own hot Forward/Key-forwarding path (`Server::
+process_client_events`'s `KeyInputEvent::Forward`/unbound-`Root`-`Key` arms)
+now enqueues onto `pane.input_tx` instead of calling `pty.write_input`
+INLINE on the main-loop thread — closing the gap follow-up #14 tracked
+(a pane whose child stops draining stdin, e.g. a hung app or a huge paste,
+previously blocked `write_input`, which blocked the ENTIRE main loop —
+rendering and input for every session, not just the stalled pane's).
+`PaneRuntime` is dropped exactly the same way as before (pane removal is the
+only way one is ever dropped); dropping it now ALSO drops `input_tx`, which
+closes the channel and lets the writer thread's `recv()` loop end on its
+own — no new explicit shutdown/join path needed. `src/server/dispatch.rs`'s
+LOWER-volume write sites (send-keys, paste-buffer, mouse-drag forwarding)
+are UNCHANGED — they still call `pty.write_input` directly; only the two
+hottest, most frequently-hit call sites (ordinary keystroke/paste forwarding)
+moved onto the new channel. Regression coverage:
+`tests/server_proto.rs::stalled_pane_stdin_does_not_block_other_sessions`
+(a session whose pane never reads stdin at all is flooded with raw `Stdin`
+frames; a concurrent CLI round trip against a DIFFERENT session, sharing the
+same main loop, must stay fast — reproduced RED against the pre-fix inline
+`write_input` call, ~3.8s, GREEN after the fix, ~1s).
+
 ## `cli` — argv parser (pure, Task 8; amended Task 7 SP3 for `-f`)
 
 ```rust
@@ -1006,6 +1299,13 @@ before `main.rs` prints the error. Loop behavior:
   and relays them to the main loop over an `mpsc` channel, so the main loop
   can ALSO wake up on a 50ms tick (a plain blocking read on the main thread
   can't do both).
+- **Follow-up #16 (stdin-reader panic):** the stdin thread's body runs inside
+  `std::panic::catch_unwind`. A panic there previously left the main loop
+  waiting on the reader channel forever (stdin forwarding silently dead, but
+  nothing told the main loop) — now the stdin thread sends an `Err` through
+  the SAME channel the reader thread uses (it holds its own clone of `tx`),
+  which the main loop's existing fatal-error handling (below) already turns
+  into a clean non-zero exit.
 - Main loop: `recv_timeout(50ms)`. `Output` → `host.write`. `Exit{code,
   msg}` → drop `Host` FIRST (restores the console), THEN print `msg`
   (stdout if `code == 0`, else stderr), THEN return `code as i32` — this
@@ -1013,13 +1313,21 @@ before `main.rs` prints the error. Loop behavior:
   restored normal screen, not the alt screen the pane content was drawn
   into. `CliDone` is ignored (not expected on an attached connection).
   Reader error/EOF without an `Exit`, or the reader thread hanging up
-  (`RecvTimeoutError::Disconnected`) → drop `Host`, print `"[lost server]"`
-  to stderr, return `1`. On `RecvTimeoutError::Timeout`: poll `host.size()`;
-  if changed since the last known size, send a `Resize` frame over the
-  ORIGINAL connection (not a clone — the reader/writer split only needs two
-  of the three duplicates to be independent, since only the main thread
-  ever writes `Resize`/the initial `Attach`, and only the stdin thread ever
-  writes `Stdin`/`Detach`).
+  (`RecvTimeoutError::Disconnected`) → drop `Host`, then (**follow-up #19,
+  kill-server race**) print `"[lost server]"` to stderr IF at least one real
+  `ServerMsg` was ever received on this connection, else print the cleaner
+  `"no server running on <pipe>"` (same text `main.rs`'s
+  `report_connect_error` uses) — a connection that raced a `kill-server`
+  teardown window (connected, `Attach` sent, but the server tore itself down
+  before serving even one reply) is indistinguishable in EFFECT from the pipe
+  never having existed, so it now gets the same message a client connecting
+  slightly later (once the pipe is fully gone) would see. Either way, return
+  `1`. On `RecvTimeoutError::Timeout`: poll `host.size()`; if changed since
+  the last known size, send a `Resize` frame over the ORIGINAL connection
+  (not a clone — the reader/writer split only needs two of the three
+  duplicates to be independent, since only the main thread ever writes
+  `Resize`/the initial `Attach`, and only the stdin thread ever writes
+  `Stdin`/`Detach`).
 - **Documented caveat** (task brief, verified true): `host::read_stdin` has
   no clean cancellation — it blocks in `ReadFile` until the NEXT keystroke
   even after `attach` has returned. This is fine ONLY because every caller
@@ -1077,7 +1385,8 @@ autostarting; `Control` connects WITHOUT autostarting either. Both of these
 non-autostarting paths' `NotFound` prints `no server running on <pipe>` and
 exits 1 — matching the design spec's "pure queries... error... auto-start:
 new-session... starts the server" rule. Covered by
-`tests/e2e_sessions.rs::no_console_fails_fast`.
+`tests/e2e_sessions.rs::e2e_no_console_fails_fast` (renamed from
+`no_console_fails_fast`, follow-up #24).
 
 **Implementation module:** `src/client.rs`. No unit tests (pure I/O glue:
 threads, a live named pipe, a live console) — coverage is

@@ -4,13 +4,21 @@ use crate::layout::PaneId;
 
 /// Copy-mode rendering data for one pane (Task 2, sub-project 4): the pane's
 /// content is read via `Grid::view_cell(scroll, ..)` instead of the live
-/// `cell` when this is `Some`, a `[scroll/history_len]` position indicator is
-/// painted right-aligned on the pane's top row in `Scene::mode_style`, and
-/// `cursor` (view coordinates) replaces the pane's live cursor for terminal
-/// cursor placement.
+/// `cell` when this is `Some`, and a `[scroll/history_len]` position
+/// indicator is painted right-aligned on the pane's top row in
+/// `Scene::mode_style`.
+///
+/// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):** the `cursor:
+/// (u16, u16)` field this struct originally carried is REMOVED. It was dead:
+/// `Renderer::compose_back` never read it (only `scroll` and `sel` are
+/// consumed) — the actual terminal cursor placement during copy mode is
+/// computed independently by `server::render_one`'s own `(cursor,
+/// cursor_visible)` match on `client.mode`, which clamps the copy state's
+/// `(cx, cy)` into the pane rect directly and was never routed through
+/// `CopyView` at all. See `docs/specs/2026-07-06-mvp-interfaces.md`'s sibling
+/// amendment for the `PaneView`/`CopyView` history.
 pub struct CopyView {
     pub scroll: u32,
-    pub cursor: (u16, u16),
     /// Selection highlight (Task 3, sub-project 4), precomputed by the
     /// SERVER in VIEW coordinates (`start_col, start_row, end_col, end_row,
     /// rect`) and already clamped into the visible pane rect -- `None` when
@@ -79,6 +87,12 @@ pub struct TreeRowCell {
     /// Painted in `Scene::mode_style` (reversed against the panel's default-
     /// style rows) when this is the current selection.
     pub selected: bool,
+    /// SP7 Task 15 (closes #50's remainder; `docs/tmux-reference/
+    /// choose-tree.md` `## 3.3`): `true` when this row is in the tagged
+    /// set. Drawn as a fixed-width `"* "` tag slot (mirroring the marker
+    /// slot's own fixed two-column width so sibling rows stay aligned)
+    /// right after the marker slot, before the row's own text.
+    pub tagged: bool,
 }
 
 /// The live preview box painted below choose-tree's row list (SP6 wave 2
@@ -97,6 +111,34 @@ pub struct TreeRowCell {
 /// interior (the renderer truncates from the top-left corner, never scales)
 /// or smaller (the renderer leaves the remainder as whatever the panel's
 /// full-clear already put there — blank).
+/// One row of a display-menu overlay (SP7 Task 16, closes #51). `text` is
+/// the FULLY pre-formatted display string (item name, right-padded, then a
+/// `" (key)"` shortcut hint if the item has one — already computed to fill
+/// the box's content width, see `server::dispatch::build_menu_rows`) — the
+/// renderer draws it verbatim, it does no padding/truncation of its own
+/// (mirrors `TreeRowCell::text`'s own "server formats, renderer just
+/// blits" split). `separator: true` draws a plain horizontal rule instead
+/// (`text` is unused, always empty, for a separator row).
+pub struct MenuRowCell {
+    pub text: String,
+    pub separator: bool,
+    pub selected: bool,
+}
+
+/// A display-menu overlay (SP7 Task 16): a small floating bordered box —
+/// UNLIKE [`Overlay::List`], this does NOT clear/replace the whole client
+/// area; it paints only inside `rect`, leaving every pane/border/status
+/// cell outside it untouched (matching real tmux's own menu, which floats
+/// over the existing screen). `rect` is resolved once at open time by the
+/// SERVER (`server::dispatch::open_menu`/`resolve_menu_axis`) — the
+/// renderer treats it as already-clamped-to-fit and does no further
+/// positioning of its own.
+pub struct MenuOverlay {
+    pub rect: Rect,
+    pub title: String,
+    pub rows: Vec<MenuRowCell>,
+}
+
 pub struct PreviewBlock {
     /// The full preview region, box borders included: row `rect.y` is the
     /// top border, row `rect.y + rect.h - 1` the bottom border, columns
@@ -125,9 +167,20 @@ pub struct ListOverlay {
     pub top: usize,
     /// `Some` when the `v`-cycled preview mode is BIG or NORMAL (never OFF)
     /// AND the panel is tall/wide enough per the sizing rule (`## 3.1`) --
-    /// `None` means the row list gets the WHOLE panel height, exactly the
-    /// pre-Task-8-wave-2 behavior.
+    /// `None` means no preview box is painted.
     pub preview: Option<PreviewBlock>,
+    /// SP7 Task 15 (closes #73): the row list's own height in panel rows,
+    /// from `Server::choose_tree_list_height` -- the AUTHORITATIVE cap on
+    /// how many rows the list paints, REGARDLESS of whether `preview` is
+    /// `Some` (list height == `preview.rect.y`, by construction) or `None`
+    /// (either a legitimate full-height list, e.g. preview OFF, in which
+    /// case this equals the panel height; OR a degenerate geometry where the
+    /// preview box couldn't be painted at all, in which case this stays at
+    /// the SMALL sizing-formula value and the rows below it are left blank
+    /// -- see `dispatch::Server::choose_tree_preview_paintable`'s doc
+    /// comment for why the list must NOT silently expand to fill that
+    /// space).
+    pub list_height: u16,
 }
 
 /// Everything [`Scene::overlay`] can paint OVER the already-composed frame
@@ -151,6 +204,11 @@ pub enum Overlay {
     /// (`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
     /// mode`).
     Clock(Rect, String, Color),
+    /// display-menu overlay (SP7 Task 16, closes #51): a small floating
+    /// bordered box, painted OVER whatever else is on screen inside its own
+    /// `rect` only — see [`MenuOverlay`]'s doc comment for how this differs
+    /// from [`Overlay::List`]'s full-panel clear.
+    Menu(MenuOverlay),
 }
 
 /// `pane-border-indicators` (Task 11, sub-project 6 wave 2 --
@@ -589,15 +647,12 @@ impl Renderer {
                     }
                     y += 1;
                 }
-                // With a preview box present, the row list is already capped
-                // to `preview.rect.y` by the sizing rule (`## 3.1`) -- the
-                // message reservation below (pre-Task-8-wave-2 behavior) only
-                // applies when there's no preview eating into the panel, same
-                // as before this amendment.
-                let list_cap: u16 = match &list.preview {
-                    Some(pv) => pv.rect.y,
-                    None => rows,
-                };
+                // SP7 Task 15 (closes #73): the row list is ALWAYS capped to
+                // `list.list_height`, whether or not a preview box is
+                // actually painted -- a `None` preview no longer implies
+                // "list gets the whole panel" (see `ListOverlay::list_height`'s
+                // doc comment for the degenerate-geometry case this fixes).
+                let list_cap: u16 = list.list_height.min(rows);
                 // A message (e.g. choose-tree's `x` kill-confirm prompt, see
                 // `ClientMode::ChooseTree`'s `pending_kill`) takes the panel's
                 // LAST row, same as it takes the status row outside the
@@ -622,7 +677,8 @@ impl Renderer {
                         Some(c) => format!("{c} "),
                         None => "  ".to_string(),
                     };
-                    let line = format!("{indent}{marker_slot}{}", row.text);
+                    let tag_slot = if row.tagged { "* " } else { "  " };
+                    let line = format!("{indent}{marker_slot}{tag_slot}{}", row.text);
                     for (cx, ch) in line.chars().enumerate() {
                         if cx as u16 >= cols {
                             break;
@@ -721,6 +777,119 @@ impl Renderer {
             }
             Some(Overlay::Clock(rect, text, colour)) => {
                 self.paint_clock(*rect, text, *colour, cols, rows);
+            }
+            Some(Overlay::Menu(m)) => {
+                self.paint_menu(m, scene.mode_style, scene.border, cols, rows);
+            }
+        }
+    }
+
+    /// Paint a display-menu overlay (SP7 Task 16, closes #51): a single-
+    /// line box (`┌─┐│└┘`, in `border` style — same glyph set choose-tree's
+    /// preview box uses) around `m.rect`, with `m.title` CENTERED over the
+    /// top border (a documented simplification of real tmux's per-title
+    /// `#[align=...]` support — winmux's `display-menu` doesn't parse
+    /// inline style/alignment markers inside `-T`, so every menu title is
+    /// centered unconditionally, matching what every one of winmux's own
+    /// default menus' titles would render as anyway since they all pass
+    /// `#[align=centre]` verbatim in real tmux). Interior rows start at
+    /// `rect.y + 1`; each real item row fills its full interior width with
+    /// `mode_style` (selected) or the default style, then draws `row.text`
+    /// starting one column in from the left border (a further 1-column pad
+    /// from the border, mirroring tmux's own item indentation) — a
+    /// separator row instead fills the interior with `─`. Zero/degenerate
+    /// rects (`w < 2 || h < 2`) paint nothing.
+    fn paint_menu(&mut self, m: &MenuOverlay, mode_style: Style, border: Style, cols: u16, rows: u16) {
+        let r = m.rect;
+        if r.w < 2 || r.h < 2 {
+            return;
+        }
+        let x0 = r.x;
+        let y0 = r.y;
+        let x1 = r.x + r.w - 1;
+        let y1 = r.y + r.h - 1;
+
+        // Interior clear (default style) — the box floats OVER whatever
+        // was already composed there.
+        for y in y0..=y1 {
+            if y >= rows {
+                break;
+            }
+            for x in x0..=x1 {
+                if x >= cols {
+                    break;
+                }
+                self.set(x, y, Cell { ch: ' ', style: Style::default() });
+            }
+        }
+
+        // Border.
+        for x in x0..=x1.min(cols.saturating_sub(1)) {
+            self.set(x, y0, Cell { ch: '─', style: border });
+            if y1 < rows {
+                self.set(x, y1, Cell { ch: '─', style: border });
+            }
+        }
+        for y in (y0 + 1)..y1 {
+            if y >= rows {
+                break;
+            }
+            self.set(x0, y, Cell { ch: '│', style: border });
+            if x1 < cols {
+                self.set(x1, y, Cell { ch: '│', style: border });
+            }
+        }
+        self.set(x0, y0, Cell { ch: '┌', style: border });
+        self.set(x1, y0, Cell { ch: '┐', style: border });
+        if y1 < rows {
+            self.set(x0, y1, Cell { ch: '└', style: border });
+            self.set(x1, y1, Cell { ch: '┘', style: border });
+        }
+
+        // Title, centered on the top border.
+        let interior_w = r.w.saturating_sub(2) as usize;
+        if !m.title.is_empty() && interior_w > 0 {
+            let title_chars: Vec<char> = m.title.chars().collect();
+            let tlen = title_chars.len().min(interior_w);
+            let pad = (interior_w - tlen) / 2;
+            let start_x = x0 + 1 + pad as u16;
+            for (i, ch) in title_chars[..tlen].iter().enumerate() {
+                let x = start_x + i as u16;
+                if x >= x1 || x >= cols {
+                    break;
+                }
+                self.set(x, y0, Cell { ch: *ch, style: border });
+            }
+        }
+
+        // Item rows.
+        for (i, row) in m.rows.iter().enumerate() {
+            let y = y0 + 1 + i as u16;
+            if y >= y1 || y >= rows {
+                break;
+            }
+            if row.separator {
+                for x in (x0 + 1)..x1 {
+                    if x >= cols {
+                        break;
+                    }
+                    self.set(x, y, Cell { ch: '─', style: border });
+                }
+                continue;
+            }
+            let style = if row.selected { mode_style } else { Style::default() };
+            for x in (x0 + 1)..x1 {
+                if x >= cols {
+                    break;
+                }
+                self.set(x, y, Cell { ch: ' ', style });
+            }
+            for (dx, ch) in row.text.chars().enumerate() {
+                let x = x0 + 2 + dx as u16;
+                if x >= x1 || x >= cols {
+                    break;
+                }
+                self.set(x, y, Cell { ch, style });
             }
         }
     }
@@ -1948,21 +2117,23 @@ mod tests {
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
-                    TreeRowCell { text: "row0".to_string(), depth: 0, marker: None, selected: false },
-                    TreeRowCell { text: "row1".to_string(), depth: 0, marker: None, selected: true },
+                    TreeRowCell { text: "row0".to_string(), depth: 0, marker: None, selected: false, tagged: false },
+                    TreeRowCell { text: "row1".to_string(), depth: 0, marker: None, selected: true, tagged: false },
                 ],
                 top: 0,
                 preview: None,
+                list_height: 3,
             })),
         };
         let mut r = Renderer::new(10, 3);
         r.compose_back(&scene);
 
         // Row 0 (unselected): depth 0 / no marker -> a 2-space blank marker
-        // slot precedes the text (no indent at depth 0), then the text,
-        // default style.
-        let row0: String = (0..6).map(|x| r.back_cell(x, 0).ch).collect();
-        assert_eq!(row0, "  row0");
+        // slot, then (SP7 Task 15) a 2-space blank tag slot (untagged),
+        // precede the text (no indent at depth 0), then the text, default
+        // style.
+        let row0: String = (0..8).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, "    row0");
         assert_eq!(r.back_cell(0, 0).style, Style::default());
         // Padding past the text is still cleared to the row's style (full
         // client-area clear, not just the text run).
@@ -1970,14 +2141,124 @@ mod tests {
         assert_eq!(r.back_cell(9, 0).style, Style::default());
 
         // Row 1 (selected): text painted in mode_style, including padding.
-        let row1: String = (0..6).map(|x| r.back_cell(x, 1).ch).collect();
-        assert_eq!(row1, "  row1");
+        let row1: String = (0..8).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, "    row1");
         assert_eq!(r.back_cell(0, 1).style, mode_style);
         assert_eq!(r.back_cell(9, 1).ch, ' ');
         assert_eq!(r.back_cell(9, 1).style, mode_style);
 
         // The overlay fully replaced the pane's own content underneath.
         assert_eq!(r.back_cell(0, 2).ch, ' ');
+    }
+
+    // ---- display-menu (SP7 Task 16, closes #51) -----------------------------
+
+    /// `Overlay::Menu` paints a single-line box at `rect` ONLY -- everything
+    /// outside it stays untouched pane content, unlike `Overlay::List`'s
+    /// full-panel clear. Exact-cell-by-cell: border glyphs, a centered
+    /// title overwriting the top border, an unselected item row (default
+    /// style), a separator row (a `─`-filled interior, no text), and a
+    /// selected item row (`mode_style` fill, text drawn on top).
+    #[test]
+    fn overlay_menu_draws_box_title_rows_and_selection() {
+        let content = "P".repeat(11 * 7);
+        let g = grid_with(11, 7, content.as_bytes());
+        let mode_style = Style { fg: Color::Idx(0), bg: Color::Idx(3), ..Style::default() };
+        let border = Style { fg: Color::Idx(240), ..Style::default() };
+        let scene = Scene {
+            size: (11, 7),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 11, h: 7 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: true, // suppress border compositing so only pane + overlay are in play
+            status: None,
+            message: None,
+            border,
+            border_active: green_active(),
+            mode_style,
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
+            overlay: Some(Overlay::Menu(MenuOverlay {
+                rect: Rect { x: 1, y: 1, w: 9, h: 5 },
+                title: "Menu".to_string(),
+                rows: vec![
+                    MenuRowCell { text: "Kill".to_string(), separator: false, selected: false },
+                    MenuRowCell { text: String::new(), separator: true, selected: false },
+                    MenuRowCell { text: "Zoom".to_string(), separator: false, selected: true },
+                ],
+            })),
+        };
+        let mut r = Renderer::new(11, 7);
+        r.compose_back(&scene);
+
+        let row = |y: u16| -> String { (0..11).map(|x| r.back_cell(x, y).ch).collect() };
+
+        // Outside the box entirely: untouched pane content.
+        assert_eq!(row(0), "PPPPPPPPPPP");
+        assert_eq!(row(6), "PPPPPPPPPPP");
+        assert_eq!(r.back_cell(0, 3).ch, 'P');
+        assert_eq!(r.back_cell(10, 3).ch, 'P');
+
+        // Top border row, title "Menu" centered (interior width 7, pad 1)
+        // over the border, flanked by box corners.
+        assert_eq!(row(1), "P┌─Menu──┐P");
+        for x in 1..=9 {
+            assert_eq!(r.back_cell(x, 1).style, border, "top border cell x={x} style");
+        }
+
+        // Row 2: unselected item "Kill" -- default style throughout the
+        // interior (borders in `border` style).
+        assert_eq!(row(2), "P│ Kill  │P");
+        assert_eq!(r.back_cell(1, 2).style, border);
+        assert_eq!(r.back_cell(9, 2).style, border);
+        assert_eq!(r.back_cell(3, 2).style, Style::default());
+        assert_eq!(r.back_cell(2, 2).style, Style::default());
+
+        // Row 3: separator -- interior filled with a horizontal rule, no
+        // text, sides still the box's vertical border.
+        assert_eq!(row(3), "P│───────│P");
+
+        // Row 4: selected item "Zoom" -- interior (including the padding
+        // cells around the text) painted in `mode_style`, borders unchanged.
+        assert_eq!(row(4), "P│ Zoom  │P");
+        assert_eq!(r.back_cell(1, 4).style, border);
+        assert_eq!(r.back_cell(2, 4).style, mode_style);
+        assert_eq!(r.back_cell(3, 4).style, mode_style);
+        assert_eq!(r.back_cell(8, 4).style, mode_style);
+        assert_eq!(r.back_cell(9, 4).style, border);
+
+        // Bottom border row.
+        assert_eq!(row(5), "P└───────┘P");
+    }
+
+    /// A menu whose box wouldn't fit inside the client at all is the
+    /// caller's (`server::dispatch::open_menu`) responsibility to refuse
+    /// opening -- this is a defensive render-layer check that a
+    /// degenerate `rect` (width/height under 2) simply paints nothing
+    /// rather than panicking on the underflowing `x1 - 1`/`y1 - 1` math.
+    #[test]
+    fn overlay_menu_degenerate_rect_paints_nothing() {
+        let g = grid_with(4, 2, b"PPPPPPPP");
+        let scene = Scene {
+            size: (4, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 4, h: 2 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: true,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
+            overlay: Some(Overlay::Menu(MenuOverlay {
+                rect: Rect { x: 0, y: 0, w: 1, h: 1 },
+                title: "X".to_string(),
+                rows: vec![MenuRowCell { text: "A".to_string(), separator: false, selected: false }],
+            })),
+        };
+        let mut r = Renderer::new(4, 2);
+        r.compose_back(&scene); // must not panic
+        assert_eq!(r.back_cell(0, 0).ch, 'P');
     }
 
     // ---- tree rows + preview box (SP6 wave 2, Task 8) ----------------------
@@ -2005,21 +2286,67 @@ mod tests {
             overlay: Some(Overlay::List(ListOverlay {
                 title: String::new(),
                 rows: vec![
-                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false },
-                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false },
+                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false, tagged: false },
+                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false, tagged: false },
                 ],
                 top: 0,
                 preview: None,
+                list_height: 2,
             })),
         };
         let mut r = Renderer::new(20, 2);
         r.compose_back(&scene);
 
-        let expect0 = "- main: 2 windows";
+        // "- " marker slot + "  " blank (untagged) tag slot (SP7 Task 15) + text.
+        let expect0 = "-   main: 2 windows";
         let row0: String = (0..expect0.chars().count() as u16).map(|x| r.back_cell(x, 0).ch).collect();
         assert_eq!(row0, expect0);
 
-        let expect1 = "    0: bash*"; // depth 1 -> "  " indent + "  " blank marker slot
+        // depth 1 -> "  " indent + "  " blank marker slot + "  " blank tag slot.
+        let expect1 = "      0: bash*";
+        let row1: String = (0..expect1.chars().count() as u16).map(|x| r.back_cell(x, 1).ch).collect();
+        assert_eq!(row1, expect1);
+    }
+
+    /// SP7 Task 15 (closes #50's remainder): a TAGGED row's tag slot renders
+    /// `"* "` instead of two blanks, right after the marker slot and before
+    /// the row's own text (`## 3.3`: "then `*` if the item is tagged").
+    #[test]
+    fn overlay_tagged_row_shows_asterisk_marker() {
+        let g = grid_with(20, 2, b"");
+        let scene = Scene {
+            size: (20, 2),
+            panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 20, h: 2 }, grid: &g, focused: true, dead: false, copy: None }],
+            zoomed: false,
+            status: None,
+            message: None,
+            border: Style::default(),
+            border_active: green_active(),
+            mode_style: Style::default(),
+            display_panes_colour: Style::default(),
+            display_panes_active_colour: Style::default(),
+            border_indicators: BorderIndicators::Colour,
+            overlay: Some(Overlay::List(ListOverlay {
+                title: String::new(),
+                rows: vec![
+                    TreeRowCell { text: "main: 2 windows".to_string(), depth: 0, marker: Some('-'), selected: false, tagged: true },
+                    TreeRowCell { text: "0: bash*".to_string(), depth: 1, marker: None, selected: false, tagged: false },
+                ],
+                top: 0,
+                preview: None,
+                list_height: 2,
+            })),
+        };
+        let mut r = Renderer::new(20, 2);
+        r.compose_back(&scene);
+
+        // "- " marker slot + "* " tag slot (TAGGED) + text.
+        let expect0 = "- * main: 2 windows";
+        let row0: String = (0..expect0.chars().count() as u16).map(|x| r.back_cell(x, 0).ch).collect();
+        assert_eq!(row0, expect0);
+
+        // Untagged sibling still gets the blank tag slot.
+        let expect1 = "      0: bash*";
         let row1: String = (0..expect1.chars().count() as u16).map(|x| r.back_cell(x, 1).ch).collect();
         assert_eq!(row1, expect1);
     }
@@ -2071,6 +2398,7 @@ mod tests {
                 rows: Vec::new(),
                 top: 0,
                 preview: Some(PreviewBlock { rect: Rect { x: 0, y: 1, w: 10, h: 5 }, title: "foo".to_string(), content_w: 3, content_h: 2, content }),
+                list_height: 1,
             })),
         };
         let mut r = Renderer::new(10, 6);
@@ -2151,6 +2479,7 @@ mod tests {
                 rows: Vec::new(),
                 top: 0,
                 preview: Some(PreviewBlock { rect: Rect { x: 0, y: 0, w: 7, h: 4 }, title: String::new(), content_w: 5, content_h: 4, content }),
+                list_height: 0,
             })),
         };
         let mut r = Renderer::new(7, 4);
@@ -2199,7 +2528,8 @@ mod tests {
     #[test]
     fn overlay_list_shrinks_to_two_thirds_when_preview_on() {
         let g = grid_with(20, 15, b"");
-        let rows: Vec<TreeRowCell> = (0..15).map(|i| TreeRowCell { text: format!("r{i}"), depth: 0, marker: None, selected: false }).collect();
+        let rows: Vec<TreeRowCell> =
+            (0..15).map(|i| TreeRowCell { text: format!("r{i}"), depth: 0, marker: None, selected: false, tagged: false }).collect();
         let scene = Scene {
             size: (20, 15),
             panes: vec![PaneView { id: 1, rect: Rect { x: 0, y: 0, w: 20, h: 15 }, grid: &g, focused: true, dead: false, copy: None }],
@@ -2223,16 +2553,17 @@ mod tests {
                     content_h: 0,
                     content: Vec::new(),
                 }),
+                list_height: 10,
             })),
         };
         let mut r = Renderer::new(20, 15);
         r.compose_back(&scene);
 
-        // Rows 0-9: list text "  r0".."  r9" (marker slot + text) -- all 10
-        // rows the 2/3 split allots.
+        // Rows 0-9: list text "    r0".."    r9" (marker slot + tag slot +
+        // text, SP7 Task 15) -- all 10 rows the 2/3 split allots.
         for i in 0..10u16 {
-            let line: String = (0..4).map(|x| r.back_cell(x, i).ch).collect();
-            assert_eq!(line, format!("  r{i}"), "row {i} should still be a list row");
+            let line: String = (0..6).map(|x| r.back_cell(x, i).ch).collect();
+            assert_eq!(line, format!("    r{i}"), "row {i} should still be a list row");
         }
         // Row 10 is the preview box's top border (its '┌' corner at column
         // 0, fix round 1), NOT list row 10's text -- proof the list was

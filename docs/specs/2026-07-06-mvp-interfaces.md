@@ -289,6 +289,57 @@ impl Layout {
 }
 ```
 
+**Amendment (SP7 Task 11 — cross-window/session structure ops, closes
+follow-up #41):** two additions, both still pure (no I/O). `PaneId`s are
+global (unique across every window's tree), so a cross-window/session
+swap-pane is a coordinated relabel of one leaf in EACH of two independent
+`Layout` trees, not a remove/insert:
+
+```rust
+impl Layout {
+    /// Swap the CONTENTS of `self`'s leaf holding `mine` with `other`'s leaf
+    /// holding `theirs` -- the cross-tree generalization of `swap_panes`.
+    /// No tree-shape change on EITHER side (geometry/split ratios
+    /// untouched); only the two leaf VALUES trade places. Each side's
+    /// `focused` is fixed up if it named the pane that just departed
+    /// (redirected to the pane that just arrived in that exact tree
+    /// position, matching tmux's "the destination window's active pane
+    /// becomes the pane that moved into it"); a side whose focused pane
+    /// was NOT part of the swap is untouched. Clears zoom on both sides.
+    /// `false` (no-op, neither tree touched) if `mine == theirs`, or either
+    /// id isn't a leaf of its own layout.
+    pub fn swap_leaf_across(&mut self, mine: PaneId, other: &mut Layout, theirs: PaneId) -> bool;
+
+    /// Insert `new_pane` into this tree by splitting the leaf holding `at`
+    /// (`new_pane` takes the second child, mirroring `split`'s own rule).
+    /// The "insert a pane into ANOTHER tree at a given position" primitive
+    /// follow-up #41's fix sketch called for -- pairs with the EXISTING
+    /// `Layout::remove` (unchanged; it already "removes a leaf, collapsing
+    /// its parent split", exactly what that sketch's other half describes,
+    /// so no new removal method was needed). No `area`/minimum check (the
+    /// caller's job, same as `apply_preset`'s own placement). Does not
+    /// touch focus/zoom. Not called by any `dispatch.rs` command as of SP7
+    /// Task 11 (`break-pane` always creates a brand-new single-pane
+    /// window, per real tmux; cross-window `swap-pane` uses
+    /// `swap_leaf_across` instead) -- reserved for a future
+    /// `join-pane`/`move-pane`. `false` (no-op) if `at` isn't a leaf here,
+    /// or `new_pane` is already present.
+    pub fn insert_leaf_at(&mut self, at: PaneId, new_pane: PaneId, dir: SplitDir, ratio: f32) -> bool;
+}
+```
+
+Tests: `layout.rs`'s `remove_leaf_collapses_parent_split` (the EXISTING
+`remove` exercised under this name -- see above), `cross_tree_swap_
+preserves_geometry_slots`, `cross_tree_swap_relabels_only_the_two_affected_
+leaves`, `cross_tree_swap_fixes_up_focus_on_the_departed_side` /
+`cross_tree_swap_fixes_up_focus_when_the_focused_pane_departs`,
+`cross_tree_swap_clears_zoom_on_both_sides`, `cross_tree_swap_same_id_is_
+noop`, `cross_tree_swap_unknown_leaf_is_noop`, `insert_leaf_at_splits_
+target_leaf`, `insert_leaf_at_unknown_target_is_noop`, `insert_leaf_at_
+duplicate_pane_is_noop`. Consumer: `server/dispatch.rs`'s `exec_swap_pane`
+(cross-window branch) -- see the `## server-dispatch` section of
+[`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md).
+
 ## `grid` — per-pane terminal emulator
 
 **SUPERSEDED (sub-project 4, Task 1):** `Grid::new` gained a third
@@ -301,6 +352,53 @@ of being ignored. See the `## grid-v2` section of
 for the full current contract. This section is kept for historical reference
 only; everything below it describing scrollback-free/OSC-ignored MVP behavior
 is superseded.
+
+**FURTHER SUPERSEDED (SP7, Task 2 — closes follow-up #47):** `grid-v2`'s
+"no reflow" divergence note (below, and mirrored in
+`2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section) is itself
+now superseded. `Grid::resize`'s signature is UNCHANGED, but on the primary
+(non-alt) screen a column-WIDTH change now reflows scrollback + the live
+screen to the new width like tmux ≥1.9 (`grid_reflow`): wrapped-chain rows
+(tracked by a new private per-row `wrapped` flag — tmux's
+`GRID_LINE_WRAPPED` — set only when the cursor auto-wraps off the right
+margin, cleared on an explicit linefeed) are concatenated into logical
+lines, then re-split at the new width (`ceil(len / new_cols)` rows per
+logical line, all but the last marked wrapped); a row-COUNT-only change (or
+any resize while showing the alternate screen — the alt screen still NEVER
+reflows, tmux clears/redraws it instead) keeps the original clip/pad
+behavior. Cursor mapping follows tmux's `grid_wrap_position`/
+`grid_unwrap_position`: preserved by offset within its own logical line,
+collapsing to "end of the line" if it sat past real content, and resetting
+to `(0, 0)` if its line was itself evicted by the resize. See
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section
+for the amended prose (amended in the same commit as this note, even though
+that file sits outside this task's normal edit scope, because it — not this
+superseded section — is the contract's actual current authority on `resize`
+and `view_cell`'s history semantics, and leaving its "no reflow" claim
+uncorrected there would misdocument the real behavior).
+
+**FURTHER SUPERSEDED (SP7, Task 3 — closes follow-up #52):** `Grid` gains
+`title_from_esc_k`, `mouse_proto`, `mouse_encoding`, and `take_bell` — pane
+mouse-mode/encoding tracking (DECSET/DECRST 9/1000/1002/1003/1005/1006), BEL
+surfacing, and `ESC k` title capture (pre-scanned/stripped out of the raw
+byte stream inside `feed`, before `vte::Parser::advance` sees it, since `vte`
+has no string-capturing path for `ESC k`). See
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section
+(amended in the same commit) for the full signatures and tmux-verified
+semantics — again the contract's actual current authority, for the same
+reason as the Task 2 note above.
+
+**Caveat (SP7 review fix):** `history_total()`'s "difference between two
+readings = view rows shifted" invariant (see its own doc comment) holds only
+for mutations that do NOT change the grid's width — `reflow_to_width` does
+not bump `history_total` to match the (non-uniform) restructuring it
+performs, so a coordinate pinned across a width-changing resize (e.g. a
+copy-mode selection anchor) cannot be repaired by any single corrected shift
+count. The server layer treats a width-changing resize of a pane bound to an
+active copy-mode selection as invalidating that selection outright (clears
+it) rather than attempting to remap it — see `Server::apply_layout_for_session`
+in `src/server.rs`, which matches real tmux's `window_copy_size_changed`
+(unconditional selection clear on ANY resize of the pane, width or height).
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -453,6 +551,17 @@ pub struct StatusRow {
 /// `## overlays` section for the server-side building rules (`ClientMode::
 /// ChooseTree`/`DisplayPanes`, the hardcoded key tables, the `cmd`/
 /// `bindings`/`options` amendments).
+///
+/// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):**
+/// `render::CopyView` loses its `cursor: (u16, u16)` field — it was dead
+/// (`Renderer::compose_back` never read it; the real copy-mode cursor
+/// placement is computed independently by `server::render_one`'s own
+/// `(cursor, cursor_visible)` match, never routed through `CopyView`). The
+/// ONE construction site (`src/server.rs`'s `render_one`) drops the
+/// `cursor: (cs.cx, cs.cy)` field from its `CopyView { .. }` literal in the
+/// same commit. See the sibling `2026-07-07-parity-polish-interfaces.md`
+/// contract's `## render` amendment (under `## copy-mode`) for the full
+/// updated struct.
 ///
 /// **LOCKED-CONTRACT AMENDMENT (2026-07-10, sub-project 6 wave 2, Task 11 —
 /// half-border active indication + `pane-border-indicators`):** `Scene`
@@ -761,6 +870,37 @@ EOF when the child exits; a waiter thread per pane does
 `WaitForSingleObject(process_handle)` and sends `Event::Exited(pane_id)`. The
 app then marks the pane dead and drops the `Pty`, which closes the
 pseudoconsole and unblocks the reader thread.
+
+**LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #14, per-pane writer
+thread):** `Pty` gains one new method and one new public type:
+
+```rust
+pub struct PtyWriter { /* private: an independent duplicate of the input
+                          pipe's write handle */ }
+
+impl Pty {
+    /// Clone the input pipe's write handle for a dedicated per-pane writer
+    /// thread. Independent of `write_input`/the `Pty` itself: a stalled
+    /// child's blocked stdin only stalls whichever thread owns the returned
+    /// `PtyWriter`, never a caller of `write_input` (in practice, the
+    /// server's single main-loop thread) — see the `## server` section of
+    /// `2026-07-07-server-client-interfaces.md` for the consuming
+    /// architecture. The clone keeps working even after the original `Pty`
+    /// drops.
+    pub fn try_clone_writer(&self) -> std::io::Result<PtyWriter>;
+}
+impl PtyWriter {
+    /// write_all + flush, matching `Pty::write_input`'s own shape.
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+```
+
+No existing signature changed; `write_input` is unchanged and still used
+directly by `src/server/dispatch.rs`'s lower-volume write sites (send-keys,
+paste-buffer, mouse-drag forwarding) — only the server's own hot
+Forward/Key-forwarding path (`src/server.rs`) was moved onto a
+`PtyWriter`-backed channel+thread. See the `## server` section referenced
+above for the full architecture note.
 
 ## `host` — host terminal control
 

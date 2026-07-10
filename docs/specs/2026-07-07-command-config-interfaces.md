@@ -375,7 +375,13 @@ pub enum ParsedCmd {
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
     SetOption { global: bool, window: bool, append: bool, unset: bool, name: String, value: Option<String> },
-    ShowOptions { global: bool, name: Option<String> },
+    // AMENDED (SP7 Task 6, closes follow-up #68): grew `window`/`quiet`/
+    // `value_only` (`-w`/`-q`/`-v`; `showw`/`show-window-options` are now
+    // accepted command spellings implying `window: true`, mirroring
+    // `setw`/`set-window-option`). Boolean flags BUNDLE for this command
+    // (`show -gqv @foo` == `show -g -q -v @foo`, tmux's real clump rule) --
+    // see the `## option-scopes` section.
+    ShowOptions { global: bool, window: bool, quiet: bool, value_only: bool, name: Option<String> },
     BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
     UnbindKey { all: bool, table: String, key: Option<String> },
     ListKeys,
@@ -503,7 +509,7 @@ requirement); the rest are new tmux-style lines authored for SP3.
 | `confirm-before` | `confirm` | `usage: confirm-before [-p prompt] command ...` |
 | `command-prompt` | — | `usage: command-prompt [-I initial]` |
 | `set-option` | `set` | `usage: set-option [-g] [-w] [-a] [-u] option [value]` |
-| `show-options` | `show` | `usage: show-options [-g] [option]` |
+| `show-options` | `show` (also accepted spellings: `show-window-options`, `showw` — imply `-w`, SP7 Task 6) | `usage: show-options [-g] [-w] [-q] [-v] [option]` (AMENDED SP7 Task 6) |
 | `bind-key` | `bind` | `usage: bind-key [-n] [-r] [-T table] key command ...` |
 | `unbind-key` | `unbind` | `usage: unbind-key [-a] [-n] [-T table] [key]` |
 | `list-keys` | `lsk` | `usage: list-keys` |
@@ -614,38 +620,33 @@ impl Options {
 }
 
 impl Default for Options { fn default() -> Options; } // == Options::new()
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SystemTimeParts {
-    pub year: i32,   // full year, e.g. 2026
-    pub month: u8,   // 1-12
-    pub day: u8,
-    pub weekday: u8, // 0 = Sunday, matches Win32 SYSTEMTIME.wDayOfWeek
-    pub hour: u8,
-    pub min: u8,
-    pub sec: u8,
-}
-
-pub struct FormatCtx<'a> {
-    pub session: &'a str,
-    pub window_index: u32,
-    pub window_name: &'a str,
-    pub window_flags: &'a str,
-    pub pane_index: u32,
-    pub hostname: &'a str,
-    pub now: SystemTimeParts,
-}
-
-pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String;
 ```
+
+**SP7 Task 1 amendment:** `SystemTimeParts`/`FormatCtx`/`expand_format`
+moved OUT of this module into a new `crate::format` module (general tmux
+format-expansion engine — see the `## format` section, at the end of this
+file, for its full contract). `options::{SystemTimeParts, FormatCtx}` are
+now `pub use` re-exports of `crate::format`'s types (source-compat: every
+pre-existing `use crate::options::{FormatCtx, ...}` import site still
+resolves unchanged); `options::expand_format` is now a one-line delegate to
+`crate::format::expand`. The signature shown above for `expand_format`
+(`fn expand_format(fmt: &str, ctx: &FormatCtx) -> String`) is UNCHANGED —
+only ITS OWN body, and what grammar it evaluates, changed.
 
 Pure module: no I/O, `std` only. **Implementation module:** `src/options.rs`.
 Depends on `crate::keys` (`Key`/`parse_key`/`key_name`, the `prefix` option's
 type) and `crate::style` (`PartialStyle`/`parse_style`, every `*-style`
-option's type). SP3 scope: one global `Options` instance — `-g`/`-w` on
+option's type). ~~SP3 scope: one global `Options` instance — `-g`/`-w` on
 `set-option`/`show-options` (from `cmd::ParsedCmd::SetOption`/`ShowOptions`)
 both hit this same table; per-session/window overlays are SP4 (documented
-deviation, matches the design spec).
+deviation, matches the design spec).~~ **SUPERSEDED (SP7 Task 6, closes
+follow-up #26):** real per-session and per-window option overlays now exist
+— see the `## option-scopes` section at the end of this file for the new
+public surface (`options::Scope`, `options::scope()`, `options::Overlay`,
+the `_for`-suffixed scope-resolving getters, `show_effective`,
+`show_user_option_scoped`) and the exact resolution/narrowing rules. The
+global `Options` table and every zero-arg getter above are UNCHANGED and
+remain the fallback level every overlay inherits from.
 
 Unit-tested with exact expected values (mirrors `keys.rs`/`style.rs`'s
 style): `defaults_match_tmux`, `set_prefix_key`, `set_style_validates`,
@@ -704,19 +705,23 @@ template can only ever expand to a clean result.
 | `history-limit` | number (inert) | 2000 |
 | `escape-time` | number (inert) | 500 |
 | `automatic-rename` | on/off (inert) | on |
-| `allow-rename` | on/off (inert) | on |
+| `allow-rename` | on/off | off (**AMENDED, SP7 Task 3 — closes follow-up #52**: default corrected from an unverified `on` to tmux's real default, off since 2.6; now LIVE via `Options::allow_rename`, gating the direct `ESC k` rename path — when on, an ESC k title renames the window and clears the window's `auto_rename` flag; when off, ESC k titles are captured but cause no rename. OSC 0/2 stays unconditional. See `grid::Grid::title_from_esc_k` in `2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` amendment) |
 | `mode-keys` | choice (`emacs`/`vi`, inert) | emacs |
 | `default-terminal` | string (inert) | `screen` |
 | `exit-empty` | on/off (inert) | on |
 | `aggressive-resize` | on/off (inert) | off |
-| `pane-base-index` | number (inert) | 0 |
+| `pane-base-index` | number (LIVE since SP7 Task 6 — closes follow-up #32; window-scoped, see `## option-scopes`) | 0 |
 
 "Inert" options are typed, validated, stored, and shown, but have no getter
-beyond `show` — nothing reads them yet (SP4 functionality). Exception:
+beyond `show` — nothing reads them yet (SP4 functionality). ~~Exception:
 `pane-base-index` DOES have a typed getter (`Options::pane_base_index`), but
 the getter itself is unused — pane indexes in kill-pane prompts/targets are
 position-based from 0 regardless of this option (final review, 2026-07-07;
-tracked in `docs/follow-ups.md`'s SP3-deferred list).
+tracked in `docs/follow-ups.md`'s SP3-deferred list).~~ **SUPERSEDED (SP7
+Task 6, closes follow-up #32):** `pane-base-index` is LIVE — consulted at
+every user-visible pane-index site (display-panes digits, `#P` expansion,
+the kill-pane confirm prompt via `#P`, numeric `:.N` pane targets); see the
+`## option-scopes` section's "pane-base-index wiring" subsection.
 
 ### `set` semantics
 
@@ -773,53 +778,22 @@ tracked in `docs/follow-ups.md`'s SP3-deferred list).
   per option, sorted alphabetically by name, joined with `\n` (no trailing
   newline).
 
-### `expand_format` (format-string subset)
+### `expand_format` (format-string grammar)
 
-Evaluated left-to-right over the input string, `#` and `%` are the only
-two meta characters (everything else copies through verbatim):
-
-| sequence | expands to |
-|---|---|
-| `##` | literal `#` |
-| `#S` | `ctx.session` |
-| `#I` | `ctx.window_index` (decimal) |
-| `#W` | `ctx.window_name` |
-| `#F` | `ctx.window_flags` |
-| `#P` | `ctx.pane_index` (decimal) |
-| `#H` | `ctx.hostname` |
-| `#{session_name}` | `ctx.session` |
-| `#{window_index}` | `ctx.window_index` (decimal) |
-| `#{window_name}` | `ctx.window_name` |
-| `#{<anything else>}` | empty (documented SP3 simplification — no
-  conditionals/modifiers, full tmux format-expression engine is SP4) |
-| `#[...]` | passed through VERBATIM, brackets included, up to and including
-  the first `]` (SP6 Task 4 addition — `#[fg=white]`-style inline style
-  markers are NOT interpreted by `expand_format`; they're left in the output
-  for `status::styled_runs` to split into styled spans afterward. An
-  unterminated marker — no closing `]` — is copied to end-of-string rather
-  than dropped) |
-| `#<any other char>`, trailing lone `#` | empty (unrecognized short code
-  consumes the one following character; a `#` with nothing after it is
-  dropped; this does NOT apply to `#[`, handled above) |
-| `%%` | literal `%` |
-| `%H` `%M` `%S` `%d` `%m` | zero-padded 2-digit hour/min/sec/day/month
-  from `ctx.now` |
-| `%Y` | full 4-digit year (`ctx.now.year`, not zero-padded/truncated) |
-| `%y` | 2-digit year (`ctx.now.year.rem_euclid(100)`, zero-padded) |
-| `%b` | 3-letter English month abbreviation (`Jan`..`Dec`) |
-| `%a` | 3-letter English weekday abbreviation (`Sun`..`Sat`, `ctx.now.weekday % 7` indexes the table) |
-| `%p` | `AM` if `hour < 12` else `PM` |
-| `%I` | 12-hour zero-padded hour (`0` hour -> `12`, otherwise `hour % 12`) |
-| `%<any other char>` | literal passthrough, BOTH characters kept (`%x`
-  stays `%x` — not an error, not expanded) |
-| trailing lone `%` | literal `%` |
-
-`%H:%M %d-%b-%y` reproduces `src/server.rs`'s `local_clock()` string exactly
-for equivalent inputs (verified by `expand_strftime`), which is why it was
-chosen as `status-right`'s default value (see the design spec deviation
-note). Unknown `#{...}` forms and unrecognized `#<c>` codes are silent
-(empty), matching the design spec's "anything else renders empty"
-directive — `expand_format` never returns an `Err`.
+**SP7 Task 1 amendment:** the SP3-era fixed subset formerly documented in
+this subsection (`#S`/`#I`/`#W`/`#F`/`#P`/`#H`, three long-form `#{...}`
+aliases, no conditionals/modifiers) is SUPERSEDED — `expand_format` now
+delegates to the general format engine in the new `crate::format` module.
+See the `## format` section at the end of this file for the full current
+grammar (braced variables, `#{?cond,true,false}` conditionals, string
+comparisons, `&&`/`||`, length-limit modifiers, single-char aliases,
+`##`/`#,`/`#}` escapes, `#[...]` style-marker passthrough, `%`-strftime
+passthrough) and its documented non-supported remainder. Every behavior the
+table above used to document is still true (it was a strict subset of what
+`crate::format::expand` does now) — nothing in this subsection is
+contradicted, it is just no longer the complete picture, so the full
+grammar is documented once, at the `format` module's own contract section,
+rather than duplicated/kept in sync in two places.
 
 ## `input-v2` — table-driven key machine (Task 5, sub-project 3)
 
@@ -980,15 +954,29 @@ and Task 9's `lone_escape_flushes_after_escape_time`,
   arrows/F-keys/Escape/BTab/Home/End/PPage/NPage/IC/DC) is emitted as `Key {
   table: Root, .. }` instead, even though nothing preceded it — the server
   looks it up in the root table and forwards it raw itself if unbound.
-  **Consequence (documented, matches the design spec's `bind -n`
-  deviation):** `bind -n` on a bare unmodified printable char, Enter, Tab,
-  Space, or BSpace is accepted by `cmd::resolve`/`bindings::Bindings::bind`
-  but can **never fire** in SP3, because `KeyMachine` never emits a `Key`
-  event for such a key in the first place — only keys carrying a modifier,
-  or a named/special key outside this set, can be bound in the root table.
-  Revisit if SP4 needs full `bind -n` coverage (would require dropping the
-  coalescing optimization or making it conditional on whether the root
-  table currently has any such binding).
+  **Consequence, RESOLVED SP7 (follow-up #30):** `KeyMachine` itself still
+  never emits a `Key { table: Root, .. }` event for a bare unmodified
+  printable char/Enter/Tab/Space/BSpace — the coalescing described above is
+  unchanged, `input.rs` was not touched by this fix, and this remains the
+  only way such a key is emitted from `feed()`. What changed is on the
+  server side: `process_key_events`'s live-pane `Forward` arm
+  (`src/server.rs`) no longer writes a coalesced `Forward` blob straight to
+  the pane. It re-decodes the blob (mirroring the pre-existing
+  Copy-mode/choose-tree/display-panes arms just above it in the same match)
+  and looks up **every** decoded key against the CURRENT
+  `self.bindings.lookup(WhichTable::Root, ..)` before deciding what to do
+  with it: a bound key dispatches its command and is swallowed (never
+  reaches the pane), matching tmux's real `bind -n <printable>` semantics
+  exactly, including runtime `bind -n`/`unbind -n` taking effect
+  immediately (no snapshot). Consecutive UNBOUND keys are still batched into
+  a single `input_tx.send` (via the new private helper
+  `Server::forward_raw_to_focused_pane`) to preserve the original
+  coalescing/throughput for ordinary typing — only a bound key interrupts a
+  batch. No public signature changed (this helper is private); see
+  `tests/server_proto.rs::bind_dash_n_printable_shadows_typing` /
+  `bind_n_printable_shadows_typing_runtime` /
+  `unbind_n_restores_plain_forwarding` /
+  `long_unbound_typing_burst_forwards_intact`.
 - **Capture mode (`set_capture`):** while on, `feed()` bypasses ALL of the
   above — every byte, including the raw prefix byte and escape sequences,
   passes through verbatim as `Captured(bytes)`, coalesced per `feed()` call
@@ -1658,9 +1646,11 @@ name returns `None`, the SAME signal an unknown built-in name gives — so
 option: ...")` mapping needs no dispatch-side change to reproduce tmux's
 DEFAULT (non-`-q`) "unset user option errors" behavior. `show_user_option`
 is the separate, explicit `-q`-aware entry point requested by the task
-brief's delegated judgment call — it is not yet wired into `server::
+brief's delegated judgment call — ~~it is not yet wired into `server::
 dispatch` (CLI `-v`/`-q` flag parsing for `show-options` is future work);
-today it is directly unit-tested against `Options` only. `show_all` also
+today it is directly unit-tested against `Options` only.~~ **SUPERSEDED
+(SP7 Task 6, closes follow-up #68):** `-v`/`-q` are now parsed by `cmd.rs`
+and threaded through dispatch — see the `## option-scopes` section. `show_all` also
 lists any ACTUALLY-SET user options (never a "default" row, unlike every
 built-in option). Test: `user_option_set_show_roundtrip`.
 
@@ -1675,22 +1665,18 @@ colour token like `display-panes-colour`, default `blue`, parsed on read via
 `absolute-centre`, default `left`), `status-left-style` / `status-right-style`
 (Style, default the literal string `"default"` — see the `style` amendment
 above for why this now parses), `window-status-format` /
-`window-status-current-format` (Str, default `#I:#W#F` as of **SP6 Task 4**
-— originally stored verbatim as tmux's literal
-`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); Task 4
-changed the DEFAULT to `#I:#W#F` because the `expand_format` subset still
-does not evaluate a general `#{?cond,a,b}` conditional. The default is
-exposed as a new public const `options::DEFAULT_WINDOW_STATUS_FORMAT` (fix
-round 1): `status::status_spans` compares each tab's effective format
-against it and, on the default path ONLY, pads an EMPTY flags string to a
-single space before expansion — reproducing the tmux conditional's `, }`
-else-branch, so the DEFAULT rendering is byte-identical to real tmux for
-both flagged and flagless windows and tab widths are stable across focus
-changes. What REMAINS of the deviation: a CUSTOM format containing
-`#{?...}` still expands its conditional to empty (docs/follow-ups.md #70;
-the general format engine is deferred to the TPM plan,
-`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`)). All defaults
-verified against `commands-config-options-formats.md`'s options appendix.
+`window-status-current-format` (Str; **historical note, SUPERSEDED by SP7
+Task 1** — originally stored verbatim as tmux's literal
+`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); SP6 Task 4
+temporarily changed the DEFAULT to the conditional-free `#I:#W#F` plus a
+`status::status_spans`-side padding shim, because the `expand_format`
+subset at the time didn't evaluate a general `#{?cond,a,b}` conditional at
+all. SP7 Task 1's general format engine (`crate::format`, see the `##
+format` section) closed that gap: the default is back to tmux's literal
+string (`options::DEFAULT_WINDOW_STATUS_FORMAT`), the SP6 Task 4 shim is
+deleted, and CUSTOM formats containing `#{?...}` now evaluate correctly too
+— this closes docs/follow-ups.md #70). All defaults verified against
+`commands-config-options-formats.md`'s options appendix.
 `visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
 `window-status-bell-style` remain INERT (no alerts/bell/clock-mode subsystem
 exists — same bucket as `mouse`/`history-limit` before their own Tasks
@@ -1957,3 +1943,898 @@ Tests: `two_pane_vertical_divider_half_styled`,
 `three_pane_left_tall_right_split_general_rule_unchanged` (`render`);
 `pane_active_border_style_runtime` (`tests/server_proto.rs`, amended --
 see the Task 11 report for the sanctioned inversion).
+
+## `format` — general tmux format-expansion engine (SP7 Task 1, closes follow-ups #27/#70)
+
+**New module**, `src/format.rs`, replacing the fixed `#`/`%` subset that
+used to live inline in `src/options.rs`. Pure: no I/O, `std` only, no
+dependency on any other winmux module in non-test code (the `#[cfg(test)]`
+module reads `crate::options::DEFAULT_WINDOW_STATUS_FORMAT` as a fixture
+constant for one acceptance test).
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemTimeParts {
+    pub year: i32,   // full year, e.g. 2026
+    pub month: u8,   // 1-12
+    pub day: u8,
+    pub weekday: u8, // 0 = Sunday, matches Win32 SYSTEMTIME.wDayOfWeek
+    pub hour: u8,
+    pub min: u8,
+    pub sec: u8,
+}
+
+pub struct FormatCtx<'a> {
+    pub session: &'a str,
+    pub window_index: u32,
+    pub window_name: &'a str,
+    pub window_flags: &'a str,
+    pub pane_index: u32,
+    pub hostname: &'a str,
+    pub now: SystemTimeParts,
+    pub pane_title: &'a str,
+}
+
+pub fn expand(fmt: &str, ctx: &FormatCtx) -> String;
+```
+
+`FormatCtx`'s field set is UNCHANGED from the pre-SP7
+`options::FormatCtx` it replaces (see "Explicit scope decision" below for
+why no `client_*` fields were added in this task).
+
+**Delegation (`options.rs`):** `options::FormatCtx`/`options::
+SystemTimeParts` are now `pub use crate::format::{FormatCtx,
+SystemTimeParts};` re-exports (source-compat choice, not a per-caller
+import-path migration — see the decision note below); `options::
+expand_format(fmt, ctx)` is a one-line delegate to `format::expand(fmt,
+ctx)`. Every existing caller (`status::status_spans`, `server::render_one`,
+`server::dispatch`'s two `FormatCtx` construction sites) needed NO code
+changes beyond what this task's own file-scope restrictions required
+(`status.rs`'s per-window loop, `server.rs`'s `render_one`) — imports of
+`crate::options::{expand_format, FormatCtx}` etc. still resolve.
+
+**`options::DEFAULT_WINDOW_STATUS_FORMAT`** changes value: from the SP6
+Task 4 deviation `"#I:#W#F"` to tmux's REAL literal default,
+`"#I:#W#{?window_flags,#{window_flags}, }"` — now expressible because
+`format::expand` evaluates the `#{?cond,a,b}` conditional directly. The
+SP6 Task 4 padding shim that used to live in `status::status_spans`'s
+per-window loop (padding an empty flags string to one space, ONLY on the
+default-format path, to reproduce the conditional's else-branch by hand)
+is DELETED — the real conditional now produces the identical output on
+its own for both flagged and flagless windows. All pre-existing
+`status.rs` tests pinning this behavior (`three_windows_order_and_
+separators`, `window_status_separator_respected`, `default_format_
+flagless_window_pads_one_space`, `custom_format_flagless_window_not_
+padded`) pass UNMODIFIED except doc-comment wording (no expected-value
+changes) — proof the new engine is byte-identical to the old shim's
+output for every case the shim covered.
+
+### Supported grammar (implements `docs/tmux-reference/commands-config-options-formats.md`'s `## 5. Formats` section, §5.1-§5.4)
+
+- `#S #W #I #P #F #H #T` single-char aliases (unchanged); `##`/`#,`/`#}`
+  literal escapes (`#,`/`#}` are NEW — `##` was the only escape in the old
+  subset).
+- `#[...]` inline style markers, passed through byte-for-byte (unchanged
+  behavior, needed by `status::styled_runs`).
+- `#{variable}` braced long-form variables: `session_name`, `window_index`,
+  `window_name`, `window_flags`, `pane_index`, `pane_title` (all pre-
+  existing), plus NEW `host` (alias for `hostname`) and `host_short`
+  (leading dot-component of `hostname`, derived, not a stored field).
+  Unknown plain names -> empty (§5.3).
+- `#{?cond,true,false}` conditionals (§5.2), including chained pairs
+  (`#{?c1,v1,c2,v2,fallback}`) and nested `#{...}`/`#,` inside any arm.
+  `cond` truthiness: direct variable-name lookup first; if that fails,
+  `cond` is format-expanded and, if unchanged, treated as false (exact
+  §5.2 two-step rule).
+- String comparisons `#{==:a,b}` `#{!=:a,b}` `#{<:a,b}` `#{>:a,b}`
+  `#{<=:a,b}` `#{>=:a,b}` -> `"1"`/`"0"`, both sides format-expanded before
+  comparing. **Scope note:** the task brief's own parenthetical examples
+  named only `==`/`!=`; the reference doc's §5.3 table documents all six
+  string comparisons together as one row/dispatch shape, so all six are
+  implemented here (deliberate doc-over-brief scope call, flagged per the
+  task's "ambiguous -> flag it, prefer the doc" instruction).
+- N-ary boolean `#{&&:a,b,...}` / `#{||:a,b,...}`, same truthiness rule as
+  a conditional's `cond` applied to each comma-separated operand.
+- Length-limit modifier `#{=N:x}` (keep the left `N` chars) / `#{=-N:x}`
+  (keep the right `N` chars) — no-op if `x` already fits. No marker-string
+  variant (`#{=/N/marker:x}`) — see non-supported remainder below. This is
+  what makes tmux's real `window-status-format` default (above) AND real
+  `status-right` default (`#{=21:pane_title}`) expand correctly for the
+  first time; `options::default_value("status-right")` is UNCHANGED in
+  this task (still the SP2-compatible `"%H:%M %d-%b-%y"`, no `#{=21:
+  pane_title}` prefix) — the engine now COULD expand tmux's real string
+  correctly, but changing that option's stored default was out of this
+  task's scope (not named in the brief; `window-status-format`'s default
+  change was explicitly named).
+- `%`-strftime passthrough: unchanged from the pre-SP7 subset (`%H %M %S
+  %d %m %Y %y %b %a %p %I %%`, any other `%<c>` literal passthrough).
+- Recursion/loop limit: expansion is capped at `FORMAT_LOOP_LIMIT` (100, the
+  real tmux `format.c` constant, §5.1) levels of recursion; past that depth
+  `expand` stops and returns the remaining input literally instead of
+  recursing further, so a pathologically/adversarially nested format string
+  degrades safely (partially-unexpanded output) rather than overflowing the
+  stack.
+
+### Documented non-supported remainder (§5.3's modifier table)
+
+Not implemented (no winmux caller needs these yet): `b:`/`d:`
+(basename/dirname), `t:` (Unix-time formatting), `p`/`pN:` (pad), `l:`
+(literal/no-expand), `E:`/`T:` (re-expand / re-expand+strftime), `S:`/
+`W:`/`P:`/`L:` (loop over sessions/windows/panes/clients), `O:`/`V:` (loop
+over options/environment), `N:` (window/session existence check), `C:`
+(pane-content search), `s/pat/repl/` (regex substitution), `m/pat/str/`
+(glob/regex match), `q:` (shell-quote), `n:`/`w:` (length/display-width),
+`a:` (ASCII-code-to-char), `c:` (colour-name-to-hex/SGR), `I/...` (client
+termcap/feature/environ lookup), `R:` (string repeat), `e|op|f|prec:`
+(arithmetic), `!:`/`!!:` (boolean NOT), `#(command)` shell jobs (no
+shell-job subsystem exists in winmux at all — a much larger pre-existing
+gap than this task's scope), and the `#{=/N/marker:x}` marker-string
+variant of the length-limit modifier (implemented: bare `#{=N:x}`/
+`#{=-N:x}` only).
+
+`client_*`, loop-injected (`loop_index` etc.), copy-mode/mouse/buffer
+format variables are unsupported because `FormatCtx` carries none of that
+data. **Explicit scope decision:** `server::dispatch.rs` (the `server`
+module's dispatch submodule, a SEPARATE FILE from `server.rs`) constructs
+`FormatCtx` at two call sites (`expand_with_ctx`, `mouse_status_click`);
+this task's file-scope restriction covers `server.rs`'s call sites only,
+not `server/dispatch.rs`'s — so `FormatCtx` gained NO new fields in this
+task (adding e.g. `client_width`/`client_height`, which WOULD have been
+cheap to source from `ClientState::cols`/`rows` at `server.rs`'s own
+`render_one` call site, would still have left `server/dispatch.rs`'s two
+struct-literal construction sites needing an update to keep compiling,
+outside this track's allowed-file list). A future task revisiting
+`server/dispatch.rs` can add `client_*` fields without touching this
+module's locked `expand`/`FormatCtx` signature (only adding fields, source
+-compatible for every caller that uses struct-literal construction with
+all fields named, which is every current caller).
+
+### Tests
+
+`src/format.rs`: `braced_variable_expands`, `undefined_variable_expands_
+empty`, `conditional_true_and_false_parts`, `conditional_nested_expansion`,
+`comparison_eq_ne`, `length_limit_truncates_right_and_left`, `hash_escape_
+literal`, `real_default_window_status_format_matches_sp6_shim_output` (both
+flagged and flagless cases), `strftime_passthrough_preserved` (9 tests).
+`src/options.rs`'s pre-existing format tests (`expand_basic`, `expand_hash_
+escape`, `expand_unknown_long_empty`, `expand_pane_title`, `expand_inline_
+style_marker_passthrough`, `expand_strftime`) are unmodified regression
+coverage through the new `expand_format` delegate; `sp6_config_compat_
+options_defaults_and_roundtrip`'s two `window_status_format`/
+`window_status_current_format` assertions were updated to compare against
+`DEFAULT_WINDOW_STATUS_FORMAT` (the real tmux string) instead of the old
+literal `"#I:#W#F"` pin. `src/status.rs`'s full pre-existing suite (14
+tests) passes UNMODIFIED (values, not just names) except doc-comment
+wording, per the brief's "regression suite must stay green unmodified
+except the shim-removal tests" — the "shim-removal" change here was
+deleting dead code, not any test's expected value.
+
+## `option-scopes` — per-session/per-window option overlays + `show -gqv` + pane-base-index wiring (SP7 Task 6, closes follow-ups #26, #32, #68)
+
+Parity authority: `docs/tmux-reference/commands-config-options-formats.md`
+§3 (storage model, `set-option`/`show-options` semantics, scope resolution)
+and §10 Appendix B (the per-option scope classification).
+
+```rust
+// src/options.rs (additions)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope { Server, Session, Window }
+
+/// The SPECS table's scope classification for a named option (None for a
+/// name not in SPECS). Per tmux, THE TABLE DECIDES THE SCOPE — set/show's
+/// -g/-w flags only pick global-vs-local WITHIN it (doc §3.3.4).
+pub fn scope(name: &str) -> Option<Scope>;
+
+/// Sparse per-entity overlay: holds only the options one session or window
+/// has locally overridden (absence = inherit the global table). Embedded
+/// as model::Session::session_options / model::Window::window_options.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay { /* opaque: values + user_options maps */ }
+
+impl Overlay {
+    pub fn new() -> Overlay; // empty: reads fall through to the global table
+    /// Same validation/parsing as Options::set (shared private core), but
+    /// writes THIS overlay. Differences (tmux's local-tree rules, §3.3.4
+    /// step 6): `-u` REMOVES the local entry (inheritance resumes) instead
+    /// of resetting to the compiled default; `-a` append and the value-less
+    /// Flag toggle operate on the overlay's OWN current entry ("", false if
+    /// never set locally), NOT the inherited effective value (documented
+    /// simplification).
+    pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String>;
+}
+
+impl Options {
+    /// Effective (local-if-set, else global) value for show: a documented
+    /// simplification of tmux's local-only-unless -A show rule.
+    pub fn show_effective(&self, name: &str, session: Option<&Overlay>, window: Option<&Overlay>) -> Option<String>;
+    /// show_user_option + an overlay checked before the global @-store.
+    pub fn show_user_option_scoped(&self, name: &str, quiet: bool, overlay: Option<&Overlay>) -> Result<Option<String>, String>;
+
+    // ONE scope-resolving read pattern: a `_for` sibling per getter a real
+    // dispatch/status/render call site reads, taking the acting entity's
+    // Overlay. Resolution = overlay-local, else the global table (exactly
+    // two levels; an empty overlay is byte-identical to the zero-arg
+    // getter — the default-behavior regression bar). Session-scoped:
+    pub fn prefix_for(&self, session: &Overlay) -> crate::keys::Key;
+    pub fn status_left_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn status_right_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn status_left_length_for(&self, session: &Overlay) -> u16;
+    pub fn status_right_length_for(&self, session: &Overlay) -> u16;
+    pub fn status_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_left_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_right_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn status_justify_for(&self, session: &Overlay) -> &'static str;
+    pub fn message_style_for<'a>(&'a self, session: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn default_command_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn renumber_windows_for(&self, session: &Overlay) -> bool;
+    pub fn mouse_for(&self, session: &Overlay) -> bool;
+    pub fn history_limit_for(&self, session: &Overlay) -> u32;
+    pub fn word_separators_for<'a>(&'a self, session: &'a Overlay) -> &'a str;
+    pub fn display_panes_time_for(&self, session: &Overlay) -> std::time::Duration;
+    pub fn display_panes_colour_for(&self, session: &Overlay) -> crate::grid::Color;
+    pub fn display_panes_active_colour_for(&self, session: &Overlay) -> crate::grid::Color;
+    // Window-scoped:
+    pub fn pane_base_index_for(&self, window: &Overlay) -> u32;
+    pub fn window_status_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_current_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn window_status_current_format_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn window_status_separator_for<'a>(&'a self, window: &'a Overlay) -> &'a str;
+    pub fn pane_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn pane_active_border_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn pane_border_indicators_for(&self, window: &Overlay) -> crate::render::BorderIndicators;
+    pub fn mode_keys_vi_for(&self, window: &Overlay) -> bool;
+    pub fn mode_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16;
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16;
+    pub fn automatic_rename_for(&self, window: &Overlay) -> bool;
+    pub fn allow_rename_for(&self, window: &Overlay) -> bool;
+    pub fn clock_mode_colour_for(&self, window: &Overlay) -> crate::grid::Color;
+    pub fn clock_mode_style_12_for(&self, window: &Overlay) -> bool;
+    pub fn monitor_activity_for(&self, window: &Overlay) -> bool;
+}
+```
+
+Note: `main_pane_width_for`/`main_pane_height_for`'s `total: u16` parameter was
+added after this Task 6 section was first written, by SP7 Task 12 (closes
+#43/#46/#54, percentage-aware `main-pane-width`/`-height` sizing) — see
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `options` amendment for
+the authoritative signature and rationale. This section is kept in sync with
+that amendment (final-gate regression review MUST-FIX #3).
+
+### Scope classification (per Appendix B of the reference doc)
+
+- **Server** (always the one global table; `-g`/`-w` harmless/ignored, per
+  tmux): `escape-time`, `default-terminal`, `exit-empty`, `buffer-limit`.
+  These getters have NO `_for` sibling on purpose.
+- **Window** (global-window level via `-g`; per-window via `setw`/`set -w`):
+  `pane-base-index`, `window-status-style`/`-current-style`/`-format`/
+  `-current-format`/`-separator`/`-bell-style`, `pane-border-style`/
+  `pane-active-border-style`/`pane-border-indicators`, `mode-keys`,
+  `mode-style`, `main-pane-width`/`-height`, `aggressive-resize`,
+  `automatic-rename`, `allow-rename`, `monitor-activity`,
+  `clock-mode-colour`/`clock-mode-style`. tmux's finer Win-vs-W/P split
+  collapses onto Window (winmux has no per-PANE option tree — documented
+  narrowing).
+- **Session** (global level via `-g`; per-session via unprefixed `set`):
+  everything else in SPECS. `@`-user options are any-scope, selected purely
+  by flags (`-w` window, default session, `-g` global), per doc §3.3.4.
+
+### Dispatch semantics (`exec_set_option`/`exec_show_options`, private)
+
+- The acting context is the dispatching CLIENT's current session (and its
+  current window for window-scoped names). **Documented narrowing:** no
+  `-t` targeting for set/show (tmux allows targeting any entity); and a
+  HEADLESS call (CLI frame or config loading — no acting client) with no
+  `-g` falls back to the GLOBAL table for named options, preserving every
+  pre-Task-6 CLI/config behavior byte-for-byte.
+- For NAMED options the table decides scope; `-w` only matters for
+  `@`-options (tmux rule). `-g` always addresses the global level.
+- `show` with a name prints the EFFECTIVE value (local else inherited) for
+  the acting entity unless `-g`; `-v` prints the value only (no `name `
+  prefix); `-q` makes an unset `@`-option silently succeed (empty output,
+  exit 0) instead of `invalid option: @name` — `show -gqv "@foo"` is the
+  TPM rung-1 primitive, end-to-end (closes follow-up #68). `show` with NO
+  name still prints the global `show_all()` listing regardless of flags
+  (documented simplification).
+- **Live-side-effect narrowing (documented):** the runtime side effects of
+  `set` (prefix rebinding + KeyMachine re-seeding, repeat-time/escape-time
+  propagation, the mouse-mode SGR broadcast, status on/position relayout)
+  fire only on a GLOBAL write, as before. A per-session `set prefix` (no
+  `-g`) stores and shows correctly but does not live-rebind that session's
+  already-attached clients' key machines (attach-time seeding IS
+  per-session); `status`/`status-position` reads that decide pane-area
+  GEOMETRY stay global-only (see the render_one comment in `src/server.rs`)
+  — both tracked in `docs/follow-ups.md` (SP7 Task 6 follow-ups).
+
+### pane-base-index wiring (closes follow-up #32)
+
+`Options::pane_base_index`(+`_for`) is now consulted at every user-visible
+pane-index site: `display-panes` digits (`server::pane_digit_entries`, which
+gained an `options: &Options` parameter — digit = base + position, keypress
+mapping and drawn overlay share it), `#P`/`pane_index` format expansion
+(`render_one`'s status FormatCtx, `dispatch::format_values` — which also
+covers the `kill-pane #P? (y/n)` confirm prompt — and the status-row
+click hit-test's FormatCtx), and numeric `:.N` pane targets
+(`dispatch::resolve_pane` gained a `base: u32` parameter; `.N` names the
+user-visible index, so under `pane-base-index 1` `.1` is the first pane and
+`.0` is `pane not found`). `+`/`-` relative specs are unaffected.
+
+### Tests
+
+`src/options.rs`: `window_option_overrides_global_for_that_window_only`,
+`session_option_overrides_global`, `unset_window_option_falls_back_to_global`,
+`setw_g_sets_global_window_level`, `overlay_unknown_option_and_control_chars_
+rejected_same_as_global`, `overlay_user_option_roundtrip`,
+`show_effective_resolves_overlay_then_global`. `src/cmd.rs`:
+`show_options_parses_v_and_q_flags`. `tests/server_proto.rs`:
+`setw_status_style_on_one_window_only_styles_that_window`,
+`set_without_g_targets_current_session`,
+`show_gqv_user_option_prints_value_only`,
+`pane_base_index_shifts_display_panes_digits_and_hash_p`.
+
+## `mouse-bindings` — table-driven mouse bindings (SP7 Task 8, closes follow-ups #57, #67(a)/(b))
+
+Parity authority: `docs/tmux-reference/mouse.md` §2.6-2.7 (key-synthesis
+grammar), §7.1/§7.3 (default binding tables). Before this task every mouse
+behavior (click-focus, border-drag-resize, wheel-scroll, drag-select,
+double/triple-click, status-row click/wheel) was a hardcoded `match` in
+`server::dispatch::dispatch_mouse` and its helpers — this task moves the
+ACTION side of that dispatch onto `Bindings` (keyed by a new mouse pseudo-key
+`KeyCode` variant), while classification (hit-testing pane/border/status,
+drag-state-machine transitions, click-run/double-triple-click counting) stays
+exactly as it was — per the task brief, "hit-testing, drag lifecycle,
+double/triple-click detection STAYS in dispatch; only the action lookup moves
+to the table."
+
+```rust
+// src/keys.rs (additions)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KeyCode {
+    // ...existing variants unchanged...
+    /// `0` is the button placeholder for `WheelUp`/`WheelDown` (real tmux
+    /// has no "WheelUp1"); real button values are 1-3.
+    MouseKey(MouseKeyKind, u8, MouseKeyLoc),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyKind { Down, Up, Drag, DragEnd, DoubleClick, TripleClick, WheelUp, WheelDown }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyLoc { Pane, Border, Status, StatusLeft, StatusRight, StatusDefault }
+```
+
+`parse_key`/`key_name` grew mouse-pseudo-key support (`<Type><Button><Location>`,
+case-insensitive on parse, canonical tmux capitalization on format — e.g.
+`MouseDown1Pane`, `WheelUpStatus`, `C-MouseDown1Status`); `encode_key` returns
+`None` for a mouse key (not sendable via `send-keys`, same "unsupported
+combination" contract as ctrl-on-a-named-key). Only the subset winmux's SGR
+button-event (`?1002h`) classification can actually produce is modeled —
+`MouseMove`/`SecondClick`/buttons 6-11/scrollbar-and-`ControlN` locations
+(all real tmux `key-string.c` entries) are out of scope, matching the parity
+doc's own "for classic winmux purposes" location list.
+
+```rust
+// src/bindings.rs (additions)
+// Sentinel default-action generators for mouse defaults that need
+// dispatch-local context (which pane, drag anchor, click-run state) no
+// static RawCmd can carry -- server::dispatch compares a resolved binding's
+// cmds against these EXACT values to pick "run the built-in Rust default"
+// vs "the user rebound this, run it generically". Four of the ten (wheel
+// in-pane x2 tables, drag-end-in-copy, wheel-in-status x2) are instead
+// expressed as REAL, generically-executable command lists and need no such
+// comparison -- dispatch always runs whatever's bound for those.
+pub(crate) fn mouse_default_drag_border() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_drag_pane_enter_copy() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_drag_pane_select() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_double_click_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_triple_click_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_status_select_window() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_wheel_up_pane_root() -> Vec<RawCmd>;   // [copy-mode -e, copy-scroll-up x5]
+pub(crate) fn mouse_default_wheel_up_pane_copy() -> Vec<RawCmd>;   // [copy-scroll-up x5]
+pub(crate) fn mouse_default_wheel_down_pane_copy() -> Vec<RawCmd>; // [copy-scroll-down x5]
+pub(crate) fn mouse_default_drag_end_pane_copy() -> Vec<RawCmd>;   // [copy-selection-and-cancel]
+pub(crate) fn mouse_default_wheel_up_status() -> Vec<RawCmd>;      // [previous-window]
+pub(crate) fn mouse_default_wheel_down_status() -> Vec<RawCmd>;    // [next-window]
+```
+
+`Bindings::default()`'s root table is no longer empty: it gains
+`MouseDrag1Border`, `MouseDrag1Pane`, `WheelUpPane`, `MouseDown1Status`,
+`WheelUpStatus`, `WheelDownStatus` (6 entries — `WheelDownPane` is
+deliberately absent at root, matching real tmux). The copy-mode and
+copy-mode-vi tables each gain 6 mouse entries, byte-identical between the two
+(matching real tmux): `MouseDrag1Pane`, `MouseDragEnd1Pane`, `WheelUpPane`,
+`WheelDownPane`, `DoubleClick1Pane`, `TripleClick1Pane`.
+
+```rust
+// src/server/dispatch.rs (additions, all private)
+impl Server {
+    fn mouse_table_for_pane(&self, client: &ClientState, pane: PaneId) -> WhichTable;
+    fn mouse_lookup(&self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Option<Vec<RawCmd>>;
+    fn dispatch_mouse_cmds(&mut self, cmds: &[RawCmd], client: &mut ClientState, session_name: &str) -> ExecOutcome;
+    fn dispatch_mouse_bound(&mut self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+}
+```
+
+`mouse_lookup` always synthesizes the UNMODIFIED key form (`ctrl`/`meta`/
+`shift: false`) regardless of the physical event's own modifier bits — the
+pre-existing hardcoded dispatch never branched on them either, so this
+reproduces that exactly; modifier-specific tmux defaults (`C-MouseDown1Pane`,
+`M-MouseDrag1Pane`) are a documented gap, not modeled. `mouse_up`'s signature
+grew a `session_name: &str` parameter (needed to reach `dispatch_mouse_bound`
+for `MouseDragEnd1Pane`); its only caller (`dispatch_mouse`) already had one.
+
+### The default/custom/unbound three-way (per gated key)
+
+For keys whose default needs bespoke Rust state (drag anchor, word/line
+select, status-column resolution): `None` (unbound) is a no-op (or, for
+`MouseDrag1Pane`'s two PendingSelect arms and `DoubleClick`/`TripleClick`,
+falls back to plain-click semantics — no default in real tmux either);
+`Some(cmds) if cmds == default` runs the SAME Rust logic this task found
+hardcoded, now gated; `Some(cmds)` (a user override) runs generically via
+`dispatch_mouse_cmds`. For keys whose default is fully expressible as real
+commands (`WheelUp`/`DownPane` in both tables, `MouseDragEnd1Pane` in the
+copy tables, `WheelUp`/`DownStatus`): `dispatch_mouse_bound` always runs
+whatever's bound, default or custom, uniformly — no comparison needed.
+
+### Scoping decisions (NOT gated — documented, low-risk simplifications)
+
+- **Click-to-focus** (`MouseDown{1,2,3}Pane`'s `select-pane` and
+  `MouseDown{1,2,3}Border`'s arm-time bookkeeping) stays unconditional —
+  the highest-traffic code path in every mouse test, with no required test
+  exercising an unbound click; gating it was judged the highest-risk,
+  lowest-value change in scope.
+- **Border-drag resize** (`MouseDrag1Border`) is gated only at ARM time
+  (the `Down` event on a border checks existence — bound vs unbound — once);
+  `mouse_drag`/`mouse_drag_border`'s per-motion resize logic is untouched
+  and unconditional once armed, matching real tmux's own "bindings are
+  bypassed for every motion event during a callback drag"
+  (`docs/tmux-reference/mouse.md` §2.5) more closely than re-checking every
+  event would. A user's custom `MouseDrag1Border` command is therefore
+  NOT run (only bound-vs-unbound is honored) — border resize inherently
+  needs continuous per-motion state a static command list can't replace.
+- **Selection continuation** (`MouseDrag::Selecting{..}`'s per-motion
+  cursor/autoscroll updates once a drag is underway) stays unconditional,
+  for the same "bypass during an active drag" reason and to minimize
+  regression surface — only the FIRST motion event of a drag (the
+  `PendingSelect` -> `Selecting` transition) is gated.
+- **`DoubleClick`/`TripleClick1Pane`, `MouseDown1Status`** — gated with the
+  full default/custom/unbound three-way (bespoke Rust default: word/line
+  select, or the click-column-to-window resolution respectively).
+
+### Follow-up #67(a): `unbind-key -q`
+
+`cmd::ParsedCmd::UnbindKey` gained a `quiet: bool` field (`-q`, parsed
+alongside the pre-existing `-a`/`-n`/`-T`); `dispatch::exec_unbind_key` now
+errors `unknown key: <tok>` for a token `keys::parse_key` rejects, unless
+`quiet` is set (matching real tmux, `docs/tmux-reference/
+commands-config-options-formats.md:442`) — the prior unconditional silent-
+no-op behavior (a workaround for mouse pseudo-keys not parsing at all) is
+gone now that those keys parse for real.
+
+### Tests
+
+`src/keys.rs`: `parse_mouse_key_names_roundtrip`, `invalid_mouse_name_rejected`.
+`src/bindings.rs`: `default_root_table_contains_mouse_bindings`,
+`copy_mode_mouse_defaults_exact` (plus updated length assertions in
+`defaults_cover_current_behavior`/`copy_mode_emacs_defaults_exact`/
+`copy_mode_vi_defaults_exact`). `src/cmd.rs`: `unbind_key_quiet_flag_parses`.
+`src/server/dispatch.rs`: `bind_unbind_copy_mode_tables` updated (a real
+mouse pseudo-key now actually removes a real default binding; the "bad key"
+example moved to a genuinely unparseable token). `tests/server_proto.rs`:
+`unbind_copy_mode_vi_dragend_disables_release_copy` (the user's real conf
+idiom, full SGR drag+release, no buffer created, copy mode stays active),
+`bind_wheelup_pane_custom_command_overrides_default`,
+`unbind_unknown_key_errors_without_q`, `unbind_unknown_key_quiet_with_q` —
+plus every pre-existing `mouse_*`/`click_*`/`drag_*`/`release_*` test in that
+file is the regression net (all pass unchanged).
+### Task 17 (SP7): alerts subsystem, closes follow-up #74
+
+Wires up the five SP6-Task-2 accepted-but-inert options
+(`visual-activity`/`visual-bell`/`visual-silence`/`bell-action`/
+`monitor-activity`) and adds the tmux options they're verified (against
+`docs/tmux-reference/status-line-and-messages.md` §4.4/§9 and, where that
+doc is thin on defaults, tmux's own `options-table.c`) to be paired with:
+
+```rust
+impl Options {
+    pub fn activity_action(&self) -> &'static str;      // default "other"
+    pub fn silence_action(&self) -> &'static str;        // default "other"
+    pub fn monitor_bell(&self) -> bool;                   // default true (ON)
+    pub fn monitor_silence(&self) -> std::time::Duration; // seconds, default 0 = off
+    pub fn window_status_activity_style(&self) -> &crate::style::PartialStyle; // default "reverse"
+
+    pub fn visual_activity_for(&self, session: &Overlay) -> &'static str;
+    pub fn visual_bell_for(&self, session: &Overlay) -> &'static str;
+    pub fn visual_silence_for(&self, session: &Overlay) -> &'static str;
+    pub fn bell_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn activity_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn silence_action_for(&self, session: &Overlay) -> &'static str;
+    pub fn monitor_bell_for(&self, window: &Overlay) -> bool;
+    pub fn monitor_silence_for(&self, window: &Overlay) -> std::time::Duration;
+    pub fn window_status_bell_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+    pub fn window_status_activity_style_for<'a>(&'a self, window: &'a Overlay) -> &'a crate::style::PartialStyle;
+}
+```
+
+New SPECS entries and their [`Scope`] classification (per Appendix B, same
+rule as the existing table above): `activity-action`/`silence-action`
+(Session — same choice set as `bell-action`, `any|none|current|other`);
+`monitor-bell` (Window, flag, default ON — note this is the OPPOSITE
+default of `monitor-activity`, which stays OFF); `monitor-silence` (Window,
+number, seconds, default `0` = off); `window-status-activity-style`
+(Window, style, default `reverse`, same as the pre-existing
+`window-status-bell-style`).
+
+**`model::Window` new fields** (this task; `## model` amendment lives in
+`docs/specs/2026-07-07-server-client-interfaces.md`): `alert_bell`/
+`alert_activity`/`alert_silence: bool` (tmux's `WINLINK_BELL`/`_ACTIVITY`/
+`_SILENCE`, collapsed onto the window since a winmux window belongs to
+exactly one session) and `last_output: std::time::Instant` (tmux's
+`activity_time`, the silence-monitor clock). New methods:
+`clear_alerts(&mut self)` (tmux's clear-on-visit), `mark_bell(&mut self,
+is_current: bool)` (unconditional — bell is "allowed even if there is an
+existing bell"), `mark_activity(&mut self, is_current: bool) -> bool` /
+`mark_silence(&mut self, is_current: bool) -> bool` (edge-triggered: `false`
+means "already flagged since the last visit, do nothing more"). `Session`
+gains `pub(crate) fn clear_alerts_for(&mut self, id: WindowId)`, called from
+every method that reassigns `self.current` (in `model.rs` AND every real
+current-changing dispatch-level call site in `server/dispatch.rs` that
+mutates `session.current` directly rather than through one of `model.rs`'s
+own methods — `exec_select_window`, `find-window`, the status-row window
+click, choose-tree's Enter commit, `break-pane -d`). `Registry` gains `pub
+fn sessions_mut(&mut self) -> &mut [Session]` (the Tick-driven silence
+check's one-pass walk).
+
+**`status::WindowEntry` new fields** (`## status` amendment, same doc):
+`activity`/`bell`/`silence: bool`, feeding `status::flags`'s (private)
+`#`/`!`/`~` chars — tmux's fixed `window_printable_flags` order: `#`
+(activity), `!` (bell), `~` (silence), then the pre-existing `*`/`-` (current/
+last), then `Z` (zoomed). `window_flags` (the general format engine's
+`FormatCtx` field, `src/format.rs`) is UNCHANGED — it is fed a
+caller-computed string, and the caller (`status::flags`, used by both
+`server::render_one`'s live status-bar entries AND `server/dispatch.rs`'s
+status-row click hit-test entries — both MUST match, since the flag chars
+affect a tab's rendered width) is what changed, not the format engine
+itself.
+
+**Detection/reaction** (`server.rs`, private — no new public surface beyond
+the `model`/`status`/`options` additions above): `Server::note_bell`/
+`note_activity` (called from the `Output` event handler — `note_bell` only
+when `Grid::take_bell()` reported a BEL that chunk; `note_activity`
+unconditionally, mirroring tmux's `window_update_activity`), `Server::
+check_silence` (called every `Tick`, mirroring tmux's per-window silence
+timer via the server's existing 50ms tick rather than a real libevent
+timer), `Server::react_alert` (the shared bell/activity/silence
+notify/visual reaction: BEL passthrough and/or a status-line message,
+`docs/tmux-reference/status-line-and-messages.md` §4.4's `alerts_set_
+message`), `Server::alert_action_applies` (the `any`/`none`/`current`/
+`other` scoping, `alerts_action_applies`). The `!`/`#`/`~` FLAG itself is
+gated only by `monitor-bell`/`monitor-activity`/`monitor-silence`; the
+notify/visual REACTION is gated by that AND `bell-action`/`activity-action`/
+`silence-action` — a window can show `!` with zero user-visible reaction
+(`bell-action none`), matching tmux's own `alerts_check_bell` (the flag-set
+condition never consults `bell-action`).
+
+### Tests (Task 17)
+
+`src/model.rs`: none added beyond the existing `Window`/`Session` test
+module (covered transitively by `src/status.rs`'s and `tests/server_proto.
+rs`'s tests below). `src/options.rs`: covered by `specs_and_defaults_stay_
+in_sync`/`show_all_sorted` (both generic over `SPECS`, no per-option test
+needed for typed round-trip). `src/status.rs`: `flags_bell_activity_silence_
+order`. `tests/server_proto.rs`: `bel_in_unfocused_window_sets_bang_flag_
+and_bell_style`, `activity_flag_hash_when_monitor_activity_on`, `flags_
+clear_on_selecting_window`, `bell_action_none_suppresses`, `visual_bell_on_
+shows_message_instead_of_passthrough`, `monitor_silence_flags_after_
+interval`.
+## Cross-window/session structure ops (SP7 Task 11, closes follow-ups #41, #42, #44, #45)
+
+`swap-pane`, `break-pane`, and `move-window` all gain real cross-window/
+cross-session behavior, replacing three SP4/Task-7-era honest-scope
+narrowings. Full spec: `docs/tmux-reference/panes-and-layout.md` §5.1
+(swap-pane) and `docs/tmux-reference/windows-and-sessions.md` (break-pane,
+move-window/link-window). The `layout` primitives these build on
+(`Layout::swap_leaf_across`, `Layout::insert_leaf_at`) are documented in
+the `## layout` amendment of
+[`2026-07-06-mvp-interfaces.md`](2026-07-06-mvp-interfaces.md); the `model`
+primitives (`Registry::move_window_to_session`, `Registry::insert_new_
+window`, and the new private `Session::insert_window`/`take_window`/
+`build_window`) are documented in the `## model` amendment of
+[`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md).
+
+### `cmd` (`src/cmd.rs`) — `BreakPane`'s shape changes
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]`. `src`/`dst`
+    /// are NEW fields (previously `BreakPane { detached: bool, name:
+    /// Option<String> }` only).
+    BreakPane { detached: bool, name: Option<String>, src: Option<String>, dst: Option<String> },
+}
+```
+
+- `usage("break-pane")`: `"usage: break-pane [-d] [-n name] [-s src] [-t dst]"`.
+- `resolve`: `scan_flags` with `bools: ["-d"]`, `values: ["-n", "-s", "-t"]`,
+  no positionals. `-s`/`-t` are both plain optional string flags (same
+  shape `swap-pane`'s own `-s`/`-t` already use) — `resolve` does no
+  further parsing of their contents; `server::dispatch::exec_break_pane`
+  interprets `-s` via `resolve_pane_target` (a pane selector) and `-t` via
+  its own `[session:]index` window-destination grammar (NOT a pane
+  selector — real tmux's own `break-pane` args string, `"abdPF:n:s:t:..."`,
+  gives `-s`/`-t` genuinely different target KINDS: `-s` is
+  `CMD_FIND_PANE`, `-t` is `CMD_FIND_WINDOW_INDEX`). Test:
+  `break_pane_flags` (existing cases, all four fields now asserted),
+  `break_pane_src_dst_flags` (new).
+- `SwapPane`/`MoveWindow` (`swap-pane`, `move-window`) themselves gain NO
+  new `ParsedCmd` fields — `swap-pane -s`/`-t`/`-U`/`-D` already carried
+  everything the new cross-window/direction-relative-to-`-s` dispatch logic
+  needs, and `move-window`'s existing `target: String` already accepts an
+  arbitrary `[session:]index` string (`exec_move_window` previously threw
+  the session part away; it doesn't anymore).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+**`exec_swap_pane`** (signature unchanged): the `-U`/`-D` branch's PIVOT
+pane is now `src.as_deref().or(dst.as_deref())` (closes follow-up #42) —
+previously a co-supplied `-s` was rejected outright
+(`cmd::usage("swap-pane")`). The explicit `-s`/`-t` branch no longer
+requires `w1 == w2` (closes follow-up #41): when the two resolved panes
+land in the SAME window, the swap is unchanged (`Layout::swap_panes`);
+when they land in DIFFERENT windows (same session or not), two new private
+helpers —
+
+```rust
+fn take_window_layout(&mut self, session_name: &str, wid: WindowId) -> Option<Layout>;
+fn put_window_layout(&mut self, session_name: &str, wid: WindowId, layout: Layout);
+```
+
+— pull each side's `Layout` out by VALUE (sidestepping the borrow checker,
+which can't hand out two live `&mut` into possibly the SAME session's
+`Vec<Window>`), call `Layout::swap_leaf_across` on the two owned values,
+and write both back. `apply_layout_for_session` is called for each DISTINCT
+session touched. The old "swap-pane: can only swap panes within the same
+window" error string is gone — it was the entire behavior this follow-up
+existed to replace.
+
+**`exec_break_pane`** (signature changed): gains `src: Option<String>, dst:
+Option<String>` parameters, inserted between `name` and `cs`:
+
+```rust
+fn exec_break_pane(&mut self, detached: bool, name: Option<String>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String>;
+```
+
+`src` resolves the SOURCE pane via the normal `resolve_pane_target`
+fallback chain (default: the resolved current pane, unchanged from
+pre-Task-11 — closes follow-up #44). `dst` is parsed as
+`split_session_prefix` + an optional trailing index (empty or absent index
+-> the destination session's lowest free slot, mirroring `move-window`'s
+own "explicit or lowest_unused_index" rule); no `session:` prefix keeps the
+new window in `src`'s own session (the pre-Task-11 default, now reached via
+`Registry::insert_new_window` instead of `Session::new_window`, since the
+destination session may no longer be the one hosting the ACTING client).
+Current/last bookkeeping (`!detached` -> destination's `current` becomes
+the new window, `last` becomes whatever WAS current there) is now owned
+directly by this handler instead of relying on `Session::new_window`'s
+own forced current-switch + an after-the-fact "restore to `wid`" undo (that
+undo silently assumed `wid == session.current`, an assumption `-s`
+targeting a NON-current window would have broken).
+
+**`exec_move_window`** (signature unchanged): branches on whether the
+`-t` target's `session:` prefix (if any) resolves to a DIFFERENT session
+than the acting session. Same session (or no prefix): pre-Task-11 code
+path, byte-identical (`Session::move_window`, index REQUIRED). Different
+session (closes follow-up #45): the index becomes OPTIONAL (absent ->
+lowest free slot), and the move is delegated to
+`Registry::move_window_to_session` — the same destination-occupant-pane
+pre-snapshot-then-clean-up-after pattern the same-session path already
+uses is repeated for the cross-session case. `renumber-windows` (if
+enabled) still only renumbers the SOURCE session (real tmux: `move-window`
+renumbers src only, never dst).
+
+### Tests
+
+`src/cmd.rs`: `break_pane_src_dst_flags`. `tests/server_proto.rs`:
+`swap_pane_between_windows_swaps_content` (replaces the now-obsolete
+`swap_pane_cross_window_errors`, same setup, opposite assertion),
+`swap_pane_dash_s_with_direction_resolves_relative_to_s`,
+`break_pane_dash_s_moves_named_pane`,
+`move_window_to_other_session_appears_there_and_leaves_source`.
+
+### Documented narrowings
+
+- **Cross-session `move-window`/`break-pane -t` refuse to empty a
+  session.** Real tmux destroys a source session left with zero windows
+  (`server_unlink_window` -> `session_detach`); winmux's
+  `Registry::move_window_to_session` instead errors `"can't move the only
+  window out of its session"` — deliberately avoiding this task also having
+  to solve session-teardown client-eviction semantics (which attached
+  client(s), if any, get reassigned/detached) for a case with no bearing on
+  the required behavior. See `docs/follow-ups.md` #45 and
+  `move_window_to_session`'s own doc comment in `src/model.rs`.
+- **`swap-pane -s` + `-t` + a direction (`-U`/`-D`) all three together**:
+  `-s` always wins the pivot role; a co-supplied `-t` plays no distinct
+  third role. Real tmux's exact three-flag interaction is not itself pinned
+  down by the parity doc (`docs/tmux-reference/panes-and-layout.md` §5.1's
+  own hedging language); this is a defensible, narrower reading, not a
+  verified-against-tmux-source ruling. See follow-up #42.
+- **`Layout::insert_leaf_at`** is a genuinely new, exhaustively unit-tested
+  primitive with NO current `dispatch.rs` caller (see its doc comment and
+  the `## layout` amendment above) — reserved for a future
+  `join-pane`/`move-pane` implementation.
+
+## `display-menu` — display-menu command + right-click default menus (SP7 Task 16, closes #51)
+
+Parity authority: the tmux reference docs do NOT fully cover menus
+(`docs/tmux-reference/mouse.md` §7.1 documents only the default menus'
+CONTENTS, abridged, and `commands-config-options-formats.md` Appendix A has
+only the raw `display-menu` flags template) — the PRIMARY spec source is
+tmux's own C source, cloned to a scratch checkout (master, commit
+`db115c6`/`ec31f45`): `menu.c` (the overlay's key/mouse state machine,
+`menu_add_item`'s separator de-dup + layout rules, `menu_key_cb`'s
+navigation/selection semantics) and `cmd-display-menu.c`
+(`cmd_display_menu_args_parse`'s NAME/KEY/COMMAND triple grammar,
+`cmd_display_menu_exec`'s flag handling). Every citation below is to those
+two files.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    DisplayMenu {
+        target: Option<String>,
+        x: MenuPos,
+        y: MenuPos,
+        title: Option<String>,
+        stay_open: bool,
+        items: Vec<MenuEntry>,
+    },
+    /// `switch-client -t target-session` — a THIRD, separate form from the
+    /// pre-existing `SwitchClient { next: bool }` (`-p`/`-n`); combining
+    /// `-t` with either is a usage error. Added because the default SESSION
+    /// menu's "Switch To <name>" items need it and nothing else in the
+    /// table could express a direct-by-name session switch.
+    SwitchClientTo { target: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPos { Literal(i32), Centre, Mouse }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuEntry {
+    Separator,
+    Item { name: String, key: Option<String>, command: String },
+}
+```
+
+- `canonical()`: `"display-menu" | "menu" => "display-menu"`.
+- `usage("display-menu")`: `"usage: display-menu [-O] [-T title] [-t target] [-x pos] [-y pos] name [key command] ..."`.
+- `resolve`: a manual flag loop (not `scan_flags` — the positional item list
+  can legitimately start with a token that looks like a flag), then a
+  triple-parsing loop reproducing `cmd_display_menu_args_parse`'s STRING/
+  STRING/COMMANDS_OR_STRING cycle: an empty-string token alone is a
+  separator (`menu.c:74`, `*name == '\0'`); otherwise the next TWO tokens
+  are consumed as `key`/`command` (`key`: empty string -> `None`, tmux's
+  `KEYC_NONE`). `command` is stored as RAW TEXT, never parsed by `resolve`
+  itself — it is only tokenized+resolved when the item is actually chosen
+  (`menu.c:509`'s `cmd_parse_and_append`), matching real tmux's late-
+  binding exactly (same precedent as `bind-key`'s own `tail: Vec<RawCmd>`,
+  except here even the FIRST parse is deferred, since a menu item's command
+  is one string, not pre-tokenized argv). `-t`/`-O`/`-M` are accepted and
+  stored/no-op (see the variant's own doc comment for why `target`/
+  `stay_open` have no live effect). `-x`/`-y` (`parse_menu_pos`): `C`
+  (centre) or `M` (mouse) or a bare integer; anything else is a parse
+  error. Tests: `display_menu_parses_name_key_command_triples`,
+  `display_menu_empty_name_is_separator`, `display_menu_empty_key_is_no_shortcut`,
+  `display_menu_flags_and_title`, `display_menu_requires_at_least_one_item_and_full_triples`.
+- `"switch-client"`'s resolve arm grew a `-t` value flag: given (and
+  `-p`/`-n` absent), returns `SwitchClientTo`; given together with `-p`/
+  `-n`, a usage error; absent, the pre-existing `-p`/`-n`-exactly-one-of
+  behavior is untouched. Test: `switch_client_to_named_session`.
+
+### `bindings` (`src/bindings.rs`)
+
+Three new root-table mouse-key sentinel defaults, following the Task 8
+sentinel pattern exactly (`mouse-menu-pane`/`mouse-menu-status`/`mouse-menu-
+status-left`, compared by VALUE in `server::dispatch` to distinguish
+"default" from "user override"):
+
+```rust
+pub(crate) fn mouse_default_menu_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_menu_status() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_menu_status_left() -> Vec<RawCmd>;
+```
+
+Registered in `root_mouse_defaults()` for `(Down, 3, Pane)` /
+`(Down, 3, Status)` / `(Down, 3, StatusLeft)` — `MouseDown3Pane`/
+`MouseDown3Status`/`MouseDown3StatusLeft`, `mouse.md` §7.1. The `M-`
+modifier variants and `-O`'s "stay open if the app owns the mouse" guard
+(tmux's `MouseDown3Pane`'s real `if -Ft=` wrapper) are NOT modeled — a
+documented narrowing, see the task report. Root table size grows from 6 to
+9 (`default_root_table_contains_mouse_bindings`, `defaults_cover_current_
+behavior` updated accordingly).
+
+### `server::dispatch` (`src/server/dispatch.rs`) and `server`/`render` overlay wiring
+
+See the sibling `docs/specs/2026-07-07-parity-polish-interfaces.md`
+amendment (`## display-menu`) for `ClientMode::Menu`/`MenuState`/`MenuRow`,
+`render::Overlay::Menu`/`MenuOverlay`/`MenuRowCell`, and every new
+`dispatch` function (`open_menu`, `open_pane_menu`/`open_window_menu`/
+`open_session_menu`, `dispatch_menu_key`/`dispatch_menu_mouse`,
+`status_hit_at`) — kept in that file since it's the one that already owns
+every other overlay's (`ChooseTree`/`DisplayPanes`/`Clock`) `server`+
+`render` contract.
+
+### Tests
+
+`src/cmd.rs`: see above. `src/bindings.rs`: `default_root_table_contains_
+mouse_bindings` (updated). `src/render.rs`:
+`overlay_menu_draws_box_title_rows_and_selection`,
+`overlay_menu_degenerate_rect_paints_nothing`. `tests/server_proto.rs`:
+`display_menu_opens_and_enter_runs_selected`,
+`right_click_on_pane_opens_default_menu`,
+`menu_click_outside_closes_without_action`, `menu_escape_closes`,
+`menu_shortcut_key_runs_item_immediately`,
+`right_click_on_window_tab_opens_menu_and_kills_that_window`,
+`right_click_on_status_left_opens_session_menu`,
+`mouse_down3_pane_user_override_runs_generically`.
+
+### Documented narrowings
+
+- **No format expansion inside item command text.** Real tmux's default
+  menus lean heavily on `#{...}`/`-t=` ("current target") format tokens
+  inside stored item commands, expanded at CHOICE time. winmux's `display-
+  menu` does none of that — every item command must name any target
+  explicitly. winmux's own default menus work around this by building
+  CONCRETE target strings (`-t :3`, `switch-client -t work`) directly in
+  Rust at menu-open time, using the live registry state already in hand —
+  see `open_pane_menu`/`open_window_menu`/`open_session_menu`'s doc
+  comments.
+- **No conditional/disabled items.** Real tmux draws a conditionally-
+  unavailable item disabled (a `-`-prefixed name, unselectable but still
+  visible, `menu.c`'s `*name == '-'` checks). winmux's default-menu
+  builders simply OMIT such an item instead — see `MenuEntry`'s doc
+  comment.
+- **No `#{S/t:...}` format-loop support.** The session menu's "Switch To
+  <name>" entries (tmux: ONE templated item that a format LOOP function
+  expands into several) are instead built by iterating live sessions
+  directly in Rust, capped at 5 like tmux's own template — see
+  `open_session_menu`'s doc comment.
+- **`MENU_STAYOPEN` (`-O`) is accepted but inert** — there are no disabled
+  items for it to matter for (see above), and separators are never
+  independently selectable.
+- **`-x`/`-y` only support `C`/`M`/a literal integer** — tmux's `R`/`P`/`W`/
+  `L` relative-position letters need a position-computing format engine
+  winmux doesn't have. winmux's own default menus use `M` (mouse position)
+  uniformly for all three (pane/window/session), a documented substitution
+  for tmux's own `-xW -yW` on the latter two — see `ParsedCmd::DisplayMenu`'s
+  doc comment.
+- **Winmux implements neither `respawn-pane`/`respawn-window` nor a
+  marked-pane concept** — the default pane/window menus omit tmux's
+  Respawn/Mark(-Unmark)/Swap-Marked items entirely.
+- **No floating panes** — the default pane menu omits tmux's Move/Move &
+  Resize/Tile/Float items entirely.
+- **No hyperlink tracking (`mouse_hyperlink`)** — the default pane menu
+  omits tmux's Type/Copy-hyperlink items entirely.
+- **`new-window` has no `-a` (insert-after) flag** — the default window
+  menu offers a single "New Window" item instead of tmux's separate "New
+  After"/"New At End".
+- **No `move-window -r` (renumber-all) equivalent** — the default window
+  and session menus omit tmux's "Renumber" item.
+- **The window menu's "Rename" item has a documented side effect**: it
+  first runs `select-window -t :<idx>` (switching the acting client's
+  CURRENT window to the one that was right-clicked) before the bare
+  `rename-window` that opens the interactive prompt — because that prompt
+  only ever operates on the CURRENT window, and there is no non-
+  interactive "set this OTHER window's name" one-shot command to use
+  instead. Real tmux's own Rename item has no such side effect.
+- **Menu clicks commit on PRESS, not RELEASE-with-no-button-held** (real
+  tmux's own rule, with hover-highlight tracked in between) — winmux has no
+  hover/click-run tracking machinery for a floating overlay. Drag/Up/Wheel
+  events over an open menu are all no-ops.
+- **`switch-client -t` targeting an unknown or already-current session is
+  a silent no-op**, not an error — matches the pre-existing `-p`/-n`'s own
+  "already there" convention rather than introducing a second error-
+  reporting shape for this one extra case.

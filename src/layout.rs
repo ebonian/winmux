@@ -24,6 +24,25 @@ enum Node {
     Split {
         dir: SplitDir,
         ratio: f32,
+        /// SP7 Task 12 (closes follow-up #43): when `Some(target)`, this
+        /// split's FIRST child wants an ABSOLUTE `target`-cell length along
+        /// `dir`'s axis, re-derived fresh (via [`clamp_main`]) against
+        /// whatever area is passed to [`split_rects`] -- unlike `ratio`,
+        /// which bakes in the area it was computed against, this survives a
+        /// later whole-window resize with a DIFFERENT area (real tmux
+        /// recomputes `main-pane-width`/`-height` the same way at layout
+        /// apply-time; this extends that to every subsequent render too,
+        /// which is winmux's deliberate parity IMPROVEMENT over one-shot
+        /// tmux presets -- see this field's setter, `build_preset_tree`'s
+        /// `MainHorizontal`/`MainVertical` arms, for the citation). `None`
+        /// for every other split (plain `split()`, the "others" stack inside
+        /// a main preset, every non-main preset) -- those keep the original
+        /// ratio-scales-with-area behavior. Manually resizing THIS split
+        /// (`resize_from`, e.g. Ctrl-arrow or a mouse border-drag) clears it
+        /// back to `None` on success -- see `Layout::clear_main_size`'s doc
+        /// comment -- so a deliberate manual override sticks instead of
+        /// snapping back to the configured absolute size on the next resize.
+        main_size: Option<u16>,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -47,13 +66,22 @@ fn child_first(l: u16, ratio: f32) -> u16 {
 }
 
 /// The two child rects of a split, EXCLUDING the single border row/column.
-/// Total: never panics; on areas too small to hold both children plus the
-/// border, the children degrade to zero-size rects (downstream minimum
-/// checks handle those).
-fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
+/// `main_size` (SP7 Task 12, follow-up #43): `Some(target)` overrides the
+/// ratio-based `child_first` computation with `clamp_main(target, L, min)`
+/// against THIS CALL's `area` -- the mechanism that makes a
+/// `main-horizontal`/`main-vertical` preset's configured absolute size
+/// survive a later resize (`ratio` is left in the node for display/
+/// backward-compat purposes but is not consulted when `main_size` is
+/// `Some`). Total: never panics; on areas too small to hold both children
+/// plus the border, the children degrade to zero-size rects (downstream
+/// minimum checks handle those).
+fn split_rects(dir: SplitDir, ratio: f32, main_size: Option<u16>, area: Rect) -> (Rect, Rect) {
     match dir {
         SplitDir::Horizontal => {
-            let c1 = child_first(area.w, ratio);
+            let c1 = match main_size {
+                Some(target) => clamp_main(target, area.w, MIN_PANE_W),
+                None => child_first(area.w, ratio),
+            };
             let c2 = area.w.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: c1, h: area.h },
@@ -61,7 +89,10 @@ fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
             )
         }
         SplitDir::Vertical => {
-            let c1 = child_first(area.h, ratio);
+            let c1 = match main_size {
+                Some(target) => clamp_main(target, area.h, MIN_PANE_H),
+                None => child_first(area.h, ratio),
+            };
             let c2 = area.h.saturating_sub(1).saturating_sub(c1);
             (
                 Rect { x: area.x, y: area.y, w: area.w, h: c1 },
@@ -74,8 +105,8 @@ fn split_rects(dir: SplitDir, ratio: f32, area: Rect) -> (Rect, Rect) {
 fn rects_of(node: &Node, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     match node {
         Node::Leaf(pid) => out.push((*pid, area)),
-        Node::Split { dir, ratio, first, second } => {
-            let (r1, r2) = split_rects(*dir, *ratio, area);
+        Node::Split { dir, ratio, main_size, first, second } => {
+            let (r1, r2) = split_rects(*dir, *ratio, *main_size, area);
             rects_of(first, r1, out);
             rects_of(second, r2, out);
         }
@@ -146,7 +177,7 @@ impl Layout {
             return Err(SplitRefused);
         }
 
-        let (r1, r2) = split_rects(dir, 0.5, fr);
+        let (r1, r2) = split_rects(dir, 0.5, None, fr);
         if r1.w < MIN_PANE_W
             || r1.h < MIN_PANE_H
             || r2.w < MIN_PANE_W
@@ -160,6 +191,7 @@ impl Layout {
         let mut replacement = Some(Node::Split {
             dir,
             ratio: 0.5,
+            main_size: None,
             first: Box::new(Node::Leaf(focused)),
             second: Box::new(Node::Leaf(new_pane)),
         });
@@ -224,7 +256,7 @@ fn leaf_is(node: &Node, id: PaneId) -> bool {
 fn remove_from(node: Node, id: PaneId) -> (Node, Option<PaneId>) {
     match node {
         Node::Leaf(pid) => (Node::Leaf(pid), None),
-        Node::Split { dir, ratio, first, second } => {
+        Node::Split { dir, ratio, main_size, first, second } => {
             if leaf_is(&first, id) {
                 let fallback = first_leaf(&second);
                 return (*second, Some(fallback));
@@ -236,13 +268,13 @@ fn remove_from(node: Node, id: PaneId) -> (Node, Option<PaneId>) {
             let (nf, rf) = remove_from(*first, id);
             if let Some(fallback) = rf {
                 return (
-                    Node::Split { dir, ratio, first: Box::new(nf), second },
+                    Node::Split { dir, ratio, main_size, first: Box::new(nf), second },
                     Some(fallback),
                 );
             }
             let (ns, rs) = remove_from(*second, id);
             (
-                Node::Split { dir, ratio, first: Box::new(nf), second: Box::new(ns) },
+                Node::Split { dir, ratio, main_size, first: Box::new(nf), second: Box::new(ns) },
                 rs,
             )
         }
@@ -283,8 +315,8 @@ fn area_at(root: &Node, path: &[bool], area: Rect) -> Rect {
     let mut a = area;
     for &b in path {
         match n {
-            Node::Split { dir, ratio, first, second } => {
-                let (r1, r2) = split_rects(*dir, *ratio, a);
+            Node::Split { dir, ratio, main_size, first, second } => {
+                let (r1, r2) = split_rects(*dir, *ratio, *main_size, a);
                 if b {
                     n = &**second;
                     a = r2;
@@ -560,11 +592,20 @@ impl Layout {
             return false;
         }
 
-        let ratio_old = match node_at(&self.root, &prefix) {
-            Node::Split { ratio, .. } => *ratio,
+        let (ratio_old, main_size_old) = match node_at(&self.root, &prefix) {
+            Node::Split { ratio, main_size, .. } => (*ratio, *main_size),
             Node::Leaf(_) => return false,
         };
-        let child1 = child_first(l, ratio_old) as i32;
+        // SP7 Task 12 (follow-up #43): a split annotated `main_size: Some`
+        // (a `main-horizontal`/`main-vertical` preset's main split) reads
+        // its CURRENT first-child length the same way `split_rects` does --
+        // via `clamp_main`, not the (possibly stale) `ratio` field -- so a
+        // manual resize starts from the length the user actually SEES, not
+        // whatever `ratio` alone would reconstruct.
+        let child1 = match main_size_old {
+            Some(target) => clamp_main(target, l, min) as i32,
+            None => child_first(l, ratio_old) as i32,
+        };
         let sign: i32 = if want_first { 1 } else { -1 };
         let lo = min as i32;
         let hi = (l as i32 - 1) - min as i32;
@@ -580,6 +621,18 @@ impl Layout {
             let ratio = c as f32 / (l as f32 - 1.0);
             self.set_ratio(&prefix, ratio);
             if self.all_min_ok(area) {
+                // A successful MANUAL resize of a `main_size`-annotated
+                // split overrides the preset's absolute-size stickiness
+                // going forward -- the user just told winmux explicitly
+                // what size they want this border at, so the next
+                // whole-window resize should scale it like any other split
+                // (ratio-based) rather than snapping back to the configured
+                // `main-pane-width`/`-height`. Only cleared on SUCCESS (not
+                // the revert-on-failure path below) so a no-op resize
+                // attempt never silently strips the annotation.
+                if main_size_old.is_some() {
+                    self.clear_main_size(&prefix);
+                }
                 return true;
             }
             if c == child1 {
@@ -654,6 +707,16 @@ impl Layout {
     fn set_ratio(&mut self, path: &[bool], v: f32) {
         if let Node::Split { ratio, .. } = node_at_mut(&mut self.root, path) {
             *ratio = v;
+        }
+    }
+
+    /// Clear the split node reached by `path`'s `main_size` annotation (SP7
+    /// Task 12, follow-up #43) -- see [`Self::resize_from`]'s only call site
+    /// for why (a successful manual resize of that split overrides the
+    /// preset's absolute-size stickiness).
+    fn clear_main_size(&mut self, path: &[bool]) {
+        if let Node::Split { main_size, .. } = node_at_mut(&mut self.root, path) {
+            *main_size = None;
         }
     }
 
@@ -762,7 +825,7 @@ fn stack_horizontal(mut nodes: Vec<Node>, widths: &[u16]) -> Node {
     let ratio = ratio_for(widths[0], l);
     let first = nodes.remove(0);
     let second = stack_horizontal(nodes, &widths[1..]);
-    Node::Split { dir: SplitDir::Horizontal, ratio, first: Box::new(first), second: Box::new(second) }
+    Node::Split { dir: SplitDir::Horizontal, ratio, main_size: None, first: Box::new(first), second: Box::new(second) }
 }
 
 /// Vertical-axis mirror of [`stack_horizontal`].
@@ -775,7 +838,7 @@ fn stack_vertical(mut nodes: Vec<Node>, heights: &[u16]) -> Node {
     let ratio = ratio_for(heights[0], l);
     let first = nodes.remove(0);
     let second = stack_vertical(nodes, &heights[1..]);
-    Node::Split { dir: SplitDir::Vertical, ratio, first: Box::new(first), second: Box::new(second) }
+    Node::Split { dir: SplitDir::Vertical, ratio, main_size: None, first: Box::new(first), second: Box::new(second) }
 }
 
 /// Clamp a requested `main-pane-width`/`main-pane-height` value so the main
@@ -826,11 +889,25 @@ fn build_preset_tree(preset: LayoutPreset, panes: &[PaneId], area: Rect, main_wi
         LayoutPreset::MainHorizontal => {
             let main_id = panes[0];
             let others = &panes[1..];
+            // `ratio` is still computed (from the CLAMPED height at this
+            // apply-time `area`) for display/back-compat parity with the
+            // pre-Task-12 tree shape; it is a NO-OP at render time whenever
+            // `main_size` is `Some` (see `split_rects`), but `apply_preset`
+            // deliberately never leaves a split without a self-consistent
+            // ratio in case some future caller reads it directly.
             let main_h = clamp_main(main_height, area.h, MIN_PANE_H);
             let ratio = ratio_for(main_h, area.h);
             let widths = even_lengths(area.w, others.len());
             let bottom = stack_horizontal(others.iter().map(|&p| Node::Leaf(p)).collect(), &widths);
-            Node::Split { dir: SplitDir::Vertical, ratio, first: Box::new(Node::Leaf(main_id)), second: Box::new(bottom) }
+            // SP7 Task 12 (follow-up #43): store the UNCLAMPED
+            // `main_height` (already percent-resolved by the caller, see
+            // `options::Options::main_pane_height`/`_for`'s doc comment) as
+            // this split's absolute-size annotation, not the clamped
+            // `main_h` -- `split_rects` re-clamps fresh against whatever
+            // area a LATER render/resize passes in, so a resize that grows
+            // the window doesn't permanently cap the target at today's
+            // clamp.
+            Node::Split { dir: SplitDir::Vertical, ratio, main_size: Some(main_height), first: Box::new(Node::Leaf(main_id)), second: Box::new(bottom) }
         }
         LayoutPreset::MainVertical => {
             let main_id = panes[0];
@@ -839,7 +916,7 @@ fn build_preset_tree(preset: LayoutPreset, panes: &[PaneId], area: Rect, main_wi
             let ratio = ratio_for(main_w, area.w);
             let heights = even_lengths(area.h, others.len());
             let right = stack_vertical(others.iter().map(|&p| Node::Leaf(p)).collect(), &heights);
-            Node::Split { dir: SplitDir::Horizontal, ratio, first: Box::new(Node::Leaf(main_id)), second: Box::new(right) }
+            Node::Split { dir: SplitDir::Horizontal, ratio, main_size: Some(main_width), first: Box::new(Node::Leaf(main_id)), second: Box::new(right) }
         }
         LayoutPreset::Tiled => {
             let n = panes.len();
@@ -965,6 +1042,106 @@ impl Layout {
         if let Some(pos) = focused_pos {
             self.focused = new_ids[pos];
         }
+        true
+    }
+
+    // ---- cross-window/session structure ops (SP7 Task 11, closes #41) -----
+
+    /// Cross-tree generalization of [`Self::swap_panes`] (follow-up #41's fix
+    /// sketch): swap the CONTENTS of `this` layout's leaf holding `mine` with
+    /// `other` layout's leaf holding `theirs`. Since `PaneId`s are global
+    /// (unique across every window's tree, never just this one), a
+    /// cross-window swap is simply a COORDINATED RELABEL of one leaf in EACH
+    /// tree -- no removal, no tree-shape change, no ratio/geometry touch in
+    /// EITHER tree (`cross_tree_swap_preserves_geometry_slots`): the leaf
+    /// that held `mine` now holds `theirs` and vice versa, so whichever
+    /// SCREEN POSITION each pane occupied, the OTHER pane now occupies it.
+    /// This is the exact tmux behavior described in
+    /// `docs/tmux-reference/panes-and-layout.md` §5.1 ("panes swap positions
+    /// in the pane list... layout cells, and geometry; when the windows
+    /// differ they also swap window membership").
+    ///
+    /// Focus fix-up (both sides, independently): each `Layout::focused` is a
+    /// bare `PaneId`, which becomes DANGLING on whichever side just lost its
+    /// pane -- every other `Layout` method's invariant is "`focused` always
+    /// names a live leaf", so this must never leave either side violating
+    /// it. If a side's `focused` named the pane that just departed, it is
+    /// redirected to the pane that just arrived in that exact tree
+    /// position -- i.e. the active SLOT keeps being active, now showing new
+    /// content, matching the tmux doc's stated destination-window rule ("the
+    /// destination window's active pane becomes src_wp, the pane that moved
+    /// into it"). A side whose `focused` pane was NOT part of the swap is
+    /// left untouched (same "content follows" rule `swap_panes` already
+    /// documents for the same-window case).
+    ///
+    /// Clears zoom on BOTH sides (matches `swap_panes`). `false` (no-op,
+    /// NEITHER tree touched) if `mine == theirs`, or either id isn't a leaf
+    /// of its respective layout.
+    pub fn swap_leaf_across(&mut self, mine: PaneId, other: &mut Layout, theirs: PaneId) -> bool {
+        if mine == theirs {
+            return false;
+        }
+        if !self.panes().contains(&mine) || !other.panes().contains(&theirs) {
+            return false;
+        }
+        self.zoomed = false;
+        other.zoomed = false;
+        // `swap_leaf_values` relabels any leaf equal to EITHER argument --
+        // safe here because `theirs` never appears in `self`'s tree and
+        // `mine` never appears in `other`'s (global, distinct ids), so each
+        // call only ever touches its own tree's single matching leaf.
+        swap_leaf_values(&mut self.root, mine, theirs);
+        swap_leaf_values(&mut other.root, theirs, mine);
+        if self.focused == mine {
+            self.focused = theirs;
+        }
+        if other.focused == theirs {
+            other.focused = mine;
+        }
+        true
+    }
+
+    /// Insert `new_pane` into this tree by splitting the leaf holding `at`
+    /// -- the "insert a pane into ANOTHER tree at a given position" half of
+    /// follow-up #41's fix sketch ("teach `Layout` to remove a leaf from one
+    /// tree and insert it into another"), pairing with [`Self::remove`] (the
+    /// existing leaf-removal primitive: it already "removes a pane's leaf
+    /// from the tree, collapsing its parent split" exactly as that sketch
+    /// describes -- no new method was needed on that side). `new_pane` takes
+    /// the SECOND child (mirrors `split`'s own "new pane takes the second
+    /// half" rule); `at` keeps the first child. `dir`/`ratio` shape the new
+    /// split exactly like `split`'s own `Node::Split`, but unlike `split`
+    /// this primitive has no `area` to check against, so it does NOT
+    /// refuse on a would-be-too-small result -- callers that need the
+    /// `MIN_PANE_W`/`MIN_PANE_H` guarantee must check a resolved `Rect`
+    /// themselves before calling this, the same way `apply_preset`/
+    /// `build_preset_tree` place panes with no per-call minimum check
+    /// either. Does NOT touch focus or zoom (caller decides -- unlike
+    /// `split`, which is a direct user action with its own focus-follows-
+    /// new-pane rule).
+    ///
+    /// Not called by any `dispatch.rs` command as of SP7 Task 11 --
+    /// `break-pane`/`move-window`/the cross-window form of `swap-pane` never
+    /// need to insert into an EXISTING window's tree (`break-pane` always
+    /// creates a brand-new single-pane window, per real tmux; see
+    /// `docs/tmux-reference/windows-and-sessions.md` §break-pane). Exercised
+    /// by its own unit tests and reserved for a future `join-pane`/
+    /// `move-pane` implementation (out of this task's scope).
+    ///
+    /// `false` (no-op) if `at` isn't one of this layout's leaves, or
+    /// `new_pane` is already present (either as `at` itself or elsewhere).
+    pub fn insert_leaf_at(&mut self, at: PaneId, new_pane: PaneId, dir: SplitDir, ratio: f32) -> bool {
+        if new_pane == at || self.panes().contains(&new_pane) || !self.panes().contains(&at) {
+            return false;
+        }
+        let mut replacement = Some(Node::Split {
+            dir,
+            ratio,
+            main_size: None,
+            first: Box::new(Node::Leaf(at)),
+            second: Box::new(Node::Leaf(new_pane)),
+        });
+        replace_leaf(&mut self.root, at, &mut replacement);
         true
     }
 }
@@ -2114,6 +2291,94 @@ mod tests {
         assert!(rects.iter().all(|(_, r)| r.w >= MIN_PANE_W));
     }
 
+    // ---- SP7 Task 12 (closes follow-up #43): absolute main-pane sizing
+    // survives a later whole-window resize -- `rects()` is called against a
+    // DIFFERENT area than `apply_preset` was, with no re-`apply_preset` call
+    // in between (exactly how `Server::apply_layout_for_session` handles a
+    // real client Resize frame). ----
+
+    #[test]
+    fn main_pane_width_survives_window_resize() {
+        // apply-time area 80x24, main-pane-width=20: main pane (id 1) gets
+        // width 20 (unclamped: max_main = 80-1-2 = 77, 20 fits).
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+
+        // Resize the WINDOW (not the layout -- no apply_preset call) to a
+        // narrower 60x24 area: a ratio-only implementation would scale the
+        // main pane down proportionally (20/79 * 59 ~= 15); the fix keeps it
+        // at the literal configured 20 cells (unclamped: max_main =
+        // 60-1-2=57, 20 still fits).
+        let narrower = Rect { x: 0, y: 0, w: 60, h: 24 };
+        let rects = l.rects(narrower);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 21, y: 0, w: 39, h: 24 }));
+
+        // Resize WIDER too (120x24): still exactly 20, not scaled up.
+        let wider = Rect { x: 0, y: 0, w: 120, h: 24 };
+        let rects = l.rects(wider);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 21, y: 0, w: 99, h: 24 }));
+    }
+
+    #[test]
+    fn main_pane_height_survives_window_resize() {
+        // Vertical-axis mirror of `main_pane_width_survives_window_resize`.
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainHorizontal, &ids(2), A, 80, 8);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+
+        let shorter = Rect { x: 0, y: 0, w: 80, h: 16 };
+        let rects = l.rects(shorter);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 9, w: 80, h: 7 }));
+
+        let taller = Rect { x: 0, y: 0, w: 80, h: 40 };
+        let rects = l.rects(taller);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 80, h: 8 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 9, w: 80, h: 31 }));
+    }
+
+    #[test]
+    fn main_pane_width_still_reclamps_on_resize_into_tiny_area() {
+        // The absolute size is re-CLAMPED (not just re-applied blindly)
+        // against whatever area a later resize provides -- shrinking the
+        // window down to 10 cols must still leave the "other" column at
+        // MIN_PANE_W, exactly like the apply-time clamp tests above.
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        let tiny = Rect { x: 0, y: 0, w: 10, h: 24 };
+        let rects = l.rects(tiny);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 7, h: 24 }));
+        assert_eq!(rects[1], (2, Rect { x: 8, y: 0, w: 2, h: 24 }));
+    }
+
+    #[test]
+    fn manual_resize_of_main_split_overrides_absolute_stickiness() {
+        // A manual Ctrl-arrow-style resize of the main-vertical border
+        // (`resize_from`) is a deliberate user override: it should stick
+        // through a later window resize, NOT snap back to the configured
+        // `main-pane-width` on the next render (matches the doc comment on
+        // `Layout::clear_main_size`).
+        let mut l = layout_with_n_panes(2);
+        l.apply_preset(LayoutPreset::MainVertical, &ids(2), A, 20, 24);
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 20, h: 24 }));
+
+        // Grow the main pane (pane 1, the first child) by 10 cells via a
+        // Right-direction resize referenced from pane 1 itself.
+        assert!(l.resize_from(1, Direction::Right, A, 10));
+        assert_eq!(l.rects(A)[0], (1, Rect { x: 0, y: 0, w: 30, h: 24 }));
+
+        // Now resize the WHOLE WINDOW to a different area: the manually-set
+        // 30-cell width must scale like an ordinary ratio-based split (NOT
+        // stay pinned at either 30 or the original 20).
+        let wider = Rect { x: 0, y: 0, w: 160, h: 24 };
+        let rects = l.rects(wider);
+        assert_ne!(rects[0].1.w, 30, "a ratio-scaled split must not stay pinned at the manually-set width");
+        assert_ne!(rects[0].1.w, 20, "must not snap back to the original configured main-pane-width either");
+    }
+
     #[test]
     fn preset_tiny_area_does_not_panic() {
         // 3x3 window, 5 panes: every preset must degrade to (legally)
@@ -2277,5 +2542,164 @@ mod tests {
         assert!(l.is_zoomed());
         l.rotate(true);
         assert!(!l.is_zoomed());
+    }
+
+    // ---- cross-window/session structure ops (SP7 Task 11, closes #41) -----
+
+    /// `Layout::remove` IS the "remove a leaf, collapsing its parent split"
+    /// primitive follow-up #41's fix sketch describes -- this test is its
+    /// permanent name-matched regression coverage. `nested_3pane` is
+    /// `H(Leaf1, V(Leaf2, Leaf3))`; removing pane 2 collapses `V(Leaf2,
+    /// Leaf3)` down to just `Leaf3`, so pane 3 absorbs pane 2's rect
+    /// {41,0,39,12} exactly (the split's border row also disappears, so pane
+    /// 3 now spans the FULL right half {41,0,39,24}, not just its own former
+    /// bottom slice).
+    #[test]
+    fn remove_leaf_collapses_parent_split() {
+        let mut l = nested_3pane();
+        assert!(l.remove(2));
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 40, h: 24 }),
+                (3, Rect { x: 41, y: 0, w: 39, h: 24 }),
+            ]
+        );
+        assert_eq!(l.panes(), vec![1, 3]);
+    }
+
+    #[test]
+    fn remove_leaf_refuses_only_pane() {
+        let mut l = Layout::new(1);
+        assert!(!l.remove(1));
+        assert_eq!(l.panes(), vec![1]);
+    }
+
+    /// Two independent single-pane windows (panes 10 and 20, each the ONLY
+    /// leaf of its own `Layout`); after `swap_leaf_across(10, &mut other,
+    /// 20)`, window A's tree now holds pane 20 (window A's own rect, e.g.
+    /// {0,0,80,24}, is untouched -- single-leaf trees have no ratio/split to
+    /// disturb) and window B's tree now holds pane 10, at window B's OWN
+    /// rect. Neither side's shape changed at all -- only the leaf VALUE --
+    /// which is exactly "preserves geometry slots".
+    #[test]
+    fn cross_tree_swap_preserves_geometry_slots() {
+        let b_area = Rect { x: 0, y: 0, w: 40, h: 12 };
+        let mut a = Layout::new(10);
+        let mut b = Layout::new(20);
+        assert!(a.swap_leaf_across(10, &mut b, 20));
+        assert_eq!(a.rects(A), vec![(20, A)]);
+        assert_eq!(b.rects(b_area), vec![(10, b_area)]);
+    }
+
+    /// A richer case: window A is `nested_3pane` (panes 1/2/3), window B is
+    /// a single pane (100). Swapping A's pane 2 (position 1, rect
+    /// {41,0,39,12}) with B's pane 100 moves pane 100 into EXACTLY that
+    /// rect (position/ratio untouched) and pane 2 becomes B's sole pane,
+    /// filling B's whole area -- panes 1 and 3 (untouched by the swap) keep
+    /// their original rects.
+    #[test]
+    fn cross_tree_swap_relabels_only_the_two_affected_leaves() {
+        let b_area = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let mut a = nested_3pane();
+        let mut b = Layout::new(100);
+        assert!(a.swap_leaf_across(2, &mut b, 100));
+        assert_eq!(
+            a.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 40, h: 24 }),
+                (100, Rect { x: 41, y: 0, w: 39, h: 12 }),
+                (3, Rect { x: 41, y: 13, w: 39, h: 11 }),
+            ]
+        );
+        assert_eq!(b.rects(b_area), vec![(2, b_area)]);
+    }
+
+    /// Focus fix-up: window A's focused pane (3, per `nested_3pane`) is NOT
+    /// part of the swap (2 <-> 100) -- untouched, "content follows" (still
+    /// names pane 3, which never moved). Window B's only pane (100) WAS its
+    /// focused pane and just departed -- B's focus redirects to whatever
+    /// arrived in that slot (2), maintaining the "focused always names a
+    /// live leaf" invariant.
+    #[test]
+    fn cross_tree_swap_fixes_up_focus_on_the_departed_side() {
+        let mut a = nested_3pane();
+        let mut b = Layout::new(100);
+        assert_eq!(a.focused(), 3);
+        assert_eq!(b.focused(), 100);
+        assert!(a.swap_leaf_across(2, &mut b, 100));
+        assert_eq!(a.focused(), 3, "A's focused pane (3) was not part of the swap");
+        assert_eq!(b.focused(), 2, "B's focused pane (100) departed -- redirects to the arriving pane (2)");
+    }
+
+    /// Mirror of the previous case: the swapped-out pane WAS the focused
+    /// one on the side that keeps changing (window A here), so window A's
+    /// focus must follow the vacated SLOT to the arriving pane (100).
+    #[test]
+    fn cross_tree_swap_fixes_up_focus_when_the_focused_pane_departs() {
+        let mut a = Layout::new(5);
+        let mut b = Layout::new(100);
+        assert!(a.swap_leaf_across(5, &mut b, 100));
+        assert_eq!(a.focused(), 100, "A's only (and focused) pane departed -- redirects to the arriving pane");
+        assert_eq!(b.focused(), 5, "same, mirrored, on B's side");
+    }
+
+    #[test]
+    fn cross_tree_swap_clears_zoom_on_both_sides() {
+        let mut a = Layout::new(1);
+        let mut b = Layout::new(2);
+        a.toggle_zoom();
+        b.toggle_zoom();
+        assert!(a.is_zoomed() && b.is_zoomed());
+        assert!(a.swap_leaf_across(1, &mut b, 2));
+        assert!(!a.is_zoomed() && !b.is_zoomed());
+    }
+
+    #[test]
+    fn cross_tree_swap_same_id_is_noop() {
+        let mut a = Layout::new(1);
+        let mut b = Layout::new(1);
+        assert!(!a.swap_leaf_across(1, &mut b, 1));
+    }
+
+    #[test]
+    fn cross_tree_swap_unknown_leaf_is_noop() {
+        let mut a = Layout::new(1);
+        let mut b = Layout::new(2);
+        assert!(!a.swap_leaf_across(99, &mut b, 2));
+        assert!(!a.swap_leaf_across(1, &mut b, 99));
+        assert_eq!(a.panes(), vec![1]);
+        assert_eq!(b.panes(), vec![2]);
+    }
+
+    /// `insert_leaf_at` splits the targeted leaf, new pane taking the
+    /// second child -- same shape `split` itself builds.
+    #[test]
+    fn insert_leaf_at_splits_target_leaf() {
+        let mut l = Layout::new(1);
+        assert!(l.insert_leaf_at(1, 2, SplitDir::Horizontal, 0.5));
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 40, h: 24 }),
+                (2, Rect { x: 41, y: 0, w: 39, h: 24 }),
+            ]
+        );
+        assert_eq!(l.panes(), vec![1, 2]);
+    }
+
+    #[test]
+    fn insert_leaf_at_unknown_target_is_noop() {
+        let mut l = Layout::new(1);
+        assert!(!l.insert_leaf_at(99, 2, SplitDir::Horizontal, 0.5));
+        assert_eq!(l.panes(), vec![1]);
+    }
+
+    #[test]
+    fn insert_leaf_at_duplicate_pane_is_noop() {
+        let mut l = nested_3pane();
+        assert!(!l.insert_leaf_at(1, 2, SplitDir::Horizontal, 0.5));
+        assert!(!l.insert_leaf_at(1, 1, SplitDir::Horizontal, 0.5));
+        assert_eq!(l.panes(), vec![1, 2, 3]);
     }
 }

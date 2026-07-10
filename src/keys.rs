@@ -8,6 +8,11 @@
 //! - [`encode_key`]: `Key` -> VT bytes to SEND to a pane (`send-keys`).
 //! - [`KeyDecoder`]: VT input bytes -> `Key` values (the future table-driven
 //!   replacement for `src/input.rs`'s hand-rolled escape parsing).
+//! - [`encode_mouse`]: `MouseEvent` -> VT bytes to FORWARD to a pane whose
+//!   own application requested mouse reporting (SP7 Task 9) — the encoding
+//!   half of [`KeyDecoder`]'s SGR mouse decoding.
+
+use crate::grid::MouseEncoding;
 
 /// A single logical key: a base [`KeyCode`] plus modifier flags.
 ///
@@ -43,6 +48,49 @@ pub enum KeyCode {
     Tab,
     BSpace,
     BTab,
+    /// A synthesized tmux mouse pseudo-key name (`MouseDown1Pane`,
+    /// `WheelUpStatus`, ...) -- Task 8, SP7 wave 3: table-driven mouse
+    /// bindings (closes follow-ups #57, #67(a)/(b)). `0` is the conventional
+    /// button placeholder for the two button-less kinds (`WheelUp`/
+    /// `WheelDown` -- real tmux has no "WheelUp1", `docs/tmux-reference/
+    /// mouse.md` §2.6); real button values are 1-3, matching the button
+    /// numbering [`MouseKind`] already uses for press/drag/release. Carried
+    /// in `Key.code` exactly like any other key so mouse pseudo-keys share
+    /// `Key`'s existing modifier fields (`C-`/`M-`/`S-` prefixes parse/
+    /// format identically, e.g. `C-MouseDown1Status`, matching real tmux's
+    /// key-string.c grammar).
+    MouseKey(MouseKeyKind, u8, MouseKeyLoc),
+}
+
+/// tmux's synthesized mouse pseudo-key TYPE (`docs/tmux-reference/mouse.md`
+/// §2.7/§7). Only the types winmux's `server::dispatch` classification can
+/// actually produce -- `MouseMove`/`SecondClick`/button numbers 6-11 are real
+/// tmux key-string.c entries but never arise from winmux's SGR-1002 (button-
+/// event, not all-motion) tracking, so they are not modeled.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyKind {
+    Down,
+    Up,
+    Drag,
+    DragEnd,
+    DoubleClick,
+    TripleClick,
+    WheelUp,
+    WheelDown,
+}
+
+/// tmux's synthesized mouse pseudo-key LOCATION -- the subset winmux's
+/// classification produces. The scrollbar/`ControlN` locations (post-3.5
+/// tmux features per `docs/tmux-reference/mouse.md`'s vintage note) are out
+/// of scope.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyLoc {
+    Pane,
+    Border,
+    Status,
+    StatusLeft,
+    StatusRight,
+    StatusDefault,
 }
 
 fn plain(code: KeyCode) -> Key {
@@ -117,6 +165,12 @@ pub fn parse_key(s: &str) -> Option<Key> {
             .and_then(|n| n.parse::<u8>().ok())
             .map(KeyCode::F),
     };
+    // Mouse pseudo-key names (`MouseDown1Pane`, `WheelUpStatus`, ...) are
+    // multi-char tokens like the named keys above, so they must be tried
+    // before the single-char `parse_char` fallback below (Task 8, SP7 wave
+    // 3). Case-insensitive, matching real tmux's `strcasecmp`-based
+    // `key_string_search_table` (`key-string.c`).
+    let code = code.or_else(|| parse_mouse_key_name(rest));
 
     match code {
         Some(code) => Some(Key {
@@ -127,6 +181,88 @@ pub fn parse_key(s: &str) -> Option<Key> {
         }),
         None => parse_char(rest, ctrl, meta, shift),
     }
+}
+
+/// Parse a tmux mouse pseudo-key name (`<Type><Button><Location>`, e.g.
+/// `MouseDown1Pane`, `WheelUpStatus` -- no button digit for the two wheel
+/// types). Case-insensitive. Longer/more-specific type prefixes are tried
+/// first so `MouseDragEnd...` is never misparsed as `MouseDrag` + a bogus
+/// `End...` location (`docs/tmux-reference/mouse.md` §2.7/§7 is the exact
+/// name list this reproduces).
+fn parse_mouse_key_name(s: &str) -> Option<KeyCode> {
+    const TYPES: &[(&str, MouseKeyKind, bool)] = &[
+        ("mousedragend", MouseKeyKind::DragEnd, true),
+        ("mousedown", MouseKeyKind::Down, true),
+        ("mouseup", MouseKeyKind::Up, true),
+        ("mousedrag", MouseKeyKind::Drag, true),
+        ("doubleclick", MouseKeyKind::DoubleClick, true),
+        ("tripleclick", MouseKeyKind::TripleClick, true),
+        ("wheelup", MouseKeyKind::WheelUp, false),
+        ("wheeldown", MouseKeyKind::WheelDown, false),
+    ];
+    let lower = s.to_ascii_lowercase();
+    for (prefix, kind, has_button) in TYPES {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let (button, loc_str) = if *has_button {
+            let mut chars = rest.chars();
+            let b = chars.next()?;
+            if !('1'..='3').contains(&b) {
+                return None; // this prefix is uniquely matched; a bad button
+                             // digit is a malformed name, not "try the next
+                             // candidate type" (no two type prefixes collide).
+            }
+            (b as u8 - b'0', &rest[1..])
+        } else {
+            (0u8, rest)
+        };
+        let loc = parse_mouse_loc(loc_str)?;
+        return Some(KeyCode::MouseKey(*kind, button, loc));
+    }
+    None
+}
+
+fn parse_mouse_loc(s: &str) -> Option<MouseKeyLoc> {
+    match s {
+        "pane" => Some(MouseKeyLoc::Pane),
+        "border" => Some(MouseKeyLoc::Border),
+        "statusleft" => Some(MouseKeyLoc::StatusLeft),
+        "statusright" => Some(MouseKeyLoc::StatusRight),
+        "statusdefault" => Some(MouseKeyLoc::StatusDefault),
+        "status" => Some(MouseKeyLoc::Status),
+        _ => None,
+    }
+}
+
+fn mouse_kind_str(k: MouseKeyKind) -> &'static str {
+    match k {
+        MouseKeyKind::Down => "MouseDown",
+        MouseKeyKind::Up => "MouseUp",
+        MouseKeyKind::Drag => "MouseDrag",
+        MouseKeyKind::DragEnd => "MouseDragEnd",
+        MouseKeyKind::DoubleClick => "DoubleClick",
+        MouseKeyKind::TripleClick => "TripleClick",
+        MouseKeyKind::WheelUp => "WheelUp",
+        MouseKeyKind::WheelDown => "WheelDown",
+    }
+}
+
+fn mouse_loc_str(l: MouseKeyLoc) -> &'static str {
+    match l {
+        MouseKeyLoc::Pane => "Pane",
+        MouseKeyLoc::Border => "Border",
+        MouseKeyLoc::Status => "Status",
+        MouseKeyLoc::StatusLeft => "StatusLeft",
+        MouseKeyLoc::StatusRight => "StatusRight",
+        MouseKeyLoc::StatusDefault => "StatusDefault",
+    }
+}
+
+/// `WheelUp`/`WheelDown` carry no button digit in tmux's naming (there is no
+/// "WheelUp1") -- every other mouse-key type does.
+fn mouse_kind_has_button(k: MouseKeyKind) -> bool {
+    !matches!(k, MouseKeyKind::WheelUp | MouseKeyKind::WheelDown)
 }
 
 fn parse_char(rest: &str, ctrl: bool, meta: bool, shift: bool) -> Option<Key> {
@@ -182,6 +318,13 @@ pub fn key_name(k: &Key) -> String {
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::BSpace => "BSpace".to_string(),
         KeyCode::BTab => "BTab".to_string(),
+        KeyCode::MouseKey(kind, btn, loc) => {
+            if mouse_kind_has_button(kind) {
+                format!("{}{}{}", mouse_kind_str(kind), btn, mouse_loc_str(loc))
+            } else {
+                format!("{}{}", mouse_kind_str(kind), mouse_loc_str(loc))
+            }
+        }
     };
     format!("{prefix}{body}")
 }
@@ -283,6 +426,10 @@ fn encode_named(code: KeyCode) -> Option<Vec<u8>> {
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
             unreachable!("arrows are handled by encode_key before reaching encode_named")
         }
+        // A mouse pseudo-key isn't a byte sequence `send-keys` can write to a
+        // pane -- same "unsupported combination" contract as ctrl-on-a-
+        // named-key above.
+        KeyCode::MouseKey(..) => None,
     }
 }
 
@@ -667,6 +814,106 @@ fn mods_from_param(p: i64) -> (bool, bool, bool) {
     (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) // (shift, meta, ctrl)
 }
 
+/// Reconstruct the xterm/SGR `Cb` button-word from a decoded [`MouseEvent`]
+/// — the exact inverse of [`mouse_kind_from_cb`] plus the modifier-bit
+/// packing `classify_sgr_mouse` reads: low 2 bits + bit 0x20 pick the
+/// button/drag encoding (button number stored as `button - 1`, matching
+/// `mouse_kind_from_cb`'s `low + 1`), bit 0x40 marks a wheel event (low bit
+/// then picks up/down), and 0x04/0x08/0x10 carry shift/meta/ctrl — SAME
+/// layout `classify_sgr_mouse` decodes, so `cb_for(classify_sgr_mouse(..))
+/// == cb` round-trips for any legally-decoded event (verified by
+/// `encode_roundtrip_via_decoder`-style tests below).
+fn cb_for(ev: &MouseEvent) -> i64 {
+    let mut cb: i64 = match ev.kind {
+        MouseKind::Down(b) | MouseKind::Up(b) => (b.saturating_sub(1)) as i64,
+        MouseKind::Drag(b) => (b.saturating_sub(1)) as i64 | 0x20,
+        MouseKind::WheelUp => 0x40,
+        MouseKind::WheelDown => 0x40 | 0x01,
+    };
+    if ev.shift {
+        cb |= 0x04;
+    }
+    if ev.meta {
+        cb |= 0x08;
+    }
+    if ev.ctrl {
+        cb |= 0x10;
+    }
+    cb
+}
+
+/// Re-encode a decoded [`MouseEvent`] (coordinates already pane-relative and
+/// 0-based — the caller's job, see `server::dispatch::forward_mouse_to_pane`)
+/// into the wire bytes a pane application requesting `encoding` expects —
+/// the forwarding half of Task 9 (SP7, closes follow-ups #35/#72): tmux's
+/// `input_key_get_mouse` (`input-keys.c:713-793`) re-encodes per the pane's
+/// own requested protocol rather than replaying the outer terminal's raw
+/// bytes verbatim, since the pane's coordinate origin and requested wire
+/// format can both differ from the client's.
+pub fn encode_mouse(ev: &MouseEvent, encoding: MouseEncoding) -> Vec<u8> {
+    match encoding {
+        MouseEncoding::Sgr => encode_mouse_sgr(ev),
+        MouseEncoding::Utf8 => encode_mouse_utf8(ev),
+        MouseEncoding::Default => encode_mouse_x10(ev),
+    }
+}
+
+/// `CSI < Cb ; Cx ; Cy (M|m)` — SGR (1006) encoding, unbounded coordinate
+/// range (1-based, no clamp). `M` for every event except a release
+/// (`MouseKind::Up`), which uses `m` — the exact inverse of
+/// `classify_sgr_mouse`'s `released = b == b'm'` check.
+fn encode_mouse_sgr(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev);
+    let final_byte = if matches!(ev.kind, MouseKind::Up(_)) { 'm' } else { 'M' };
+    format!("\x1b[<{cb};{};{}{final_byte}", ev.x as u32 + 1, ev.y as u32 + 1).into_bytes()
+}
+
+/// `CSI M <Cb+32> <Cx+32> <Cy+32>` — legacy X10/xterm-normal encoding
+/// (DECSET 1000, the `MouseEncoding::Default` fallback when neither 1005
+/// nor 1006 was requested): three raw bytes, 1-based coordinates offset by
+/// 32 and clamped at 223 (byte value 255) since a single byte can't carry a
+/// coordinate past `255 - 32`, per the task brief ("X10 encoding caps at
+/// 223") and real xterm's own `MOUSE_PARAM_POS_OFF`/byte-width limit
+/// (`docs/tmux-reference/mouse.md` §1's decode-side mirror: `x = byte -
+/// 33`, i.e. encode is `byte = x + 33` — 32 for the offset, 1 more for the
+/// 0-based-to-1-based conversion `classify_sgr_mouse`'s own `(cx - 1)`
+/// undoes on decode). No release-button ambiguity here (unlike real X10,
+/// which can't distinguish which button released) since [`MouseEvent`]
+/// always carries the concrete kind/button already.
+fn encode_mouse_x10(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev).clamp(0, 255 - 32) as u8;
+    let cx = ((ev.x as u32 + 1).min(223)) as u8;
+    let cy = ((ev.y as u32 + 1).min(223)) as u8;
+    vec![0x1b, b'[', b'M', cb.wrapping_add(32), cx.wrapping_add(32), cy.wrapping_add(32)]
+}
+
+/// `CSI M <Cb+32> <Cx+32 as UTF-8> <Cy+32 as UTF-8>` — UTF-8 extended
+/// coordinates (DECSET 1005): same button byte as legacy X10 (button/
+/// modifier words never approach the 223 cap in practice), but `Cx+32`/
+/// `Cy+32` are emitted as UTF-8-encoded codepoints instead of raw bytes,
+/// extending the usable coordinate range well past 223 (capped here at
+/// 2015 = 2047 - 32, xterm's own ctlseqs-documented 1005 limit) — matches
+/// real xterm/tmux's 1005 extension, though no `docs/tmux-reference/*.md`
+/// source line pins the exact byte-for-byte algorithm (1005 is a rare,
+/// largely-superseded-by-1006 protocol; this is a best-effort, clearly
+/// peripheral encoding, not exercised by winmux's own default `?1006h`-
+/// only enable sequence).
+fn encode_mouse_utf8(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev).clamp(0, 255 - 32) as u8;
+    let cx = (ev.x as u32 + 1).min(2015) + 32;
+    let cy = (ev.y as u32 + 1).min(2015) + 32;
+    let mut out = vec![0x1b, b'[', b'M', cb.wrapping_add(32)];
+    if let Some(c) = char::from_u32(cx) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    if let Some(c) = char::from_u32(cy) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    out
+}
+
 fn parse_csi(params_str: &str, final_byte: u8) -> Option<Key> {
     let parts: Vec<i64> = if params_str.is_empty() {
         Vec::new()
@@ -805,6 +1052,85 @@ mod tests {
         assert_eq!(parse_key("C-"), None);
         assert_eq!(parse_key("Fxx"), None);
         assert_eq!(parse_key("ab"), None);
+    }
+
+    // ---- mouse pseudo-key names (Task 8, SP7 wave 3) ----
+
+    #[test]
+    fn parse_mouse_key_names_roundtrip() {
+        let button_kinds: &[MouseKeyKind] = &[
+            MouseKeyKind::Down,
+            MouseKeyKind::Up,
+            MouseKeyKind::Drag,
+            MouseKeyKind::DragEnd,
+            MouseKeyKind::DoubleClick,
+            MouseKeyKind::TripleClick,
+        ];
+        let wheel_kinds: &[MouseKeyKind] = &[MouseKeyKind::WheelUp, MouseKeyKind::WheelDown];
+        let locs: &[MouseKeyLoc] = &[
+            MouseKeyLoc::Pane,
+            MouseKeyLoc::Border,
+            MouseKeyLoc::Status,
+            MouseKeyLoc::StatusLeft,
+            MouseKeyLoc::StatusRight,
+            MouseKeyLoc::StatusDefault,
+        ];
+        for &kind in button_kinds {
+            for btn in 1..=3u8 {
+                for &loc in locs {
+                    let key = Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false };
+                    let name = key_name(&key);
+                    assert_eq!(parse_key(&name), Some(key), "round-trip of {name:?}");
+                }
+            }
+        }
+        for &kind in wheel_kinds {
+            for &loc in locs {
+                let key = Key { code: KeyCode::MouseKey(kind, 0, loc), ctrl: false, meta: false, shift: false };
+                let name = key_name(&key);
+                assert_eq!(parse_key(&name), Some(key), "round-trip of {name:?}");
+            }
+        }
+
+        // Exact canonical spellings.
+        assert_eq!(
+            key_name(&Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Pane), ctrl: false, meta: false, shift: false }),
+            "MouseDown1Pane"
+        );
+        assert_eq!(
+            key_name(&Key {
+                code: KeyCode::MouseKey(MouseKeyKind::DragEnd, 1, MouseKeyLoc::Pane),
+                ctrl: false,
+                meta: false,
+                shift: false
+            }),
+            "MouseDragEnd1Pane"
+        );
+        assert_eq!(
+            key_name(&Key { code: KeyCode::MouseKey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status), ctrl: false, meta: false, shift: false }),
+            "WheelUpStatus"
+        );
+
+        // Case-insensitive parse (tmux's `strcasecmp`-based lookup).
+        assert_eq!(
+            parse_key("mousedown1pane"),
+            Some(Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Pane), ctrl: false, meta: false, shift: false })
+        );
+
+        // Modifier prefixes combine with mouse keys exactly like any other key.
+        assert_eq!(
+            parse_key("C-MouseDown1Status"),
+            Some(Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Status), ctrl: true, meta: false, shift: false })
+        );
+    }
+
+    #[test]
+    fn invalid_mouse_name_rejected() {
+        assert_eq!(parse_key("MouseDown4Pane"), None, "button out of 1-3 range");
+        assert_eq!(parse_key("MouseDown1Nowhere"), None, "unrecognized location");
+        assert_eq!(parse_key("MouseClickPane"), None, "unrecognized type");
+        assert_eq!(parse_key("WheelUp1Pane"), None, "wheel types carry no button digit");
+        assert_eq!(parse_key("MouseDown"), None, "type with no button/location at all");
     }
 
     // ---- key_name / round-trip ----
@@ -1255,5 +1581,89 @@ mod tests {
             dec.feed(&input),
             vec![dm(MouseKind::Down(1), 5, 10, b"\x1b[<0;6;11M"), dk(plain(KeyCode::Char('a')), b"a")]
         );
+    }
+
+    // ---- encode_mouse (SP7 Task 9 -- closes follow-ups #35/#72) ----
+
+    fn me(kind: MouseKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind, ctrl: false, meta: false, shift: false, x, y }
+    }
+
+    #[test]
+    fn encode_mouse_sgr_press_matches_wire_format() {
+        // 0-based (5, 10) pane-relative -> 1-based (6, 11) on the wire.
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 5, 10), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<0;6;11M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_release_uses_lowercase_m() {
+        let bytes = encode_mouse(&me(MouseKind::Up(1), 5, 10), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<0;6;11m");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_drag_sets_motion_bit() {
+        let bytes = encode_mouse(&me(MouseKind::Drag(1), 9, 4), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<32;10;5M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_wheel() {
+        assert_eq!(encode_mouse(&me(MouseKind::WheelUp, 2, 2), MouseEncoding::Sgr), b"\x1b[<64;3;3M");
+        assert_eq!(encode_mouse(&me(MouseKind::WheelDown, 2, 2), MouseEncoding::Sgr), b"\x1b[<65;3;3M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_carries_modifiers() {
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: true, meta: true, shift: true, x: 0, y: 0 };
+        // cb = 0 (button 1) | 0x04 (shift) | 0x08 (meta) | 0x10 (ctrl) = 28.
+        assert_eq!(encode_mouse(&ev, MouseEncoding::Sgr), b"\x1b[<28;1;1M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_roundtrips_through_decoder() {
+        // encode_mouse's SGR output, fed back into KeyDecoder, must decode to
+        // the exact same MouseEvent it was built from -- the inverse-function
+        // property `cb_for`'s doc comment claims.
+        for ev in [
+            me(MouseKind::Down(1), 5, 10),
+            me(MouseKind::Down(3), 0, 0),
+            me(MouseKind::Up(1), 5, 10),
+            me(MouseKind::Drag(1), 9, 4),
+            me(MouseKind::WheelUp, 2, 2),
+            me(MouseKind::WheelDown, 2, 2),
+        ] {
+            let bytes = encode_mouse(&ev, MouseEncoding::Sgr);
+            let mut dec = KeyDecoder::new();
+            let items = dec.feed(&bytes);
+            assert_eq!(items, vec![dm(ev.kind, ev.x, ev.y, &bytes)], "roundtrip failed for {ev:?}");
+        }
+    }
+
+    #[test]
+    fn encode_mouse_x10_offsets_by_32_and_caps_at_223() {
+        // 0-based (5, 10) -> 1-based (6, 11) -> +32 offset -> bytes (38, 43).
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 5, 10), MouseEncoding::Default);
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 6 + 32, 11 + 32]);
+
+        // A coordinate past the 223 cap clamps rather than overflowing the
+        // single wire byte (task brief: "X10 encoding caps at 223").
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 500, 500), MouseEncoding::Default);
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 223 + 32, 223 + 32]);
+    }
+
+    #[test]
+    fn encode_mouse_utf8_extends_range_past_x10_cap() {
+        // A coordinate that would clamp under X10 (500 > 223) survives
+        // uncapped under the UTF-8 (1005) encoding -- decode the emitted
+        // UTF-8 codepoints back into 0-based coordinates and check they
+        // match, rather than pinning exact byte sequences.
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 500, 500), MouseEncoding::Utf8);
+        let s = std::str::from_utf8(&bytes[4..]).unwrap();
+        let mut chars = s.chars();
+        let cx = chars.next().unwrap() as u32 - 32 - 1;
+        let cy = chars.next().unwrap() as u32 - 32 - 1;
+        assert_eq!((cx, cy), (500, 500));
     }
 }

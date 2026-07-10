@@ -23,10 +23,17 @@ impl Grid {
     pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self;
     /// Feed raw VT bytes from the pane's ConPTY output.
     pub fn feed(&mut self, bytes: &[u8]);
-    /// Content is clipped (shrink) or padded with default cells (grow);
-    /// cursor is clamped into range. While in alt-screen mode the saved
-    /// primary buffer is ALSO clipped/padded in lockstep, so a subsequent
-    /// leave-alt restores a primary screen consistent with the new size.
+    /// **AMENDED (SP7, Task 2 — closes follow-up #47):** on the primary
+    /// (non-alt) screen, a column-WIDTH change now REFLOWS scrollback + the
+    /// live screen to the new width, tmux (`grid_reflow`)-style, instead of
+    /// clipping/padding — see "Reflow on resize" below. A row-COUNT-only
+    /// change still clips (shrink)/pads (grow), preserving the overlapping
+    /// top-left region, and leaves history untouched. The alternate screen
+    /// still NEVER reflows (tmux clears/redraws it) — any resize while
+    /// showing it keeps the original clip/pad behavior for BOTH axes, and
+    /// the saved primary buffer is ALSO clipped/padded in lockstep, so a
+    /// subsequent leave-alt restores a primary screen consistent with the
+    /// new size. Cursor is clamped into range in all cases.
     pub fn resize(&mut self, cols: u16, rows: u16);
     pub fn cols(&self) -> u16;
     pub fn rows(&self) -> u16;
@@ -46,7 +53,18 @@ impl Grid {
     /// "lines-ever-captured" coordinate system copy-mode selection anchors
     /// are pinned to (see the `## copy-mode` Task 3 selection-math
     /// amendment). Stays 0 when `history_limit == 0` (nothing is ever
-    /// captured).
+    /// captured). **Caveat (SP7 review fix):** this invariant holds only
+    /// across mutations that do NOT change the grid's width —
+    /// `reflow_to_width` (see "Reflow on resize" below) does not increment
+    /// `history_total` to match the non-uniform row restructuring it
+    /// performs, so a coordinate (e.g. a copy-mode selection anchor) pinned
+    /// before a width-changing resize cannot be repaired by any single
+    /// corrected shift count afterward. The server layer does not attempt
+    /// to: it clears any copy-mode selection bound to a pane that actually
+    /// gets resized (`Server::apply_layout_for_session`), matching real
+    /// tmux's `window_copy_size_changed` (`window-copy.c`), which
+    /// unconditionally clears the copy-mode selection on ANY resize of the
+    /// pane (width or height), not just width changes.
     pub fn history_total(&self) -> u64;
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen), clamped to `history_len()`.
@@ -60,22 +78,118 @@ impl Grid {
     /// Convenience: collect a whole view row into a `String` (e.g. for
     /// copy-mode search).
     pub fn view_row_text(&self, scroll_back: u32, row: u16) -> String;
-    /// The pane's title as last captured via OSC 0/2, if any has ever been set.
+    /// The pane's title as last captured via OSC 0/2, if any has ever been
+    /// set. **AMENDED (SP7, Task 3 — closes follow-up #52):** ALSO captures
+    /// the historical `ESC k <name> ESC \` rename escape into this same
+    /// slot — see `title_from_esc_k` below for how a consumer tells the two
+    /// sources apart.
     pub fn title(&self) -> Option<&str>;
     /// Edge-triggered: true the first time this is called after the title
     /// has changed, then false until it changes again. Intended to be
-    /// polled by the server after each `feed`.
+    /// polled by the server after each `feed`. Fires for either title
+    /// source (SP7, Task 3).
     pub fn take_title_changed(&mut self) -> bool;
+    /// **NEW (SP7, Task 3 — closes follow-up #52):** `true` if the CURRENT
+    /// `title()` was last set by `ESC k` rather than OSC 0/2. Not
+    /// edge-triggered — reflects the source of whatever `title()` currently
+    /// holds. `ESC k` is pre-scanned and stripped out of the raw byte
+    /// stream inside `feed`, BEFORE `vte::Parser::advance` ever sees those
+    /// bytes (the `vte` crate has no string-capturing path for `ESC k`: in
+    /// its `Escape` state, `k` falls in the generic `0x60..=0x7e ->
+    /// (Ground, EscDispatch)` bucket, so every subsequent title byte would
+    /// otherwise `Print`-leak into the pane's visible cells). The pre-scan
+    /// persists across `feed` calls (a sequence split across chunk
+    /// boundaries, including a lone trailing `ESC`, is still captured
+    /// correctly) and, verified against tmux's real `input.c` state
+    /// machine (`input_state_rename_string_table`/`input_exit_rename`):
+    /// commits the title the instant a bare `ESC` is seen after the opening
+    /// `ESC k` (tmux's `rename_string` state's `exit` callback fires on
+    /// ANY state change away from it, before the following byte — the
+    /// expected `\` — is even read), and treats `BEL` inside the title as a
+    /// silent no-op, NOT a terminator (unlike OSC 0/2, whose terminator IS
+    /// BEL-or-ST) — `input_state_rename_string_table` has no `BEL` arm,
+    /// unlike OSC's dedicated one. The server handles `ESC k`-sourced titles
+    /// according to the `allow-rename` option (`options::Options::allow_rename`,
+    /// default off — see the `## options` amendment in
+    /// `2026-07-07-command-config-interfaces.md`): when `allow-rename` is on,
+    /// an ESC k title renames the window directly (independent of
+    /// `automatic-rename` and of any prior manual rename), then clears that
+    /// window's `auto_rename` flag — matching tmux's `input_exit_rename` per
+    /// `docs/tmux-reference/windows-and-sessions.md:358-374`. When `allow-rename`
+    /// is off, ESC k titles are captured by the grid but cause no rename. The
+    /// OSC 0/2 path is unconditional, matching real tmux.
+    pub fn title_from_esc_k(&self) -> bool;
     /// Task 5 (mouse) addition: `true` while the pane is showing the
     /// alternate screen (`CSI ?1049h` seen more recently than a matching
-    /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide
-    /// whether a wheel event scrolls winmux's own copy-mode/scrollback
-    /// (primary screen) or is translated into 3 synthesized arrow-key
-    /// presses sent to the pane (alt screen — tmux's own alt-screen wheel
-    /// translation, since alt-screen apps like `less`/vim have their own
-    /// paging, not winmux's). See the `## mouse` section below.
+    /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide how
+    /// to handle a wheel event: on the primary screen, wheel-up enters/
+    /// scrolls winmux's own copy-mode/scrollback. **Superseded by SP7 Task
+    /// 9** (see the "Task 9 amendment" section below, closes follow-ups
+    /// #35/#72) — the alt-screen branch no longer translates a wheel event
+    /// into 3 synthesized arrow-key presses; that was a since-removed SP6
+    /// hack. Current behavior: an alt-screen wheel event is forwarded to
+    /// the pane app as a real mouse escape sequence if that app has
+    /// requested mouse reporting (`mouse_proto() != Off`), else silently
+    /// swallowed (no arrow-key synthesis, matching `docs/tmux-reference/
+    /// mouse.md` §9: tmux never converts wheel to arrow keys).
     pub fn alt_screen(&self) -> bool;
+
+    /// **NEW (SP7, Task 3 — closes follow-up #52; prerequisite for Task 9's
+    /// mouse re-encoding/forwarding):** the pane app's requested mouse
+    /// REPORTING protocol, tracked from DECSET/DECRST 9 (X10) / 1000
+    /// (VT200 "normal"/click-only) / 1002 ("button-event"/drag) / 1003
+    /// ("any-event"/all motion) in `csi_dispatch`'s existing `?`-private
+    /// mode match. Verified against tmux's own pane-mode tracking
+    /// (`input_csi_dispatch_sm_private`/`_rm_private`, tmux `input.c`):
+    /// these 4 mode numbers are MUTUALLY EXCLUSIVE — SET of any one first
+    /// clears every other mouse-mode bit before setting its own (so the
+    /// LAST one set simply wins outright, not a priority order), and RESET
+    /// of ANY of the four unconditionally clears to `Off`, regardless of
+    /// which specific mode number is named in the reset or which one was
+    /// actually active. Modern tmux has no `MODE_MOUSE_X10` bit at all
+    /// (mode 9 is pane-side-unimplemented legacy in current tmux), but
+    /// winmux tracks it with the identical mutual-exclusion rule since
+    /// Task 9's interface promise requires the `X10` variant to exist. This
+    /// task only TRACKS the mode; forwarding/re-encoding mouse events to
+    /// the pane app based on it is Task 9's job.
+    pub fn mouse_proto(&self) -> MouseProto;
+    /// **NEW (SP7, Task 3):** the pane app's requested mouse COORDINATE
+    /// ENCODING, tracked from DECSET/DECRST 1005 (UTF-8) / 1006 (SGR) —
+    /// independent bits (`MODE_MOUSE_UTF8`/`MODE_MOUSE_SGR` in real tmux),
+    /// not mutually exclusive with each other or with `mouse_proto`. SGR
+    /// wins if both are set, else UTF-8, else the legacy default — matching
+    /// tmux's own forwarding precedence (`input-keys.c`
+    /// `input_key_get_mouse`).
+    pub fn mouse_encoding(&self) -> MouseEncoding;
+    /// **NEW (SP7, Task 3; prerequisite for a later alerts task, follow-up
+    /// #74/Task 17):** edge-triggered — true the first time this is called
+    /// after a BEL (`\x07`) byte has been fed via `execute`, then false
+    /// until another BEL arrives. BEL never prints as a visible character
+    /// and does not affect cursor/wrap state.
+    pub fn take_bell(&mut self) -> bool;
+    /// **NEW (SP7, Task 13 — closes follow-up #55):** `true` once the pane
+    /// app has requested bracketed-paste mode via DECSET 2004, `false`
+    /// after a matching DECRST or if it was never requested. NOT
+    /// edge-triggered — reflects current mode, same shape as `mouse_proto`/
+    /// `alt_screen`. Consumed by `server::dispatch::exec_paste_buffer`'s
+    /// `maybe_bracket_paste` helper: `paste-buffer -p` wraps its write in
+    /// `ESC[200~`/`ESC[201~` ONLY when this is `true` on the TARGET pane —
+    /// otherwise `-p` stays a silent no-op wrapper, matching real tmux
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5).
+    pub fn bracketed_paste(&self) -> bool;
 }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse REPORTING
+/// protocol — see `Grid::mouse_proto`'s doc comment for the tmux-verified
+/// mutual-exclusion semantics among the 4 variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProto { #[default] Off, X10, Normal, Button, Any }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse COORDINATE
+/// ENCODING — see `Grid::mouse_encoding`'s doc comment for the resolution
+/// precedence when multiple encoding bits are set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding { #[default] Default, Utf8, Sgr }
 ```
 
 **Scrollback capture rules:**
@@ -90,9 +204,13 @@ impl Grid {
 - Each captured line is a `Vec<Cell>` exactly `cols` cells wide AT CAPTURE
   TIME. `view_cell`/`view_row_text` clip (extra columns read as blank) or
   pad (missing columns read as blank) a captured line lazily on read if the
-  grid's width has since changed — **no reflow** (documented divergence from
-  tmux ≥1.9, which does reflow; ticketed in `docs/follow-ups.md` at SP4
-  closeout).
+  grid's width has since changed. **SUPERSEDED (SP7, Task 2 — closes
+  follow-up #47):** this "no reflow" divergence from tmux ≥1.9 is fixed —
+  see "Reflow on resize" below. The clip/pad-on-read behavior described here
+  now only fires in the residual case where a captured line's width somehow
+  still differs from the current `cols` outside of a `resize` call (it
+  shouldn't in practice, since `reflow_to_width` rewrites every history line
+  to the current width immediately).
 - Eviction: once a push brings the scrollback length to `>= history_limit`,
   the oldest `max(1, history_limit / 10)` lines are dropped in one chunk
   (mirrors tmux's `grid_collect_history` batch-eviction, not evict-one-at-
@@ -133,7 +251,44 @@ row `index - history_len`.
 - `resize` while in alt mode also clips/pads the saved primary buffer (and
   clamps its saved cursor) in lockstep with the active alt buffer, so a
   later leave restores a primary screen consistent with the grid's current
-  dimensions.
+  dimensions. This is unconditional clip/pad on BOTH axes (never reflow) —
+  the alternate screen itself never reflows even on a width change (SP7
+  Task 2), since tmux clears/redraws the alt screen on resize rather than
+  reflowing it.
+
+**Reflow on resize (SP7, Task 2 — closes follow-up #47):** on the primary
+(non-alt) screen, `resize` reflows scrollback + the live screen whenever the
+column WIDTH changes (row-count-only changes are unaffected and still
+clip/pad, matching tmux: reflow is a width-axis operation only).
+- **Wrapped-row tracking:** a new private per-row `wrapped: bool` (tmux's
+  `GRID_LINE_WRAPPED`), one for each live-screen row and one carried on
+  every captured `HistLine`. Set ONLY at the instant the cursor auto-wraps
+  off the right margin while printing (consuming `wrap_pending`); cleared
+  on an explicit linefeed (`0x0A`) even if it was (stale-)true. Row
+  shifts (`scroll_up`/`scroll_down`/`insert_lines`/`delete_lines`, and
+  capture into `HistLine` on `scroll_up`) carry the flag along with the
+  row's cells; newly-blanked rows get `wrapped = false`.
+- **Algorithm (`grid_reflow`-equivalent):** the combined history+screen rows
+  are grouped into "logical lines" by following `wrapped` chains — a run of
+  `wrapped = true` rows (always fully used at the OLD width, since a row is
+  only ever marked wrapped once completely filled) followed by exactly one
+  `wrapped = false` terminal row, whose trailing never-written cells are
+  trimmed. Each logical line's content is re-split at the new width into
+  `ceil(len / new_cols)` rows (1 row for an empty line), every row but the
+  last marked wrapped. If the reflowed total needs more rows than the
+  screen has, the extra rows accumulate into `history` (oldest first,
+  subject to the normal `history_limit`/eviction rules — discarded outright
+  when `history_limit == 0`); if fewer, blank rows pad the tail (tmux:
+  `grid_reflow_add`).
+- **Cursor mapping** follows tmux's `grid_wrap_position`/
+  `grid_unwrap_position`: the cursor's offset within its OWN logical line is
+  preserved; a cursor sitting past that row's real content (trailing blank
+  padding) collapses to "end of the logical line" (tmux's `UINT_MAX`
+  sentinel); if the mapped position ends up scrolled into history (only
+  possible when eviction drops the cursor's own line), the cursor resets to
+  `(0, 0)` (tmux `screen_resize_cursor`).
+- Implemented entirely in `src/grid.rs` (`TermState::reflow_to_width`,
+  private); `Grid::resize`'s public signature is unchanged.
 
 **OSC title capture (`osc_dispatch`):**
 - OSC `0` (icon + title) and OSC `2` (title) both set the title: OSC
@@ -240,6 +395,14 @@ deviation).
 | `C-r` | `copy-search-backward` |
 | `n` | `copy-search-again` |
 | `N` | `copy-search-reverse` |
+
+**Task 13 amendment (SP7, closes follow-up #56)** — added to the emacs
+table:
+
+| Key(s) | Command |
+|---|---|
+| `C-k` | `copy-end-of-line-and-cancel` |
+| `M-m` | `copy-back-to-indentation` |
 
 Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 
@@ -360,6 +523,49 @@ pattern above — no special-casing was needed in `canonical()`/`usage()`/
 (documented deviation, see the task report); `SearchAgain`/`SearchReverse`
 take none either way (repeat the STORED pattern).
 
+**Task 13 amendment (SP7, closes follow-ups #53/#55/#56)** — clipboard.
+`CopyAction` gains 4 variants:
+
+```rust
+pub enum CopyAction {
+    // ... unchanged above ...
+    BackToIndentation,   // emacs M-m: first non-blank col of the view row
+    EndOfLineAndCancel,  // emacs C-k: copy cursor->EOL into a buffer, cancel
+    CopyPipe(Option<String>),          // copy-pipe [command]
+    CopyPipeAndCancel(Option<String>), // copy-pipe-and-cancel [command]
+}
+```
+
+`CopyAction` is no longer `Copy` (only `Clone`) because of the two
+`Option<String>`-carrying variants; `copy_action_name` now takes `&CopyAction`
+accordingly (every call site updated).
+
+Canonical names: `copy-back-to-indentation` (generic `copy-<action>`, no
+args, same as every Task 2/3/4 movement command); `copy-end-of-line-and-
+cancel` (like `copy-selection-and-cancel`, tmux's own command name ALREADY
+carries the `copy-` prefix, so canonical == `-X` spelling, both
+`"copy-end-of-line-and-cancel"` — winmux's OWN naming choice, not tmux
+master's pipe-always `copy-pipe-end-of-line-and-cancel` default; see
+`CopyAction::EndOfLineAndCancel`'s doc comment in `src/cmd.rs`); `copy-pipe`/
+`copy-pipe-and-cancel` (tmux's own command names, canonical == `-X` spelling
+again, same precedent). Unlike every other `copy-*` command, `copy-pipe`/
+`copy-pipe-and-cancel` accept ONE OPTIONAL positional argument (the shell
+command to spawn) — `resolve()` special-cases these two names BEFORE the
+generic `copy_action_from_canonical` zero-args check (the same pattern
+`copy-mode` itself already used), and `usage()` returns `"usage: copy-pipe
+[command]"`/`"usage: copy-pipe-and-cancel [command]"` instead of the generic
+`"(no arguments)"` string. `send-keys -X copy-pipe[-and-cancel] [command]`
+takes the command from the NEXT positional token after the `-X` name (`p.get(1)`),
+`None` if absent — every other `-X` name ignores extra positional tokens,
+unchanged.
+
+`ParsedCmd::PasteBuffer` gains a 4th field: `bracket: bool` (the `-p` flag,
+now actually consumed — previously parsed and silently discarded):
+
+```rust
+PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
+```
+
 ### `options` amendment
 
 Adds `mode-style` (`Style`, default `bg=yellow,fg=black`) and two getters:
@@ -374,6 +580,18 @@ pub fn mode_keys_vi(&self) -> bool; // true iff mode-keys == "vi"
 
 ```rust
 pub fn buffer_limit(&self) -> u32;
+```
+
+**Task 13 amendment (SP7, closes follow-up #53)** — adds `set-clipboard`
+(`Choice`, `on`/`external`/`off`, default `external` — matches real tmux's
+own default and 3-value choice set, `Scope::Server`) and two getters:
+
+```rust
+pub fn set_clipboard(&self) -> &'static str;
+/// `true` for `on`/`external`, `false` for `off` — the ONLY gate copy-mode
+/// OSC 52 emission uses (no ConPTY `Ms`-capability probe exists; plan
+/// decision (a) in `.superpowers/sdd/task-13-brief.md`).
+pub fn set_clipboard_emits(&self) -> bool;
 ```
 
 ### `server`/`server::dispatch` amendment
@@ -540,6 +758,22 @@ model:
   `Grid::view_row_text`/`view_cell` that reproduces a CURRENT key in view
   coordinates (`Grid` clamps `scroll_back` to its actual `history_len`
   internally, so an over-large value is harmless).
+- **SP7 review fix — width-changing resize invalidates the anchor, it is
+  NOT remapped:** `anchor_key_now`'s `history_total` delta is only exact
+  across mutations that don't change the grid's width; a width-changing
+  resize reflows scrollback non-uniformly (`reflow_to_width`, `## grid-v2`
+  amendment above) without bumping `history_total` to match, so there is no
+  single corrected shift count that could keep a stored anchor pointing at
+  the same content afterward. Rather than attempt that repair,
+  `Server::apply_layout_for_session` (`src/server.rs`) clears (`cs.sel =
+  None`) any client's active copy-mode selection whose pane actually gets
+  resized — matching real tmux's `window_copy_size_changed`
+  (`window-copy.c:1174-1193`, called unconditionally from
+  `window_copy_resize` whenever `window_pane_resize` fires, i.e. on ANY
+  actual resize of the pane, width or height, not just width changes; see
+  `window_copy_clear_selection`, `window-copy.c:5914-5929`). The copy
+  cursor (`scroll`/`cx`/`cy`) is left as-is (already view-relative) and
+  copy mode itself stays active — only the selection is dropped.
 
 **Task 3 amendment — text extraction** (`extract_selection_text` in
 `src/server/dispatch.rs`, a free `fn(grid: &Grid, sel: &SelState, cx: u16,
@@ -650,9 +884,13 @@ the sense the brief was steering away from.
 ### `render` amendment
 
 ```rust
+// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):** the `cursor:
+// (u16, u16)` field this struct originally carried here is REMOVED — it was
+// dead (`Renderer::compose_back` never read it; see
+// `2026-07-06-mvp-interfaces.md`'s sibling amendment for the full history).
+// The construction site below is updated in the same commit to drop it.
 pub struct CopyView {
     pub scroll: u32,
-    pub cursor: (u16, u16),
     // Task 3: precomputed by the server in VIEW coordinates, already
     // clamped into the pane's visible rows/cols; None = no active
     // selection, or it's wholly scrolled out of the current view.
@@ -694,10 +932,11 @@ to 0/`cols-1`, so this same shape logic paints it correctly as a full-width
 "middle" row — see `compute_sel_view`'s doc comment in `src/server.rs`.)
 
 `server::render_one`: when `client.mode` is `Copy(cs)`, the `PaneView` whose
-`id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, cursor: (cs.cx,
-cs.cy), sel: cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
+`id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, sel:
+cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
 cs.cy, cs.scroll, rect.h, rect.w, p.grid.history_len(),
-p.grid.history_total()))})` (the two trailing grid readings are the Task 3
+p.grid.history_total()))})` (SP7 Task 4, follow-up #63: no more `cursor`
+field — see the amendment above; the two trailing grid readings are the Task 3
 review fix's content-pinning inputs — see the position/ordering-key
 amendment above; every other pane, including a DIFFERENT client's
 focused/zoomed pane, renders live as before); the terminal cursor is placed
@@ -765,7 +1004,7 @@ u32` getter — see the `## copy-mode` section's `options amendment` above.
 `ParsedCmd` gains:
 
 ```rust
-PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
 ListBuffers,
 DeleteBuffer { name: Option<String> },
 SetBuffer { name: Option<String>, data: String },
@@ -777,9 +1016,14 @@ SetBuffer { name: Option<String>, data: String },
   error with no `-t`). `no_replace` is `-r`'s value: DEFAULT (`false`)
   replaces every `\n` in the buffer with `\r` before writing to the pane's
   pty (tmux's own default -- tmux's `-r` flag means "do NOT replace LF with
-  CR"; verified against tmux master's `paste.c`). `-p` (bracketed-paste
-  passthrough) is accepted and IGNORED -- v1 simplification, documented in
-  the design spec's deferrals list.
+  CR"; verified against tmux master's `paste.c`). `bracket` is `-p`'s value
+  -- **SUPERSEDED (SP7, Task 13, closes follow-up #55):** previously
+  accepted and IGNORED; now really wraps the write in `ESC[200~`/`ESC[201~`
+  via `maybe_bracket_paste(bytes, bracket, pane.grid.bracketed_paste())`,
+  but ONLY when the TARGET pane's grid currently has bracketed-paste mode
+  set (`Grid::bracketed_paste`, DECSET/DECRST 2004 -- see the `grid-v2`
+  section's amendment) -- otherwise `-p` stays a silent no-op wrapper,
+  matching real tmux exactly.
 - `list-buffers|lsb`: no arguments. Full multi-line CLI/headless text (one
   `<name>: <size> bytes: "<sample>"` line per buffer, oldest first,
   newline-terminated) via `exec_list_buffers_headless`; dispatched from a
@@ -1085,24 +1329,27 @@ simpler, and satisfies the same observable contract (the client's next
 `server::handle_stdin`'s `KeyInputEvent::Mouse` arm):**
 1. `!options.mouse()` → dropped (`Ok`, no-op) — see the `keys` amendment's
    "consume-always" note for why this drop happens here, not at decode time.
-2. `client.mode` is `ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` →
-   dropped (documented deviation: real tmux's mouse-during-prompt behavior
-   was left undecided by the task brief; winmux swallows mouse events during
-   these overlays so a stray click/drag can never race a confirm's y/n
-   capture or act on pane geometry the overlay is hiding). **Final SP4
-   review, MUST-FIX (NEW-1):** `ChooseTree`/`DisplayPanes` (Task 8, added
-   after this guard was written) joined the match arm in the merge-gate fix
-   round — both overlays draw full-screen exactly like `ConfirmCmd`/
-   `Prompt`, so the identical "hidden pane geometry" risk applies (a click
-   would silently focus, a border-drag would silently resize, a wheel would
-   silently enter copy mode on a pane the user cannot currently see). See
-   the `## overlays` section's "server::dispatch amendment: key routing"
-   subsection for the analogous KEYBOARD dismissal policy this mirrors —
-   mouse dismisses NEITHER overlay and never navigates/selects a
-   choose-tree row (a pure swallow, matching `ConfirmCmd`/`Prompt` exactly,
-   not display-panes' "any non-digit KEY dismisses" rule). Real tmux-style
-   mouse routing into choose-tree is out of scope here, ticketed
-   `docs/follow-ups.md` #61 (amends #38's scope to all four modal states).
+2. `client.mode` is `ConfirmCmd`/`Prompt`/`DisplayPanes` → dropped
+   (documented deviation: real tmux's mouse-during-prompt behavior was left
+   undecided by the task brief; winmux swallows mouse events during these
+   overlays so a stray click/drag can never race a confirm's y/n capture or
+   act on pane geometry the overlay is hiding). **Final SP4 review, MUST-FIX
+   (NEW-1):** `DisplayPanes` (Task 8, added after this guard was written)
+   joined the match arm in the merge-gate fix round — it draws full-screen
+   exactly like `ConfirmCmd`/`Prompt`, so the identical "hidden pane
+   geometry" risk applies (a click would silently focus, a border-drag
+   would silently resize, a wheel would silently enter copy mode on a pane
+   the user cannot currently see); no `docs/tmux-reference/*.md` source
+   pins any display-panes mouse behavior at all (`cmd_display_panes_key` is
+   KEY-only), so this stays a pure swallow rather than a guess.
+   `ChooseTree` gets its OWN branch: mouse dismisses it neither by key nor
+   mouse (unchanged), but **SP7 Task 10 (closes follow-up #61, amending
+   this section)** now routes `Down(1)` into `dispatch_choose_tree_mouse`
+   — click selects a row, double-click commits — UNLESS a kill-confirm
+   prompt is pending on it (`state.pending_kill.is_some()`), which still
+   swallows mouse entirely for the same y/n-race-safety reason as
+   `ConfirmCmd`/`Prompt`. See the `## overlays` section's "SP7 Task 10
+   amendment" subsection below for the full design.
 3. `y` equals the status row for THIS client (`mouse_status_row`: row 0 if
    `status-position top` else `client.rows - 1`, `None` if `status` off) →
    `dispatch_mouse_status`.
@@ -1289,34 +1536,198 @@ match any branch (degrade to `None`), tolerating a too-small terminal.
   scrollback direction to enter copy mode from at the live bottom).
 
 **Status-row routing (`dispatch_mouse_status`):** `Down(1)` →
-`mouse_status_click`, which rebuilds the SAME left-prefix-width-then-per-
-window-span layout `render_one`/`status::status_spans` draws (one separator
-space between tabs, none after the last) to hit-test which window tab (if
-any) column `x` falls in — a click on the `status-left` prefix, a separator,
-or past the last tab is a no-op (design spec: "Down-click on a status-line
-area with no window: no-op"); a hit selects that window
-(`session.current`/`session.last` updated directly, then
-`apply_layout_for_session`). Does NOT replicate `render::compose_back`'s
-final spatial right-truncation (when left+right don't fit the terminal
-width) — documented v1 gap, `docs/follow-ups.md`. `WheelUp`/`WheelDown` on
-the status row → `exec_step_window(false, ..)` / `exec_step_window(true,
-..)` (previous-window / next-window — tmux's default `WheelUpStatus`/
-`WheelDownStatus` bindings).
+`mouse_status_click`, which maps click column `x` through `status::
+status_tab_columns` (SP7 parity wave 3 fix, see the `## status` section's
+amendment in `2026-07-07-server-client-interfaces.md`) — the SAME layout
+core `render_one`/`status::status_spans` draws from, including window-list
+overflow scrolling and its `<`/`>` markers — to hit-test which window tab
+(if any) column `x` falls in; a click on the `status-left` prefix, a
+separator, a `<`/`>` marker, or past the last tab is a no-op (design spec:
+"Down-click on a status-line area with no window: no-op"); a hit selects
+that window (`session.current`/`session.last` updated directly, then
+`apply_layout_for_session`). Prior to this fix, `mouse_status_click`
+reconstructed the tab layout itself (unscrolled, a hardcoded
+`"{index}:{name}{flags}"` text-length guess) — a reconstruction that
+predated SP7 Task 7's overflow scrolling and disagreed with it the moment a
+real window list actually scrolled, so a click on the visually-current tab
+could resolve to the wrong window (`tests/server_proto.rs::status_click_
+selects_correct_window_when_list_scrolled` is the regression test).
+**VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39):** re-investigated
+whether this still doesn't replicate `render::compose_back`'s final
+spatial right-truncation (when left+right don't fit the terminal width) —
+it doesn't need to. `mouse_status_click` and `render_one`'s status-row
+build construct `left`/`right_len`/`width` IDENTICALLY (same
+`expand_format`/`truncate_visible`/`truncate_chars` calls reading the same
+options, same `session.size.0`), so both feed the SAME inputs into
+`plan_tab_layout`, whose own math guarantees `left_width + list_avail ==
+width - right_len` whenever the list fits and produces ZERO tab hitboxes
+at all whenever it doesn't — `compose_back`'s own final truncation is a
+provable no-op under matching inputs. `status_click_past_truncation_is_noop`
+(`tests/server_proto.rs`) proves the one place a genuine hit-test bug
+could still hide — a click landing exactly on a `<`/`>` overflow marker
+character, which is drawn outside every `TabColumn` range — is also
+correctly a no-op. `WheelUp`/`WheelDown` on the status row →
+`exec_step_window(false, ..)` / `exec_step_window(true, ..)` (previous-window
+/ next-window — tmux's default `WheelUpStatus`/`WheelDownStatus` bindings).
 
-**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
-forwarding a click/drag to the pane's own mouse-reporting application (the
-design spec's "v1: NOT forwarded" note; ticketed `docs/follow-ups.md` #72).
-Two PRIOR deferrals in this section are now RESOLVED and removed from this
-list: "drag-to-select on a live (non-copy-mode) pane" (Task 6's
-`PendingSelect { enter_copy: true }`) and "`word-separators` as a real
-option" (Task 7's `Options::word_separators`, replacing the old hardcoded
-`" -_@"` guess with the doc-verified tmux default). One new interaction is
-left untested rather than deferred outright: toggling `rectangle-toggle`
+**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):** THREE
+PRIOR deferrals in this section are now RESOLVED and removed from this list:
+"drag-to-select on a live (non-copy-mode) pane" (Task 6's `PendingSelect {
+enter_copy: true }`), "`word-separators` as a real option" (Task 7's
+`Options::word_separators`, replacing the old hardcoded `" -_@"` guess with
+the doc-verified tmux default), and "forwarding a click/drag to the pane's
+own mouse-reporting application" (follow-ups #35/#72 — SP7 Task 9, see the
+`### Task 9 amendment` immediately below this section). One new interaction
+is left untested rather than deferred outright: toggling `rectangle-toggle`
 (`R`/`v`) mid-drag on a `Word`/`Line`-kind selection — `sel.rect` and
 `sel.kind` are independent fields, so this is representable, but real tmux
 itself treats `SEL_WORD`/`SEL_LINE` and rectangle selection as mutually
 exclusive selection MODES rather than orthogonal flags; low risk (mouse-only
 entry point, no keybinding reaches this combination).
+
+### Task 9 amendment: application mouse passthrough (SP7, closes follow-ups #35/#72)
+
+Real tmux forwards mouse events to a pane whose own application has
+requested mouse reporting, INSTEAD of consuming them for winmux's own
+copy-mode-entry/drag-selection gestures, per `docs/tmux-reference/mouse.md`
+§3.1/§7.1/§7.4. This amendment wires that up using Task 3's pane-side
+tracking (`Grid::mouse_proto`/`mouse_encoding`) and Task 8's table-driven
+mouse routing.
+
+```rust
+// keys (new)
+pub fn encode_mouse(ev: &MouseEvent, encoding: MouseEncoding) -> Vec<u8>;
+```
+
+`encode_mouse` is the re-encoding half of `KeyDecoder`'s SGR mouse
+decoding — the inverse of `classify_sgr_mouse`/`mouse_kind_from_cb`, plus
+two more wire formats decode never needed to produce: legacy X10 (`CSI M
+<Cb+32><Cx+32><Cy+32>`, three raw bytes, coordinates capped at 223 since a
+single byte can't carry more) and UTF-8 (1005, same button byte, but
+`Cx+32`/`Cy+32` emitted as UTF-8-encoded codepoints, extending the
+coordinate range to 2015 — a best-effort encoding with no
+`docs/tmux-reference/*.md` source line pinning its exact algorithm, since
+1005 is a rare, largely-superseded-by-1006 protocol winmux itself never
+requests). `ev.x`/`ev.y` must already be PANE-relative and 0-based (the
+caller's job); `MouseEncoding::Sgr` is unbounded (1-based, no clamp).
+`MouseKind::Up` encodes with the SGR release final byte (`m`) / X10-and-UTF8
+still emit the button byte concretely since `MouseEvent` always carries the
+resolved kind, unlike real X10's release-button ambiguity.
+
+```rust
+// server (MouseDrag amendment)
+enum MouseDrag {
+    // ...existing variants unchanged...
+    Forwarding { pane: PaneId }, // NEW
+}
+```
+
+`MouseDrag::Forwarding { pane }`: armed when a drag START (the first
+`Drag1Pane` motion event after a `PendingSelect { enter_copy: true }`
+press) finds the pressed pane eligible to receive it instead of entering
+copy mode. Every subsequent `Drag`/`Up` event on this client re-attempts
+forwarding (`Server::forward_mouse_to_pane`, re-checked live per event,
+matching tmux's "no drag-update callback installed -> every motion
+re-synthesizes and re-dispatches" rule, `mouse.md` §2.5) rather than
+driving any winmux copy-mode/selection state; `Up` forwards the release
+too, resolved against whichever pane is under the pointer AT RELEASE
+(mirrors the pre-existing `Selecting`/`MouseDragEnd1Pane` release-position
+rule).
+
+```rust
+// server::dispatch (new)
+fn mouse_forward_eligible(proto: MouseProto, kind: MouseKind) -> bool;
+fn forward_mouse_to_pane(&mut self, pane: PaneId, ev: MouseEvent, rect: Rect) -> bool; // private method
+```
+
+`mouse_forward_eligible`: `Down`/`Up`/`WheelUp`/`WheelDown` are eligible
+whenever `proto != MouseProto::Off` — INCLUDING `MouseProto::X10`, the one
+variant modern tmux itself has no `MODE_MOUSE_*` bit for at all (per
+`Grid::mouse_proto`'s doc comment, tracked in winmux specifically because
+"a later task's interface promise requires the X10 variant to exist" — this
+is that promise: an app that only ever sent `CSI ?9h` still owns its own
+clicks, wire-encoded via `MouseEncoding::Default`/X10 since it never also
+requested 1005/1006). `Drag` (pure motion) additionally requires
+`MouseProto::Button`/`Any` (`MOTION_MOUSE_MODES` — X10/Normal never asked
+the terminal to report motion at all).
+
+`forward_mouse_to_pane`: re-encodes `ev` relative to `rect` (the pane's
+current rect — `px = ev.x - rect.x`, clamped, same for `py`) via
+`keys::encode_mouse(&rel, pane.grid.mouse_encoding())` and writes the
+result to the pane's `Pty::write_input`, IF `mouse_forward_eligible`. Returns
+whether it actually wrote anything — callers use this to decide "forward
+INSTEAD of my own action" (`mouse_drag`'s `PendingSelect { enter_copy: true
+}` arm, `mouse_wheel`) vs. "forward IN ADDITION to my own action, which
+always happens regardless" (`mouse_down`'s pane-click branch — mirrors
+tmux's UNGATED root `MouseDown1Pane -> select-pane -t=; send -M`, the only
+default root pane binding with no `if -F mouse_any_flag` guard at all).
+
+**Call-site precedence (mirrors each gated default binding's own `if -F`
+guard, which a plain `RawCmd` list can't express directly):**
+
+- `mouse_down` (pane click, any button): unconditional focus (unchanged),
+  PLUS an unconditional forward attempt when `!in_copy_here` — no
+  `mouse_lookup` gate at all, since real tmux's `MouseDown1Pane` default has
+  none either.
+- `mouse_drag`'s `PendingSelect { enter_copy: true }` arm (root
+  `MouseDrag1Pane`): the forward attempt runs in the `mouse_lookup ==
+  None` arm (real tmux's unconditional "unbound -> forward_key" step) AND
+  in the "resolved to the exact default" arm (standing in for the
+  default's own `if -F {mouse_any_flag} {send -M} {copy-mode -M}` body) —
+  NOT when a user's own override is bound, since an override fully replaces
+  the default's guard along with its action.
+- `mouse_wheel` (root `WheelUpPane`/`WheelDownPane`, only reached when the
+  pane is NOT already in this client's copy mode): same `None`-arm /
+  is-the-default-arm split as `mouse_drag` above. Replaces the OLD
+  unconditional alt-screen "wheel -> 3x synthesized arrow-key presses"
+  translation entirely (`docs/tmux-reference/mouse.md` §9: "No wheel→arrow
+  translation... tmux never converts wheel to arrow keys") — an alt-screen
+  pane that does NOT own the mouse now SWALLOWS wheel (matches tmux's
+  `alternate_on` guard: `send -M` reaches `input_key_get_mouse`, which
+  returns 0 for an app that hasn't enabled its own mouse reporting) instead
+  of receiving synthesized arrows.
+- Border drags and status-line clicks are UNCHANGED — no forwarding check
+  was added to either path, matching real tmux's "ALWAYS KEEPS: border
+  drags, status-line clicks" rule (`mouse.md` §7.4 point 2); a border-owning
+  pane's own mouse mode has no effect on border-drag resize.
+
+TDD evidence (`src/server/dispatch.rs::mouse_dispatch_tests`, all built the
+same "real `Server` + `Grid::feed`'d DECSET, no ConPTY" way
+`alt_screen_wheel_does_not_enter_copy_mode` established):
+`mouse_forward_eligible_gates_by_proto_and_kind` (exhaustive over every
+`MouseProto` × representative `MouseKind`), `forward_mouse_to_pane_writes_
+when_pane_owns_mouse_click` / `_false_when_pane_does_not_own_mouse`,
+`mouse_down_focuses_pane_that_owns_mouse` (focus AND forward both happen,
+proving the UNGATED-click claim), `drag_on_mouse_owning_pane_does_not_
+enter_copy_mode` (asserts `client.mode` stays `Normal` AND `client.mouse.
+drag` becomes `Forwarding`), `wheel_forwards_to_mouse_owning_pane_instead_
+of_copy_mode`, `border_drag_still_resizes_when_pane_owns_mouse` (a REAL
+2-pane split via `Layout::split`, proving actual resize still happens),
+`passthrough_stops_after_decrst` (proves the gate re-reads live state, not
+a one-time snapshot). Unit tests (`src/keys.rs::tests`):
+`encode_mouse_sgr_{press,release,drag,wheel}_*`, `encode_mouse_sgr_
+carries_modifiers`, `encode_mouse_sgr_roundtrips_through_decoder` (every
+SGR encode output, fed back into `KeyDecoder`, decodes to the exact
+`MouseEvent` it was built from), `encode_mouse_x10_offsets_by_32_and_caps_
+at_223`, `encode_mouse_utf8_extends_range_past_x10_cap`.
+
+**Residual gap, honestly noted:** an end-to-end proof of "the pane's own
+REAL PROCESS actually receives these bytes on its stdin" (as opposed to the
+above, which proves the SERVER decides to write them and byte-verifies
+their exact wire encoding) was evaluated and NOT attempted, for the same
+class of reason `alt_screen_wheel_sends_arrows` (Task 5/SP6) was
+abandoned: a real interactive shell's own line editor / conhost's VT-INPUT
+parser would almost certainly reinterpret (not passively echo) an
+unrecognized `CSI < ... M` sequence typed into its stdin in an
+unpredictable, un-pinnable way, unlike straightforward ASCII keystrokes
+(which the project's OTHER `send-keys`-style e2e tests already rely on
+echoing reliably). The unit-level coverage above exercises the exact same
+`forward_mouse_to_pane` → `keys::encode_mouse` → `Pty::write_input` call
+chain a live pane would receive; only the LAST hop (does `write_input`
+correctly deliver already-known-correct bytes to a real process) is
+unverified by THIS task specifically — general `Pty::write_input` delivery
+is already covered by `tests/pty_smoke.rs` and every other keystroke-based
+e2e test in the suite.
 
 Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
 sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
@@ -1341,7 +1752,16 @@ scroll would produce alone); `drag_after_double_click_extends_by_words`
 row, asserts the copied text includes that word's WHOLE trailing text, not
 truncated at the drop column); `drag_after_triple_click_extends_by_lines`
 (triple-clicks a line, drags onto a later row, asserts both the full first
-and full second line were captured).
+and full second line were captured); `word_separators_option_moves_double_
+click_word_boundary` (SP7 parity wave 3 fix, closes follow-up #37's coverage
+gap — a NON-DEFAULT `word-separators` value including `_` moves the
+double-click word boundary: `foo_bar` selects whole with the default, only
+`bar` once `_` is added as a separator). **SP7 parity wave 3 fix (review of
+128cfc0):** `status_click_selects_correct_window_when_list_scrolled` (the
+`mouse_status_click` hit-test regression test — a narrow terminal with 5
+windows forces the status-line window list to scroll; a click on the
+visually-current tab must select that SAME window, not whatever the old
+unscrolled-order reconstruction resolved to).
 Unit tests (`src/server/dispatch.rs::mouse_dispatch_tests`):
 `exec_copy_mode_wires_mouse_flag_to_scroll_exit` (fix round: the Minor
 finding — `exec_copy_mode`'s `mouse` parameter is genuinely read now).
@@ -1397,31 +1817,27 @@ window, `Session::new_window`) initialize it to `None`.
 
 ### `options` amendment
 
-Two new `Number` options, both with typed getters returning `u16`:
+Two new `Size` options (SP7 Task 12 promotes these from `Number` to a new
+`Kind::Size`/`Value::Size(SizeSpec)` -- see that task's amendment below),
+both with typed getters returning `u16`:
 
 ```rust
-// SPECS additions: Spec { name: "main-pane-width", kind: Kind::Number, .. },
-//                  Spec { name: "main-pane-height", kind: Kind::Number, .. }
+// SPECS additions: Spec { name: "main-pane-width", kind: Kind::Size, .. },
+//                  Spec { name: "main-pane-height", kind: Kind::Size, .. }
 // defaults: main-pane-width = 80, main-pane-height = 24 (tmux defaults)
 
 impl Options {
-    pub fn main_pane_width(&self) -> u16;
-    pub fn main_pane_height(&self) -> u16;
+    pub fn main_pane_width(&self, total: u16) -> u16;
+    pub fn main_pane_height(&self, total: u16) -> u16;
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16;
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16;
 }
 ```
 
-**Documented deviation: ratio-baked, not absolute, across later resizes.**
-`Layout`'s tree only ever stores `f32` split ratios (no absolute-size node
-variant), so `apply_preset` converts `main-pane-width`/`-height`'s absolute
-cell count into a ratio via `ratio_for(target, area_len)` ONCE, at
-`select-layout`/`next-layout` apply-time. The FIRST render after applying the
-preset reproduces the exact configured cell count, but a LATER window
-resize scales the main pane proportionally along with everything else,
-rather than re-deriving the same absolute width/height the way real tmux
-does (tmux recomputes the absolute size on every resize). Functionally
-acceptable given the architecture and the Task 6 brief's test scope (exact
-rects at a fixed area); tracked as `docs/follow-ups.md` #43 for eventual
-absolute-size preservation.
+**Formerly a documented deviation (ratio-baked, not absolute, across later
+resizes) -- FIXED by SP7 Task 12, see that task's amendment below for the
+current behavior and `docs/follow-ups.md` #43's closed entry for the
+before/after.**
 
 ### `cmd` amendment
 
@@ -1576,13 +1992,15 @@ pub enum ParsedCmd {
     /// time as a bare/`:`-prefixed index within the SAME session; any
     /// `session:` prefix is accepted but ignored (no cross-session move).
     MoveWindow { kill: bool, target: String },
-    /// `find-window|findw <pattern>`: case-insensitive substring search
-    /// (v1, no regex) over window NAMES and every pane's CURRENTLY VISIBLE
-    /// content (not scrollback) in the target session, in window-index
-    /// order (the current window counts too); jumps to the FIRST match.
-    /// No match -> `Ok` carrying a transient `no windows matching: <p>`
-    /// message (not an `Err`).
-    FindWindow { pattern: String },
+    /// `find-window|findw [-CNTirZ] <pattern>` -- **SP7 Task 12 (closes
+    /// follow-ups #46/#54) REPLACED this variant's shape and its dispatch
+    /// behavior**; see the `find-window-and-main-pane-sizing` (SP7 Task 12)
+    /// section at the end of this file for the current, authoritative
+    /// contract. The v1 shape (`FindWindow { pattern: String }`, plain
+    /// case-insensitive substring, direct jump to the first match) is
+    /// PRESERVED HERE ONLY as a historical record of Task 7's original
+    /// scope.
+    FindWindow { pattern: String, by_content: bool, by_name: bool, by_title: bool, regex: bool, ignore_case: bool },
 }
 ```
 
@@ -1639,13 +2057,14 @@ Three new `exec_*` helpers, wired into both `execute` (headless) and
   `last_rects` cleanup if `-k` kills it — the occupant's `Window`/`Layout`
   is gone from the registry afterward), then respects
   `Options::renumber_windows()` same as every other structural op.
-- `exec_find_window`: snapshots `(WindowId, name, pane_ids)` for every
-  window in the target session, then for each in index order checks the
-  name (case-insensitive substring) then every listed pane's grid via the
-  new free function `grid_contains(grid: &Grid, needle_lowercased: &str) ->
-  bool` (walks `0..grid.rows()` × `0..grid.cols()`, i.e. the CURRENTLY
-  VISIBLE screen only, not scrollback); first match wins, `None` returns
-  the `no windows matching:` message as `Ok`, not `Err`.
+- `exec_find_window` (Task 7 original; **REPLACED by SP7 Task 12's
+  `exec_find_window_client`/headless-error split** -- see the
+  `find-window-and-main-pane-sizing` section at the end of this file):
+  snapshotted `(WindowId, name, pane_ids)` for every window in the target
+  session, checked the name (case-insensitive substring) then every listed
+  pane's grid via `grid_contains`, and jumped DIRECTLY to the first match.
+  `grid_contains` itself is retired by Task 12 in favor of a matcher-
+  generic `grid_matches`, see below.
 
 `'`'s dispatch has no dedicated `exec_*` — its `PromptKind::Index` commit
 validates `buf` is empty or all-ASCII-digits BEFORE delegating (Task-7
@@ -1905,20 +2324,98 @@ one difference from copy mode's own precedent, below.
   "not reprocessed" simplification).
 
 **Mouse dismissal policy while either overlay is open (final SP4 review,
-MUST-FIX NEW-1):** `server::dispatch::dispatch_mouse`'s modal guard (see the
-`## mouse` section's routing-step-2 amendment above) swallows EVERY mouse
-event — click, drag, wheel — outright while `client.mode` is `ChooseTree`
-or `DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
-handling. This is deliberately NOT the same policy as the keyboard rules
-just above: a click never dismisses either overlay (unlike display-panes'
-"any non-digit KEY dismisses" rule) and never navigates or selects a
-choose-tree row (unlike an unbound key, which is silently ignored but at
-least leaves the possibility of a future bound mouse action open — today
-there is none). The simplest, safest policy given the brief left real
-tmux's mouse-during-overlay behavior undecided: a stray click/drag/wheel
-can never act on the pane geometry either overlay is currently hiding.
-Real tmux-style routing (click selects a choose-tree row, wheel scrolls the
-list) is out of scope here — ticketed `docs/follow-ups.md` #61.
+MUST-FIX NEW-1; AMENDED by SP7 Task 10 for `ChooseTree`, see below):**
+`server::dispatch::dispatch_mouse`'s modal guard (see the `## mouse`
+section's routing-step-2 amendment above) still swallows EVERY mouse
+event — click, drag, wheel — outright while `client.mode` is
+`DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
+handling: a click never dismisses it (unlike display-panes' own "any
+non-digit KEY dismisses" keyboard rule), consistent with no
+`docs/tmux-reference/*.md` source pinning any display-panes mouse
+behavior at all. `ChooseTree` no longer follows this same blanket swallow
+— see the `## overlays` section's "SP7 Task 10 amendment" subsection
+immediately below for its real routing (closes follow-up #61).
+
+### SP7 Task 10 amendment: choose-tree mouse routing (closes follow-up #61)
+
+`docs/tmux-reference/choose-tree.md` §7.4 (`mode_tree_key`'s mouse branch):
+click selects a row (no choose), double-click selects AND commits
+(rewrites the key to Enter), right-click is a context menu (out of scope —
+winmux has no context-menu system anywhere), and **wheel is a documented
+NO-OP with `mouse on`** — tmux's mouse branch swallows every mouse key
+except the three click types before its key switch is even reached, so
+`WheelUp`/`DownPane`'s `mode_tree_up`/`_down` cases are UNREACHABLE via a
+real mouse event; the doc's own words: "matching tmux exactly means
+click/double-click/right-click only" (a wheel-scrolls-the-list mapping is
+explicitly called out as "a (defensible) divergence", not what real tmux
+does). Given this project's stated guiding principle ("be exactly like
+tmux"), winmux implements wheel as a no-op here too — a deliberate
+deviation from the task brief's own more casual "wheel scrolls the list"
+phrasing, in favor of the doc's more rigorously researched ruling.
+
+```rust
+// server::dispatch (new, private methods)
+fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize>;
+// `acting_id` threaded from `dispatch_mouse` (Wave-4 merge: Task 14's `exec_tree_commit`
+// gained it for choose-client self-detach; `dispatch_mouse` itself gained the same
+// parameter, passed from `handle_stdin`'s per-client `id`).
+fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome;
+```
+
+`choose_tree_row_at` maps a click's screen row `y` to an index into a
+freshly-rebuilt `rows` (`build_choose_rows` — the sorted/filtered seam, so
+hit-testing always sees exactly what the renderer drew), mirroring
+`server::render_one`'s `RenderOverlay::Tree` → `render::ListOverlay` layout
+exactly: `list_height`/`preview`-shown (via `choose_tree_preview_paintable`,
+the Task-15 #73 split)/`msg_reserved`/`title_reserved` (the Task-15 sort/
+filter title row always occupies the panel's first row, so list rows start
+at screen row 1 and a click on row 0 is a miss)/`top`/the visible `[start,
+end)` window are recomputed the SAME way `render_one`'s own `RenderOverlay::
+Tree` arm does (same `choose_tree_list_height` call, same
+`pending_kill.is_some() || client.message.is_some()` message-reservation
+rule). `None` (no row) on a click outside the list — an empty list, the
+title row, the preview box, a reserved kill-confirm row, or past the last
+row.
+
+`dispatch_choose_tree_mouse` is called from `dispatch_mouse`'s
+`ChooseTree` guard branch ONLY for `Down(1)` with no kill-confirm pending
+(both already checked by the caller). It resolves the row under `ev.y`,
+updates `state.sel`/`state.selected` to it unconditionally (a plain click
+always at least selects), then uses the SAME `advance_click_run` click-run
+tracker `mouse_down` uses for pane double/triple-clicks (choose-tree isn't
+using `client.mouse` for anything else while open) to detect a same-cell
+second press within the click window — on a `run >= 2`, it sets
+`client.mode = ClientMode::Normal` and calls `exec_tree_commit`, exactly
+mirroring `dispatch_choose_tree_key`'s `ChooseTreeAction::Commit` arm. A
+plain single click (`run == 1`) returns `Ok` with no further action —
+selection only, no choose, per the doc.
+
+`dispatch_mouse`'s `ChooseTree` guard (amended): checks
+`state.pending_kill.is_none()` BEFORE calling `dispatch_choose_tree_mouse`
+— a kill-confirm prompt (`x` was pressed, awaiting y/n) still swallows
+`Down(1)` too, exactly like `ConfirmCmd`/`Prompt`, so a stray click can
+never silently re-arm the selection out from under a pending confirm
+answer. Every other mouse event kind (wheel, `Drag`, `Up`, non-left
+buttons) reaching a `ChooseTree` client is still a pure swallow, matching
+the doc's click/double-click-only ruling above; `Drag`/`Up` additionally
+still run `end_drag` first (#64: a drag armed before the overlay opened
+must not survive across it — unchanged from the pre-existing guard).
+
+TDD evidence (`tests/server_proto.rs`): `choose_tree_click_selects_row`
+(a plain click on a non-current row, then a bare keyboard Enter, switches
+to THAT row — proving the click alone changed the selection, since a
+no-op click would leave Enter re-committing the already-current window, a
+silent non-event), `choose_tree_double_click_commits_switch` (two presses
+on the same row within the click window switches with NO keyboard
+involved at all), `choose_tree_wheel_is_noop_matching_tmux` (wheel events
+followed by a bare Enter still commit the ORIGINAL default selection, not
+whatever wheel might have moved it to), `choose_tree_click_swallowed_
+during_pending_kill_confirm` (a click during a pending `x` kill-confirm
+doesn't disrupt the confirm flow). `mouse_ignored_under_choose_tree_
+overlay` (pre-existing, Task 8 era) still passes unmodified — its click
+lands on a blank/no-row area of an (only one window) tree panel, so it's
+still a no-op for row selection too, and its actual claim (no leak-through
+to the hidden pane underneath) is unaffected by this task either way.
 
 **Task 8 review fix (Important #2) — interception applies to EVERY `Key`
 event, not just `table: Root`:** the original `Key{table, ..}` arm gated
@@ -2172,11 +2669,15 @@ full-clear already put there (blank) when smaller. The server builds
 `content` at exactly the inset interior size (`build_render_overlay` passes
 `w - 4` x `sy - list_height - 2` to `build_tree_preview`); no extra
 "inset shrank the blit below 1x1" drop rule is needed —
-`choose_tree_list_height`'s box-size guard (`sy-h <= 4 || w <= 4` drops
-the preview) already guarantees the interior is >= 1x3 whenever a preview
-is emitted. That guard folds tmux's paint-time "skip the box" check into
-the height function itself — a degenerate-only divergence, ticketed
-`docs/follow-ups.md` #73.
+`choose_tree_preview_paintable`'s box-size guard (`sy-h <= 4 || w <= 4`
+drops the preview) already guarantees the interior is >= 1x3 whenever a
+preview is emitted. **RESOLVED by SP7 Task 15** (was: this guard used to be
+folded into `choose_tree_list_height` itself, collapsing the row list to
+the FULL panel height whenever the guard failed — a real divergence,
+ticketed `docs/follow-ups.md` #73; see the SP7 Tasks 14/15 amendment below
+for the fix, which splits sizing (`choose_tree_list_height`) from
+paintability (`choose_tree_preview_paintable`) so a degenerate pane's list
+keeps its own small height instead of expanding).
 
 ### TDD evidence (this task)
 
@@ -2196,6 +2697,272 @@ own doc comment). Three pre-existing tests were updated for the new default-
 selection starting point (a `Down`-from-row-0 assumption is now wrong when
 the default selection is already the current, often LAST, row) — see the
 task report for the specific before/after reasoning per test.
+
+### **AMENDMENT (SP7 Task 12 — `find-window` routes into a FILTERED choose-tree):**
+
+`ChooseTreeState` gains one field — `win_filter: Option<HashSet<WindowId>>`
+(shown in the merged struct in the Tasks 14/15 amendment just below; named
+`win_filter`, not `filter`, because Task 15's interactive text filter owns
+the plain name) — `Some(matches)` for a tree opened by `find-window` (the
+exact `WindowId`s the pattern matched, snapshotted ONCE at open time,
+deliberately not live-refiltered while the tree stays open, a documented
+simplification), `None` for a plain `choose-tree`/`w`/`s` open.
+`build_tree_rows` gains the matching `win_filter: Option<&HashSet<WindowId>>`
+parameter (full merged signature below): in the `Windows` view, a window
+row is only emitted when `win_filter` is `None` or contains that window's
+id (the session HEADER row is always emitted regardless, for context); the
+`Sessions` view ignores `win_filter` entirely (`find-window` never opens
+that view). The window filter composes with Task 15's sort/text filter:
+win-filter first (inside `build_tree_rows`), sort with it, text filter on
+top (`build_choose_rows`).
+
+Opening a tree is refactored into one shared helper both `choose-tree` and
+`find-window` call (itself a thin default-selection layer over Task 14's
+even more general `open_choose_mode`, below):
+
+```rust
+impl Server {
+    /// `win_filter: None` = plain `choose-tree` (`exec_choose_tree_client`
+    /// is now a thin `sessions`-to-`view` wrapper around this).
+    /// `win_filter: Some(_)` = `find-window`'s filtered open: default
+    /// selection is the FIRST matching window row (not necessarily the
+    /// session's current window, which may not even be in the match set)
+    /// instead of the session's current-window default a plain
+    /// `choose-tree -w` open uses.
+    fn open_choose_tree(
+        &mut self,
+        view: ChooseTreeView,
+        win_filter: Option<std::collections::HashSet<WindowId>>,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome;
+}
+```
+
+### **AMENDMENT (SP7 Tasks 14/15): choose-buffer/choose-client overlays + tagging/sort/filter + tiny-pane guard parity (closes #48, #49, #50, #73)**
+
+Task 14 generalizes the choose-tree overlay machinery to two new flat (no
+tree structure) views instead of duplicating it; Task 15 adds tagging, a
+sort-field cycle, a substring filter, and the tag marker/title-line render
+work to the SAME machinery (applying "for free" to all four views), plus a
+correctness fix to `choose_tree_list_height`'s tiny-pane guard (#73). Both
+tasks touch the same types, documented together.
+
+**`server` (`ChooseTreeView`, `TreeTarget`, `ChooseTreeState`, `SortKey`,
+`ClientState`):**
+
+```rust
+enum ChooseTreeView { Windows, Sessions, Buffers, Clients }   // Buffers/Clients new (Task 14)
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]                  // Hash new (Task 15, keys `tagged`)
+enum TreeTarget {
+    Session(String),
+    Window(String, WindowId),
+    Buffer(String),      // new (Task 14): buffer name, `buffers::Buffers`'s own stable identity
+    Client(ClientId),    // new (Task 14): winmux has no tty path, the id IS the identity
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]                   // new (Task 15)
+enum SortKey { Index, Name, Size, Creation }
+
+struct ChooseTreeState {
+    view: ChooseTreeView,
+    sel: usize,
+    selected: Option<TreeTarget>,
+    pending_kill: Option<(Vec<TreeTarget>, String)>,   // CHANGED (Task 15): Vec, was a single TreeTarget
+    expanded: HashSet<String>,
+    preview: PreviewMode,
+    win_filter: Option<HashSet<WindowId>>,   // new (Task 12): find-window's match set, see amendment above
+    tagged: HashSet<TreeTarget>,      // new (Task 15)
+    sort: SortKey,                    // new (Task 15)
+    reversed: bool,                   // new (Task 15)
+    filter: Option<String>,           // new (Task 15): committed filter
+    filter_edit: Option<String>,      // new (Task 15): in-progress `f`-prompt edit buffer
+}
+```
+
+`pending_kill`'s `Vec<TreeTarget>` only ever holds `Session`/`Window`
+targets — `Buffers`/`Clients` kills/detaches never confirm at all (`## 9`/
+`## 10`: "No confirm prompts"), bypassing `pending_kill` entirely. Multiple
+targets = the tagged set at `x`-press time (empty tagged set falls back to
+just the current row, the pre-Task-15 shape). `cancel_stale_choose_trees`
+now `retain`s only the still-alive targets inside the vec instead of nulling
+the whole confirm, so one concurrently-killed tagged target doesn't cancel
+confirmation for the rest.
+
+`ClientState` gains `attached_at: Instant` (set once in `finish_attach`) —
+choose-client's "attach time" row column and its `Creation` sort key both
+read it; only meaningful relative to another client's `attached_at`.
+
+**`server::dispatch` (row building, sort/filter, title, preview, key
+routing, exec helpers):**
+
+```rust
+// SIGNATURE CHANGED (Task 12: gained `win_filter`; Task 15: gained `sort: SortKey, reversed: bool`);
+// new Buffers/Clients arms (Task 14).
+pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>, win_filter: Option<&HashSet<WindowId>>, sort: SortKey, reversed: bool) -> Vec<TreeRow>;
+
+// new (Task 15): substring/case-insensitive filter over `TreeRow::text`, with the
+// "depth-0 row also kept if any depth-1 child matches" rule for the two-level tree.
+fn apply_choose_filter(rows: Vec<TreeRow>, filter: &str) -> Vec<TreeRow>;
+
+// new (Task 15): the ONE seam both `build_render_overlay` and `dispatch_choose_tree_key`
+// use to get sorted+filtered rows; `(rows, filter_no_matches)` -- an over-narrow filter
+// falls back to the UNFILTERED list with `filter_no_matches: true` (mirrors mode-tree's
+// own "ignore a filter that matches nothing" rule, `## 2.2` point 4).
+pub(super) fn build_choose_rows(&self, session_name: &str, state: &ChooseTreeState) -> (Vec<TreeRow>, bool);
+
+// new (Task 15): the `" <item> (sort: <field>[, reversed])[ (filter: active|no matches)]"`
+// title string (`## 3.2`), now ALWAYS non-empty -- see the `render`/title-row-reservation
+// note below for the render-side consequence.
+pub(super) fn build_choose_title(&self, rows: &[TreeRow], sel: usize, state: &ChooseTreeState, filter_no_matches: bool) -> String;
+
+fn item_display_name(&self, target: &TreeTarget) -> String;   // new (Task 15) helper for the title
+fn client_label(id: ClientId) -> String;                       // new (Task 14): "client-<id>"
+fn sort_seq(view: ChooseTreeView) -> &'static [SortKey];       // new (Task 15): per-view `O`-cycle sequence
+fn next_sort(view: ChooseTreeView, cur: SortKey) -> SortKey;   // new (Task 15)
+fn sort_key_name(k: SortKey) -> &'static str;                  // new (Task 15)
+
+// SIGNATURE CHANGED (#73 fix, Task 15): DROPPED the `w: u16` parameter -- the paint-time
+// box-size guard (which used `w`) is no longer folded into this function at all (see below).
+pub(super) fn choose_tree_list_height(sy: u16, line_size: usize, mode: PreviewMode) -> u16;
+
+// new (#73 fix, Task 15): `mode_tree_draw`'s SEPARATE paint-time guard (mode-tree.c:980-981),
+// checked independently of `choose_tree_list_height`'s own sizing formula -- `false` means
+// "no preview box," and the caller must keep using the SAME (possibly tiny) list height
+// rather than falling back to a full-height list (the bug #73 tracked).
+pub(super) fn choose_tree_preview_paintable(sy: u16, h: u16, w: u16) -> bool;
+
+// SIGNATURE CHANGED (Task 14): gained `acting_id: ClientId` (needed for choose-client
+// self-detach vs. detaching another client).
+pub(super) fn dispatch_choose_tree_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> Option<ExecOutcome>;
+
+fn exec_tree_kill(&mut self, target: TreeTarget, session_name: &str, acting_id: ClientId) -> ExecOutcome;      // gained acting_id
+fn exec_tree_commit(&mut self, target: TreeTarget, client: &mut ClientState, session_name: &mut String, acting_id: ClientId) -> ExecOutcome;  // gained acting_id
+fn exec_client_detach(&mut self, id: ClientId, acting_id: ClientId) -> ExecOutcome;   // new (Task 14)
+fn tree_kill_prompt_many(&self, targets: &[TreeTarget]) -> String;                     // new (Task 15): single -> `tree_kill_prompt`, N>1 -> "kill N tagged? (y/n)"
+
+fn exec_choose_buffer_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome;   // new (Task 14)
+fn exec_choose_client_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome;   // new (Task 14)
+fn open_choose_mode(&mut self, view: ChooseTreeView, default_target: Option<TreeTarget>, win_filter: Option<HashSet<WindowId>>, session_name: &str, client: &mut ClientState) -> ExecOutcome; // new (Task 14): shared opener, `open_choose_tree` (and thus `exec_choose_tree_client`/`find-window`) delegates to it; `win_filter` threaded from Task 12
+
+fn feed_choose_filter_byte(&mut self, client: &mut ClientState, b: u8) -> (bool, Option<ExecOutcome>);  // new (Task 15), same shape as `feed_copy_search_byte`
+```
+
+`ChooseTreeAction` (the hardcoded key enum) gains, ALL Task 15: `ToggleTag`
+(`t`), `UntagAll` (`T`), `TagAll` (`C-t`), `SortNext` (`O`), `SortReverse`
+(`r`), `FilterOpen` (`f`), `FilterClear` (`c`) — `resolve_choose_tree_key`
+maps them; `C-t` is special-cased above the blanket `ctrl||meta => None`
+guard, same pattern as `C-c`. `dispatch_choose_tree_key`'s `Kill` arm now
+collects targets from the tagged set (falling back to the current row when
+empty) and branches on `view`: `Sessions`/`Windows` still arm
+`pending_kill` (confirm, `y`/`Y`/Enter); `Buffers`/`Clients` act
+IMMEDIATELY via `exec_tree_kill` in a loop, no confirm. `feed_mode_byte`
+gains a peek for `ClientMode::ChooseTree(state) if state.filter_edit.
+is_some()` (mirrors the pre-existing `CopyState::search_prompt` peek),
+routing to `feed_choose_filter_byte`.
+
+`build_tree_rows`'s `Buffers`/`Clients` arms produce FLAT rows (`depth: 0`,
+`marker: None`): buffer text is `"<name>: <size> bytes: \"<sample>\""`
+(reusing `list-buffers`' own format), sorted by `Buffers::list()`'s
+insertion order (`Creation`, reversed for newest-first default), name, or
+byte size; client text is `"<client_label>: session <name> (attached
+<secs>s)"`, sorted by `client_label`, `cols*rows`, or `attached_at`. Default
+sort per view (`sort_seq(view)[0]`): `Index` (tree), `Creation` (buffer,
+newest-first), `Name` (client) — matching `## 4.1`/`## 9`/`## 10`'s
+documented defaults, restricted to a 2-3-entry sequence per view (no
+`activity`/`z` — not modeled, a documented divergence).
+
+**`cmd` (`ParsedCmd`):**
+
+```rust
+ChooseBuffer,   // new (Task 14): `choose-buffer|chooseb`, no flags modeled
+ChooseClient,   // new (Task 14): `choose-client`, no flags modeled
+```
+
+Usage strings: `usage: choose-buffer`, `usage: choose-client`. Headless
+dispatch: `Err("no current client")` for both (same as `ChooseTree`).
+Client dispatch: `ChooseBuffer => exec_choose_buffer_client(...)`,
+`ChooseClient => exec_choose_client_client(...)`.
+
+**`bindings`:** two new default prefix bindings (Task 14, real tmux's own
+defaults, `key-bindings.c:412,414`): `=` -> `choose-buffer`, `D` ->
+`choose-client`.
+
+**`render` (`TreeRowCell`, `ListOverlay`, paint code):**
+
+```rust
+struct TreeRowCell {
+    text: String,
+    depth: u8,
+    marker: Option<char>,
+    selected: bool,
+    tagged: bool,   // new (Task 15)
+}
+
+struct ListOverlay {
+    title: String,   // now ALWAYS non-empty in practice (see below) -- was always `String::new()` pre-Task-15
+    rows: Vec<TreeRowCell>,
+    top: usize,
+    preview: Option<PreviewBlock>,
+    list_height: u16,   // new (#73 fix, Task 15) -- see below
+}
+```
+
+Row painting inserts a fixed 2-column "tag slot" (`"* "` tagged / `"  "`
+untagged) between the marker slot and the row's text (`## 3.3`).
+
+**#73 fix — `ListOverlay::list_height` and the `list_cap` computation:**
+pre-Task-15, a `None` preview meant "the list gets the WHOLE panel," which
+was correct for the legitimate cases (`PreviewMode::Off`, or a list too
+short for the 2/3 rule) but WRONG for the genuinely-degenerate case (a pane
+too small for `mode_tree_draw`'s own paint-time box guard) — that case used
+to be folded into `choose_tree_list_height` itself, collapsing `h` to the
+full panel height and silently EXPANDING the row list into the space a tiny
+preview box would have occupied. The fix splits sizing from paintability
+(`choose_tree_list_height` no longer contains the paint-time guard at all;
+`choose_tree_preview_paintable` checks it separately) and adds
+`ListOverlay::list_height`, which `render`'s `list_cap` now uses
+UNCONDITIONALLY (`list.list_height.min(rows)`) instead of matching on
+`preview.is_some()` — so a degenerate pane's row list stays capped at its
+own small `list_height` and the freed rows stay blank, matching real tmux.
+
+**Title row + scroll-math reservation:** `build_choose_title` now returns a
+non-empty string for every choose overlay open (previously `ListOverlay.
+title` was wired up but always fed `String::new()`, so the render code's
+existing "paint title row 0, list starts at row 1" logic went entirely
+unused pre-Task-15). Since the title now always consumes the panel's own
+first row, `Server`'s `top` (scroll-into-view) computation in the
+`RenderOverlay::Tree` match arm reserves 1 row for it (`title_reserved`,
+alongside the pre-existing `msg_reserved`) — omitting this reservation
+regressed `choose_tree_scrolls_long_list_with_confirm_message_shown`
+(caught during this task's own verification pass, not a pre-existing gap).
+
+**`server` (`RenderOverlay::Tree`):**
+
+```rust
+Tree {
+    rows: Vec<(String, u8, Option<char>, bool)>,   // 4th element `tagged: bool`, new (Task 15)
+    sel: usize,
+    list_height: u16,
+    preview: Option<TreePreviewData>,
+    title: String,   // new (Task 15)
+}
+```
+
+### TDD evidence (SP7 Tasks 14/15)
+
+`tests/server_proto.rs`: `choose_buffer_lists_buffers_enter_pastes`,
+`choose_buffer_x_deletes_selected`, `choose_client_lists_attached_clients`,
+`choose_client_x_detaches_selected` (Task 14); `choose_tree_t_tags_row_and_
+x_kills_all_tagged`, `choose_tree_o_cycles_sort_r_reverses`, `choose_tree_
+filter_narrows_rows`, `choose_tree_tiny_pane_keeps_short_list_blank_
+remainder` (Task 15, #73). `render::tests`: `overlay_tagged_row_shows_
+asterisk_marker` (new); `overlay_list_paints_rows_and_selection`, `overlay_
+tree_rows_indent_children`, `overlay_list_shrinks_to_two_thirds_when_
+preview_on` amended in place for the new `tagged`/`list_height` fields (2
+extra columns per row; exact expected strings recomputed in each test's own
+comment).
 
 ## `clock-mode` — clock-mode overlay (sub-project 6 wave 2, Task 10)
 
@@ -2579,3 +3346,345 @@ window), `manual_rename_disables_auto` (CLI `rename-window` -> a later OSC
 title change is ignored), `pane_title_format_expands` (`display-message
 '#T'` returns the FULL title, distinguishing it from the derived-and-
 truncated window name).
+
+## `find-window-and-main-pane-sizing` (SP7 Task 12, closes #43/#46/#54)
+
+Two independent fixes bundled in one task per the SP7 plan: `find-window`
+gains real fnmatch-glob/regex matching plus routes into a filtered
+choose-tree instead of jumping directly (closes #46/#54, per
+`docs/tmux-reference/windows-and-sessions.md` `### find-window`); the
+`main-horizontal`/`main-vertical` layout presets' absolute `main-pane-width`/
+`-height` now survives a later whole-window resize instead of being baked
+into a ratio once at apply-time (closes #43, per
+`docs/tmux-reference/panes-and-layout.md`'s options table). The
+`ChooseTreeState.filter`/`build_tree_rows`/`open_choose_tree` amendments and
+the `ParsedCmd::FindWindow` shape change are documented in place, above (the
+`overlays` and `window-ops` sections respectively); this section covers
+everything else.
+
+### New dependency: `regex` (first external crate beyond `vte`/`windows`)
+
+**Justification** (per the task brief's explicit allowance): tmux's `-r`
+flag is real POSIX-extended-regex matching (`cmd-find-window.c`'s `m/r:`/
+`C/r:` format functions). Hand-rolling even a small ERE engine correctly
+(character classes, anchors, alternation, quantifiers) is a substantial,
+bug-prone undertaking for a rarely-used flag, whereas `regex` is a
+well-established, pure-Rust (no `unsafe`-heavy C bindings), no-OS-API
+dependency that composes cleanly with the existing crate set. The NON-`-r`
+default path (fnmatch-style glob: `*`/`?`, substring-wrapped) is still
+hand-rolled (`glob_match`, below) -- no crate needed for that, matching the
+brief's "hand-roll the subset if simple" fallback for the part that
+actually IS simple.
+
+### `cmd` amendment -- `find-window` flags
+
+`resolve`'s `"find-window"` arm now accepts `-C`/`-N`/`-T`/`-i`/`-r`/`-Z` as
+bool flags (via the existing `scan_flags` helper) plus exactly one
+positional `pattern`; usage string: `usage: find-window [-CNTirZ] pattern`.
+`-Z` (keep the tree zoomed) is accepted for config/CLI compatibility with
+real tmux invocations but is otherwise a documented no-op -- winmux's
+choose-tree has no zoom-passthrough state to keep (same "accepted, no
+behavior yet" bucket as several SP6 Task 2 options); tracked as a residual
+note for a future ticket, not blocking this task's closed tickets. See the
+`window-ops` section (above) for the full `ParsedCmd::FindWindow` shape.
+
+### `server::dispatch` amendment -- matcher + exec split
+
+Two new private helpers (module-level free functions in `dispatch.rs`):
+
+```rust
+/// fnmatch-lite: `*` (any run, including empty) and `?` (exactly one
+/// char), no character classes (`[...]`) -- a documented scope narrowing
+/// (real tmux's fnmatch supports them; window names/pane titles/content
+/// practically never need them, and the task brief sanctioned a "small"
+/// hand-rolled matcher). Classic greedy-backtrack wildcard algorithm
+/// (linear amortized, no recursion). `text`/`pattern` compared char-by-char
+/// (Unicode scalar granularity, not byte), so multi-byte UTF-8 names/titles
+/// match correctly.
+fn glob_match(pattern: &str, text: &str) -> bool;
+
+/// A compiled `find-window` matcher: either `Regex` (`-r`, `-i` folded in
+/// via `(?i)`) or a plain glob/substring pattern (case already folded to
+/// lowercase at construction time if `-i`, matching every other `-i`-style
+/// case-fold in this codebase). `Result::Err` only from `Regex::new`
+/// failing on `-r` (surfaced as `Err("invalid regex: {msg}")`, an ordinary
+/// command error -- unlike `ChooseTree`, `find-window` CAN fail before ever
+/// reaching a client, so this stays a `Result`, not baked into the
+/// `ExecOutcome`-returning client helper).
+struct FindMatcher { regex: Option<regex::Regex>, glob_pattern: String, ignore_case: bool }
+
+impl FindMatcher {
+    fn new(pattern: &str, use_regex: bool, ignore_case: bool) -> Result<FindMatcher, String>;
+    /// Name/title matching (`-N`/`-T`): glob mode wraps `glob_pattern` in
+    /// `*...*` (substring-glob, per the doc's "star = wrapped unless -r"
+    /// rule) and calls `glob_match` against the FULL string; regex mode
+    /// calls `Regex::is_match` (already substring-search semantics unless
+    /// the user's own pattern anchors with `^`/`$`).
+    fn matches_name(&self, text: &str) -> bool;
+    /// Content matching (`-C`): PLAIN substring search (glob mode does NOT
+    /// wrap/glob here -- tmux's `#{C:}` format function is a literal
+    /// substring/regex search, not fnmatch, per
+    /// `docs/tmux-reference/commands-config-options-formats.md`'s format
+    /// function table) or `Regex::is_match`, checked per VISIBLE grid ROW
+    /// (mirrors the retired `grid_contains`'s per-row walk -- not history,
+    /// not a single joined blob).
+    fn matches_content(&self, text: &str) -> bool;
+}
+```
+
+`exec_find_window_client(&mut self, pattern: String, by_content: bool,
+by_name: bool, by_title: bool, use_regex: bool, ignore_case: bool, client:
+&mut ClientState, session_name: &str) -> ExecOutcome`: when none of
+`by_content`/`by_name`/`by_title` are set (bare `find-window pattern`),
+defaults to all three (`docs/tmux-reference/windows-and-sessions.md`: "C = N
+= T = 1" when none given). Builds one `FindMatcher`, then for every window
+in the target session (index order) ORs the enabled criteria -- name
+(`w.name`), title (any pane's `grid.title().unwrap_or("")`), content (any
+pane's visible rows) -- short-circuiting per window on the first hit;
+collects the full match SET (not just the first). Zero matches: `Ok`
+carrying the existing transient `no windows matching: <p>` message, exactly
+as before (documented, intentional scope narrowing versus real tmux, which
+would open an empty filtered tree -- showing nothing to select is worse UX
+than the existing message and no test/ticket requires the stricter
+behavior). One or more matches: **always** calls `open_choose_tree` with
+`Some(matches)` -- no more "jump directly when exactly one match" shortcut
+(the parity fix `#46` targets).
+
+`execute_headless`'s `FindWindow { .. }` arm changes from directly executing
+the search to `Err("no current client".to_string())` -- matching `ChooseTree
+{ .. }`'s existing rule exactly, since opening (a possibly-filtered) tree is
+fundamentally a CLIENT-side mode, unlike the old direct-jump behavior which
+needed no client at all. `PromptKind::FindWindow`'s commit handler
+(`feed_prompt_byte`) now calls `exec_find_window_client` instead of the
+retired `exec_find_window`, routing its `ExecOutcome` through the same
+`route_outcome` path `PromptKind::Command` already uses.
+
+### `layout` -- NO public surface change
+
+`Layout::apply_preset`'s signature is UNCHANGED
+(`apply_preset(&mut self, preset: LayoutPreset, panes: &[PaneId], area:
+Rect, main_width: u16, main_height: u16)`) -- callers still pass
+pre-resolved absolute `u16` cell counts (now resolved from a percent-aware
+`options::Options::main_pane_width`/`_for`, see the `layout-presets`
+section's amended `options` amendment above). The fix for #43 lives entirely
+in `layout::Node`, a PRIVATE enum with no contract surface: `Node::Split`
+gains a `main_size: Option<u16>` field remembering "this split's first
+child wants an absolute `N`-cell length, re-derived via `clamp_main` against
+whatever area a LATER `rects()` call passes in" -- set by `build_preset_tree`
+only for the `MainHorizontal`/`MainVertical` presets' top split, `None`
+everywhere else, and cleared by a successful manual `resize_from` on that
+same split (a deliberate user override of the border takes precedence over
+the configured absolute size on any FURTHER resize). No other `Layout`
+method's signature changes.
+
+### TDD evidence (this task)
+
+Unit (`layout::tests`): `main_pane_width_survives_window_resize`,
+`main_pane_height_survives_window_resize`,
+`main_pane_width_still_reclamps_on_resize_into_tiny_area`,
+`manual_resize_of_main_split_overrides_absolute_stickiness`. Unit
+(`options::tests`): `main_pane_size_percent` (`50%`/`25%` resolve against a
+caller `total`, round-trips via `show`, `-u` restores the plain-cells
+default); `main_pane_size_getters` updated in place for the new `total`
+parameter. `tests/server_proto.rs`: `find_window_multi_match_opens_choose_
+list`, `find_window_single_match_opens_choose_list_too` (the OLD
+direct-jump assumption inverted, per the task brief's sanction),
+`find_window_regex_flag_matches_anchor` (`-r '^foo'`),
+`main_pane_width_survives_window_resize` (end-to-end: apply `main-vertical`
+with `main-pane-width 20`, push a real client `Resize` frame, assert the
+main pane column is still exactly 20). `find_window_f_prompt` (Task 7's
+original test) is rewritten to open the tree and commit with `Enter` for
+both the name-match and content-match cases, keeping its no-match assertion
+unchanged (see `exec_find_window_client`'s doc comment above for why the
+zero-match message path is preserved).
+
+## `display-menu` — display-menu overlay + right-click default menus (SP7 Task 16, closes #51)
+
+The `cmd`/`bindings` side of this task (`ParsedCmd::DisplayMenu`/`MenuPos`/
+`MenuEntry`, the three `mouse_default_menu_*` sentinel defaults) is
+documented in `docs/specs/2026-07-07-command-config-interfaces.md`'s sibling
+`## display-menu` section — this section covers the NEW overlay itself:
+`server::ClientMode::Menu`, `render::Overlay::Menu`, and every new
+`server::dispatch` function. Parity authority: the cloned tmux C source's
+`menu.c`/`cmd-display-menu.c` (see the sibling section's citation) — the
+reference docs under `docs/tmux-reference/` do not fully cover menus.
+
+### `server` (`src/server.rs`)
+
+```rust
+enum ClientMode {
+    // ...
+    Menu(MenuState),
+}
+
+struct MenuState {
+    rect: Rect,
+    title: String,
+    rows: Vec<MenuRow>,
+    /// `-1` = no row highlighted yet (tmux's `md->choice == -1`).
+    sel: i32,
+}
+
+struct MenuRow {
+    /// Fully pre-formatted display text (name, right-padded, then a
+    /// `" (key)"` hint if the item has one) — `render` blits it verbatim.
+    text: String,
+    /// Parsed once at open time from the item's key-notation string.
+    key: Option<Key>,
+    /// `None` = separator row.
+    command: Option<String>,
+}
+```
+
+Unlike `ChooseTreeState` (which is deliberately snapshot-FREE, rebuilding
+its row list from live registry state on every render/key), `MenuState` IS
+a stable snapshot taken once at open time — this matches real tmux exactly
+(`menu.c`'s `struct menu` is built once by `cmd_display_menu_exec`/the
+default-menu builders and never rebuilt while showing). `rect` is likewise
+resolved once at open time and never repositioned on a later client resize
+— a documented narrowing vs. tmux's `menu_resize_cb`.
+
+`render_one` reads `ClientMode::Menu` DIRECTLY (not through the
+`RenderOverlay` two-phase indirection every other overlay uses) — `MenuState`
+needs no `&self` server context beyond what's already snapshotted in it, so
+there is nothing for that indirection (which exists specifically for
+overlays needing `&self` before `render_all`'s mutable per-client loop
+begins) to buy here. `build_render_overlay` therefore has NO `ClientMode::
+Menu` arm (falls through its existing `_ => None`). The message/cursor
+`match &client.mode` sites gain `ClientMode::Menu(_)` arms: `too_small`
+still shows "terminal too small" (no overlay painted); otherwise any
+transient `client.message` passes through UNCHANGED underneath the menu
+(unlike `ChooseTree`/`DisplayPanes`, which take over the message row — the
+menu is a small floating box, not a full-panel overlay, so there's no
+reason to hide an unrelated message); cursor is hidden (tmux: `MODE_CURSOR`
+cleared). `handle_stdin`'s `Forward`-blob and `Key{table,key,raw}` branches
+each gain a `ClientMode::Menu` arm mirroring `ChooseTree`'s (unconditional
+interception, including a completed prefix sequence), routing to
+`dispatch_menu_key`.
+
+`switch_client_session_to` (new free fn, mirrors the pre-existing `switch_
+client_session`'s `-p`/`-n` shape): switches directly to a NAMED session for
+`ParsedCmd::SwitchClientTo`. `None` (silent no-op, same convention as the
+`-p`/`-n` sibling) for both an unknown name and "already there".
+
+### `render` (`src/render.rs`)
+
+```rust
+pub struct MenuRowCell {
+    pub text: String,
+    pub separator: bool,
+    pub selected: bool,
+}
+
+pub struct MenuOverlay {
+    pub rect: Rect,
+    pub title: String,
+    pub rows: Vec<MenuRowCell>,
+}
+
+pub enum Overlay {
+    // ...
+    Menu(MenuOverlay),
+}
+```
+
+`Renderer::paint_menu` (new private method, called from `compose_back`'s
+overlay match): UNLIKE `Overlay::List`'s full-client-area clear, this paints
+ONLY inside `rect` — every cell outside it (other panes, borders, the
+status row) is left exactly as already composed, matching real tmux's own
+floating-menu behavior. Draws a single-line box (`┌─┐│└┘`, `scene.border`
+style — the same glyph set `Overlay::List`'s preview box uses), the title
+CENTERED over the top border (a documented simplification: winmux's
+`display-menu` doesn't parse `#[align=...]` inside `-T`, so every title
+centers unconditionally — which is what every one of winmux's own default
+menus' titles would render as anyway, since real tmux's own default menus
+all pass `#[align=centre]`), then each row: a separator fills the interior
+with `─`; a real item fills the interior with `scene.mode_style` (selected)
+or the default style, then draws `row.text` starting one column in from the
+left border. Zero/degenerate rects (`w < 2 || h < 2`) paint nothing (no
+panic on the underflowing box-corner math).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+```rust
+// Generic display-menu execution (CLI/config/`:` prompt).
+fn exec_display_menu_client(&mut self, x: cmd::MenuPos, y: cmd::MenuPos, title: Option<String>, items: Vec<cmd::MenuEntry>, client: &mut ClientState) -> ExecOutcome;
+fn open_menu(&mut self, client: &mut ClientState, title: String, entries: Vec<(String, Option<String>, Option<String>)>, x: cmd::MenuPos, y: cmd::MenuPos, trigger: Option<(u16, u16)>) -> ExecOutcome;
+
+// Default menu builders (built directly in Rust from live state, not a
+// tmux-style conditional format-string template).
+fn open_pane_menu(&mut self, pane_id: PaneId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn open_window_menu(&mut self, wid: WindowId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn open_session_menu(&mut self, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+
+// Key/mouse routing while ClientMode::Menu is active.
+pub(super) fn dispatch_menu_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn dispatch_menu_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn menu_move(&mut self, client: &mut ClientState, down: bool);
+fn menu_choose(&mut self, idx: usize, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+fn exec_menu_command(&mut self, command: &str, client: &mut ClientState, session_name: &mut String) -> ExecOutcome;
+
+// Root-table MouseDown3* triage (unbound/override/default sentinel).
+fn mouse_down_pane_button3(&mut self, pane_id: PaneId, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn mouse_status_button3(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+fn status_hit_at(&self, session_name: &str, x: u16) -> StatusHit; // Left | Window(WindowId) | Other
+```
+
+- **`dispatch_mouse`** gains a `ClientMode::Menu` guard (same shape as the
+  pre-existing `ChooseTree` guard): a `Down` event routes to `dispatch_menu_
+  mouse`; every other kind (Drag/Up/Wheel) no-ops after `end_drag` hygiene.
+- **`mouse_down`**'s `MouseHit::Pane` arm gains a `btn == 3` branch (checked
+  before the existing generic `btn != 1` early-return) calling `mouse_down_
+  pane_button3` — table-driven exactly like every other Task-8 mouse
+  default: unbound no-ops, a user override runs generically via `dispatch_
+  mouse_cmds`, the default sentinel calls `open_pane_menu`. The pane is
+  focused (`mouse_focus_pane`) BEFORE this branch runs, same as every other
+  button — a documented substitution for tmux's own `MouseDown3Pane`, which
+  only focuses on its "relay to app" branch, not when opening the menu;
+  winmux's default pane-menu item commands (`split-window -h`, `kill-pane`,
+  ...) rely on this focus, since they use the ordinary "no `-t` = current
+  pane" default rather than an explicit target.
+- **`dispatch_mouse_status`** gains a `MouseKind::Down(3)` arm calling
+  `mouse_status_button3`, which discriminates `MouseDown3StatusLeft` vs.
+  `MouseDown3Status` via `status_hit_at` (mirrors `mouse_status_click`'s own
+  `left`/`status::status_tab_columns` construction EXACTLY — duplicated
+  rather than shared, since `mouse_status_click` also SELECTS the window as
+  a side effect a hit-test-only caller must not have), then the same
+  unbound/override/default-sentinel triage as `mouse_down_pane_button3`.
+- **`open_pane_menu`/`open_window_menu`/`open_session_menu`** build a
+  `MenuBuilder` (private helper reproducing `menu_add_item`'s separator
+  de-dup rule: a `sep()` call is dropped if the list is empty or the
+  previous entry was already a separator) directly from live state, then
+  call `open_menu` with `x`/`y` both `MenuPos::Mouse` and `trigger =
+  Some((mx, my))` — the pointer position that triggered the click. See the
+  sibling command-config-interfaces amendment's "Documented narrowings" for
+  every content substitution versus tmux's `DEFAULT_PANE_MENU`/
+  `DEFAULT_WINDOW_MENU`/`DEFAULT_SESSION_MENU`.
+- **`build_menu_rows`**/**`resolve_menu_axis`** (private free functions):
+  finalize a `(name, key, command)` tuple list into display-ready `MenuRow`s
+  plus the box's content width (mirrors `menu_add_item`'s own `menu->width`
+  tracking, minus tmux's overflow-truncation machinery — not needed, since
+  every entry list here is short and fixed); resolve one axis of the box's
+  top-left corner from a `MenuPos`, mirroring `menu_prepare`'s own centering
+  formula and on-screen clamp.
+- **`menu_move`** mirrors `menu.c`'s `KEYC_UP`/`KEYC_DOWN` cases exactly:
+  wrapping, separator-skipping navigation that is a no-op if every OTHER
+  row is a separator (the skip loop wraps back to the untouched original
+  selection). **`menu_choose`** resets `client.mode` to `Normal` BEFORE
+  running the chosen row's command (mirrors `menu.c`'s `chosen:` label),
+  so an item that itself opens another overlay is never fighting the menu
+  it was chosen from. **`dispatch_menu_key`** checks every row's OWN
+  shortcut key FIRST (mirrors `menu_key_cb`'s per-item loop, which runs
+  before its `switch` on navigation keys) — a shortcut match runs
+  immediately regardless of the current selection.
+- **`execute_headless`**/**`execute_for_client`** gain `DisplayMenu`/
+  `SwitchClientTo` arms: `DisplayMenu` is client-only (`Err("no current
+  client")` headless, same rule as `ChooseTree`/`ClockMode`); `SwitchClientTo`
+  is likewise client-only, mapping to `ExecOutcome::SwitchedSession`/`Ok`
+  exactly like the pre-existing `SwitchClient` arm.
+
+### Tests
+
+See the sibling command-config-interfaces amendment's Tests list (covers
+both files' additions together, since the behavior is one feature split
+across two contract documents purely by module-ownership convention).

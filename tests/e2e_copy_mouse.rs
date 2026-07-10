@@ -533,3 +533,59 @@ fn mouse_wheel_scrolls_history_e2e() {
     let _ = pty.write_input(b"q");
     let _ = pty.write_input(b"\x02d");
 }
+
+// `app_mouse_reporting_*_e2e` (SP7 Task 19 closeout): an application
+// mouse-passthrough e2e test (follow-ups #35/#72) was ATTEMPTED here and
+// deliberately WITHDRAWN after investigation confirmed it cannot be built
+// reliably on this platform -- not merely "hard", genuinely infeasible with
+// the current ConPTY-hosted-pane architecture. Documented per the task
+// brief's explicit sanction ("skip if infeasible under ConPTY and document
+// why") rather than left silent.
+//
+// Two approaches were tried, in order:
+//
+// 1. **Byte-level proof of the CHILD PROCESS's receipt of a forwarded
+//    click.** The task brief's own suggestion: drive a pane app that emits
+//    a mouse-mode DECSET and reads its own raw stdin to prove a forwarded
+//    click's exact bytes arrive. Rejected before implementation: this
+//    project's e2e harness always hosts real `powershell.exe` panes, whose
+//    default `PSReadLine` module binds a literal `ESC` byte to `RevertLine`
+//    (clear the current input) -- any forwarded mouse byte sequence (X10 or
+//    SGR, both `ESC`-prefixed) delivered to an ordinary interactive prompt
+//    would be intercepted by the shell's own line editor, not echoed back
+//    verbatim, before a test could observe it.
+// 2. **Prove the GATING decision changed instead** (a real pane requesting
+//    mouse mode should divert wheel/drag events to forwarding rather than
+//    winmux's own copy-mode entry) by having a real `powershell.exe` pane
+//    emit `ESC[?1000h` on its own stdout (`Write-Host`/`[Console]::Out.Write`,
+//    both tried), then sending a real SGR wheel event and checking copy mode
+//    did NOT open. Implemented, run, and found to FAIL in a way that traces
+//    to a genuine platform-level discovery, not a test bug: **Windows
+//    ConPTY does not relay `CSI ?1000h`-class mouse-mode DECSET sequences
+//    from a hosted process's output through to the reader of the
+//    pseudoconsole's output pipe at all** -- confirmed with a minimal,
+//    permanent regression-pin probe,
+//    `tests/pty_smoke.rs::mouse_decset_private_mode_is_not_relayed_by_conpty`
+//    (see that test's doc comment for the full writeup, the SGR-survives
+//    control that rules out "the reader just isn't working", and why this
+//    retroactively explains three OTHER previously-separate "investigated
+//    and gave up" notes already in `docs/follow-ups.md`: the SP4
+//    abandonment of `alt_screen_wheel_sends_arrows`, follow-up #35/#72's own
+//    "no live-process byte-receipt e2e proof was attempted", and follow-up
+//    #53's bracketed-paste positive path being "fundamentally unprovable
+//    black-box"). Since `Grid::mouse_proto` (which parses exactly this
+//    sequence) can never observe a real hosted app's mouse-mode request over
+//    ConPTY on this platform, approach 2 cannot be built either -- there is
+//    no way for a real child process in this harness to ever get the pane
+//    INTO the state ("this pane's app requested mouse reporting") the test
+//    needs to exercise.
+//
+// The underlying feature (`forward_mouse_to_pane`/`mouse_forward_eligible`,
+// `src/server/dispatch.rs`) remains covered at the unit level (synthetic
+// `Grid` byte-feed proving DECSET parsing, `mouse_forward_eligible_gates_
+// by_proto_and_kind` proving the gating table, `forward_mouse_to_pane_
+// writes_when_pane_owns_mouse_click` proving the re-encode-and-write path)
+// -- exactly the residual gap follow-up #35/#72's resolution already
+// disclosed honestly, now with a confirmed root cause rather than a
+// suspected one. See `CLAUDE.md`'s "Hard-won platform gotchas" section for
+// the one-line summary of the finding itself.

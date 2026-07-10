@@ -44,14 +44,17 @@ use crate::cmd::RawCmd;
 use crate::geom::Rect;
 use crate::grid::{Cell, Grid, Style};
 use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
+use crate::keys::Key;
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
 use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{CopyView, ListOverlay, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell};
-use crate::status::{status_spans, strip_style_markers, WindowEntry};
+use crate::render::{
+    CopyView, ListOverlay, MenuOverlay, MenuRowCell, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell,
+};
+use crate::status::{status_spans, strip_style_markers, truncate_visible, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -103,6 +106,21 @@ struct PaneRuntime {
     /// call site can hand out `&str` directly without an `unwrap_or("")` at
     /// every use.
     title: String,
+    /// Per-pane writer channel (follow-up #14): the main loop's hot
+    /// Forward/Key-forwarding path (`Server::process_client_events`) enqueues
+    /// here instead of calling `pty.write_input` inline, so a pane whose
+    /// child stops draining stdin (hung app, huge paste) only blocks the
+    /// dedicated writer thread draining this channel — never the main loop,
+    /// never any OTHER session/client. Mirrors the existing per-client
+    /// writer design (`spawn_writer`) exactly. `spawn_pane` is the only
+    /// producer of a real one (a `PtyWriter`-backed thread); a pane inserted
+    /// directly by a unit test with `pty: None` gets a channel with no
+    /// writer thread behind it, which is fine — sends into it just pile up
+    /// harmlessly until the `Sender` drops with the `PaneRuntime`. Dropping
+    /// `PaneRuntime` (pane removal — the ONLY way one is ever dropped) drops
+    /// this field, which closes the channel and lets the writer thread's
+    /// `recv()` loop end on its own; no explicit shutdown/join needed.
+    input_tx: Sender<Vec<u8>>,
 }
 
 /// Which status-line prompt is in progress (`,` rename-window, `$`
@@ -185,9 +203,17 @@ enum ClientMode {
     /// tmux's "any key exits" (`window_clock_key`/`window_pane_reset_mode`)
     /// is the only way out (see `dispatch::Server::dispatch_clock_key`).
     Clock(ClockState),
+    /// display-menu overlay (SP7 Task 16, closes #51; `display-menu`/`menu`,
+    /// plus the default `MouseDown3Pane`/`MouseDown3Status`/
+    /// `MouseDown3StatusLeft` right-click context menus). Per-CLIENT, a
+    /// momentary modal overlay like `DisplayPanes`/`Clock` — see
+    /// `MenuState`'s own doc comment for why it's a stable snapshot rather
+    /// than `ChooseTree`'s live rebuild.
+    Menu(MenuState),
 }
 
-/// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
+/// The choose overlay's four view kinds (Task 8; `Buffers`/`Clients` added
+/// SP7 Task 14, closes #48/#49). `Sessions` (`-s`) lists every session as
 /// a real tree row (SP6 wave 2, Task 8: a `+`/`-` expand marker, collapsed by
 /// default per `docs/tmux-reference/choose-tree.md` `## 1.1` -- "sessions
 /// start collapsed"; `Right`/`+` reveals its windows as indented children);
@@ -196,11 +222,16 @@ enum ClientMode {
 /// -- see the design spec's `## 7. Overlays` section for the documented
 /// "windows of the current session only" scope simplification, which this
 /// task does not change: real tmux's `-w` shows the whole multi-session
-/// tree).
+/// tree). `Buffers` (`choose-buffer`, `## 10`) and `Clients` (`choose-
+/// client`, `## 9`) are FLAT (`depth: 0` on every row, no expand affordance)
+/// -- see `dispatch::Server::build_tree_rows`'s doc comment for their row
+/// format and `dispatch::sort_seq` for their (restricted) sort sequences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChooseTreeView {
     Windows,
     Sessions,
+    Buffers,
+    Clients,
 }
 
 /// choose-tree's live preview mode (SP6 wave 2, Task 8;
@@ -225,6 +256,27 @@ impl PreviewMode {
             PreviewMode::Normal => PreviewMode::Off,
         }
     }
+}
+
+/// The choose overlay's sort FIELD (SP7 Task 15, closes #50's remainder;
+/// `docs/tmux-reference/choose-tree.md` `## 4`/`## 9`/`## 10`), cycled by
+/// `O` and flipped by `r` (`ChooseTreeState::sort`/`reversed`). Each view
+/// only cycles through a RESTRICTED sequence (`dispatch::sort_seq`) — a
+/// documented simplification of tmux's per-mode sequences: `activity`/`z`
+/// (choose-tree) and `activity` (choose-client) aren't modeled (winmux
+/// tracks no per-window "z" order and no per-client activity clock), so
+/// `Index`/`Name` is choose-tree's whole sequence, `Creation`/`Name`/`Size`
+/// is choose-buffer's, and `Name`/`Size`/`Creation` is choose-client's.
+/// `Index` for buffers/clients
+/// is unreachable via `O` (never in either view's sequence) but kept as a
+/// variant for a uniform type; `sort_rows`/`build_tree_rows` treat it as a
+/// no-op ("natural"/insertion order) if ever passed directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKey {
+    Index,
+    Name,
+    Size,
+    Creation,
 }
 
 /// choose-tree's per-client state (Task 8; review fix, Critical #1).
@@ -265,9 +317,64 @@ struct ChooseTreeState {
     view: ChooseTreeView,
     sel: usize,
     selected: Option<TreeTarget>,
-    pending_kill: Option<(TreeTarget, String)>,
+    /// `Some((targets, prompt))` between `x` and the y/n answer — `targets`
+    /// is EVERY target the confirm applies to: the tagged set (SP7 Task 15)
+    /// when non-empty at `x`-press time, else just the current row (the
+    /// pre-Task-15 shape, now wrapped in a length-1 `Vec`). Only ever
+    /// populated for `Sessions`/`Windows` views (`## 7.2`'s `x`/`X` kill
+    /// confirms) — `Buffers`/`Clients` targets are removed IMMEDIATELY on
+    /// `x` with no confirm (`## 9`/`## 10`: "No confirm prompts" for
+    /// choose-client; choose-buffer's `d`/`D` likewise never confirm), so
+    /// this field is simply never set for those two views.
+    pending_kill: Option<(Vec<TreeTarget>, String)>,
     expanded: HashSet<String>,
     preview: PreviewMode,
+    /// SP7 Task 12 (closes follow-ups #46/#54): `Some(matches)` for a tree
+    /// opened by `find-window` -- the exact `WindowId`s the pattern matched,
+    /// snapshotted ONCE at open time (deliberately not live-refiltered
+    /// while the tree stays open -- a documented simplification, see
+    /// `dispatch::Server::exec_find_window_client`'s doc comment). `None`
+    /// for a plain `choose-tree`/`w`/`s` open (no filtering). Only the
+    /// `Windows` view ever has a window filter -- `find-window` never opens
+    /// `Sessions`. Named `win_filter` (not `filter`) because SP7 Task 15's
+    /// interactive `f` TEXT filter below owns the plain name; the two
+    /// filters are independent and compose (win-filter first, inside
+    /// `build_tree_rows`; text filter on top, in `build_choose_rows`).
+    win_filter: Option<HashSet<WindowId>>,
+    /// SP7 Task 15 (closes #50's remainder): the tagged set, keyed by the
+    /// SAME stable identity `selected` uses — `t` toggles membership, `T`
+    /// clears it, `C-t` tags every currently-visible root row. When
+    /// non-empty, `x` (Kill) applies to every tagged target instead of just
+    /// the current row (`## 7.1`'s `t`/`T`/`C-t`, collapsed with `x`/`X`
+    /// per the task brief's "kill applies to tagged when tags exist" rule).
+    /// Cleared after every kill/detach/delete that consumes it.
+    tagged: HashSet<TreeTarget>,
+    /// SP7 Task 15: the active sort field, `O`-cycled through
+    /// `dispatch::sort_seq(view)`; seeded to that sequence's first entry
+    /// (the view's tmux-documented default) at overlay-open time.
+    sort: SortKey,
+    /// SP7 Task 15: `r`-flipped reverse flag, ANDed onto every comparison
+    /// `sort` makes (mirrors tmux's `sort_criteria.reversed` negating the
+    /// comparator's final result, `## 4.2`).
+    reversed: bool,
+    /// SP7 Task 15: the COMMITTED filter string (substring, case-
+    /// insensitive over a row's rendered `text` — a documented
+    /// simplification of tmux's real per-pane FORMAT filter, `## 7.1`).
+    /// `None`/empty = no filter. A filter that would match nothing is
+    /// IGNORED (the unfiltered row list is used, with the title showing
+    /// `(filter: no matches)` instead of narrowing to zero rows) —
+    /// `dispatch::Server::build_choose_rows` implements this exactly like
+    /// `mode_tree_build`'s own fallback (`## 2.2` point 4).
+    filter: Option<String>,
+    /// SP7 Task 15: `Some(buf)` while the `f` filter prompt is being
+    /// edited — kept INSIDE `ChooseTreeState` rather than switching
+    /// `client.mode` away to `ClientMode::Prompt`, the exact same reason
+    /// `CopyState::search_prompt` does (see its doc comment): switching
+    /// modes while typing would hide the row list/preview mid-edit.
+    /// Editing uses the same byte-capture machinery as every other status-
+    /// line-shaped prompt (`client.key_machine.set_capture(true)`,
+    /// `edit_line_buf`) via `dispatch::Server::feed_choose_filter_byte`.
+    filter_edit: Option<String>,
 }
 
 /// Re-resolve choose-tree's selection identity to a display INDEX into a
@@ -296,10 +403,12 @@ fn resolve_tree_sel(rows: &[dispatch::TreeRow], selected: &Option<TreeTarget>, f
     }
 }
 
-/// A choose-tree row's underlying identity (Task 8): resolved fresh from the
-/// registry at both render time and commit/kill time, never cached across a
-/// render -- see `ClientMode::ChooseTree`'s doc comment.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A choose overlay row's underlying identity (Task 8; `Buffer`/`Client`
+/// added SP7 Task 14, closes #48/#49): resolved fresh from live state at
+/// both render time and commit/kill time, never cached across a render --
+/// see `ClientMode::ChooseTree`'s doc comment. `Hash` (SP7 Task 15) lets it
+/// key `ChooseTreeState::tagged`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TreeTarget {
     Session(String),
     /// Session name + window id (the session is always the acting client's
@@ -307,6 +416,15 @@ enum TreeTarget {
     /// carried explicitly rather than assumed, for clarity at the exec
     /// sites).
     Window(String, WindowId),
+    /// A paste buffer, keyed by NAME (`buffers::Buffers`'s own stable
+    /// identity — `buffer<N>` names are never reused, `set_named`
+    /// overwrites in place, so a name is exactly as stable as tmux's
+    /// creation-order counter, `## 10`).
+    Buffer(String),
+    /// An attached client, keyed by its `ClientId` (winmux has no tty-path
+    /// client name; the identity IS the id -- `dispatch::client_label`
+    /// derives the display name from it, `## 9`).
+    Client(ClientId),
 }
 
 /// display-panes' per-client state (Task 8): just the auto-dismiss deadline
@@ -333,6 +451,55 @@ struct DisplayPanesState {
 struct ClockState {
     pane: PaneId,
     text: String,
+}
+
+/// display-menu's per-client state (SP7 Task 16, closes #51). Unlike
+/// `ChooseTreeState`, `rows` IS a stable SNAPSHOT, taken once at open time —
+/// this matches real tmux exactly: `menu.c`'s `struct menu` is built once by
+/// `cmd_display_menu_exec`/`open_pane_menu`-and-friends and never rebuilt
+/// while the overlay is showing (contrast `docs/tmux-reference/choose-
+/// tree.md`'s live-rebuild-every-render rule, which is a `ChooseTreeView`-
+/// specific design, not a general overlay rule). `rect` is likewise resolved
+/// once at open time from the requested [`crate::cmd::MenuPos`] `x`/`y` and
+/// the client's THEN-current size, clamped to fit — a documented narrowing
+/// vs. real tmux's `menu_resize_cb`, which re-clamps a showing menu against
+/// a live client resize; winmux does not reposition an already-open menu.
+struct MenuState {
+    rect: Rect,
+    title: String,
+    rows: Vec<MenuRow>,
+    /// `-1` = no row highlighted (tmux's `md->choice == -1`, the initial
+    /// state before any Up/Down/mouse-hover/key-shortcut selects one).
+    sel: i32,
+    /// What live entity this menu is scoped to, if any (SP7 final-fix wave,
+    /// correctness review SHOULD-FIX #6) — consulted by
+    /// [`Server::cancel_stale_menus`], the same staleness-sweep pattern
+    /// `cancel_stale_confirms`/`_copy_modes`/`_clock_modes`/`_choose_trees`
+    /// already apply to every other modal overlay. `None` for a generic
+    /// user-authored `display-menu` (`exec_display_menu_client`), which
+    /// isn't scoped to any single pane/window/session and so has nothing to
+    /// go stale.
+    anchor: Option<MenuAnchor>,
+}
+
+/// See [`MenuState::anchor`].
+enum MenuAnchor {
+    Pane(PaneId),
+    Window(String, WindowId),
+    Session(String),
+}
+
+/// One row of an open [`MenuState`] — a snapshot of one [`crate::cmd::
+/// MenuEntry`], pre-formatted for display and with its shortcut key (if any)
+/// already parsed once at open time rather than on every keypress.
+/// `command: None` marks a separator (mirrors `MenuEntry::Separator`); `text`
+/// is the SAME field for both, but only meaningful (non-empty) for a real
+/// item — a separator's row is drawn as a plain horizontal rule regardless of
+/// `text`'s content (see `render::MenuRowCell::separator`).
+struct MenuRow {
+    text: String,
+    key: Option<Key>,
+    command: Option<String>,
 }
 
 /// Format the clock-mode display string per `clock-mode-style`
@@ -368,8 +535,18 @@ fn format_clock(hour24: u8, minute: u8, style12: bool) -> String {
 /// (`Server::build_render_overlay`) and the digit-keypress resolution path
 /// (`dispatch::Server::dispatch_display_panes_key`) so they can never
 /// disagree about which digit means which pane.
-fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
-    window.layout.panes().into_iter().take(10).enumerate().map(|(i, id)| (id, i as u32)).collect()
+/// `options` supplies `pane-base-index` (#32, SP7 Task 6, window-scoped:
+/// consulted via `window`'s own [`Options::pane_base_index_for`] overlay,
+/// falling back to the global default like every other window-scoped
+/// read) — the digit shown for the Nth pane (and the digit a keypress must
+/// match, since both callers share this one function) is `base + N`, not
+/// always `N`. Still capped at the first 10 panes (documented
+/// simplification, unchanged): with a nonzero base a pane whose digit
+/// would exceed 9 simply gets no reachable single-digit key, same as the
+/// pre-existing "11th+ pane" cap.
+fn pane_digit_entries(window: &crate::model::Window, options: &Options) -> Vec<(PaneId, u32)> {
+    let base = options.pane_base_index_for(&window.window_options);
+    window.layout.panes().into_iter().take(10).enumerate().map(|(i, id)| (id, i as u32 + base)).collect()
 }
 
 /// Precomputed, render-ready overlay content for one client (Task 8),
@@ -380,20 +557,24 @@ fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
 /// clients`, neither of which the per-client `render_one` (called while
 /// `self.clients` is already mutably borrowed) can see directly.
 enum RenderOverlay {
-    /// Already-formatted row text (+ tree depth/expand-marker) in order,
-    /// plus which index is selected; `render_one` turns this into a
-    /// `render::Overlay::List` (padding/scrolling is a rendering concern,
+    /// Already-formatted row text (+ tree depth/expand-marker/tagged flag)
+    /// in order, plus which index is selected; `render_one` turns this into
+    /// a `render::Overlay::List` (padding/scrolling is a rendering concern,
     /// computed there with the client's own `rows`/`cols` in hand).
     /// `list_height` is the pre-sized row-list height (`Server::
     /// choose_tree_list_height`, SP6 wave 2 Task 8) -- equal to the full
     /// scene height whenever `preview` is `None` (preview OFF, or the panel
     /// too small per the sizing rule), reproducing the pre-Task-8-wave-2
-    /// full-height list exactly in that case.
+    /// full-height list exactly in that case. `title` (SP7 Task 15) is the
+    /// box-title-shaped `" <item> (sort: <field>[, reversed])[ (filter:
+    /// active|no matches)]"` string (`## 3.2`) painted on the panel's own
+    /// first row (`render::ListOverlay::title`).
     Tree {
-        rows: Vec<(String, u8, Option<char>)>,
+        rows: Vec<(String, u8, Option<char>, bool)>,
         sel: usize,
         list_height: u16,
         preview: Option<TreePreviewData>,
+        title: String,
     },
     /// The digit-to-pane mapping for the client's current window (see
     /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
@@ -645,6 +826,12 @@ struct ClientState {
     /// triple-click detection and in-progress border-resize/selection
     /// dragging. See [`MouseClientState`].
     mouse: MouseClientState,
+    /// SP7 Task 15 (#48/#49/#50): when this client attached — choose-
+    /// client's "attach time" row column and its `Creation` sort key
+    /// (`docs/tmux-reference/choose-tree.md` `## 9`) both read this. Only
+    /// meaningful relative to another client's `attached_at` (an `Instant`
+    /// has no absolute wall-clock meaning); set once in `finish_attach`.
+    attached_at: Instant,
 }
 
 /// SGR mouse-mode enable sequence (normal tracking `?1000h` + button-event
@@ -756,6 +943,18 @@ enum MouseDrag {
     /// motion, and without this flag a plain click would always look like a
     /// (zero-width) completed drag.
     Selecting { moved: bool },
+    /// (SP7 Task 9, closes follow-ups #35/#72) The press landed on a pane
+    /// whose own application owns the mouse (`Grid::mouse_proto() != Off`,
+    /// eligible per `dispatch::mouse_forward_eligible` for the motion that
+    /// started this drag) -- tmux's root `MouseDrag1Pane -> if mouse_any_flag
+    /// { send -M } else { copy-mode -M }` guard took the `send -M` branch, so
+    /// winmux never enters copy-mode/selection at all for this drag. Every
+    /// subsequent `Drag`/`Up` on `pane` is re-encoded and forwarded to the
+    /// pane's own pty instead (`dispatch::Server::forward_mouse_to_pane`,
+    /// re-checked live on each event, mirroring tmux's "no callback
+    /// installed -> every motion re-synthesizes and re-dispatches" rule,
+    /// `mouse.md` §2.5) rather than driving any winmux copy-mode state.
+    Forwarding { pane: PaneId },
 }
 
 /// Advance `m`'s click-run-length tracker for a `Down` at `(x, y)` with
@@ -828,16 +1027,35 @@ struct Server {
     /// cleanup exactly).
     pane_activity: HashMap<PaneId, u64>,
     next_active_point: u64,
+    /// `status-interval`-driven periodic status refresh (SP7 Task 7, closes
+    /// follow-up #29): the last `Tick` at which the interval was deemed to
+    /// have elapsed, checked against `options.status_interval()` on every
+    /// `Tick` (`now - last_status_render >= status_interval`). This is
+    /// SEPARATE from `clock`'s minute-granularity change-detector above --
+    /// that one only forces a redraw when the default `%H:%M`-shaped
+    /// `status-right` would visibly change; `status-interval` forces one on
+    /// its own configured cadence regardless of what `status-right`
+    /// contains, matching real tmux's per-client status timer
+    /// (`docs/tmux-reference/status-line-and-messages.md` §8, "Timer").
+    /// One server-global timer rather than per-session/per-client (a
+    /// documented narrowing, consistent with `status-interval` otherwise
+    /// having no `_for` scope-resolving getter yet -- see the task report).
+    /// `status_interval() == 0` means "never re-arm" (tmux's own "0 = no
+    /// periodic refresh" rule), so a zero interval never sets `dirty`.
+    last_status_render: Instant,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
 /// from `app.rs` (which dies in Task 8) rather than shared. Since SP3 Task 8
 /// the status bar's right side is rendered via `expand_format` instead, but
-/// this string is still the `Tick` handler's change detector: a re-render is
-/// triggered whenever it changes (minute granularity — matching the default
-/// `status-right`; a custom `%S`-bearing format only refreshes when the
-/// minute flips, documented SP4 refinement alongside the stored-but-unused
-/// `status-interval`).
+/// this string is still ONE of the `Tick` handler's change detectors: a
+/// re-render is triggered whenever it changes (minute granularity — matching
+/// the default `status-right`). SP7 Task 7 (closes follow-up #29) adds the
+/// SECOND, independent detector: `Server::last_status_render` vs.
+/// `options.status_interval()`, so a custom `%S`-bearing (or otherwise
+/// sub-minute-sensitive) `status-right` now also refreshes on the configured
+/// `status-interval` cadence, not only when this minute-granularity string
+/// happens to change.
 fn local_clock() -> String {
     // SAFETY: no preconditions; windows 0.58 returns the SYSTEMTIME by value.
     let st = unsafe { GetLocalTime() };
@@ -921,6 +1139,10 @@ fn spawn_pane(
 ) -> std::io::Result<PaneRuntime> {
     let mut pty = Pty::spawn(shell, cols.max(1), rows.max(1))?;
     let mut reader = pty.take_reader()?;
+    // Per-pane writer thread (follow-up #14): acquire the writer clone
+    // immediately after the reader, before spawning any threads that assume
+    // success (all fallible setup happens before threads are spawned).
+    let mut writer = pty.try_clone_writer()?;
 
     let out_tx = tx.clone();
     thread::spawn(move || {
@@ -947,8 +1169,17 @@ fn spawn_pane(
         let _ = wait_tx.send(ServerEvent::Exited(id));
     });
 
+    let (input_tx, input_rx) = channel::<Vec<u8>>();
+    thread::spawn(move || {
+        while let Ok(bytes) = input_rx.recv() {
+            if writer.write(&bytes).is_err() {
+                break;
+            }
+        }
+    });
+
     let grid = Grid::new(cols.max(1), rows.max(1), history_limit);
-    Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new() })
+    Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new(), input_tx })
 }
 
 /// Recognized Windows executable/script suffixes stripped from an
@@ -1046,13 +1277,19 @@ fn derive_auto_name(title: &str) -> Option<String> {
 /// Resize every pane whose computed rect changed (pty + grid), caching the
 /// last applied rect per pane so unchanged panes are skipped. Same shape as
 /// `app.rs`'s `apply_layout`, keyed by `HashMap` instead of a `Vec` (panes
-/// now span every session/window, not just one flat list).
+/// now span every session/window, not just one flat list). Returns the
+/// `PaneId`s that were actually resized (rect changed, either axis) so the
+/// caller (`apply_layout_for_session`) can invalidate any copy-mode
+/// selection bound to one of them -- see that function's doc comment for
+/// why (SP7 review fix, closes the `Grid::history_total()` width-reflow
+/// regression).
 fn apply_layout(
     layout: &Layout,
     area: Rect,
     panes: &mut HashMap<PaneId, PaneRuntime>,
     last_rects: &mut HashMap<PaneId, Rect>,
-) {
+) -> Vec<PaneId> {
+    let mut resized = Vec::new();
     for (id, rect) in layout.rects(area) {
         if last_rects.get(&id) == Some(&rect) {
             continue;
@@ -1064,7 +1301,9 @@ fn apply_layout(
             p.grid.resize(rect.w.max(1), rect.h.max(1));
         }
         last_rects.insert(id, rect);
+        resized.push(id);
     }
+    resized
 }
 
 /// Writer thread: owns the write half of the connection, drains an
@@ -1121,6 +1360,24 @@ fn switch_client_session(
     client.session = Some(neighbor.clone());
     client.renderer.resize(client.cols.max(1), client.rows.max(1));
     Some((old, neighbor))
+}
+
+/// `switch-client -t target-session` (SP7 Task 16, closes #51): switch
+/// directly to a NAMED session rather than a relative neighbor. `None` (no
+/// switch performed, caller treats it as a silent success — matching
+/// [`switch_client_session`]'s own "already there" convention) for BOTH an
+/// unknown session name and "already on it" — a documented narrowing vs.
+/// real tmux, which errors on an unknown target; kept uniform with the
+/// `-p`/`-n` sibling above rather than introducing a second error-reporting
+/// convention for this one extra case.
+fn switch_client_session_to(registry: &mut Registry, client: &mut ClientState, session_name: &mut String, target: &str) -> Option<(String, String)> {
+    if target == session_name.as_str() || !registry.sessions().iter().any(|s| s.name == target) {
+        return None;
+    }
+    let old = std::mem::replace(session_name, target.to_string());
+    client.session = Some(target.to_string());
+    client.renderer.resize(client.cols.max(1), client.rows.max(1));
+    Some((old, target.to_string()))
 }
 
 /// One config file to attempt loading at server startup (Task 7):
@@ -1200,6 +1457,7 @@ impl Server {
             buffers: Buffers::new(),
             pane_activity: HashMap::new(),
             next_active_point: 1,
+            last_status_render: Instant::now(),
         }
     }
 
@@ -1281,17 +1539,57 @@ impl Server {
     fn handle_event(&mut self, ev: ServerEvent) -> bool {
         match ev {
             ServerEvent::Output(id, bytes) => {
+                let mut bell = false;
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.grid.feed(&bytes);
-                    // automatic-rename (Task 9, sub-project 4): OSC 0/2
-                    // titles are edge-triggered (`take_title_changed`) --
-                    // refresh the cached `#T` value and, if this pane is the
-                    // ACTIVE pane of some window, consider renaming it.
+                    // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                    // `Grid::take_bell` is edge-triggered per `feed()` call
+                    // (Wave 1 Task 3) -- captured here, acted on below
+                    // (`note_bell`) once `p`'s borrow of `self.panes` has
+                    // ended, since that needs `self.registry`/`self.options`/
+                    // `self.clients` too.
+                    bell = p.grid.take_bell();
+                    // automatic-rename (Task 9, sub-project 4): OSC 0/2 and
+                    // ESC-k (SP7 Task 3, closes follow-up #52) titles are
+                    // both edge-triggered (`take_title_changed`) -- refresh
+                    // the cached `#T` value unconditionally (the grid always
+                    // captures both sources into the same slot), but only
+                    // feed an ESC-k-sourced title into automatic-rename when
+                    // `allow-rename` is on -- real tmux's `allow-rename`
+                    // gates ONLY the `ESC k` escape, never OSC 0/2 (see
+                    // `docs/tmux-reference/windows-and-sessions.md`
+                    // "allow-rename -- what it actually gates").
                     if p.grid.take_title_changed() {
+                        let from_esc_k = p.grid.title_from_esc_k();
                         let title = p.grid.title().unwrap_or("").to_string();
                         p.title = title.clone();
-                        self.maybe_auto_rename(id, &title);
+                        if from_esc_k {
+                            // `ESC k` goes through its OWN path (SP7-B
+                            // review fix of cae6af2), NOT `maybe_auto_rename`
+                            // -- see `rename_window_from_esc_k`'s doc
+                            // comment for why real tmux's `allow-rename`
+                            // gate is independent of `automatic-rename`.
+                            // `allow-rename` is window-scoped (#26).
+                            let allow = match self.window_containing_pane(id) {
+                                Some(w) => self.options.allow_rename_for(&w.window_options),
+                                None => self.options.allow_rename(),
+                            };
+                            if allow {
+                                self.rename_window_from_esc_k(id, &title);
+                            }
+                        } else {
+                            self.maybe_auto_rename(id, &title);
+                        }
                     }
+                }
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // activity is tracked on EVERY output event (mirrors tmux's
+                // `window_update_activity`, called unconditionally from the
+                // input parser); bell only when this chunk actually
+                // contained a BEL byte.
+                self.note_activity(id);
+                if bell {
+                    self.note_bell(id);
                 }
                 true
             }
@@ -1314,6 +1612,25 @@ impl Server {
                     false
                 };
                 let deadline = Instant::now();
+                // status-interval (closes follow-up #29): a periodic
+                // refresh independent of whether `clock`'s minute string
+                // actually changed -- a custom `status-right` with
+                // sub-minute-sensitive content (e.g. `%S`, or a pane-title
+                // format that ticks faster than once a minute) needs
+                // `render_all` to re-run and recompute fresh content on
+                // this cadence too, not just when the coarse minute clock
+                // flips.
+                let interval = self.options.status_interval();
+                if interval > Duration::ZERO && deadline.duration_since(self.last_status_render) >= interval {
+                    self.last_status_render = deadline;
+                    dirty = true;
+                }
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // per-window silence monitoring, checked on every tick (see
+                // `check_silence`'s doc comment).
+                if self.check_silence() {
+                    dirty = true;
+                }
                 // escape-time (Task 9, sub-project 4): collected during the
                 // borrow-checked `iter_mut` pass below (can't remove a
                 // client from `self.clients` mid-iteration) and processed
@@ -1335,7 +1652,6 @@ impl Server {
                 // (`window-clock.c:146-168`). Real time, therefore untested
                 // at unit level beyond `format_clock` itself (the pure
                 // formatting seam) -- see that function's test module.
-                let clock_style12 = self.options.clock_mode_style_12();
                 let clock_now = system_time_parts();
                 for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
@@ -1353,6 +1669,24 @@ impl Server {
                         dirty = true;
                     }
                     if let ClientMode::Clock(cs) = &mut client.mode {
+                        // clock-mode-style is window-scoped (#26): resolve
+                        // through the clock pane's own window. Inlined
+                        // (not `Server::window_containing_pane`, an opaque
+                        // `&self` method call that would borrow ALL of
+                        // `self` and conflict with the enclosing
+                        // `self.clients.iter_mut()`) as a direct
+                        // `self.registry` field projection, which the
+                        // borrow checker CAN see is disjoint from
+                        // `self.clients`.
+                        let window = self
+                            .registry
+                            .sessions()
+                            .iter()
+                            .find_map(|s| s.windows.iter().find(|w| w.layout.panes().contains(&cs.pane)));
+                        let clock_style12 = match window {
+                            Some(w) => self.options.clock_mode_style_12_for(&w.window_options),
+                            None => self.options.clock_mode_style_12(),
+                        };
                         let text = format_clock(clock_now.hour, clock_now.min, clock_style12);
                         if text != cs.text {
                             cs.text = text;
@@ -1408,6 +1742,223 @@ impl Server {
         }
     }
 
+    /// Locate the `(session name, window id)` of the window whose ACTIVE
+    /// pane (`window.layout.focused()`) is `pane_id`, if any -- shared by
+    /// `maybe_auto_rename` and `rename_window_from_esc_k` so a background
+    /// pane's title changing never renames anything, from either path,
+    /// matching tmux (only the active pane's title is ever tracked).
+    fn window_for_active_pane(&self, pane_id: PaneId) -> Option<(String, WindowId)> {
+        self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.focused() == pane_id)
+                .map(|w| (s.name.clone(), w.id))
+        })
+    }
+
+    /// Locate the window that owns `pane_id` (any pane in the window, not
+    /// just its active one -- unlike [`Server::window_for_active_pane`]).
+    /// SP7 Task 6 (closes follow-up #26): the read helper used to route a
+    /// window-scoped option lookup through that window's
+    /// `window_options` overlay when the caller only has a `PaneId` in
+    /// hand.
+    fn window_containing_pane(&self, pane_id: PaneId) -> Option<&crate::model::Window> {
+        self.registry
+            .sessions()
+            .iter()
+            .find_map(|s| s.windows.iter().find(|w| w.layout.panes().contains(&pane_id)))
+    }
+
+    /// Like [`Server::window_for_active_pane`], but matches ANY pane in the
+    /// window (mirrors [`Server::window_containing_pane`], adding the
+    /// session name) -- the alerts subsystem (SP7 Task 17) must detect
+    /// output/bell on a BACKGROUND pane too, not just a window's active one
+    /// (tmux monitors every pane in a window for activity/bell).
+    fn session_and_window_for_pane(&self, pane_id: PaneId) -> Option<(String, WindowId)> {
+        self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.panes().contains(&pane_id))
+                .map(|w| (s.name.clone(), w.id))
+        })
+    }
+
+    /// `<kind>-action` scoping (tmux `alerts_action_applies`,
+    /// alerts.c:70-89): whether the notify/visual REACTION applies to a
+    /// window, given whether it's currently the acting session's current
+    /// window. `any` -> always; `current` -> only the current window;
+    /// `other` -> only non-current windows; `none`/anything else -> never.
+    fn alert_action_applies(action: &str, is_current: bool) -> bool {
+        match action {
+            "any" => true,
+            "current" => is_current,
+            "other" => !is_current,
+            _ => false, // "none"
+        }
+    }
+
+    /// The shared bell/activity/silence REACTION (tmux `alerts_set_message`,
+    /// alerts.c:292-325): for every client attached to `session_name`,
+    /// `visual` (`off`/`on`/`both`) selects a terminal-BEL passthrough
+    /// (`off`/`both`) and/or a status-line message (`on`/`both`). Message
+    /// wording matches tmux exactly: `"<kind> in current window"` when
+    /// `is_current`, else `"<kind> in window <window_index>"`. `kind`:
+    /// `"Bell"`/`"Activity"`/`"Silence"`.
+    fn react_alert(&mut self, session_name: &str, kind: &str, is_current: bool, window_index: u32, visual: &str) {
+        let bell_passthrough = visual == "off" || visual == "both";
+        let message = visual != "off";
+        if !bell_passthrough && !message {
+            return;
+        }
+        let text = if is_current {
+            format!("{kind} in current window")
+        } else {
+            format!("{kind} in window {window_index}")
+        };
+        for client in self.clients.values_mut() {
+            if client.session.as_deref() != Some(session_name) {
+                continue;
+            }
+            if bell_passthrough {
+                send_output(&client.tx, vec![0x07]);
+            }
+            if message {
+                client.message = Some((text.clone(), Instant::now()));
+            }
+        }
+    }
+
+    /// BEL detection (SP7 Task 17, closes follow-up #74): called once per
+    /// `Output` event whose fed bytes contained a BEL, for the pane's
+    /// owning window. Mirrors tmux's `alerts_check_bell` (alerts.c:
+    /// 182-218): `!` is set unconditionally (via `model::Window::
+    /// mark_bell`) for a non-current window, gated by the window-scoped
+    /// `monitor-bell` option; the `bell-action`-scoped notify/visual-bell
+    /// REACTION is evaluated separately (and unconditionally re-evaluated
+    /// on every bell, unlike activity/silence's edge-triggering).
+    fn note_bell(&mut self, pane_id: PaneId) {
+        let Some((session_name, wid)) = self.session_and_window_for_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let is_current = session.current == wid;
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        if !self.options.monitor_bell_for(&window.window_options) {
+            return;
+        }
+        window.mark_bell(is_current);
+        let window_index = window.index;
+        let action = self.options.bell_action_for(&session.session_options);
+        if !Server::alert_action_applies(action, is_current) {
+            return;
+        }
+        let visual = self.options.visual_bell_for(&session.session_options);
+        self.react_alert(&session_name, "Bell", is_current, window_index, visual);
+    }
+
+    /// Activity detection (SP7 Task 17, closes follow-up #74): called on
+    /// EVERY `Output` event for the pane's owning window (mirrors tmux's
+    /// `window_update_activity`, called unconditionally from the input
+    /// parser). Always refreshes `last_output` (the silence-monitor clock),
+    /// regardless of `monitor-activity`; the `#` flag/reaction is
+    /// EDGE-TRIGGERED (`model::Window::mark_activity`'s `false` return
+    /// means "already flagged since the last visit, do nothing more" --
+    /// tmux's `if (wl->flags & WINLINK_ACTIVITY) continue;`).
+    fn note_activity(&mut self, pane_id: PaneId) {
+        let Some((session_name, wid)) = self.session_and_window_for_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let is_current = session.current == wid;
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        window.note_output();
+        if !self.options.monitor_activity_for(&window.window_options) {
+            return;
+        }
+        if !window.mark_activity(is_current) {
+            return;
+        }
+        let window_index = window.index;
+        let action = self.options.activity_action_for(&session.session_options);
+        if !Server::alert_action_applies(action, is_current) {
+            return;
+        }
+        let visual = self.options.visual_activity_for(&session.session_options);
+        self.react_alert(&session_name, "Activity", is_current, window_index, visual);
+    }
+
+    /// Silence detection (SP7 Task 17, closes follow-up #74): checked on
+    /// every `Tick` (mirrors tmux's per-window silence timer,
+    /// `alerts_timer`/`alerts_reset`, alerts.c:42-49/138-155, collapsed
+    /// onto the server's existing 50ms tick rather than a real per-window
+    /// libevent timer). For every window with a non-zero window-scoped
+    /// `monitor-silence` and no ALREADY-set `~` flag (edge-triggered, same
+    /// shape as activity) whose `last_output` has aged past that interval:
+    /// sets the flag (non-current windows only) and evaluates the
+    /// `silence-action`-scoped reaction exactly like bell/activity. Reacts
+    /// AFTER the registry walk (collected into `fires`) so the reaction's
+    /// `&mut self.clients` borrow never overlaps the `&mut self.registry`
+    /// walk. Returns whether any window's flag changed (the caller ORs this
+    /// into the tick's overall "needs a render pass" flag).
+    fn check_silence(&mut self) -> bool {
+        let now = Instant::now();
+        struct Fire {
+            session: String,
+            window_index: u32,
+            is_current: bool,
+            visual: &'static str,
+        }
+        let mut fires: Vec<Fire> = Vec::new();
+        let mut dirty = false;
+        for session in self.registry.sessions_mut() {
+            let current = session.current;
+            for window in session.windows.iter_mut() {
+                if window.alert_silence {
+                    continue;
+                }
+                let secs = self.options.monitor_silence_for(&window.window_options);
+                if secs.is_zero() {
+                    continue;
+                }
+                if now.duration_since(window.last_output) < secs {
+                    continue;
+                }
+                let is_current = window.id == current;
+                // SP7 final-fix wave, correctness review SHOULD-FIX #4:
+                // gate on `mark_silence`'s return -- it's now `false` once
+                // this window's silence-reaction latch has already fired
+                // (see `Window::mark_silence`'s doc comment), which is the
+                // ONLY thing that stopped the CURRENT window (whose
+                // `alert_silence` display flag never sets, so the top-of-
+                // loop `if window.alert_silence { continue; }` guard above
+                // never engages for it) from forcing `dirty = true` and
+                // re-running the reaction on every single 50ms tick.
+                if !window.mark_silence(is_current) {
+                    continue;
+                }
+                dirty = true;
+                let action = self.options.silence_action_for(&session.session_options);
+                if !Server::alert_action_applies(action, is_current) {
+                    continue;
+                }
+                let visual = self.options.visual_silence_for(&session.session_options);
+                fires.push(Fire { session: session.name.clone(), window_index: window.index, is_current, visual });
+            }
+        }
+        for f in fires {
+            self.react_alert(&f.session, "Silence", f.is_current, f.window_index, f.visual);
+        }
+        dirty
+    }
+
+    /// `mode-keys` is window-scoped (#26): which copy-mode key table
+    /// `pane`'s own window resolves to (falling back to global if the pane
+    /// isn't found in any live window, which shouldn't happen for a pane
+    /// currently in copy mode but is handled defensively like every other
+    /// `_for` fallback in this module).
+    fn mode_keys_vi_for_pane(&self, pane: PaneId) -> bool {
+        match self.window_containing_pane(pane) {
+            Some(w) => self.options.mode_keys_vi_for(&w.window_options),
+            None => self.options.mode_keys_vi(),
+        }
+    }
+
     /// automatic-rename (Task 9, sub-project 4): if `pane_id` is the ACTIVE
     /// pane of some window (`window.layout.focused() == pane_id`), and both
     /// the global `automatic-rename` option and that window's own
@@ -1422,20 +1973,24 @@ impl Server {
     /// actual rename happens, so a title that keeps re-deriving to the
     /// SAME name never gets throttled against a later, genuinely different
     /// one.
+    ///
+    /// This function is used ONLY for OSC 0/2 titles (`automatic-rename`'s
+    /// actual gate). `ESC k` titles go through `rename_window_from_esc_k`
+    /// instead -- see that function's doc comment for why the two paths
+    /// must NOT share logic beyond the active-pane lookup above (SP7-B
+    /// review fix of cae6af2, which had wrongly routed `allow-rename`-gated
+    /// `ESC k` titles through this function).
     fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str) {
-        if !self.options.automatic_rename() {
-            return;
-        }
         let Some(name) = derive_auto_name(title) else { return };
-        let target = self.registry.sessions().iter().find_map(|s| {
-            s.windows
-                .iter()
-                .find(|w| w.layout.focused() == pane_id)
-                .map(|w| (s.name.clone(), w.id))
-        });
-        let Some((session_name, wid)) = target else { return };
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
         let Some(session) = self.registry.session_mut(&session_name) else { return };
         let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        // `automatic-rename` is window-scoped (#26): checked HERE (after
+        // the window is resolved), not up front against the global-only
+        // value, so a per-window override actually takes effect.
+        if !self.options.automatic_rename_for(&window.window_options) {
+            return;
+        }
         if !window.auto_rename || window.name == name {
             return;
         }
@@ -1447,6 +2002,45 @@ impl Server {
         }
         window.name = name;
         window.last_auto_rename = Some(now);
+    }
+
+    /// `ESC k <name> ESC \` rename escape, gated ONLY by `allow-rename`
+    /// (SP7-B review fix of cae6af2 -- the previous implementation routed
+    /// this through `maybe_auto_rename`, which wrongly made it ALSO require
+    /// `automatic-rename` to be on and blocked it once a window had ever
+    /// been manually renamed). Verified against real tmux's
+    /// `input_exit_rename` (input.c:2799-2830; see
+    /// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what
+    /// it actually gates", lines 358-374): when `allow-rename` is on and the
+    /// captured name is non-empty, tmux renames the window UNCONDITIONALLY
+    /// -- it never reads `automatic-rename` first, and a prior manual
+    /// rename never blocks it -- then sets `automatic-rename` off for that
+    /// window as a side effect
+    /// (`options_set_number(w->options, "automatic-rename", 0)`), exactly
+    /// like a manual `rename-window` does. Reproduced here: the name is
+    /// validated with the SAME `model::validate_name` gate the manual
+    /// `rename-window` path (`exec_rename_window` in
+    /// `src/server/dispatch.rs`) uses -- deliberately NOT
+    /// `derive_auto_name`'s basename/extension-stripping transform, since
+    /// real tmux's `window_set_name(w, ictx->input_buf, 1)` uses the
+    /// captured text as-is, with no derivation. An invalid name (empty,
+    /// containing `:`/`.`, or a control character -- `validate_name`'s
+    /// gate, a winmux-specific invariant since window names double as
+    /// `session:window`/`session.window` target syntax) is silently
+    /// ignored rather than surfaced as an error, since there is no
+    /// client-facing command invocation here to report one to; this also
+    /// means winmux does not (yet) reproduce tmux's special empty-name
+    /// case (reverting the window-local `automatic-rename` override) --
+    /// documented as a residual divergence in follow-up #52.
+    fn rename_window_from_esc_k(&mut self, pane_id: PaneId, title: &str) {
+        if crate::model::validate_name(title, "window").is_err() {
+            return;
+        }
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        window.name = title.to_string();
+        window.auto_rename = false;
     }
 
     fn handle_connected(&mut self, conn: PipeConn) {
@@ -1567,30 +2161,48 @@ impl Server {
     /// Common tail of a successful attach: register the client, then
     /// recompute the session's shared size and reapply its layout.
     fn finish_attach(&mut self, id: ClientId, tx: Sender<Vec<u8>>, session_name: String, cols: u16, rows: u16) {
-        let mut renderer = Renderer::new(cols.max(1), rows.max(1));
-        // Force a full repaint on the very first compose (see module docs /
-        // task brief: "use a fresh Renderer (or resize) at attach").
+        // Follow-up #21: `Renderer::new` starts with `force_full: false`, so
+        // constructing at the real size and then immediately `resize`-ing to
+        // that SAME size (as this used to do) allocated the front/back
+        // buffers twice for no reason — `resize`'s only OTHER job, setting
+        // `force_full: true` so the very first `compose()` is a guaranteed
+        // full repaint (see module docs / task brief: "use a fresh Renderer
+        // (or resize) at attach"), doesn't need a same-size `new` first.
+        let mut renderer = Renderer::new(0, 0);
         renderer.resize(cols.max(1), rows.max(1));
         // First-attach-only config-error notice (Task 7): `take()` so a
         // SECOND client attaching later never sees it again.
         let message = self.pending_config_message.take().map(|m| (m, Instant::now()));
+        // `mouse`/`prefix` are session-scoped (#26): resolve through the
+        // session this client is attaching TO (it already exists by this
+        // point -- `handle_attach` creates it before calling here).
+        let session_overlay = self.registry.sessions().iter().find(|s| s.name == session_name).map(|s| &s.session_options);
         // Task 5 (mouse): a newly-attaching client needs the enable sequence
         // too if `mouse` is already on (e.g. set in a `.tmux.conf`, or a
         // second client attaching after a first client turned it on) — sent
         // directly as its own Output frame rather than waiting for the next
         // composed render, matching how `exec_set_option`'s runtime toggle
         // broadcasts it.
-        if self.options.mouse() {
+        let mouse_on = match session_overlay {
+            Some(ov) => self.options.mouse_for(ov),
+            None => self.options.mouse(),
+        };
+        if mouse_on {
             send_output(&tx, MOUSE_ENABLE_SEQ.to_vec());
         }
-        let mut key_machine = KeyMachine::new(self.options.prefix());
+        let prefix = match session_overlay {
+            Some(ov) => self.options.prefix_for(ov),
+            None => self.options.prefix(),
+        };
+        let mut key_machine = KeyMachine::new(prefix);
         // Escape-time (Task 9, sub-project 4): seed from the CURRENT option
         // value (e.g. already set by a `.tmux.conf` loaded at startup) --
         // mirrors `prefix`'s existing at-creation seeding above. Unlike
         // `repeat-time` (a pre-existing gap: only re-synced by a runtime
         // `set`, never at attach time), escape-time getting this wrong would
         // silently break Escape-key delivery for a client that attaches
-        // after config already changed it.
+        // after config already changed it. `escape-time` is Server-scope
+        // (always global, unaffected by this task).
         key_machine.set_escape_time(self.options.escape_time());
         let client = ClientState {
             session: Some(session_name.clone()),
@@ -1602,6 +2214,7 @@ impl Server {
             message,
             tx,
             mouse: MouseClientState::default(),
+            attached_at: Instant::now(),
         };
         self.clients.insert(id, client);
         self.had_session = true;
@@ -1609,9 +2222,12 @@ impl Server {
         self.apply_layout_for_session(&session_name);
     }
 
-    /// `detach_others`: every OTHER client currently attached to `session_name`
-    /// gets a plain `[detached]` (distinct from the `Detach`-action/-frame
-    /// message, which names the session).
+    /// `detach_others`: every OTHER client currently attached to
+    /// `session_name` gets `Exit{0, "[detached (from session <name>)]"}` —
+    /// follow-up #17: previously a bare `[detached]` with no session name,
+    /// inconsistent with every OTHER detach exit path in this module (the
+    /// `d`-key/`Detach`-frame action and the `detach-client` CLI command both
+    /// already name the session). Now identical text to those.
     fn detach_others(&mut self, session_name: &str) {
         let ids: Vec<ClientId> = self
             .clients
@@ -1621,7 +2237,7 @@ impl Server {
             .collect();
         for id in ids {
             if let Some(c) = self.clients.remove(&id) {
-                send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: "[detached]".to_string() });
+                send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: format!("[detached (from session {session_name})]") });
             }
         }
     }
@@ -1809,28 +2425,73 @@ impl Server {
     }
 
     /// Cancel any attached client's choose-tree (Task 8) `pending_kill`
-    /// confirm whose snapshotted target no longer exists (killed by another
-    /// client, or by this same client's own dispatch, while the `x` (y/n)
-    /// prompt was up). Navigation/commit never go stale (see
+    /// confirm whose snapshotted target(s) no longer exist (killed by
+    /// another client, or by this same client's own dispatch, while the `x`
+    /// (y/n) prompt was up). Navigation/commit never go stale (see
     /// `ClientMode::ChooseTree`'s doc comment for why) — `pending_kill` is
     /// the one piece of state this mode carries across renders, so it is the
     /// only thing this sweep needs to re-validate. Called from the same two
     /// sites as `cancel_stale_confirms`/`cancel_stale_copy_modes`.
+    ///
+    /// SP7 Task 15: `pending_kill` now carries a `Vec` (the tagged-kill
+    /// case) — a DEAD target is dropped from the vec (not the whole
+    /// confirm), so a tagged multi-kill where only ONE tagged item died
+    /// concurrently still confirms the rest; the confirm is cancelled only
+    /// once every target has died. `pending_kill` is only ever populated for
+    /// `Sessions`/`Window` targets (`## ChooseTreeState` doc comment), so no
+    /// `Buffer`/`Client` liveness check is needed here.
     fn cancel_stale_choose_trees(&mut self) {
         let live_sessions: HashSet<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
         let live_windows: HashSet<(String, WindowId)> =
             self.registry.sessions().iter().flat_map(|s| s.windows.iter().map(move |w| (s.name.clone(), w.id))).collect();
         for client in self.clients.values_mut() {
             if let ClientMode::ChooseTree(state) = &mut client.mode {
-                if let Some((target, _)) = &state.pending_kill {
-                    let alive = match target {
+                if let Some((targets, _)) = &mut state.pending_kill {
+                    targets.retain(|target| match target {
                         TreeTarget::Session(n) => live_sessions.contains(n),
                         TreeTarget::Window(sn, wid) => live_windows.contains(&(sn.clone(), *wid)),
-                    };
-                    if !alive {
+                        TreeTarget::Buffer(_) | TreeTarget::Client(_) => true,
+                    });
+                    if targets.is_empty() {
                         state.pending_kill = None;
                     }
                 }
+            }
+        }
+    }
+
+    /// Cancel any attached client's open `display-menu` overlay (Task 16)
+    /// whose anchor (`MenuState::anchor` — the pane/window/session it was
+    /// opened against, e.g. a right-click default context menu) no longer
+    /// exists, killed by another client while the menu was still open (SP7
+    /// final-fix wave, correctness review SHOULD-FIX #6: this overlay had
+    /// no equivalent to `cancel_stale_confirms`/`_copy_modes`/
+    /// `_clock_modes`/`_choose_trees` at all). A menu with no anchor (a
+    /// generic user-authored `display-menu`, not scoped to any single
+    /// pane/window/session) is never considered stale here. Called from the
+    /// same two sites as the other three sweeps.
+    fn cancel_stale_menus(&mut self) {
+        let live_sessions: HashSet<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+        let live_windows: HashSet<(String, WindowId)> =
+            self.registry.sessions().iter().flat_map(|s| s.windows.iter().map(move |w| (s.name.clone(), w.id))).collect();
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        for client in self.clients.values_mut() {
+            let stale = match &client.mode {
+                ClientMode::Menu(state) => match &state.anchor {
+                    Some(MenuAnchor::Pane(p)) => !live_panes.contains(p),
+                    Some(MenuAnchor::Window(sn, wid)) => !live_windows.contains(&(sn.clone(), *wid)),
+                    Some(MenuAnchor::Session(sn)) => !live_sessions.contains(sn),
+                    None => false,
+                },
+                _ => false,
+            };
+            if stale {
+                client.mode = ClientMode::Normal;
             }
         }
     }
@@ -1856,13 +2517,45 @@ impl Server {
         }
     }
 
+    /// Resizes every pane of `name`'s current window whose rect changed, then
+    /// (SP7 review fix, tmux ruling) clears any copy-mode selection bound to
+    /// one of those panes: real tmux's `window_pane_resize`
+    /// (`window.c:1362-1388`) calls the active mode's `resize` callback
+    /// whenever a pane's width OR height actually changes at all; for copy
+    /// mode that's `window_copy_resize` (`window-copy.c:1196-1227`), which
+    /// unconditionally ends by calling `window_copy_size_changed`
+    /// (`window-copy.c:1174-1193`) -- and THAT unconditionally clears the
+    /// selection (`window_copy_clear_selection`, `window-copy.c:5914-5929`)
+    /// regardless of whether the resize actually reflowed anything. `Grid`'s
+    /// `history_total()` shift-invariant (see its doc comment) only holds
+    /// for mutations that don't change the grid's WIDTH -- a width-changing
+    /// resize reflows scrollback non-uniformly (`reflow_to_width`), so a
+    /// stored selection anchor keyed to a pre-reflow `(anchor_scroll,
+    /// anchor_y, anchor_total)` can silently resolve to unrelated content
+    /// after such a resize (there is no single "shift count" that could
+    /// repair it). Rather than attempt that repair, this matches tmux
+    /// exactly: any actual resize of the bound pane drops the selection
+    /// (`cs.sel = None`) and leaves copy mode itself active, with the copy
+    /// cursor (`scroll`/`cx`/`cy`) left as-is (already view-relative, same
+    /// simplification the pre-existing "new pane output mid-selection"
+    /// handling uses).
     fn apply_layout_for_session(&mut self, name: &str) {
         let area_y = self.pane_area_y();
         let Some(session) = self.registry.session_mut(name) else { return };
         let size = session.size;
         let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
         let window = session.current_window_mut();
-        apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        let resized = apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        if resized.is_empty() {
+            return;
+        }
+        for client in self.clients.values_mut() {
+            if let ClientMode::Copy(cs) = &mut client.mode {
+                if resized.contains(&cs.pane) {
+                    cs.sel = None;
+                }
+            }
+        }
     }
 
     /// Natural pane exit: tmux `remain-on-exit off` parity. If other panes in
@@ -1957,11 +2650,23 @@ impl Server {
         self.cancel_stale_copy_modes();
         self.cancel_stale_clock_modes();
         self.cancel_stale_choose_trees();
+        self.cancel_stale_menus();
         true
     }
 
     /// Tear down a session: drop all its panes, remove it from the
     /// registry, and tell every attached client `Exit{0, "[exited]"}`.
+    ///
+    /// Follow-up #18: the loop below (dropping every pane) runs sequentially
+    /// on the main-loop thread. Each pane drop runs a synchronous
+    /// `TerminateProcess` plus `ClosePseudoConsole` plus `CloseHandle` (see
+    /// `src/pty.rs`'s `Drop for Pty`). This is not a real scaling concern
+    /// today. It is bounded by one session's pane count, typically a small
+    /// number. Each `TerminateProcess` call is fast. And unlike follow-up
+    /// #14's concern (a STALLED child that never drains its stdin), killing
+    /// an already-alive process is not something a hung child can
+    /// meaningfully stall. Worth revisiting only if a future workflow makes
+    /// sessions with very many panes common.
     fn destroy_session(&mut self, name: &str) {
         if let Some(session) = self.registry.session_mut(name) {
             let pane_ids: Vec<PaneId> = session.windows.iter().flat_map(|w| w.layout.panes()).collect();
@@ -2047,11 +2752,11 @@ impl Server {
                     // coalesced, since the blob is always a complete,
                     // self-contained run) and resolve each one against the
                     // copy table instead.
-                    if matches!(client.mode, ClientMode::Copy(_)) {
+                    if let ClientMode::Copy(cs) = &client.mode {
                         let mut dec = crate::keys::KeyDecoder::new();
                         let mut decoded = dec.feed(&data);
                         decoded.extend(dec.flush());
-                        let which = if self.options.mode_keys_vi() { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
+                        let which = if self.mode_keys_vi_for_pane(cs.pane) { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
                         for item in decoded {
                             // A coalesced `Forward` blob is built ONLY from
                             // plain-forwardable KEYS (`is_plain_forwardable`
@@ -2090,7 +2795,7 @@ impl Server {
                         decoded.extend(dec.flush());
                         for item in decoded {
                             let crate::keys::DecodedInput::Key(dk) = item else { continue };
-                            if let Some(outcome) = self.dispatch_choose_tree_key(&dk.key, &mut client, &mut session_name) {
+                            if let Some(outcome) = self.dispatch_choose_tree_key(&dk.key, &mut client, &mut session_name, id) {
                                 dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                                 if detach || destroy {
                                     break 'events;
@@ -2123,12 +2828,75 @@ impl Server {
                         if detach || destroy {
                             break 'events;
                         }
-                    } else if let Some(session) = self.registry.session_mut(&session_name) {
-                        let fid = session.current_window().layout.focused();
-                        if let Some(pane) = self.panes.get_mut(&fid) {
-                            if let Some(pty) = pane.pty.as_mut() {
-                                let _ = pty.write_input(&data);
+                    } else if matches!(client.mode, ClientMode::Menu(_)) {
+                        // display-menu (SP7 Task 16): same Forward-blob
+                        // re-decode as choose-tree above -- shortcut keys
+                        // (letters like `X`/`p`/`h`) and navigation
+                        // (`j`/`k`/`q`) are all plain-forwardable, so every
+                        // decoded key is resolved against the menu's OWN
+                        // per-row shortcut table / hardcoded nav keys
+                        // (`dispatch_menu_key`), never forwarded to the pane
+                        // underneath.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        for item in decoded {
+                            let crate::keys::DecodedInput::Key(dk) = item else { continue };
+                            let outcome = self.dispatch_menu_key(&dk.key, &mut client, &mut session_name);
+                            dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                            if detach || destroy {
+                                break 'events;
                             }
+                        }
+                    } else {
+                        // Follow-up #30: a coalesced Forward blob (built from
+                        // ANY run of plain-forwardable keys, per
+                        // `is_plain_forwardable`'s doc comment) used to be
+                        // written straight to the pane with no root-table
+                        // lookup at all, so a `bind -n <printable>` binding
+                        // could never shadow typing -- unlike the
+                        // Copy/ChooseTree/DisplayPanes arms above, which
+                        // already re-decode a Forward blob and resolve each
+                        // key against their own table. Mirror that pattern
+                        // here for the live-pane case: re-decode the blob and
+                        // consult the CURRENT `self.bindings` root table
+                        // (so a runtime `bind -n`/`unbind -n` takes effect
+                        // immediately) for every key. Bound keys dispatch
+                        // their command and are swallowed (never reach the
+                        // pane) exactly like tmux. Runs of UNBOUND keys are
+                        // still batched into a single `input_tx.send` --
+                        // preserving the original coalescing/throughput --
+                        // and only flushed early when a bound key interrupts
+                        // the run or at the end of the blob.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        let mut pending_raw: Vec<u8> = Vec::new();
+                        for item in decoded {
+                            let crate::keys::DecodedInput::Key(dk) = item else {
+                                debug_assert!(false, "Forward blob decoded to a Mouse item");
+                                continue;
+                            };
+                            let binding = self.bindings.lookup(WhichTable::Root, &dk.key).cloned();
+                            match binding {
+                                Some(b) => {
+                                    if !pending_raw.is_empty() {
+                                        self.forward_raw_to_focused_pane(&session_name, std::mem::take(&mut pending_raw));
+                                    }
+                                    let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
+                                    if b.repeat {
+                                        client.key_machine.arm_repeat(now);
+                                    }
+                                    dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                                    if detach || destroy {
+                                        break 'events;
+                                    }
+                                }
+                                None => pending_raw.extend_from_slice(&dk.raw),
+                            }
+                        }
+                        if !pending_raw.is_empty() {
+                            self.forward_raw_to_focused_pane(&session_name, pending_raw);
                         }
                     }
                 }
@@ -2166,7 +2934,7 @@ impl Server {
                     // ignored (overlay stays open either way), never as the
                     // prefix-bound command.
                     if matches!(client.mode, ClientMode::ChooseTree(_)) {
-                        if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name) {
+                        if let Some(outcome) = self.dispatch_choose_tree_key(&key, &mut client, &mut session_name, id) {
                             dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                             if detach || destroy {
                                 break 'events;
@@ -2202,6 +2970,19 @@ impl Server {
                         }
                         continue;
                     }
+                    // display-menu (SP7 Task 16): same unconditional
+                    // interception as choose-tree above -- a completed
+                    // prefix sequence is either reinterpreted as a menu
+                    // action (a shortcut key match, if any) or silently
+                    // swallowed, never the prefix-bound command.
+                    if matches!(client.mode, ClientMode::Menu(_)) {
+                        let outcome = self.dispatch_menu_key(&key, &mut client, &mut session_name);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
+                        continue;
+                    }
                     // Copy mode (Task 2): a `Root`-table Key event while the
                     // acting client is in `ClientMode::Copy` is looked up
                     // against the copy table `mode-keys` selects instead —
@@ -2210,8 +2991,8 @@ impl Server {
                     // `## copy-mode` contract section). A `Prefix`-table
                     // event is left alone: prefix bindings (e.g. `C-b c`)
                     // still fire from copy mode, matching tmux.
-                    let table = if matches!(client.mode, ClientMode::Copy(_)) && table == WhichTable::Root {
-                        if self.options.mode_keys_vi() {
+                    let table = if let (ClientMode::Copy(cs), true) = (&client.mode, table == WhichTable::Root) {
+                        if self.mode_keys_vi_for_pane(cs.pane) {
                             WhichTable::CopyModeVi
                         } else {
                             WhichTable::CopyMode
@@ -2237,10 +3018,12 @@ impl Server {
                             WhichTable::Root => {
                                 if let Some(session) = self.registry.session_mut(&session_name) {
                                     let fid = session.current_window().layout.focused();
-                                    if let Some(pane) = self.panes.get_mut(&fid) {
-                                        if let Some(pty) = pane.pty.as_mut() {
-                                            let _ = pty.write_input(&raw);
-                                        }
+                                    if let Some(pane) = self.panes.get(&fid) {
+                                        // Follow-up #14: see the Forward-blob
+                                        // arm above — same per-pane writer
+                                        // channel, not an inline blocking
+                                        // `pty.write_input`.
+                                        let _ = pane.input_tx.send(raw);
                                     }
                                 }
                             }
@@ -2283,7 +3066,7 @@ impl Server {
                     // Task 5 (mouse): routed entirely outside the prefix/
                     // binding-table machinery — see `dispatch::dispatch_mouse`
                     // and the design spec's `## 4. Mouse` section.
-                    let outcome = self.dispatch_mouse(event, &mut client, &session_name);
+                    let outcome = self.dispatch_mouse(event, &mut client, &session_name, id);
                     dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                     if detach || destroy {
                         break 'events;
@@ -2334,6 +3117,32 @@ impl Server {
         // this OR another client may have just removed the session/window
         // this client had a kill confirm armed on.
         self.cancel_stale_choose_trees();
+        // Same idea for an open display-menu (Task 16): another client may
+        // have just killed the pane/window/session this menu was opened
+        // against (SP7 final-fix wave, correctness review SHOULD-FIX #6).
+        self.cancel_stale_menus();
+    }
+
+    /// Follow-up #30 helper: write raw bytes to whatever pane is currently
+    /// focused in `session_name`'s current window. Deliberately re-derives
+    /// the focused pane fresh on every call (not cached by the caller)
+    /// because a root-table binding dispatched earlier in the same
+    /// `process_key_events` Forward-blob loop may itself have changed the
+    /// focused pane, the current window, or even the session (e.g. a
+    /// `bind -n` command that splits or switches) — subsequent unbound keys
+    /// in the same blob must follow that change, matching tmux processing
+    /// keys one at a time. A no-op if the session or pane no longer exists.
+    /// Follow-up #14 still applies: this enqueues onto the pane's own writer
+    /// thread instead of calling `pty.write_input` inline, since this is the
+    /// server's single main-loop thread and must never block on one pane's
+    /// (possibly stalled) stdin.
+    fn forward_raw_to_focused_pane(&mut self, session_name: &str, data: Vec<u8>) {
+        if let Some(session) = self.registry.session_mut(session_name) {
+            let fid = session.current_window().layout.focused();
+            if let Some(pane) = self.panes.get(&fid) {
+                let _ = pane.input_tx.send(data);
+            }
+        }
     }
 
     /// Precompute per-client overlay render data (Task 8) for every
@@ -2344,7 +3153,13 @@ impl Server {
         let session_name = client.session.as_deref()?;
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let rows = self.build_tree_rows(session_name, state.view, &state.expanded);
+                // SP7 Task 15: `build_choose_rows` applies the active
+                // sort/filter on top of `build_tree_rows`'s live rebuild --
+                // see its doc comment for the "filter matches nothing ->
+                // fall back to unfiltered" rule. (It also passes through
+                // Task 12's `win_filter`, so a `find-window` tree renders
+                // its match set here too.)
+                let (rows, filter_no_matches) = self.build_choose_rows(session_name, state);
                 // Task 8 review fix, Critical #1: resolve by IDENTITY, not
                 // a raw clamped index -- see `resolve_tree_sel`'s doc
                 // comment. `build_render_overlay` runs with `&self` only
@@ -2352,6 +3167,7 @@ impl Server {
                 // is a read-only re-derivation, same as every other render
                 // pass; the persisted `ChooseTreeState` is not mutated here.
                 let sel = resolve_tree_sel(&rows, &state.selected, state.sel);
+                let title = self.build_choose_title(&rows, sel, state, filter_no_matches);
                 // SP6 wave 2, Task 8: sizing (`## 3.1`) + the selected row's
                 // live preview content, built here (not `render_one`) for the
                 // same reason the rows themselves are -- this is the one pass
@@ -2359,18 +3175,28 @@ impl Server {
                 // hand before `render_all`'s mutable per-client loop begins.
                 let sy = client.rows;
                 let w = client.cols;
-                let list_height = Server::choose_tree_list_height(sy, w, rows.len(), state.preview);
-                let preview = if list_height < sy {
+                let list_height = Server::choose_tree_list_height(sy, rows.len(), state.preview);
+                // SP7 Task 15 fix (closes #73): the paint-time box-size
+                // guard is now CHECKED SEPARATELY from `list_height`'s own
+                // sizing formula (`choose_tree_preview_paintable`'s doc
+                // comment) -- a degenerate geometry no longer implies
+                // `list_height == sy`, so `list_height < sy` alone is no
+                // longer a reliable "is there a preview" test; the
+                // `RenderOverlay::Tree` -> `ListOverlay` conversion below
+                // still caps the row list to `list_height` (via its own new
+                // `list_height` field) EVEN when no preview is painted, so a
+                // degenerate pane leaves the leftover rows blank rather than
+                // expanding the list into them.
+                let preview = if Server::choose_tree_preview_paintable(sy, list_height, w) {
                     // Fix round 1 (`## 3.2`): the interior is inset inside
                     // the full 4-sided box -- 2 cells horizontal each side
                     // (`w - 4`), 1 row vertical each (top + bottom border:
-                    // `(sy - list_height) - 2`). `choose_tree_list_height`'s
-                    // box-size guard (`sy-h <= 4 || w <= 4` drops the
-                    // preview) guarantees both are >= 1 whenever this branch
-                    // is reached (region >= 5 rows -> interior >= 3 rows;
-                    // panel >= 5 cols -> interior >= 1 col), so no extra
-                    // "inset shrank the blit area below 1x1" drop rule is
-                    // needed here.
+                    // `(sy - list_height) - 2`). `choose_tree_preview_paintable`
+                    // guarantees both are >= 1 whenever this branch is
+                    // reached (region >= 5 rows -> interior >= 3 rows; panel
+                    // >= 5 cols -> interior >= 1 col), so no extra "inset
+                    // shrank the blit area below 1x1" drop rule is needed
+                    // here.
                     let interior_h = sy.saturating_sub(list_height).saturating_sub(2);
                     let interior_w = w.saturating_sub(4);
                     rows.get(sel).map(|r| {
@@ -2381,15 +3207,16 @@ impl Server {
                     None
                 };
                 Some(RenderOverlay::Tree {
-                    rows: rows.into_iter().map(|r| (r.text, r.depth, r.marker)).collect(),
+                    rows: rows.into_iter().map(|r| { let tagged = state.tagged.contains(&r.target); (r.text, r.depth, r.marker, tagged) }).collect(),
                     sel,
                     list_height,
                     preview,
+                    title,
                 })
             }
             ClientMode::DisplayPanes(_) => {
                 let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
-                Some(RenderOverlay::Digits(pane_digit_entries(session.current_window())))
+                Some(RenderOverlay::Digits(pane_digit_entries(session.current_window(), &self.options)))
             }
             ClientMode::Clock(state) => Some(RenderOverlay::Clock { pane: state.pane, text: state.text.clone() }),
             _ => None,
@@ -2451,7 +3278,8 @@ fn render_one(
     // `too_small` only applies in `Normal` mode, where it additionally takes
     // priority over a transient status message.
     let default_style = Style::default();
-    let msg_style = options.message_style().apply_to(default_style);
+    // message-style is session-scoped (#26).
+    let msg_style = options.message_style_for(&session.session_options).apply_to(default_style);
     let message = match &client.mode {
         ClientMode::ConfirmCmd { prompt, .. } => Some(prompt.clone()),
         ClientMode::Prompt { label, buf, .. } => Some(format!("{label}{buf}")),
@@ -2482,6 +3310,7 @@ fn render_one(
         ClientMode::ChooseTree(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::DisplayPanes(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::Clock(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::Menu(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::ChooseTree(state) => match &state.pending_kill {
             Some((_, prompt)) => Some(prompt.clone()),
             None => client.message.as_ref().map(|(msg, _)| msg.clone()),
@@ -2490,21 +3319,54 @@ fn render_one(
         // clock-mode (Task 10): no message of its own -- the time is drawn
         // directly on the pane, same as display-panes' digits.
         ClientMode::Clock(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // display-menu (SP7 Task 16): no message of its own -- any
+        // transient status message underneath still shows (the menu is a
+        // small floating box, not a full-panel overlay, so there's no
+        // reason to hide it, unlike the other three overlays' own
+        // messages above).
+        ClientMode::Menu(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
     // Status row from the option table. status off -> None (no row painted;
     // the pane area already includes the freed row via
     // `recompute_session_size`).
+    //
+    // `status`/`status-position` are session-scoped per the reference doc,
+    // but a documented NARROWING (SP7 Task 6): the pane-area GEOMETRY that
+    // decides how many rows are reserved for the status bar
+    // (`Server::status_rows`/`pane_area_y`, which feed `recompute_
+    // session_size`/`apply_layout_for_session`/`render_all`'s single
+    // shared `area_y`) still reads the GLOBAL value only, not per-session
+    // -- those functions size EVERY session's shared pane area up front,
+    // before any per-client render pass, and `render_all` currently
+    // computes ONE `area_y` for every attached client regardless of
+    // session. Making the geometry itself per-session would need to
+    // thread a session-specific `area_y`/pane-row-count through that whole
+    // chain (`recompute_session_size`, `apply_layout_for_session`, EVERY
+    // `pane_area_y()` call site, `render_all`'s per-client loop) — real,
+    // but out of this task's tractable blast radius; a HALF-threaded
+    // version (visual content session-scoped, reserved row count global)
+    // would be actively WORSE than not threading at all, since a session
+    // with a local `status off` override would then paint no row while
+    // still reserving/hiding a blank one, or vice versa. So the on/off and
+    // top/bottom CHECKS below intentionally stay global-only (`options.
+    // status_on()`/`status_position_top()`, matching the pre-Task-6
+    // geometry every layout call already assumes); every option that
+    // affects the row's CONTENT ONLY, not whether/where it's reserved
+    // (`status-left`/`-right`/lengths/styles/`status-justify`, and every
+    // per-window `window-status-*` below), IS resolved per-session/
+    // per-window. Tracked as a new follow-up (see the task report).
     let status = if options.status_on() {
-        let base = options.status_style().apply_to(default_style);
+        let base = options.status_style_for(&session.session_options).apply_to(default_style);
         // Format context from live state: the current window's index/name/
         // flags and the focused pane's position in `layout.panes()`.
         let mut window_flags = String::from("*");
         if window.layout.is_zoomed() {
             window_flags.push('Z');
         }
-        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32;
+        let pane_index = window.layout.panes().iter().position(|p| *p == focused).unwrap_or(0) as u32
+            + options.pane_base_index_for(&window.window_options); // #32
         let pane_title = panes.get(&focused).map(|p| p.title.as_str()).unwrap_or("");
         let fctx = FormatCtx {
             session: &session.name,
@@ -2525,54 +3387,135 @@ fn render_one(
         // `#[...]`-styled sub-runs the way the left/window-list spans have),
         // so any markers are dropped to plain text rather than leaking their
         // literal `#[...]` bytes onto the screen (SP6 Task 4).
-        let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
-        let right_expanded = strip_style_markers(&expand_format(options.status_right(), &fctx));
-        let right = truncate_chars(&right_expanded, options.status_right_length());
+        // status-left keeps its `#[...]` markers (unlike status-right, which
+        // strips them since `StatusRow::right` has only one style slot) --
+        // the length cap counts only VISIBLE characters and never bisects a
+        // marker (`truncate_visible`, closes follow-up #69b).
+        let left = truncate_visible(
+            &expand_format(options.status_left_for(&session.session_options), &fctx),
+            options.status_left_length_for(&session.session_options),
+        );
+        let right_expanded = strip_style_markers(&expand_format(options.status_right_for(&session.session_options), &fctx));
+        let right = truncate_chars(&right_expanded, options.status_right_length_for(&session.session_options));
+        // window-status-format/-current-format/-style/-current-style ARE
+        // window-scoped (#26): each tab resolves through ITS OWN window's
+        // overlay, not the shared/current window's -- so one window's
+        // `setw window-status-current-format ...` never leaks onto another
+        // window's tab. `format_override`/`style_override` are always
+        // `Some(..)` here since the `_for` getter already folds in the
+        // "no local override -> global default" fallback (see `status::
+        // WindowEntry`'s doc comment for why `None` still exists, as the
+        // pure module's own zero-overlay default path).
         let entries: Vec<WindowEntry> = session
             .windows
             .iter()
-            .map(|w| WindowEntry {
-                index: w.index,
-                name: w.name.clone(),
-                current: w.id == session.current,
-                last: Some(w.id) == session.last,
-                zoomed: w.layout.is_zoomed(),
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    options.window_status_current_format_for(&w.window_options)
+                } else {
+                    options.window_status_format_for(&w.window_options)
+                };
+                let base_style = if is_current {
+                    options.window_status_current_style_for(&w.window_options)
+                } else {
+                    options.window_status_style_for(&w.window_options)
+                };
+                // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                // bell-style layers over the base if `alert_bell` is set AND
+                // the style isn't the literal `default` (an unmentioned/
+                // `default`-keyword style parses to `PartialStyle::
+                // default()`); ELSE (only when bell did NOT already apply --
+                // `docs/tmux-reference/status-line-and-messages.md` §2.2)
+                // activity-style layers if `alert_activity` or
+                // `alert_silence` is set and its style isn't `default`
+                // either. A current window's alert flags are always false
+                // (clear-on-visit, `model::Window::clear_alerts`), so this
+                // is a no-op for the current tab in practice.
+                let style: crate::style::PartialStyle = if w.alert_bell {
+                    let bell_style = options.window_status_bell_style_for(&w.window_options);
+                    if *bell_style != crate::style::PartialStyle::default() {
+                        base_style.merge(bell_style)
+                    } else {
+                        *base_style
+                    }
+                } else if w.alert_activity || w.alert_silence {
+                    let activity_style = options.window_status_activity_style_for(&w.window_options);
+                    if *activity_style != crate::style::PartialStyle::default() {
+                        base_style.merge(activity_style)
+                    } else {
+                        *base_style
+                    }
+                } else {
+                    *base_style
+                };
+                // SP7 Task 7 (closes follow-up #71): THIS window's own
+                // active pane, not the acting client's focused pane in the
+                // CURRENT window -- `w.layout` is per-window, so a
+                // background window's `#P`/`#T` must reflect ITS OWN
+                // active pane, exactly mirroring the `fctx` computation
+                // above for the current window (same pane-base-index shift
+                // via `Options::pane_base_index_for`).
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + options.pane_base_index_for(&w.window_options);
+                let w_pane_title = panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
+                WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
+                    format_override: Some(fmt.to_string()),
+                    style_override: Some(style),
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
+                }
             })
             .collect();
         let spans = status_spans(
             &left,
-            options.status_left_style(),
+            options.status_left_style_for(&session.session_options),
             &entries,
             &fctx,
-            options.window_status_format(),
-            options.window_status_current_format(),
+            options.window_status_format_for(&window.window_options),
+            options.window_status_current_format_for(&window.window_options),
             base,
-            options.window_status_style(),
-            options.window_status_current_style(),
-            options.window_status_separator(),
-            options.status_justify(),
+            options.window_status_style_for(&window.window_options),
+            options.window_status_current_style_for(&window.window_options),
+            options.window_status_separator_for(&window.window_options),
+            options.status_justify_for(&session.session_options),
             session.size.0,
             right.chars().count(),
         );
         Some(StatusRow {
+            // Global-only, matching the geometry narrowing above (`area_y`
+            // is computed the same way regardless of session).
             top: options.status_position_top(),
             base,
             spans,
             right,
             // status-right-style layered over base (SP6 Task 4; previously
             // always bare `base` until this task wired the option in).
-            right_style: options.status_right_style().apply_to(base),
+            right_style: options.status_right_style_for(&session.session_options).apply_to(base),
         })
     } else {
         None
     };
 
-    let border = options.pane_border_style().apply_to(default_style);
-    let border_active = options.pane_active_border_style().apply_to(default_style);
-    let border_indicators = options.pane_border_indicators();
-    let mode_style = options.mode_style().apply_to(default_style);
-    let display_panes_colour = Style { bg: options.display_panes_colour(), ..default_style };
-    let display_panes_active_colour = Style { bg: options.display_panes_active_colour(), ..default_style };
+    // Window-scoped (#26): pane-border-style/-active-border-style/
+    // -border-indicators/mode-style resolve through the CURRENT window's
+    // overlay. display-panes-colour/-active-colour are session-scoped.
+    let border = options.pane_border_style_for(&window.window_options).apply_to(default_style);
+    let border_active = options.pane_active_border_style_for(&window.window_options).apply_to(default_style);
+    let border_indicators = options.pane_border_indicators_for(&window.window_options);
+    let mode_style = options.mode_style_for(&window.window_options).apply_to(default_style);
+    let display_panes_colour = Style { bg: options.display_panes_colour_for(&session.session_options), ..default_style };
+    let display_panes_active_colour =
+        Style { bg: options.display_panes_active_colour_for(&session.session_options), ..default_style };
     let scene_size = (client.cols, client.rows);
 
     if too_small {
@@ -2616,7 +3559,7 @@ fn render_one(
                             p.grid.history_total(),
                         )
                     });
-                    Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy), sel })
+                    Some(CopyView { scroll: cs.scroll, sel })
                 }
                 _ => None,
             };
@@ -2640,7 +3583,9 @@ fn render_one(
         // OTHER overlay/message case above).
         // clock-mode (Task 10): "Cursor is hidden" (`s->mode &= ~MODE_CURSOR`
         // in `window-clock.c`) -- same treatment as the other two overlays.
-        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => (None, false),
+        // display-menu (SP7 Task 16): tmux's own menu screen also has
+        // `MODE_CURSOR` cleared (`menu_prepare`: `md->s.mode &= ~MODE_CURSOR`).
+        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) | ClientMode::Menu(_) => (None, false),
         _ => match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
             (Some(r), Some(p)) => {
                 let (cx, cy) = p.grid.cursor();
@@ -2651,8 +3596,28 @@ fn render_one(
         },
     };
 
-    let overlay = overlay_data.map(|ov| match ov {
-        RenderOverlay::Tree { rows, sel, list_height, preview } => {
+    // display-menu (SP7 Task 16): unlike every other overlay, this reads
+    // straight off `client.mode` rather than through `build_render_overlay`/
+    // `overlay_data` -- `MenuState` needs no `&self` context at all beyond
+    // what's already snapshotted in it at open time (no live registry
+    // rebuild, see `MenuState`'s doc comment), so there's nothing for the
+    // two-phase `RenderOverlay` indirection (which exists specifically for
+    // overlays that need `&self` before `render_all`'s mutable per-client
+    // loop begins) to buy here.
+    let overlay = if let ClientMode::Menu(state) = &client.mode {
+        Some(Overlay::Menu(MenuOverlay {
+            rect: state.rect,
+            title: state.title.clone(),
+            rows: state
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| MenuRowCell { text: r.text.clone(), separator: r.command.is_none(), selected: state.sel == i as i32 })
+                .collect(),
+        }))
+    } else {
+        overlay_data.map(|ov| match ov {
+        RenderOverlay::Tree { rows, sel, list_height, preview, title } => {
             // Task 8 review fix, Important #3: `compose_back`'s actual paint
             // pass reserves the panel's OWN last row for `scene.message`
             // (choose-tree's `x` kill-confirm prompt) whenever it's `Some`
@@ -2669,7 +3634,15 @@ fn render_one(
             // `*list_height == scene_size.1` in every other case, so this
             // subsumes the pre-Task-8-wave-2 math exactly.
             let msg_reserved = if message.is_some() && preview.is_none() { 1 } else { 0 };
-            let visible = (*list_height as usize).saturating_sub(msg_reserved);
+            // SP7 Task 15: the title row (`## 3.2`'s sort/filter indicator,
+            // now always non-empty) takes the panel's own FIRST row before
+            // any list rows are painted (`compose_back`'s `y += 1` when
+            // `!list.title.is_empty()`) -- reserved here too, same reason
+            // `msg_reserved` already is, so `top`'s "keep `sel` on screen"
+            // math never assumes one more paintable row than `compose_back`
+            // will actually use.
+            let title_reserved = 1usize; // title is always non-empty (see `Server::build_choose_title`)
+            let visible = (*list_height as usize).saturating_sub(msg_reserved).saturating_sub(title_reserved);
             let top = sel.saturating_sub(visible.saturating_sub(1));
             let preview_block = preview.as_ref().map(|p| PreviewBlock {
                 rect: Rect { x: 0, y: *list_height, w: scene_size.0, h: scene_size.1.saturating_sub(*list_height) },
@@ -2679,14 +3652,21 @@ fn render_one(
                 content: p.content.clone(),
             });
             Overlay::List(ListOverlay {
-                title: String::new(),
+                title: title.clone(),
                 rows: rows
                     .iter()
                     .enumerate()
-                    .map(|(i, (text, depth, marker))| TreeRowCell { text: text.clone(), depth: *depth, marker: *marker, selected: i == *sel })
+                    .map(|(i, (text, depth, marker, tagged))| TreeRowCell {
+                        text: text.clone(),
+                        depth: *depth,
+                        marker: *marker,
+                        selected: i == *sel,
+                        tagged: *tagged,
+                    })
                     .collect(),
                 top,
                 preview: preview_block,
+                list_height: *list_height,
             })
         }
         RenderOverlay::Digits(entries) => {
@@ -2706,9 +3686,14 @@ fn render_one(
             // tolerated per the project's own "every consumer must tolerate
             // w==0/h==0" rule, so `paint_clock` simply no-ops on it).
             let rect = rects.iter().find(|(id, _)| id == pane).map(|(_, r)| *r).unwrap_or(Rect { x: 0, y: 0, w: 0, h: 0 });
-            Overlay::Clock(rect, text.clone(), options.clock_mode_colour())
+            // `clock-mode-colour` is window-scoped (#26); the clock pane
+            // is always in the client's CURRENT window by render time
+            // (`cancel_stale_clock_modes` guarantees it, per the comment
+            // above).
+            Overlay::Clock(rect, text.clone(), options.clock_mode_colour_for(&window.window_options))
         }
-    });
+        })
+    };
 
     let scene = Scene {
         size: scene_size,
