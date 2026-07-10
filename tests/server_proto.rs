@@ -5234,6 +5234,55 @@ fn clock_mode_opens_and_any_key_exits() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Task 10 fix round 1 (review Major): tmux's `window_clock_key`
+/// (`window-clock.c:214-218`) calls `window_pane_reset_mode`
+/// UNCONDITIONALLY -- its `key` and `mouse_event` parameters are both
+/// `__unused` -- so ANY MOUSE EVENT exits clock mode too, exactly like any
+/// key. And, same as the key path, the exiting event is CONSUMED by the
+/// exit, not reprocessed: a click landing on a DIFFERENT (non-focused)
+/// pane closes the overlay but must NOT focus that pane.
+#[test]
+fn clock_mode_exits_on_mouse() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Split; the new RIGHT pane is focused. Move focus to the LEFT pane so
+    // the later click on the RIGHT pane would be an observable focus
+    // change if it were (wrongly) reprocessed after the clock exit.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+
+    // prefix-t: clock mode opens on the focused LEFT pane -- blue big-digit
+    // blocks appear left of the border.
+    c.send(&ClientMsg::Stdin(vec![0x02, b't']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(4), 0, border_x, 0, 23));
+
+    // Click (press + release) well inside the RIGHT pane: the overlay must
+    // close (any mouse event exits, `window-clock.c:214-218`)...
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x + 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x + 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // ...and the click must have been CONSUMED by the exit, not reprocessed
+    // as a click-to-focus: a marker typed now still lands in the LEFT pane.
+    c.send(&ClientMsg::Stdin(b"staymark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "staymark").map(|col| col < border_x).unwrap_or(false));
+
+    // Cleanup: kill-server (two live panes).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn choose_tree_w_lists_and_switches() {
     let name = unique_pipe_name();

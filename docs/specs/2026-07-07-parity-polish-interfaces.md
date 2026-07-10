@@ -2284,13 +2284,22 @@ split, there is no case where the key does anything OTHER than close the
 overlay, so `dispatch_clock_key` takes no `key`/`session_name` parameter at
 all — simply `client: &mut ClientState`.
 
-**Mouse:** swallowed unconditionally, added to `dispatch_mouse`'s existing
-`ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` guard. The reference doc
-documents no mouse behavior for window-clock (tmux's own mode struct
-defines no mouse callback) — this is the safe default (same as every other
-momentary overlay) rather than falling through to ordinary pane click/
-drag/wheel handling underneath a mode the user can't see through; a
-documented judgment call, not a doc-cited rule.
+**Mouse (fix round 1):** ANY mouse event EXITS clock mode, exactly like
+any key — tmux's `window_clock_key` (`window-clock.c:214-218`) calls
+`window_pane_reset_mode` UNCONDITIONALLY, with both its `key` and
+`mouse_event` parameters `__unused`, so there is no key-vs-mouse
+distinction at all. And, same as the key path, the exiting event is
+CONSUMED by the exit, never reprocessed (a click on a different pane
+closes the overlay but does NOT focus that pane). Implemented as a
+dedicated guard in `dispatch_mouse` BEFORE the pre-existing `ConfirmCmd`/
+`Prompt`/`ChooseTree`/`DisplayPanes` pure-swallow guard (which consumes
+but keeps its mode open — the wrong behavior for clock mode, where a
+first-draft judgment call had initially placed it), keeping that sibling
+guard's Drag/Up `end_drag` hygiene (#64). Reached only when the `mouse`
+option is on, same as every other mouse path — with `mouse off` the
+terminal is never put in mouse-reporting mode, so no mouse sequences
+arrive at all (matching tmux, whose mouse key events likewise only exist
+with the option on).
 
 **Cursor:** hidden (`(None, false)`), added to the `ChooseTree`/
 `DisplayPanes` cursor-hiding match arm — matches the doc's "Cursor is
@@ -2391,7 +2400,11 @@ detected via a blue-background cell scan, same technique
 bitmap coordinates; a completed `C-b c` prefix sequence typed while open
 both dismisses the overlay AND does not execute `new-window` underneath it,
 confirmed via a fresh CLI `list-windows` connection; pane content is
-genuinely restored afterward, confirmed via a marker string round-trip).
+genuinely restored afterward, confirmed via a marker string round-trip),
+`clock_mode_exits_on_mouse` (fix round 1: with `mouse on` and two panes,
+an SGR click on the NON-focused pane while clock mode is open both closes
+the overlay AND leaves focus unchanged — the exiting mouse event is
+consumed, not reprocessed as a click-to-focus).
 
 ## `naming` — escape-time disambiguation + automatic-rename (Task 9)
 

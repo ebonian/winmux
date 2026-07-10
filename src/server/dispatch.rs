@@ -1991,19 +1991,25 @@ impl Server {
         if !self.options.mouse() {
             return ExecOutcome::Ok(String::new());
         }
+        // clock-mode (Task 10, fix round 1): tmux's `window_clock_key`
+        // (`window-clock.c:214-218`) calls `window_pane_reset_mode`
+        // UNCONDITIONALLY -- its `key` and `mouse_event` parameters are
+        // both `__unused` -- so ANY mouse event EXITS clock mode, exactly
+        // like any key. And, same as the key path (`dispatch_clock_key`),
+        // the exiting event is CONSUMED by the exit, never reprocessed as
+        // a click-to-focus/drag/wheel underneath. The Drag/Up `end_drag`
+        // hygiene mirrors the sibling swallow-guard below (#64: a drag
+        // armed before the mode opened must not survive across it).
+        if matches!(client.mode, ClientMode::Clock(_)) {
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
         if matches!(
             client.mode,
-            ClientMode::ConfirmCmd { .. }
-                | ClientMode::Prompt { .. }
-                | ClientMode::ChooseTree(_)
-                | ClientMode::DisplayPanes(_)
-                // clock-mode (Task 10): the reference doc documents no mouse
-                // behavior for window-clock (its mode struct defines no
-                // mouse callback) -- swallowed here as the safe default,
-                // same as every other momentary overlay, rather than
-                // falling through to ordinary pane click/drag/wheel
-                // handling underneath a mode the user can't see through.
-                | ClientMode::Clock(_)
+            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
         ) {
             // #64: a drag armed before the overlay opened (keyboard-
             // triggered mid-drag) must not survive across the overlay's
