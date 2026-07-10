@@ -188,6 +188,18 @@ pub enum ParsedCmd {
     /// not tracked in SP3 -- passing `-l` is a `usage:` error like any other
     /// unrecognized flag).
     SwitchClient { next: bool },
+    /// `switch-client -t target-session` (SP7 Task 16, closes #51): switch
+    /// the acting client directly to a NAMED session, unlike [`ParsedCmd::
+    /// SwitchClient`]'s relative `-p`/`-n`. Kept as a SEPARATE variant
+    /// rather than folding `-t` into `SwitchClient` itself so every existing
+    /// `-p`/`-n` consumer (`server::switch_client_session`, the `(`/`)`
+    /// default bindings) is untouched -- both spellings share the real tmux
+    /// command name `switch-client`/`switchc` at the `resolve()` level, they
+    /// just produce different `ParsedCmd` shapes depending on which flag was
+    /// given (`-t` together with `-p`/`-n` is a usage error). Added for the
+    /// default session context menu's "Switch To <name>" entries, which have
+    /// no other way to target a specific session.
+    SwitchClientTo { target: String },
     DisplayMessage { text: Option<String> },
     ConfirmBefore { prompt: Option<String>, tail: Vec<RawCmd> },
     CommandPrompt { initial: Option<String> },
@@ -373,6 +385,82 @@ pub enum ParsedCmd {
     /// winmux's overlay lives in per-CLIENT state, not addressable by an
     /// arbitrary target pane.
     ClockMode,
+    /// `display-menu|menu [-O] [-T title] [-t target-pane] [-x pos] [-y pos]
+    /// name [key command] ...` (SP7 Task 16, closes #51): open a menu
+    /// overlay on the acting client. Grammar per tmux's own `cmd-display-
+    /// menu.c` (`cmd_display_menu_args_parse`/`cmd_display_menu_exec`,
+    /// tmux master commit db115c6, verified against the cloned C source):
+    /// each item is either a single EMPTY-STRING token (a separator line —
+    /// `menu_add_item(menu, NULL, ...)` when `*name == '\0'`) or a NAME/KEY/
+    /// COMMAND triple. `key` is `""` for "no shortcut key" (tmux's
+    /// `KEYC_NONE`, used by items only reachable via navigation — e.g. the
+    /// default pane menu has none, but a config/CLI-authored menu can);
+    /// `command` is stored as RAW TEXT, not parsed here — exactly like real
+    /// tmux's `menu_item.command`, which is only `cmd_parse_and_append`-ed
+    /// when the item is actually chosen (`menu.c`'s `menu_key_cb` `chosen:`
+    /// label) — so a stored menu can reference a command winmux doesn't
+    /// parse until that specific item is picked.
+    ///
+    /// `target`/`stay_open` (`-t`/`-O`) are ACCEPTED AND STORED but not
+    /// wired to behavior (documented narrowing, matching this project's
+    /// existing precedent for accepted-but-inert flags like `find-window
+    /// -Z`): winmux's `display-menu` does not expand `#{...}`/`-t=` format
+    /// tokens inside item command text at all -- every item command must
+    /// name any target explicitly -- so `target` has nothing left to
+    /// influence; `stay_open` (tmux's `MENU_STAYOPEN`, "menu survives a
+    /// separator/disabled-item click") has no effect because winmux's menu
+    /// rows are never disabled-but-visible (see `title`'s sibling doc note
+    /// on `MenuEntry` below) and a separator is never independently
+    /// selectable to begin with.
+    ///
+    /// `x`/`y` ([`MenuPos`]) support only `C` (centre, the default), `M`
+    /// (the triggering mouse position), and a literal column/row -- tmux's
+    /// `R`/`P`/`W`/`L` relative-position letters (pane-right-edge, pane-
+    /// left-edge, window-status-line-column, "same as the last menu") are
+    /// NOT modeled: winmux has no format engine computing those positions
+    /// outside a live mouse click. winmux's OWN default context menus
+    /// (`Bindings::default()`'s `MouseDown3Pane`/`MouseDown3Status`/
+    /// `MouseDown3StatusLeft` sentinels) use `Mouse` for both `x` and `y`
+    /// on ALL THREE menus, including window/session -- a documented
+    /// substitution for tmux's own `-xW -yW` (window-status-line-relative)
+    /// on those two: since winmux's defaults are always mouse-triggered,
+    /// positioning at the click itself is visually equivalent and needs no
+    /// extra per-status-segment column math.
+    DisplayMenu {
+        target: Option<String>,
+        x: MenuPos,
+        y: MenuPos,
+        title: Option<String>,
+        stay_open: bool,
+        items: Vec<MenuEntry>,
+    },
+}
+
+/// `-x`/`-y` position argument for [`ParsedCmd::DisplayMenu`] -- see that
+/// variant's doc comment for exactly which of tmux's position letters are
+/// (and are not) modeled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPos {
+    Literal(i32),
+    Centre,
+    Mouse,
+}
+
+/// One row of a [`ParsedCmd::DisplayMenu`] item list: either a separator
+/// line (tmux: an item whose name is the empty string) or a real, choosable
+/// item. `key: None` is tmux's `KEYC_NONE` ("no direct-jump shortcut for
+/// this item" — still reachable via Up/Down navigation). There is no
+/// "disabled" variant: real tmux draws a name-prefixed-with-`-` item as
+/// visible-but-unselectable (`menu.c`'s `*name == '-'` checks throughout
+/// `menu_key_cb`); winmux's default menu BUILDERS (`server::dispatch`'s
+/// `open_pane_menu`/`open_window_menu`/`open_session_menu`) instead OMIT an
+/// item outright when its tmux equivalent would be disabled (e.g. "Zoom"
+/// when the window has only one pane) — a documented simplification, see
+/// those functions' doc comments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuEntry {
+    Separator,
+    Item { name: String, key: Option<String>, command: String },
 }
 
 /// The Task 2 (movement/scroll/cancel) subset of tmux copy-mode's internal
@@ -698,6 +786,7 @@ fn canonical(name: &str) -> Option<&'static str> {
         "choose-client" => "choose-client",
         "display-panes" | "displayp" => "display-panes",
         "clock-mode" => "clock-mode",
+        "display-menu" | "menu" => "display-menu",
         _ => return None,
     })
 }
@@ -744,7 +833,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "detach-client" => "usage: detach-client -s target",
         "send-keys" => "usage: send-keys [-l] [-t target] key ...",
         "send-prefix" => "usage: send-prefix",
-        "switch-client" => "usage: switch-client [-p] [-n]",
+        "switch-client" => "usage: switch-client [-p] [-n] [-t target-session]",
         "display-message" => "usage: display-message [text]",
         "confirm-before" => "usage: confirm-before [-p prompt] command ...",
         "command-prompt" => "usage: command-prompt [-I initial]",
@@ -778,6 +867,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "choose-client" => "usage: choose-client",
         "display-panes" => "usage: display-panes [-d ms]",
         "clock-mode" => "usage: clock-mode",
+        "display-menu" => "usage: display-menu [-O] [-T title] [-t target] [-x pos] [-y pos] name [key command] ...",
         _ => unreachable!("canonical() and usage() command lists diverged"),
     })
 }
@@ -847,6 +937,17 @@ fn split_tail(tokens: &[String]) -> Vec<RawCmd> {
         out.push(RawCmd { name, args: cur[1..].to_vec() });
     }
     out
+}
+
+/// Parse a [`MenuPos`] `-x`/`-y` token -- see [`ParsedCmd::DisplayMenu`]'s
+/// doc comment for which of tmux's letters are modeled. `None` for anything
+/// else (an unrecognized letter, or a non-numeric non-letter token).
+fn parse_menu_pos(s: &str) -> Option<MenuPos> {
+    match s {
+        "C" => Some(MenuPos::Centre),
+        "M" => Some(MenuPos::Mouse),
+        _ => s.parse::<i32>().ok().map(MenuPos::Literal),
+    }
 }
 
 fn direction_of(hits: &[String]) -> Option<Direction> {
@@ -1045,12 +1146,22 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::SendPrefix)
         }
         "switch-client" => {
-            let Ok((b, _, p)) = scan_flags(&raw.args, &["-p", "-n"], &[]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-p", "-n"], &["-t"]) else { return Err(bad()) };
             if !p.is_empty() {
                 return Err(bad());
             }
             let has_p = has(&b, "-p");
             let has_n = has(&b, "-n");
+            // SP7 Task 16 (closes #51): `-t target-session` is a THIRD,
+            // mutually exclusive form (`ParsedCmd::SwitchClientTo`) --
+            // combining it with `-p`/`-n` is a usage error, same as
+            // combining `-p` and `-n` with each other below.
+            if let Some(target) = value_of(&v, "-t") {
+                if has_p || has_n {
+                    return Err(bad());
+                }
+                return Ok(ParsedCmd::SwitchClientTo { target });
+            }
             if has_p == has_n {
                 // Neither given, or both given: SP3 requires exactly one.
                 return Err(bad());
@@ -1459,6 +1570,87 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
                 return Err(bad());
             }
             Ok(ParsedCmd::ClockMode)
+        }
+        "display-menu" => {
+            // Manual flag loop (not `scan_flags`): unlike every other
+            // command, everything AFTER the recognized flags is the
+            // positional item-triple list, which legitimately starts with
+            // tokens that could themselves look like flags (an item named
+            // e.g. "-foo") -- `scan_flags` would misclassify those. Mirrors
+            // `bind-key`/`set-option`'s own manual-loop-then-break pattern.
+            let mut target: Option<String> = None;
+            let mut title: Option<String> = None;
+            let mut x = MenuPos::Centre;
+            let mut y = MenuPos::Centre;
+            let mut stay_open = false;
+            let mut i = 0;
+            while i < raw.args.len() {
+                match raw.args[i].as_str() {
+                    "-t" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        target = Some(v.clone());
+                        i += 1;
+                    }
+                    "-T" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        title = Some(v.clone());
+                        i += 1;
+                    }
+                    "-x" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        let Some(pos) = parse_menu_pos(v) else { return Err(format!("invalid position: {v}")) };
+                        x = pos;
+                        i += 1;
+                    }
+                    "-y" => {
+                        i += 1;
+                        let Some(v) = raw.args.get(i) else { return Err(bad()) };
+                        let Some(pos) = parse_menu_pos(v) else { return Err(format!("invalid position: {v}")) };
+                        y = pos;
+                        i += 1;
+                    }
+                    "-O" => {
+                        stay_open = true;
+                        i += 1;
+                    }
+                    "-M" => {
+                        // Real tmux's "menu may be dismissed by mouse
+                        // movement" flag -- accepted for compatibility with
+                        // the default-menu argument strings this project's
+                        // own `Bindings::default()` builds, but winmux's
+                        // menu is always mouse-eligible once open (there is
+                        // no `MENU_NOMOUSE` distinction here), so this is a
+                        // documented no-op, same treatment as `-O`.
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let rest = &raw.args[i..];
+            if rest.is_empty() {
+                return Err(bad());
+            }
+            let mut items = Vec::new();
+            let mut j = 0;
+            while j < rest.len() {
+                let name = &rest[j];
+                if name.is_empty() {
+                    items.push(MenuEntry::Separator);
+                    j += 1;
+                    continue;
+                }
+                if rest.len() - j < 3 {
+                    return Err("not enough arguments".to_string());
+                }
+                let key = rest[j + 1].clone();
+                let command = rest[j + 2].clone();
+                items.push(MenuEntry::Item { name: name.clone(), key: if key.is_empty() { None } else { Some(key) }, command });
+                j += 3;
+            }
+            Ok(ParsedCmd::DisplayMenu { target, x, y, title, stay_open, items })
         }
         _ => unreachable!("canonical() and resolve() command lists diverged"),
     }
@@ -1973,6 +2165,97 @@ mod tests {
         assert_eq!(resolve(&raw("clock-mode", &["-t", "1"])).unwrap_err(), usage("clock-mode").unwrap());
         assert_eq!(resolve(&raw("clock-mode", &["extra"])).unwrap_err(), usage("clock-mode").unwrap());
         assert_eq!(usage("clock-mode").unwrap(), "usage: clock-mode");
+    }
+
+    // ---- display-menu (SP7 Task 16, closes #51) ----
+
+    #[test]
+    fn display_menu_parses_name_key_command_triples() {
+        assert_eq!(
+            resolve(&raw("display-menu", &["Kill", "X", "kill-pane", "Zoom", "z", "resize-pane -Z"])).unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: None,
+                x: MenuPos::Centre,
+                y: MenuPos::Centre,
+                title: None,
+                stay_open: false,
+                items: vec![
+                    MenuEntry::Item { name: "Kill".to_string(), key: Some("X".to_string()), command: "kill-pane".to_string() },
+                    MenuEntry::Item {
+                        name: "Zoom".to_string(),
+                        key: Some("z".to_string()),
+                        command: "resize-pane -Z".to_string(),
+                    },
+                ],
+            }
+        );
+        // `menu` is the tmux alias.
+        assert_eq!(
+            resolve(&raw("menu", &["Kill", "X", "kill-pane"])).unwrap(),
+            resolve(&raw("display-menu", &["Kill", "X", "kill-pane"])).unwrap()
+        );
+    }
+
+    #[test]
+    fn display_menu_empty_name_is_separator() {
+        assert_eq!(
+            resolve(&raw("display-menu", &["A", "a", "cmd-a", "", "B", "b", "cmd-b"])).unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: None,
+                x: MenuPos::Centre,
+                y: MenuPos::Centre,
+                title: None,
+                stay_open: false,
+                items: vec![
+                    MenuEntry::Item { name: "A".to_string(), key: Some("a".to_string()), command: "cmd-a".to_string() },
+                    MenuEntry::Separator,
+                    MenuEntry::Item { name: "B".to_string(), key: Some("b".to_string()), command: "cmd-b".to_string() },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn display_menu_empty_key_is_no_shortcut() {
+        let ParsedCmd::DisplayMenu { items, .. } = resolve(&raw("display-menu", &["Move", "", "move-pane"])).unwrap() else {
+            panic!("expected DisplayMenu");
+        };
+        assert_eq!(items, vec![MenuEntry::Item { name: "Move".to_string(), key: None, command: "move-pane".to_string() }]);
+    }
+
+    #[test]
+    fn display_menu_flags_and_title() {
+        assert_eq!(
+            resolve(&raw(
+                "display-menu",
+                &["-T", "My Title", "-x", "M", "-y", "10", "-t", "work", "-O", "A", "a", "cmd-a"]
+            ))
+            .unwrap(),
+            ParsedCmd::DisplayMenu {
+                target: Some("work".to_string()),
+                x: MenuPos::Mouse,
+                y: MenuPos::Literal(10),
+                title: Some("My Title".to_string()),
+                stay_open: true,
+                items: vec![MenuEntry::Item { name: "A".to_string(), key: Some("a".to_string()), command: "cmd-a".to_string() }],
+            }
+        );
+    }
+
+    #[test]
+    fn display_menu_requires_at_least_one_item_and_full_triples() {
+        assert_eq!(resolve(&raw("display-menu", &[])).unwrap_err(), usage("display-menu").unwrap());
+        assert!(resolve(&raw("display-menu", &["A", "a"])).is_err());
+    }
+
+    #[test]
+    fn switch_client_to_named_session() {
+        assert_eq!(
+            resolve(&raw("switch-client", &["-t", "work"])).unwrap(),
+            ParsedCmd::SwitchClientTo { target: "work".to_string() }
+        );
+        // `-t` combined with `-p`/`-n` is a usage error.
+        assert!(resolve(&raw("switch-client", &["-t", "work", "-p"])).is_err());
     }
 
     #[test]

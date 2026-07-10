@@ -29,8 +29,9 @@ use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use crate::bindings::{
-    mouse_default_double_click_pane, mouse_default_drag_pane_enter_copy, mouse_default_drag_pane_select,
-    mouse_default_status_select_window, mouse_default_triple_click_pane, mouse_default_wheel_up_pane_root, Binding,
+    mouse_default_double_click_pane, mouse_default_drag_pane_enter_copy, mouse_default_drag_pane_select, mouse_default_menu_pane,
+    mouse_default_menu_status, mouse_default_menu_status_left, mouse_default_status_select_window, mouse_default_triple_click_pane,
+    mouse_default_wheel_up_pane_root, Binding,
 };
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
@@ -45,9 +46,9 @@ use crate::status;
 use super::{
     advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
     send_msg, spawn_pane, system_time_parts, truncate_chars, AutoscrollState, ChooseTreeState, ChooseTreeView,
-    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag,
-    PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, SortKey, TreeTarget,
-    MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
+    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MenuRow, MenuState,
+    MouseDrag, PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, SortKey,
+    TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::{Cell, Grid, MouseProto, Style};
 use std::time::Duration;
@@ -2634,9 +2635,11 @@ impl Server {
     /// §7.4 documents real tmux's mouse branch as click/double-click/
     /// right-click ONLY (wheel is UNREACHABLE via mouse with `mouse on` --
     /// "matching tmux exactly means click/double-click/right-click only");
-    /// right-click (context menu) and drag are out of scope (winmux has no
-    /// context-menu system, and `mouse.md` §2.5's drag-selection semantics
-    /// don't apply to a list overlay).
+    /// right-click and drag are out of scope for the tree list SPECIFICALLY
+    /// (SP7 Task 16 gave winmux a real context-menu system for panes/
+    /// window tabs/the session name, `## display-menu`, but did not extend
+    /// it to per-row choose-tree context menus -- `mouse.md` §2.5's drag-
+    /// selection semantics don't apply to a list overlay either way).
     pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str, acting_id: ClientId) -> ExecOutcome {
         // `mouse` is session-scoped (#26).
         let mouse_on = match self.acting_session_overlay(Some(session_name)) {
@@ -2677,6 +2680,22 @@ impl Server {
             }
             if no_pending_kill && matches!(ev.kind, MouseKind::Down(1)) {
                 return self.dispatch_choose_tree_mouse(ev, client, session_name, acting_id);
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+        // SP7 Task 16 (closes #51): display-menu gets its OWN guard, same
+        // shape as choose-tree's above -- a press (any button) is routed
+        // into the menu's own click-inside/outside handling instead of
+        // being swallowed outright; every other event kind (drag/up/wheel)
+        // still no-ops, after clearing any drag armed before the menu
+        // opened (same #64-style hygiene as every other overlay guard here).
+        if matches!(client.mode, ClientMode::Menu(_)) {
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            if matches!(ev.kind, MouseKind::Down(_)) {
+                let mut sn = session_name.to_string();
+                return self.dispatch_menu_mouse(ev, client, &mut sn);
             }
             return ExecOutcome::Ok(String::new());
         }
@@ -2875,6 +2894,16 @@ impl Server {
                     if let Some(rect) = rect {
                         self.forward_mouse_to_pane(pane_id, ev, rect);
                     }
+                }
+                // SP7 Task 16 (closes #51): `MouseDown3Pane` — the default
+                // right-click pane context menu, table-driven like every
+                // other Task-8 mouse default (`mouse_down_pane_button3`).
+                // Checked ahead of the generic `btn != 1` early-return below
+                // (which would otherwise silently swallow button 3 the same
+                // as button 2 always has).
+                if btn == 3 {
+                    client.mouse.drag = MouseDrag::None;
+                    return self.mouse_down_pane_button3(pane_id, ev, client, session_name);
                 }
                 if btn != 1 {
                     client.mouse.drag = MouseDrag::None;
@@ -3432,6 +3461,11 @@ impl Server {
                     Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
                 }
             }
+            // SP7 Task 16 (closes #51): `MouseDown3Status`/
+            // `MouseDown3StatusLeft` — the default right-click window/
+            // session context menus, dispatched from `mouse_status_button3`
+            // which discriminates the two by hit-testing `ev.x`.
+            MouseKind::Down(3) => self.mouse_status_button3(ev, client, session_name),
             MouseKind::WheelUp => self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status, client, session_name),
             MouseKind::WheelDown => {
                 self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelDown, 0, MouseKeyLoc::Status, client, session_name)
@@ -4344,6 +4378,8 @@ impl Server {
             ChooseClient => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
             ClockMode => Err("no current client".to_string()),
+            DisplayMenu { .. } => Err("no current client".to_string()),
+            SwitchClientTo { .. } => Err("switch-client: only from a client connection".to_string()),
         }
     }
 
@@ -4539,6 +4575,11 @@ impl Server {
             ChooseClient => self.exec_choose_client_client(client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
             ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
+            DisplayMenu { target: _, x, y, title, stay_open: _, items } => self.exec_display_menu_client(x, y, title, items, client),
+            SwitchClientTo { target } => match super::switch_client_session_to(&mut self.registry, client, session_name, &target) {
+                Some((old, new)) => ExecOutcome::SwitchedSession(old, new),
+                None => ExecOutcome::Ok(String::new()),
+            },
         }
     }
 
@@ -4596,9 +4637,12 @@ impl Server {
             // `KeyInputEvent::Key`/`Forward` path with a table override
             // (see `handle_stdin`), not `Captured` bytes. This arm exists
             // only for match-exhaustiveness.
-            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => {
-                (true, None)
-            }
+            ClientMode::Normal
+            | ClientMode::Copy(_)
+            | ClientMode::ChooseTree(_)
+            | ClientMode::DisplayPanes(_)
+            | ClientMode::Clock(_)
+            | ClientMode::Menu(_) => (true, None),
         }
     }
 
@@ -6125,6 +6169,576 @@ impl Server {
         client.mode = ClientMode::Clock(ClockState { pane, text });
         ExecOutcome::Ok(String::new())
     }
+
+    // ---- display-menu (SP7 Task 16, closes #51) ----
+
+    /// `display-menu|menu` from the CLI/`:` prompt/config (a client-mutating
+    /// command, never headless — see `execute_headless`'s arm). `target`
+    /// (`-t`) is accepted by `cmd::resolve` but has no effect here — see
+    /// `ParsedCmd::DisplayMenu`'s doc comment. `trigger: None` (no mouse
+    /// event context for a typed command): `MenuPos::Mouse` falls back to
+    /// `0` per `resolve_menu_axis`'s doc comment, mirroring real tmux's own
+    /// "`event->m.valid` false -> the mouse format variables are simply
+    /// unset -> `strtol("") == 0`" behavior for this exact case.
+    fn exec_display_menu_client(
+        &mut self,
+        x: cmd::MenuPos,
+        y: cmd::MenuPos,
+        title: Option<String>,
+        items: Vec<cmd::MenuEntry>,
+        client: &mut ClientState,
+    ) -> ExecOutcome {
+        let entries = menu_entries_from_parsed(&items);
+        self.open_menu(client, title.unwrap_or_default(), entries, x, y, None)
+    }
+
+    /// Build a [`ClientMode::Menu`] from an already-finalized entry list
+    /// (`(name, key notation, command)`; `command: None` = separator) and
+    /// switch the client into it. `trigger` is the mouse press position that
+    /// opened the menu, if any — consulted only when `x`/`y` is
+    /// [`cmd::MenuPos::Mouse`]. A no-op (menu never opens, `client.mode`
+    /// untouched) when `entries` is empty (mirrors tmux's own `if
+    /// (menu->count == 0) goto out;`) or the box — `content_w + 4` wide,
+    /// `rows.len() + 2` tall — doesn't fit the client's CURRENT size at all
+    /// (tmux's `cmd_display_menu_get_pos`: "if the popup is too big, stop
+    /// now"; `menu_prepare`'s own `c->tty.sx < menu->width+4` check is the
+    /// same guard restated).
+    fn open_menu(
+        &mut self,
+        client: &mut ClientState,
+        title: String,
+        entries: Vec<(String, Option<String>, Option<String>)>,
+        x: cmd::MenuPos,
+        y: cmd::MenuPos,
+        trigger: Option<(u16, u16)>,
+    ) -> ExecOutcome {
+        if entries.is_empty() {
+            return ExecOutcome::Ok(String::new());
+        }
+        let (rows, content_w) = build_menu_rows(&entries);
+        let w = content_w + 4;
+        let h = rows.len() as u16 + 2;
+        if client.cols < w || client.rows < h {
+            return ExecOutcome::Ok(String::new());
+        }
+        let px = resolve_menu_axis(x, w, client.cols, trigger.map(|(mx, _)| mx));
+        let py = resolve_menu_axis(y, h, client.rows, trigger.map(|(_, my)| my));
+        client.mode = ClientMode::Menu(MenuState { rect: Rect { x: px, y: py, w, h }, title, rows, sel: -1 });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// Right-click default PANE context menu (`MouseDown3Pane`;
+    /// `docs/tmux-reference/mouse.md` §7.1, item contents abridged at that
+    /// doc's lines 717-721 — full triples verified against the cloned tmux
+    /// source's `key-bindings.c` `DEFAULT_PANE_MENU` macro). Built directly
+    /// in Rust from LIVE state (mirrors `build_tree_rows`'s own "no format-
+    /// engine loop, just iterate live data" precedent) rather than tmux's
+    /// `#{?...,X,}` conditional-item-name format strings — winmux's
+    /// `display-menu` doesn't expand formats inside item text at all (see
+    /// `ParsedCmd::DisplayMenu`'s doc comment), so a conditionally-shown
+    /// item is OMITTED outright here rather than drawn disabled-with-a-`-`-
+    /// prefix like tmux does (`MenuEntry`'s own doc comment).
+    ///
+    /// Item commands rely on winmux's normal "no `-t`/`-s` -> the acting
+    /// client's current pane/window" target defaulting, which is safe here
+    /// because `dispatch_mouse`'s `mouse_down` ALREADY focused `pane_id`
+    /// (`self.mouse_focus_pane`) before this function is ever called — a
+    /// documented substitution for tmux's OWN `MouseDown3Pane`, which does
+    /// NOT focus the pane before opening its menu (only on the "relay to
+    /// app" branch) — see the task report.
+    ///
+    /// Substitutions from tmux's `DEFAULT_PANE_MENU` (documented, not
+    /// oversights): no "Go To Top/Bottom" (only meaningful with the pane
+    /// already in copy mode, a state a right-click can never reach here —
+    /// copy-mode's own mouse handling intercepts first); no floating-pane
+    /// items (Move/Move & Resize/Tile/Float — winmux has no floating
+    /// panes); no Respawn/Mark (winmux implements neither `respawn-pane`
+    /// nor a marked-pane concept); no hyperlink items (`mouse_hyperlink` is
+    /// not tracked). Swap Up/Down and Zoom are OMITTED (not drawn disabled)
+    /// when the window has only one pane.
+    fn open_pane_menu(&mut self, pane_id: PaneId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let window = session.current_window();
+        let pane_count = window.layout.panes().len();
+        let zoomed = window.layout.is_zoomed();
+        let pane_index = window.layout.panes().iter().position(|p| *p == pane_id).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
+        let has_buffer = self.buffers.newest().is_some();
+
+        let mut b = MenuBuilder::new();
+        if has_buffer {
+            b.item("Paste", Some("p"), "paste-buffer");
+        }
+        b.sep();
+        b.item("Horizontal Split", Some("h"), "split-window -h");
+        b.item("Vertical Split", Some("v"), "split-window -v");
+        if pane_count > 1 {
+            b.sep();
+            b.item("Swap Up", Some("u"), "swap-pane -U");
+            b.item("Swap Down", Some("d"), "swap-pane -D");
+        }
+        b.sep();
+        b.item("Kill", Some("X"), "kill-pane");
+        if pane_count > 1 {
+            b.item(if zoomed { "Unzoom" } else { "Zoom" }, Some("z"), "resize-pane -Z");
+        }
+
+        let title = format!("Pane {pane_index}");
+        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+    }
+
+    /// Right-click default WINDOW context menu (`MouseDown3Status`, a
+    /// window-tab click). Item commands target the CLICKED window `wid`
+    /// explicitly via `-t`/`-s :<index>` (NOT the "current window"
+    /// default `open_pane_menu` relies on) since a status-row right-click
+    /// need not land on the acting client's currently-selected tab.
+    ///
+    /// "Rename" is the one exception: winmux's non-interactive `rename-
+    /// window` can only either open the (CURRENT-window-only) interactive
+    /// prompt (`rename-window` with no name argument, dispatch's `is_bare`
+    /// special case) or take a name UP FRONT — neither of which a static
+    /// menu item command can do for a NON-current window. The item command
+    /// is therefore `select-window -t :<index> ; rename-window`: the first
+    /// half switches the acting client onto the clicked window (a
+    /// documented side effect — real tmux's own Rename item has none), the
+    /// second half then opens the SAME prompt the `,` binding uses,
+    /// pre-filled with (now-current) window's name.
+    ///
+    /// Substitutions from tmux's `DEFAULT_WINDOW_MENU`: no "Swap Marked"
+    /// (no marked-pane concept); "New Window" replaces tmux's separate "New
+    /// After"/"New At End" (winmux's `new-window` has no `-a` insert-after
+    /// flag, so there is only one behavior — append at the end — to offer);
+    /// no Renumber (no `move-window -r` renumber-all equivalent). Swap
+    /// Left/Right are omitted when the session has only one window.
+    fn open_window_menu(&mut self, wid: WindowId, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(pos) = session.windows.iter().position(|w| w.id == wid) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let window = &session.windows[pos];
+        let idx = window.index;
+        let title = format!("{}:{}", window.index, window.name);
+        let count = session.windows.len();
+
+        let mut b = MenuBuilder::new();
+        if count > 1 {
+            let left_pos = if pos == 0 { count - 1 } else { pos - 1 };
+            let right_pos = if pos + 1 == count { 0 } else { pos + 1 };
+            let left_idx = session.windows[left_pos].index;
+            let right_idx = session.windows[right_pos].index;
+            b.item("Swap Left", Some("l"), format!("swap-window -s :{idx} -t :{left_idx}"));
+            b.item("Swap Right", Some("r"), format!("swap-window -s :{idx} -t :{right_idx}"));
+            b.sep();
+        }
+        b.item("Kill", Some("X"), format!("kill-window -t :{idx}"));
+        b.sep();
+        b.item("Rename", Some("n"), format!("select-window -t :{idx} ; rename-window"));
+        b.sep();
+        b.item("New Window", Some("w"), "new-window");
+
+        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+    }
+
+    /// Right-click default SESSION context menu (`MouseDown3StatusLeft`).
+    /// Substitutions from tmux's `DEFAULT_SESSION_MENU`: the "Switch To
+    /// <session>" entries are built by iterating `self.registry.sessions()`
+    /// directly in Rust (up to 5, excluding the current one, in registry
+    /// order) rather than replicating tmux's `#{S/t:...}` format LOOP
+    /// modifier (`format.c`'s session-loop function, which generates
+    /// MULTIPLE menu items from a single templated item — not modeled by
+    /// winmux's `expand_format` subset at all); no Renumber (no `move-
+    /// window -r` equivalent).
+    fn open_session_menu(&mut self, mx: u16, my: u16, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let others: Vec<String> = self.registry.sessions().iter().map(|s| s.name.clone()).filter(|n| n != session_name).take(5).collect();
+
+        let mut b = MenuBuilder::new();
+        for name in &others {
+            b.item(&format!("Switch To {name}"), None, format!("switch-client -t {name}"));
+        }
+        if !others.is_empty() {
+            b.sep();
+        }
+        b.item("Rename", Some("r"), "rename-session");
+        b.item("Detach", Some("d"), "detach-client");
+        b.sep();
+        b.item("New Session", Some("s"), "new-session");
+        b.item("New Window", Some("w"), "new-window");
+
+        self.open_menu(client, session_name.to_string(), b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+    }
+
+    /// Run one menu item's raw command TEXT: re-tokenized (`cmd::parse_line`
+    /// — supports a `;`-separated sequence, exactly like a config line) and
+    /// dispatched through the SAME `dispatch_client` pipeline every other
+    /// command entry point uses, so a menu item can reference `bind-key`-
+    /// rebindable commands / set options / anything else the dispatcher
+    /// knows about. Mirrors real tmux's `menu_key_cb`'s `chosen:` label
+    /// (`cmd_parse_and_append` + `cmdq_append`), which parses the stored
+    /// command string at CHOICE time, not at menu-open time.
+    fn exec_menu_command(&mut self, command: &str, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        match cmd::parse_line(command) {
+            Ok(cmds) => self.dispatch_client(&cmds, client, session_name),
+            Err(e) => ExecOutcome::Err(e),
+        }
+    }
+
+    /// Advance the open menu's selection by one row, WRAPPING and SKIPPING
+    /// separators — mirrors `menu.c`'s `KEYC_UP`/`KEYC_DOWN` cases exactly
+    /// (`down: true` = `KEYC_DOWN`/`j`, `false` = `KEYC_UP`/`k`/`KEYC_BTAB`).
+    /// A no-op if there are no rows, or if every OTHER row is a separator
+    /// (the loop wraps back to the untouched original selection).
+    fn menu_move(&mut self, client: &mut ClientState, down: bool) {
+        let ClientMode::Menu(state) = &mut client.mode else { return };
+        let count = state.rows.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let old = if state.sel == -1 { 0 } else { state.sel };
+        loop {
+            if state.sel == -1 || state.sel == if down { count - 1 } else { 0 } {
+                state.sel = if down { 0 } else { count - 1 };
+            } else {
+                state.sel += if down { 1 } else { -1 };
+            }
+            if state.rows[state.sel as usize].command.is_some() || state.sel == old {
+                break;
+            }
+        }
+    }
+
+    /// Choose row `idx`: close the menu, then (unless it's a separator, or
+    /// the client is no longer in `ClientMode::Menu` at all — both no-ops)
+    /// run its command via [`Self::exec_menu_command`]. Mirrors `menu.c`'s
+    /// `chosen:` label: `client.mode` is reset to `Normal` BEFORE the
+    /// command runs (real tmux: the overlay is cleared via `server_client_
+    /// clear_overlay`-equivalent bookkeeping before `cmdq_append`), so a
+    /// menu item that itself opens another overlay (e.g. a nested `display-
+    /// menu`, or `choose-tree`) is never fighting the menu it was chosen
+    /// from.
+    fn menu_choose(&mut self, idx: usize, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(row) = state.rows.get(idx) else {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(command) = row.command.clone() else {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        };
+        client.mode = ClientMode::Normal;
+        self.exec_menu_command(&command, client, session_name)
+    }
+
+    /// Route one decoded key to the open menu (SP7 Task 16): a shortcut-key
+    /// match (checked FIRST, mirroring `menu_key_cb`'s own per-item loop
+    /// ahead of its `switch`) runs that item immediately regardless of the
+    /// current selection; otherwise Up/`k`/BTab and Down/`j` navigate,
+    /// Enter chooses the current selection (a no-op if nothing is selected
+    /// yet, `sel == -1`), and Escape/`q`/`C-c`/`C-g`/`C-[` cancel. Any other
+    /// key is swallowed (menu stays open, matches tmux's default `break`).
+    pub(super) fn dispatch_menu_key(&mut self, key: &Key, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if let Some(idx) = state.rows.iter().position(|r| r.command.is_some() && r.key.as_ref() == Some(key)) {
+            return self.menu_choose(idx, client, session_name);
+        }
+        let is_up = matches!(key.code, KeyCode::Up | KeyCode::BTab) || (!key.ctrl && !key.meta && key.code == KeyCode::Char('k'));
+        let is_down = !key.ctrl && !key.meta && (key.code == KeyCode::Down || key.code == KeyCode::Char('j'));
+        let is_cancel = matches!(key.code, KeyCode::Escape | KeyCode::Char('q'))
+            || (key.ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('g') | KeyCode::Char('[')));
+        if is_up {
+            self.menu_move(client, false);
+            return ExecOutcome::Ok(String::new());
+        }
+        if is_down {
+            self.menu_move(client, true);
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(key.code, KeyCode::Enter) {
+            let ClientMode::Menu(state) = &client.mode else {
+                return ExecOutcome::Ok(String::new());
+            };
+            if state.sel == -1 {
+                client.mode = ClientMode::Normal;
+                return ExecOutcome::Ok(String::new());
+            }
+            return self.menu_choose(state.sel as usize, client, session_name);
+        }
+        if is_cancel {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// Route one mouse event to the open menu (SP7 Task 16; `menu.c`'s
+    /// `menu_key_cb` mouse branch): a PRESS (any button) outside the box
+    /// closes the menu with no action; a press INSIDE it, on a real item
+    /// row, chooses that row. A documented simplification vs. real tmux,
+    /// which commits on RELEASE-with-no-button-held and hover-highlights on
+    /// motion in between (winmux has no click-run/hover-tracking machinery
+    /// for a floating overlay) — winmux commits on PRESS instead; Drag/Up/
+    /// Wheel events are all no-ops (they neither move the selection nor
+    /// close the menu).
+    fn dispatch_menu_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &mut String) -> ExecOutcome {
+        let ClientMode::Menu(state) = &client.mode else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let r = state.rect;
+        let inside = ev.x >= r.x && ev.x < r.x + r.w && ev.y >= r.y && ev.y < r.y + r.h;
+        let MouseKind::Down(_) = ev.kind else {
+            return ExecOutcome::Ok(String::new());
+        };
+        if !inside {
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
+        if ev.y == r.y || ev.y == r.y + r.h - 1 {
+            // Border row: not a choosable item.
+            return ExecOutcome::Ok(String::new());
+        }
+        let idx = (ev.y - r.y - 1) as usize;
+        self.menu_choose(idx, client, session_name)
+    }
+
+    /// `MouseDown3Pane` (SP7 Task 16): table-driven like every other Task-8
+    /// mouse default — unbound is a silent no-op, bound-to-a-user-override
+    /// runs it generically, bound-to-the-default sentinel runs the built-in
+    /// pane-menu builder.
+    fn mouse_down_pane_button3(&mut self, pane_id: PaneId, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::Pane) {
+            None => ExecOutcome::Ok(String::new()),
+            Some(cmds) if cmds == mouse_default_menu_pane() => self.open_pane_menu(pane_id, ev.x, ev.y, client, session_name),
+            Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+        }
+    }
+
+    /// `MouseDown3Status`/`MouseDown3StatusLeft` (SP7 Task 16): which of the
+    /// two applies is decided by [`Server::status_hit_at`] (the SAME hit-
+    /// test `mouse_status_click`'s Down(1) path uses), then routed through
+    /// the usual table-driven default/override/unbound triage.
+    fn mouse_status_button3(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        match self.status_hit_at(session_name, ev.x) {
+            StatusHit::Left => match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::StatusLeft) {
+                None => ExecOutcome::Ok(String::new()),
+                Some(cmds) if cmds == mouse_default_menu_status_left() => self.open_session_menu(ev.x, ev.y, client, session_name),
+                Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+            },
+            StatusHit::Window(wid) => match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 3, MouseKeyLoc::Status) {
+                None => ExecOutcome::Ok(String::new()),
+                Some(cmds) if cmds == mouse_default_menu_status() => self.open_window_menu(wid, ev.x, ev.y, client, session_name),
+                Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+            },
+            StatusHit::Other => ExecOutcome::Ok(String::new()),
+        }
+    }
+
+    /// Which status-row region column `x` falls in — mirrors `mouse_status_
+    /// click`'s own `left`/`columns` construction EXACTLY (same format
+    /// context, same option reads) so a right-click's hit-test always
+    /// agrees with a left-click's, and with what's actually drawn
+    /// (`render_one`'s status-row build). Duplicated rather than shared
+    /// with `mouse_status_click` (which also SELECTS the window as a side
+    /// effect, which a hit-test-only caller must not do) — see that
+    /// function's own doc comment for the fields being mirrored.
+    fn status_hit_at(&self, session_name: &str, x: u16) -> StatusHit {
+        let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
+            return StatusHit::Other;
+        };
+        let window = session.current_window();
+        let pane_index = window.layout.panes().iter().position(|p| *p == window.layout.focused()).unwrap_or(0) as u32
+            + self.options.pane_base_index_for(&window.window_options);
+        let mut window_flags = String::from("*");
+        if window.layout.is_zoomed() {
+            window_flags.push('Z');
+        }
+        let pane_title = self.panes.get(&window.layout.focused()).map(|p| p.title.clone()).unwrap_or_default();
+        let fctx = FormatCtx {
+            session: &session.name,
+            window_index: window.index,
+            window_name: &window.name,
+            window_flags: &window_flags,
+            pane_index,
+            hostname: &self.hostname,
+            now: system_time_parts(),
+            pane_title: &pane_title,
+        };
+        let left = crate::options::expand_format(self.options.status_left_for(&session.session_options), &fctx);
+        let left = status::truncate_visible(&left, self.options.status_left_length_for(&session.session_options));
+        if (x as usize) < left.chars().count() {
+            return StatusHit::Left;
+        }
+        let right_expanded = status::strip_style_markers(&crate::options::expand_format(
+            self.options.status_right_for(&session.session_options),
+            &fctx,
+        ));
+        let right_len =
+            truncate_chars(&right_expanded, self.options.status_right_length_for(&session.session_options)).chars().count();
+        let entries: Vec<status::WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    self.options.window_status_current_format_for(&w.window_options)
+                } else {
+                    self.options.window_status_format_for(&w.window_options)
+                };
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + self.options.pane_base_index_for(&w.window_options);
+                let w_pane_title = self.panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
+                status::WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
+                    format_override: Some(fmt.to_string()),
+                    style_override: None,
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
+                }
+            })
+            .collect();
+        let columns = status::status_tab_columns(
+            &left,
+            &entries,
+            &fctx,
+            self.options.window_status_format_for(&window.window_options),
+            self.options.window_status_current_format_for(&window.window_options),
+            self.options.window_status_separator_for(&window.window_options),
+            self.options.status_justify_for(&session.session_options),
+            session.size.0,
+            right_len,
+        );
+        match columns.iter().find(|c| x >= c.start && x < c.end).and_then(|c| session.windows.get(c.window_pos)) {
+            Some(w) => StatusHit::Window(w.id),
+            None => StatusHit::Other,
+        }
+    }
+}
+
+/// [`Server::status_hit_at`]'s result.
+enum StatusHit {
+    Left,
+    Window(WindowId),
+    Other,
+}
+
+/// Accumulates a default menu's item list with tmux's own separator de-dup
+/// rule (`menu.c`'s `menu_add_item`: a separator is dropped if it would be
+/// the very first item, or if the immediately preceding item was ALSO a
+/// separator) — reproduced here in Rust since winmux's default menus are
+/// built directly from live state rather than through `menu_add_item`
+/// itself.
+struct MenuBuilder {
+    entries: Vec<(String, Option<String>, Option<String>)>,
+}
+
+impl MenuBuilder {
+    fn new() -> Self {
+        MenuBuilder { entries: Vec::new() }
+    }
+    fn item(&mut self, name: &str, key: Option<&str>, command: impl Into<String>) {
+        self.entries.push((name.to_string(), key.map(|k| k.to_string()), Some(command.into())));
+    }
+    fn sep(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.entries.last().map(|e| e.2.is_none()).unwrap_or(false) {
+            return;
+        }
+        self.entries.push((String::new(), None, None));
+    }
+    fn into_entries(self) -> Vec<(String, Option<String>, Option<String>)> {
+        self.entries
+    }
+}
+
+/// [`cmd::MenuEntry`] list (a config/CLI-parsed `display-menu`'s items) ->
+/// [`open_menu`]'s generic `(name, key, command)` tuple shape.
+fn menu_entries_from_parsed(items: &[cmd::MenuEntry]) -> Vec<(String, Option<String>, Option<String>)> {
+    items
+        .iter()
+        .map(|e| match e {
+            cmd::MenuEntry::Separator => (String::new(), None, None),
+            cmd::MenuEntry::Item { name, key, command } => (name.clone(), key.clone(), Some(command.clone())),
+        })
+        .collect()
+}
+
+/// Finalize a menu's entry list into display-ready [`MenuRow`]s plus the
+/// box's CONTENT width (the widest row, name + `" (key)"` hint if any, or
+/// the item name alone with no key) — mirrors `menu.c`'s `menu_add_item`
+/// (`new_item->name` layout + `menu->width` tracking), minus the alignment-
+/// marker/truncation machinery real tmux applies for an overflowing item
+/// (winmux's menus are always built from short, known-fixed strings, so
+/// truncation is not needed here — a documented scope narrowing, not
+/// modeled at all). A separator row's `text` is always empty (unused by the
+/// renderer either way — see `render::MenuRowCell::separator`).
+fn build_menu_rows(entries: &[(String, Option<String>, Option<String>)]) -> (Vec<MenuRow>, u16) {
+    let content_w = entries
+        .iter()
+        .filter(|(_, _, cmd)| cmd.is_some())
+        .map(|(name, key, _)| {
+            let hint_len = key.as_ref().filter(|k| !k.is_empty()).map(|k| k.chars().count() + 3).unwrap_or(0); // " (" + key + ")"
+            name.chars().count() + hint_len
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let rows = entries
+        .iter()
+        .map(|(name, key, command)| {
+            if command.is_none() {
+                return MenuRow { text: String::new(), key: None, command: None };
+            }
+            let key = key.as_ref().filter(|k| !k.is_empty());
+            let hint = key.map(|k| format!(" ({k})")).unwrap_or_default();
+            let pad = (content_w as usize).saturating_sub(name.chars().count() + hint.chars().count());
+            let text = format!("{name}{}{hint}", " ".repeat(pad));
+            let parsed_key = key.and_then(|k| keys::parse_key(k));
+            MenuRow { text, key: parsed_key, command: command.clone() }
+        })
+        .collect();
+    (rows, content_w)
+}
+
+/// Resolve one axis (`px` or `py`) of a menu's top-left corner from its
+/// [`cmd::MenuPos`], the box's extent (width or height) on that axis, the
+/// client's available extent (cols or rows), and the triggering mouse
+/// coordinate on that axis (if any). `Centre` and an absent `mouse` for
+/// `Mouse` both fall back to the SAME formula real tmux's own `-x C`/`-y C`
+/// centering uses (`(avail - extent) / 2`, floor) — matching tmux's
+/// `cmd_display_menu_get_pos`'s `#{popup_centre_x}`/`#{popup_centre_y}`
+/// computation (`(tty->sx - 1) / 2 - w / 2`, which is the same floor-
+/// division centering up to the "-1" tmux subtracts for its own unrelated
+/// reason of reserving a column — not reproduced here, a documented minor
+/// divergence). The result is always clamped so the box fits ENTIRELY
+/// on-screen (`raw + extent > avail -> avail - extent`), mirroring `menu_
+/// prepare`'s own clamp.
+fn resolve_menu_axis(pos: cmd::MenuPos, extent: u16, avail: u16, mouse: Option<u16>) -> u16 {
+    let raw = match pos {
+        cmd::MenuPos::Centre => avail.saturating_sub(extent) / 2,
+        cmd::MenuPos::Mouse => mouse.unwrap_or(0),
+        cmd::MenuPos::Literal(n) => n.clamp(0, u16::MAX as i32) as u16,
+    };
+    if raw.saturating_add(extent) > avail {
+        avail.saturating_sub(extent)
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]
@@ -6347,6 +6961,7 @@ mod mouse_dispatch_tests {
                 ClientMode::ChooseTree(_) => "ChooseTree",
                 ClientMode::DisplayPanes(_) => "DisplayPanes",
                 ClientMode::Clock(_) => "Clock",
+                ClientMode::Menu(_) => "Menu",
             }
         );
     }

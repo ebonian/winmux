@@ -3666,6 +3666,7 @@ fn sgr_mouse(cb: u8, x: u16, y: u16, release: bool) -> Vec<u8> {
 }
 
 const CB_LEFT: u8 = 0; // button 1, plain press/release (no motion, no modifiers)
+const CB_RIGHT: u8 = 2; // button 3, plain press/release (SP7 Task 16, closes #51)
 const CB_LEFT_DRAG: u8 = 0x20; // button 1 + motion bit
 const CB_WHEEL_UP: u8 = 0x40;
 const CB_WHEEL_DOWN: u8 = 0x41;
@@ -9052,5 +9053,242 @@ fn move_window_to_other_session_appears_there_and_leaves_source() {
     let mut cli_kill = cli_client(&name);
     cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// ---- display-menu (SP7 Task 16, closes #51) ----
+
+/// `display-menu` opened generically via the `prefix-:` command prompt (the
+/// same dispatcher path a config/CLI `display-menu` line uses): navigating
+/// with `j` (Down) selects the FIRST item (`sel` starts at `-1`, one Down
+/// press lands on row 0 -- `menu.c`'s own `KEYC_DOWN` case), Enter runs its
+/// command. Proves the whole `ParsedCmd::DisplayMenu` parse -> open -> key
+/// navigate -> commit pipeline end to end, independent of any default
+/// right-click binding.
+#[test]
+fn display_menu_opens_and_enter_runs_selected() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // setup_two_named_windows leaves window 1 ("w1") current.
+    assert!(row_text(&grid, grid.rows() - 1).contains("1:w1*"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(
+        b"display-menu -T MenuTest First f \"select-window -t :=0\" Second s \"select-window -t :=1\"\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("MenuTest")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("First")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("Second")));
+
+    c.send(&ClientMsg::Stdin(b"j".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+    // The menu box is gone.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("MenuTest")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3Pane` (the default right-click binding, table-driven since
+/// Task 8): a press on a live pane opens winmux's default PANE context
+/// menu — asserts the box renders with the expected item text.
+#[test]
+fn right_click_on_pane_opens_default_menu() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("Horizontal Split")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("Vertical Split")), "got: {text:?}");
+    // Single pane: Swap Up/Down and Zoom are omitted (see `open_pane_menu`'s
+    // doc comment).
+    assert!(!text.iter().any(|l| l.contains("Swap Up")));
+    assert!(!text.iter().any(|l| l.contains("Zoom")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// A press OUTSIDE the open menu's box closes it with NO action taken —
+/// proven by there being no vertical border immediately after the outside
+/// click (nothing was accidentally triggered by it) and by a real binding
+/// working again afterward (the client is back in `ClientMode::Normal`).
+#[test]
+fn menu_click_outside_closes_without_action() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 40, 12, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // Top-left corner is well outside a menu opened around (40, 12).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+    assert!(!has_vertical_border(&grid), "outside click must not have triggered any action");
+
+    // The client is back in Normal mode: a real binding works again.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Escape cancels an open menu with no action, same as a click outside.
+#[test]
+fn menu_escape_closes() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+    assert!(!has_vertical_border(&grid), "Escape must not have triggered any action");
+
+    // Back in Normal mode.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// A menu item's own shortcut key runs it IMMEDIATELY, regardless of the
+/// current navigation selection (`menu.c`'s per-item key loop, checked
+/// BEFORE Up/Down/Enter) — pressing `v` (the default pane menu's "Vertical
+/// Split" shortcut) with no prior navigation splits the pane and closes the
+/// menu in one keystroke.
+#[test]
+fn menu_shortcut_key_runs_item_immediately() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Horizontal Split")));
+
+    // "Horizontal Split" (`split-window -h`) divides the pane left/right,
+    // i.e. a VERTICAL divider line -- tmux's own (counterintuitive) naming:
+    // `-h`/"horizontal" describes the two resulting panes' side-by-side
+    // ARRANGEMENT, not the divider's orientation.
+    c.send(&ClientMsg::Stdin(b"h".to_vec()));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    // The menu closed as part of running the item.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("Horizontal Split")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3Status` (right-click on a window tab, including a
+/// NON-current one) opens winmux's default WINDOW context menu; choosing
+/// "Kill" (via its own shortcut key `X`) kills THAT window, not the
+/// client's current one.
+#[test]
+fn right_click_on_window_tab_opens_menu_and_kills_that_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // Window 1 ("w1") is current; window 0 ("w0") is not.
+    let status_row = grid.rows() - 1;
+    let line = row_text(&grid, status_row);
+    let tab0_col = line.find("0:w0-").expect("window 0 tab must be on the status line") as u16;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, tab0_col, status_row, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("0:w0")), "window menu title should name window 0: {text:?}");
+
+    c.send(&ClientMsg::Stdin(b"X".to_vec()));
+    // Window 0 is gone; only window 1 remains, and it's current.
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, g.rows() - 1);
+        row.contains("1:w1*") && !row.contains("0:w0")
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `MouseDown3StatusLeft` (right-click on the session-name segment) opens
+/// winmux's default SESSION context menu.
+#[test]
+fn right_click_on_status_left_opens_session_menu() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // status-left's default format starts at column 0 with `[<session>]`.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 0, grid.rows() - 1, false)));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Rename")));
+    let text = screen_text(&grid);
+    assert!(text.iter().any(|l| l.contains("Detach")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("New Session")), "got: {text:?}");
+    assert!(text.iter().any(|l| l.contains("New Window")), "got: {text:?}");
+
+    c.send(&ClientMsg::Stdin(b"\x1b".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("Rename")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Rebinding `MouseDown3Pane` (`bind -n`) replaces the default pane-menu
+/// behavior entirely, generically — table-driven exactly like every other
+/// Task-8 mouse default. A right-click now runs the user's own command
+/// (here, a horizontal split) instead of opening any menu.
+#[test]
+fn mouse_down3_pane_user_override_runs_generically() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["bind-key".into(), "-n".into(), "MouseDown3Pane".into(), "split-window".into(), "-h".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, 10, 5, false)));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("Kill")), "the default menu must not have opened");
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
     server.join().expect("server exits after kill-server");
 }

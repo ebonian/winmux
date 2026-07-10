@@ -103,6 +103,24 @@ pub(crate) fn mouse_default_triple_click_pane() -> Vec<RawCmd> {
 pub(crate) fn mouse_default_status_select_window() -> Vec<RawCmd> {
     vec![cmd1("mouse-status-select-window", &[])]
 }
+/// SP7 Task 16 (closes #51): right-click default context menus. Same
+/// sentinel idiom as the others above -- `dispatch_mouse`'s `mouse_down`/
+/// `dispatch_mouse_status` need dispatch-local context (which pane/window/
+/// session is under the pointer, the live registry state used to decide
+/// which items to OFFER) that can't be expressed as a static `RawCmd`
+/// list, so these three compare a resolved binding's `cmds` against these
+/// exact sentinels to decide "run the built-in Rust menu builder" vs "the
+/// user rebound this key, execute whatever they bound generically" -- see
+/// `server::dispatch::open_pane_menu`/`open_window_menu`/`open_session_menu`.
+pub(crate) fn mouse_default_menu_pane() -> Vec<RawCmd> {
+    vec![cmd1("mouse-menu-pane", &[])]
+}
+pub(crate) fn mouse_default_menu_status() -> Vec<RawCmd> {
+    vec![cmd1("mouse-menu-status", &[])]
+}
+pub(crate) fn mouse_default_menu_status_left() -> Vec<RawCmd> {
+    vec![cmd1("mouse-menu-status-left", &[])]
+}
 
 /// `copy-mode -e` (enters copy mode with `scroll_exit` armed) then 5x
 /// `copy-scroll-up` -- `5` mirrors `server::MOUSE_WHEEL_STEP`, a private
@@ -144,6 +162,14 @@ fn root_mouse_defaults() -> HashMap<Key, Binding> {
     b(mkey(MouseKeyKind::Down, 1, MouseKeyLoc::Status), mouse_default_status_select_window());
     b(mkey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status), mouse_default_wheel_up_status());
     b(mkey(MouseKeyKind::WheelDown, 0, MouseKeyLoc::Status), mouse_default_wheel_down_status());
+    // SP7 Task 16 (closes #51): right-click default context menus --
+    // `mouse.md` §7.1's `MouseDown3Pane`/`MouseDown3Status`/
+    // `MouseDown3StatusLeft` (the `M-` modified variants, and `-O`'s
+    // stay-open-on-app-owned-mouse guard, are not modeled -- see the task
+    // report).
+    b(mkey(MouseKeyKind::Down, 3, MouseKeyLoc::Pane), mouse_default_menu_pane());
+    b(mkey(MouseKeyKind::Down, 3, MouseKeyLoc::Status), mouse_default_menu_status());
+    b(mkey(MouseKeyKind::Down, 3, MouseKeyLoc::StatusLeft), mouse_default_menu_status_left());
     t
 }
 
@@ -652,7 +678,9 @@ mod tests {
         // Root table: SP3 had none; Task 8 (SP7 wave 3) adds the mouse
         // defaults asserted in detail by `default_root_table_contains_mouse_bindings`
         // below -- and nothing else (no keyboard `bind -n` defaults exist).
-        assert_eq!(b.root.len(), 6);
+        // SP7 Task 16 (closes #51) adds the three `MouseDown3*` context-menu
+        // defaults, bringing the total from 6 to 9.
+        assert_eq!(b.root.len(), 9);
     }
 
     /// Task 8 (SP7 wave 3, closes #57/#67): the root table's mouse defaults,
@@ -669,6 +697,9 @@ mod tests {
             ("MouseDown1Status", mouse_default_status_select_window()),
             ("WheelUpStatus", mouse_default_wheel_up_status()),
             ("WheelDownStatus", mouse_default_wheel_down_status()),
+            ("MouseDown3Pane", mouse_default_menu_pane()),
+            ("MouseDown3Status", mouse_default_menu_status()),
+            ("MouseDown3StatusLeft", mouse_default_menu_status_left()),
         ];
         for (k, cmds) in expected {
             let binding = b.lookup(WhichTable::Root, &key(k)).unwrap_or_else(|| panic!("default root mouse binding missing for {k}"));
