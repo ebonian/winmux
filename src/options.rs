@@ -50,6 +50,20 @@ enum Value {
     Choice(&'static str),
     Str(String),
     Style(String, PartialStyle),
+    /// SP7 Task 12 (closes follow-ups #43/#54's sibling gap): a
+    /// `main-pane-width`/`main-pane-height`-shaped value -- either a plain
+    /// absolute cell count or an `N%` percentage, resolved against a caller-
+    /// supplied total at READ time (see [`resolve_size`]) rather than at
+    /// `set` time, since the "total" (the target window's area at
+    /// apply-time) isn't known until `server::dispatch` applies a preset.
+    Size(SizeSpec),
+}
+
+/// See [`Value::Size`]'s doc comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeSpec {
+    Cells(u32),
+    Percent(u32),
 }
 
 /// Which shape an option's value must take; drives `set`'s parsing/validation
@@ -62,6 +76,8 @@ enum Kind {
     Choice,
     Str,
     Style,
+    /// See [`Value::Size`]'s doc comment.
+    Size,
 }
 
 /// One row of the static option table: name, kind, and the default value
@@ -133,9 +149,14 @@ const SPECS: &[Spec] = &[
     // `word_separators()` getter's doc comment for the verified default.
     Spec { name: "word-separators", kind: Kind::Str, choices: &[] },
     // Layout presets (Task 6, sub-project 4): `main-horizontal`/
-    // `main-vertical`'s main-pane size.
-    Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
-    Spec { name: "main-pane-height", kind: Kind::Number, choices: &[] },
+    // `main-vertical`'s main-pane size. SP7 Task 12: promoted from plain
+    // `Number` to `Size` -- accepts an absolute cell count OR an `N%`
+    // percentage (`docs/tmux-reference/panes-and-layout.md`'s options table:
+    // "supports N%"), resolved against the target window's area at
+    // `select-layout`/`next-layout` apply-time (see `main_pane_width`/
+    // `main_pane_width_for`'s doc comment).
+    Spec { name: "main-pane-width", kind: Kind::Size, choices: &[] },
+    Spec { name: "main-pane-height", kind: Kind::Size, choices: &[] },
     // Overlays (Task 8, sub-project 4): choose-tree + display-panes.
     // `display-panes-colour`/`-active-colour` are plain BARE colours (not
     // full `fg=...`/`bg=...` style strings) -- stored as `Str` and parsed on
@@ -312,6 +333,15 @@ fn parse_typed_value(spec: &Spec, value: &str) -> Result<Value, String> {
             let parsed = style::parse_style(value)?;
             Ok(Value::Style(value.to_string(), parsed))
         }
+        Kind::Size => {
+            if let Some(pct) = value.strip_suffix('%') {
+                let n = pct.parse::<u32>().map_err(|_| format!("bad value: {value}"))?;
+                Ok(Value::Size(SizeSpec::Percent(n)))
+            } else {
+                let n = value.parse::<u32>().map_err(|_| format!("bad value: {value}"))?;
+                Ok(Value::Size(SizeSpec::Cells(n)))
+            }
+        }
     }
 }
 
@@ -330,6 +360,7 @@ fn value_kind(v: &Value) -> Kind {
         Value::Choice(_) => Kind::Choice,
         Value::Str(_) => Kind::Str,
         Value::Style(_, _) => Kind::Style,
+        Value::Size(_) => Kind::Size,
     }
 }
 
@@ -403,8 +434,8 @@ fn default_value(name: &str) -> Value {
         // `dispatch::char_class` as its own `CharClass::Whitespace` variant
         // rather than folded into `Separator` here.
         "word-separators" => Value::Str("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".to_string()),
-        "main-pane-width" => Value::Number(80),
-        "main-pane-height" => Value::Number(24),
+        "main-pane-width" => Value::Size(SizeSpec::Cells(80)),
+        "main-pane-height" => Value::Size(SizeSpec::Cells(24)),
         "display-panes-time" => Value::Number(1000),
         "display-panes-colour" => Value::Str("blue".to_string()),
         "display-panes-active-colour" => Value::Str("red".to_string()),
@@ -812,17 +843,26 @@ impl Options {
         self.set_clipboard() != "off"
     }
 
-    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4): the
-    /// `main-horizontal`/`main-vertical` layout presets' main-pane size,
-    /// clamped at APPLICATION time by `layout::apply_preset` so the other
-    /// panes never fall below `MIN_PANE_W`/`MIN_PANE_H`. tmux defaults: width
-    /// 80, height 24.
-    pub fn main_pane_width(&self) -> u16 {
-        self.number("main-pane-width") as u16
+    /// `main-pane-width`/`main-pane-height` (Task 6, sub-project 4; SP7 Task
+    /// 12 promotes these to percentage-aware `total`-resolving getters,
+    /// closing follow-up #43's sibling gap): the `main-horizontal`/
+    /// `main-vertical` layout presets' main-pane size. `total` is the
+    /// window's area length along the relevant axis AT THE MOMENT the
+    /// caller is about to apply a preset (`area.w` for width, `area.h` for
+    /// height) -- needed to resolve a stored `N%` value into an absolute
+    /// cell count (`resolve_size`); a plain absolute value ignores `total`
+    /// entirely. The RESULT is still clamped at APPLICATION time by
+    /// `layout::apply_preset`/`clamp_main` so the other panes never fall
+    /// below `MIN_PANE_W`/`MIN_PANE_H` -- and, since SP7 Task 12, re-clamped
+    /// on every subsequent render too (see `layout::Node::main_size`'s doc
+    /// comment), not just once at apply-time. tmux defaults: width 80,
+    /// height 24.
+    pub fn main_pane_width(&self, total: u16) -> u16 {
+        resolve_size(self.values.get("main-pane-width").expect("main-pane-width always has a default"), total)
     }
 
-    pub fn main_pane_height(&self) -> u16 {
-        self.number("main-pane-height") as u16
+    pub fn main_pane_height(&self, total: u16) -> u16 {
+        resolve_size(self.values.get("main-pane-height").expect("main-pane-height always has a default"), total)
     }
 
     /// `display-panes-time` (Task 8, sub-project 4): how long the
@@ -1325,12 +1365,12 @@ impl Options {
         as_style(self.resolve_window("mode-style", window))
     }
 
-    pub fn main_pane_width_for(&self, window: &Overlay) -> u16 {
-        as_number(self.resolve_window("main-pane-width", window)) as u16
+    pub fn main_pane_width_for(&self, window: &Overlay, total: u16) -> u16 {
+        resolve_size(self.resolve_window("main-pane-width", window), total)
     }
 
-    pub fn main_pane_height_for(&self, window: &Overlay) -> u16 {
-        as_number(self.resolve_window("main-pane-height", window)) as u16
+    pub fn main_pane_height_for(&self, window: &Overlay, total: u16) -> u16 {
+        resolve_size(self.resolve_window("main-pane-height", window), total)
     }
 
     pub fn automatic_rename_for(&self, window: &Overlay) -> bool {
@@ -1547,6 +1587,30 @@ fn format_value(value: &Value) -> String {
         Value::Choice(c) => c.to_string(),
         Value::Str(s) => quote_if_needed(s),
         Value::Style(src, _) => quote_if_needed(src),
+        Value::Size(SizeSpec::Cells(n)) => n.to_string(),
+        Value::Size(SizeSpec::Percent(n)) => format!("{n}%"),
+    }
+}
+
+/// Resolve a [`Value::Size`] (`main-pane-width`/`-height`'s stored value)
+/// against `total` (the axis length of the area a preset is being applied
+/// against RIGHT NOW -- `area.w` for width, `area.h` for height): `Cells(n)`
+/// passes `n` through unchanged (percent semantics never apply to it, even
+/// if `total` later shrinks -- that clamping happens downstream, in
+/// `layout::clamp_main`/`split_rects`, not here); `Percent(p)` computes
+/// `floor(total * p / 100)`, matching tmux's own integer-percentage
+/// convention (`docs/tmux-reference/panes-and-layout.md` §2 "`-p pct`":
+/// `size = curval * p / 100`). Saturates rather than panics on a
+/// pathological huge `p` (there is no upper-bound validation on `set-option`
+/// today, matching every other `Number`-kind option in this table).
+fn resolve_size(v: &Value, total: u16) -> u16 {
+    match v {
+        Value::Size(SizeSpec::Cells(n)) => (*n).min(u16::MAX as u32) as u16,
+        Value::Size(SizeSpec::Percent(p)) => {
+            let scaled = (total as u32).saturating_mul(*p) / 100;
+            scaled.min(u16::MAX as u32) as u16
+        }
+        _ => unreachable!("resolve_size called on a non-Size value"),
     }
 }
 
@@ -1817,12 +1881,32 @@ mod tests {
     #[test]
     fn main_pane_size_getters() {
         let mut o = Options::new();
-        assert_eq!(o.main_pane_width(), 80);
-        assert_eq!(o.main_pane_height(), 24);
+        assert_eq!(o.main_pane_width(80), 80);
+        assert_eq!(o.main_pane_height(24), 24);
         o.set("main-pane-width", Some("30"), false, false).unwrap();
         o.set("main-pane-height", Some("10"), false, false).unwrap();
-        assert_eq!(o.main_pane_width(), 30);
-        assert_eq!(o.main_pane_height(), 10);
+        assert_eq!(o.main_pane_width(999), 30);
+        assert_eq!(o.main_pane_height(999), 10);
+    }
+
+    /// SP7 Task 12 (closes follow-up #43's sibling gap): `main-pane-width`/
+    /// `-height` also accept an `N%` value, resolved against the caller's
+    /// `total` at READ time -- `floor(total * p / 100)`, per
+    /// `docs/tmux-reference/panes-and-layout.md`'s `-p pct` percentage rule.
+    #[test]
+    fn main_pane_size_percent() {
+        let mut o = Options::new();
+        o.set("main-pane-width", Some("50%"), false, false).unwrap();
+        assert_eq!(o.main_pane_width(80), 40);
+        assert_eq!(o.main_pane_width(81), 40); // floor(81*50/100) = 40
+        assert_eq!(o.show("main-pane-width"), Some("50%".to_string()));
+
+        o.set("main-pane-height", Some("25%"), false, false).unwrap();
+        assert_eq!(o.main_pane_height(24), 6);
+
+        // `-u` restores the plain-cells default.
+        o.set("main-pane-width", None, false, true).unwrap();
+        assert_eq!(o.main_pane_width(80), 80);
     }
 
     /// Task 8, sub-project 4: `display-panes-time` (Duration getter) and the
@@ -2059,13 +2143,13 @@ mod tests {
         let o = Options::new();
         let mut win = Overlay::new();
         win.set("main-pane-width", Some("30"), false, false).unwrap();
-        assert_eq!(o.main_pane_width_for(&win), 30);
+        assert_eq!(o.main_pane_width_for(&win, 999), 30);
 
         // `-u` on the OVERLAY removes the local entry so inheritance
         // resumes -- unlike `Options::set`'s `-u`, which resets a GLOBAL
         // entry to its compiled default (globals must always exist).
         win.set("main-pane-width", None, false, true).unwrap();
-        assert_eq!(o.main_pane_width_for(&win), 80, "falls back to the compiled global default");
+        assert_eq!(o.main_pane_width_for(&win, 999), 80, "falls back to the compiled global default");
     }
 
     /// `setw -g`/`set -g <window-scoped-name>` writes the shared GLOBAL
