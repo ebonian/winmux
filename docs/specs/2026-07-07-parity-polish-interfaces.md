@@ -162,6 +162,16 @@ impl Grid {
     /// until another BEL arrives. BEL never prints as a visible character
     /// and does not affect cursor/wrap state.
     pub fn take_bell(&mut self) -> bool;
+    /// **NEW (SP7, Task 13 — closes follow-up #55):** `true` once the pane
+    /// app has requested bracketed-paste mode via DECSET 2004, `false`
+    /// after a matching DECRST or if it was never requested. NOT
+    /// edge-triggered — reflects current mode, same shape as `mouse_proto`/
+    /// `alt_screen`. Consumed by `server::dispatch::exec_paste_buffer`'s
+    /// `maybe_bracket_paste` helper: `paste-buffer -p` wraps its write in
+    /// `ESC[200~`/`ESC[201~` ONLY when this is `true` on the TARGET pane —
+    /// otherwise `-p` stays a silent no-op wrapper, matching real tmux
+    /// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5).
+    pub fn bracketed_paste(&self) -> bool;
 }
 
 /// **NEW (SP7, Task 3):** a pane application's requested mouse REPORTING
@@ -381,6 +391,14 @@ deviation).
 | `n` | `copy-search-again` |
 | `N` | `copy-search-reverse` |
 
+**Task 13 amendment (SP7, closes follow-up #56)** — added to the emacs
+table:
+
+| Key(s) | Command |
+|---|---|
+| `C-k` | `copy-end-of-line-and-cancel` |
+| `M-m` | `copy-back-to-indentation` |
+
 Default `copy-mode-vi` table — movement/scroll/cancel subset only:
 
 | Key(s) | Command |
@@ -500,6 +518,49 @@ pattern above — no special-casing was needed in `canonical()`/`usage()`/
 (documented deviation, see the task report); `SearchAgain`/`SearchReverse`
 take none either way (repeat the STORED pattern).
 
+**Task 13 amendment (SP7, closes follow-ups #53/#55/#56)** — clipboard.
+`CopyAction` gains 4 variants:
+
+```rust
+pub enum CopyAction {
+    // ... unchanged above ...
+    BackToIndentation,   // emacs M-m: first non-blank col of the view row
+    EndOfLineAndCancel,  // emacs C-k: copy cursor->EOL into a buffer, cancel
+    CopyPipe(Option<String>),          // copy-pipe [command]
+    CopyPipeAndCancel(Option<String>), // copy-pipe-and-cancel [command]
+}
+```
+
+`CopyAction` is no longer `Copy` (only `Clone`) because of the two
+`Option<String>`-carrying variants; `copy_action_name` now takes `&CopyAction`
+accordingly (every call site updated).
+
+Canonical names: `copy-back-to-indentation` (generic `copy-<action>`, no
+args, same as every Task 2/3/4 movement command); `copy-end-of-line-and-
+cancel` (like `copy-selection-and-cancel`, tmux's own command name ALREADY
+carries the `copy-` prefix, so canonical == `-X` spelling, both
+`"copy-end-of-line-and-cancel"` — winmux's OWN naming choice, not tmux
+master's pipe-always `copy-pipe-end-of-line-and-cancel` default; see
+`CopyAction::EndOfLineAndCancel`'s doc comment in `src/cmd.rs`); `copy-pipe`/
+`copy-pipe-and-cancel` (tmux's own command names, canonical == `-X` spelling
+again, same precedent). Unlike every other `copy-*` command, `copy-pipe`/
+`copy-pipe-and-cancel` accept ONE OPTIONAL positional argument (the shell
+command to spawn) — `resolve()` special-cases these two names BEFORE the
+generic `copy_action_from_canonical` zero-args check (the same pattern
+`copy-mode` itself already used), and `usage()` returns `"usage: copy-pipe
+[command]"`/`"usage: copy-pipe-and-cancel [command]"` instead of the generic
+`"(no arguments)"` string. `send-keys -X copy-pipe[-and-cancel] [command]`
+takes the command from the NEXT positional token after the `-X` name (`p.get(1)`),
+`None` if absent — every other `-X` name ignores extra positional tokens,
+unchanged.
+
+`ParsedCmd::PasteBuffer` gains a 4th field: `bracket: bool` (the `-p` flag,
+now actually consumed — previously parsed and silently discarded):
+
+```rust
+PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
+```
+
 ### `options` amendment
 
 Adds `mode-style` (`Style`, default `bg=yellow,fg=black`) and two getters:
@@ -514,6 +575,18 @@ pub fn mode_keys_vi(&self) -> bool; // true iff mode-keys == "vi"
 
 ```rust
 pub fn buffer_limit(&self) -> u32;
+```
+
+**Task 13 amendment (SP7, closes follow-up #53)** — adds `set-clipboard`
+(`Choice`, `on`/`external`/`off`, default `external` — matches real tmux's
+own default and 3-value choice set, `Scope::Server`) and two getters:
+
+```rust
+pub fn set_clipboard(&self) -> &'static str;
+/// `true` for `on`/`external`, `false` for `off` — the ONLY gate copy-mode
+/// OSC 52 emission uses (no ConPTY `Ms`-capability probe exists; plan
+/// decision (a) in `.superpowers/sdd/task-13-brief.md`).
+pub fn set_clipboard_emits(&self) -> bool;
 ```
 
 ### `server`/`server::dispatch` amendment
@@ -926,7 +999,7 @@ u32` getter — see the `## copy-mode` section's `options amendment` above.
 `ParsedCmd` gains:
 
 ```rust
-PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool },
+PasteBuffer { name: Option<String>, target: Option<String>, no_replace: bool, bracket: bool },
 ListBuffers,
 DeleteBuffer { name: Option<String> },
 SetBuffer { name: Option<String>, data: String },
@@ -938,9 +1011,14 @@ SetBuffer { name: Option<String>, data: String },
   error with no `-t`). `no_replace` is `-r`'s value: DEFAULT (`false`)
   replaces every `\n` in the buffer with `\r` before writing to the pane's
   pty (tmux's own default -- tmux's `-r` flag means "do NOT replace LF with
-  CR"; verified against tmux master's `paste.c`). `-p` (bracketed-paste
-  passthrough) is accepted and IGNORED -- v1 simplification, documented in
-  the design spec's deferrals list.
+  CR"; verified against tmux master's `paste.c`). `bracket` is `-p`'s value
+  -- **SUPERSEDED (SP7, Task 13, closes follow-up #55):** previously
+  accepted and IGNORED; now really wraps the write in `ESC[200~`/`ESC[201~`
+  via `maybe_bracket_paste(bytes, bracket, pane.grid.bracketed_paste())`,
+  but ONLY when the TARGET pane's grid currently has bracketed-paste mode
+  set (`Grid::bracketed_paste`, DECSET/DECRST 2004 -- see the `grid-v2`
+  section's amendment) -- otherwise `-p` stays a silent no-op wrapper,
+  matching real tmux exactly.
 - `list-buffers|lsb`: no arguments. Full multi-line CLI/headless text (one
   `<name>: <size> bytes: "<sample>"` line per buffer, oldest first,
   newline-terminated) via `exec_list_buffers_headless`; dispatched from a

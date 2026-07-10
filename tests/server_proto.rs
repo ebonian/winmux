@@ -2714,6 +2714,248 @@ fn copy_selection_to_buffer_and_paste() {
     server.join().expect("server exits after kill-server");
 }
 
+// ---- clipboard: copy-pipe / OSC 52 / bracketed paste / emacs C-k, M-m
+// (SP7 Task 13, closes follow-ups #53/#55/#56) ----
+
+/// Select a printed line's whole content in copy mode via the EMACS default
+/// table (`C-a` start-of-line, `C-Space` begin-selection, `C-e`
+/// end-of-line), leaving the client still IN copy mode with the selection
+/// live -- shared setup for `copy_pipe_runs_command_with_selection_stdin`
+/// and `osc52_emitted_to_client_on_copy`. `text` must already be on screen
+/// (trailing-blank-trimmed match) before calling.
+fn enter_copy_mode_and_select_line(c: &mut Client, grid: &mut Grid, text: &str) {
+    c.recv_output_until(grid, |g| screen_text(g).iter().any(|l| l.trim_end() == text));
+    let target_row = screen_text(grid).iter().position(|l| l.trim_end() == text).unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n: cursor-up
+        c.recv_output_until(grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line
+    c.send(&ClientMsg::Stdin(vec![0x00])); // C-Space: begin-selection
+    c.send(&ClientMsg::Stdin(vec![0x05])); // C-e: end-of-line
+    c.recv_output_until(grid, |g| g.cursor().1 == target_row);
+}
+
+/// `copy-pipe-and-cancel <command>` (SP7 Task 13, closes follow-ups
+/// #53/#56): the selection is piped to a real spawned command with the
+/// selection text on its stdin, which writes it to a scratch file --
+/// proves both the selection extraction AND the real `cmd.exe /C`
+/// subprocess plumbing (`spawn_copy_pipe`, `src/server/dispatch.rs`).
+///
+/// Driven via a TEMPORARY `bind-key -T copy-mode` binding rather than
+/// `send-keys -X copy-pipe-and-cancel` over a headless CLI frame: copy-mode
+/// commands require an ACTING CLIENT (`CopyCmd(_) => Err("no current
+/// client")` on the headless path in `dispatch.rs`), so the command must be
+/// fired by a real keystroke from the attached client actually sitting in
+/// copy mode.
+#[test]
+fn copy_pipe_runs_command_with_selection_stdin() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+
+    let out_path = std::env::temp_dir().join(format!(
+        "winmux-test-copypipe-{}-{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&out_path);
+    // No `|` (cmd.exe pipe metacharacter) or embedded `"` anywhere in this
+    // command -- both would be re-parsed by the `cmd.exe /C` wrapper
+    // `spawn_copy_pipe` runs it through, since Rust's own Windows arg
+    // quoting wraps the WHOLE string in exactly one pair of `"..."` that
+    // cmd.exe's `/C` then strips before re-lexing the contents.
+    let command = format!(
+        "powershell -NoProfile -Command Set-Content -NoNewline -Path '{}' -Value ([Console]::In.ReadToEnd())",
+        out_path.display()
+    );
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind-key".into(),
+        "-T".into(),
+        "copy-mode".into(),
+        "P".into(), // unbound by default in the emacs copy-mode table
+        "copy-pipe-and-cancel".into(),
+        command,
+    ]));
+    expect_cli_done(&cli, 0);
+
+    enter_copy_mode_and_select_line(&mut c, &mut grid, "hello123");
+    c.send(&ClientMsg::Stdin(b"P".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let content = loop {
+        if let Ok(s) = std::fs::read_to_string(&out_path) {
+            if !s.is_empty() {
+                break s;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for copy-pipe command to write {out_path:?}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(content, "hello123");
+    let _ = std::fs::remove_file(&out_path);
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// OSC 52 (SP7 Task 13, closes follow-up #53): with `set-clipboard on`, an
+/// ordinary copy (default emacs `C-w` = `copy-selection-and-cancel`) emits
+/// `\x1b]52;c;<base64>\x07` to the ATTACHED CLIENT's own output stream --
+/// not just `copy-pipe`, every copy destination. `base64("hello123")` ==
+/// `"aGVsbG8xMjM="`, verified independently (`printf 'hello123' | base64`).
+#[test]
+fn osc52_emitted_to_client_on_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "set-clipboard".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    enter_copy_mode_and_select_line(&mut c, &mut grid, "hello123");
+    c.send(&ClientMsg::Stdin(vec![0x17])); // C-w: copy-selection-and-cancel
+
+    let _ = c.recv_output_bytes_until_contains(b"\x1b]52;c;aGVsbG8xMjM=\x07");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `paste-buffer -p` (SP7 Task 13, closes follow-up #55): when the target
+/// pane never requested bracketed-paste mode (DECSET 2004 -- the default,
+/// untouched state here), `-p` is a silent no-op wrapper: the buffer lands
+/// exactly as a plain unwrapped paste would, no `ESC[200~`/`ESC[201~`
+/// artifacts. (The complementary "pane DID request it" case is covered at
+/// the unit level -- `server::dispatch::clipboard_tests::
+/// bracket_wraps_only_when_both_flag_and_pane_true` plus `grid::tests::
+/// decset_2004_tracks_bracketed_paste` -- see that test module's doc
+/// comment in `src/server/dispatch.rs` for why the positive case isn't
+/// provable black-box over a real ConPTY pane.)
+#[test]
+fn paste_p_plain_when_not_requested() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set-buffer".into(), "plainmark".into()]));
+    expect_cli_done(&cli, 0);
+
+    let baseline = screen_text(&grid).iter().filter(|l| l.contains("plainmark")).count();
+    cli.send(&ClientMsg::Cli(vec!["paste-buffer".into(), "-p".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().filter(|l| l.contains("plainmark")).count() > baseline);
+
+    let line = screen_text(&grid).into_iter().find(|l| l.contains("plainmark")).expect("pasted marker line");
+    // No stray control-sequence garbage from a marker that should never
+    // have been added (`~` is otherwise not part of the pasted text or the
+    // prompt).
+    assert!(!line.contains('~'), "must not contain a stray bracket-paste marker artifact: {line:?}");
+
+    // The pasted text is unsubmitted, invalid-command input on the prompt
+    // line -- kill the server directly (same cleanup as
+    // `copy_selection_to_buffer_and_paste`).
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Emacs `C-k` (SP7 Task 13, closes follow-up #56): `copy-end-of-line-and-
+/// cancel` -- copies from the cursor to the end of the (view) line into a
+/// new automatic buffer, then exits copy mode. Deliberately winmux's OWN
+/// naming choice, NOT tmux master's pipe-always `copy-pipe-end-of-line-and-
+/// cancel` -- see `CopyAction::EndOfLineAndCancel`'s doc comment
+/// (`src/cmd.rs`).
+#[test]
+fn emacs_c_k_copies_to_eol_and_cancels() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo abcdefgh\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "abcdefgh"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "abcdefgh").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n
+        c.recv_output_until(&mut grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line
+    c.send(&ClientMsg::Stdin(vec![0x06, 0x06, 0x06])); // C-f x3 -> column 3 ('d')
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, target_row));
+
+    c.send(&ClientMsg::Stdin(vec![0x0b])); // C-k: copy-end-of-line-and-cancel
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("buffer0: 5 bytes: \"defgh\""), "unexpected list-buffers output: {out:?}");
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli2, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Emacs `M-m` (SP7 Task 13, closes follow-up #56): `back-to-indentation`
+/// moves the cursor to the first non-blank column of the current view line
+/// (does NOT copy/select anything, stays in copy mode).
+#[test]
+fn emacs_m_m_moves_to_first_nonblank() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"Write-Output \"   xyz\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "   xyz"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "   xyz").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    let entry_row = grid.cursor().1;
+    if entry_row > target_row {
+        c.send(&ClientMsg::Stdin(vec![0x10; (entry_row - target_row) as usize])); // C-p x n
+        c.recv_output_until(&mut grid, |g| g.cursor().1 == target_row);
+    }
+    c.send(&ClientMsg::Stdin(vec![0x01])); // C-a: start-of-line -> column 0
+    c.recv_output_until(&mut grid, |g| g.cursor() == (0, target_row));
+
+    c.send(&ClientMsg::Stdin(vec![0x1b, b'm'])); // M-m: back-to-indentation
+    c.recv_output_until(&mut grid, |g| g.cursor() == (3, target_row));
+    assert!(has_indicator(&grid, "[0/"), "back-to-indentation must not cancel copy mode");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 #[test]
 fn rectangle_selection() {
     let name = unique_pipe_name();

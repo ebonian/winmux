@@ -404,6 +404,110 @@ fn extract_selection_text(grid: &Grid, sel: &SelState, cx: u16, cy: u16, scroll:
     lines.join("\n")
 }
 
+// ---- clipboard: copy-pipe / OSC 52 / bracketed paste (SP7 Task 13, closes
+// follow-ups #53/#55/#56) ----
+
+/// Extract cursor-to-end-of-line text (emacs `C-k` /
+/// [`CopyAction::EndOfLineAndCancel`]) from the CURRENT view row, trailing
+/// blanks trimmed (same rule `extract_selection_text` applies per line). No
+/// selection/anchor involved -- just the live cursor position.
+fn extract_end_of_line_text(grid: &Grid, cx: u16, cy: u16, scroll: u32) -> String {
+    let chars: Vec<char> = grid.view_row_text(scroll, cy).chars().collect();
+    let lo = (cx as usize).min(chars.len());
+    let slice: String = chars[lo..].iter().collect();
+    trim_trailing_blanks(&slice)
+}
+
+/// `paste-buffer -p`'s bracket-wrap decision (SP7 Task 13, closes follow-up
+/// #55): wrap `bytes` in `ESC[200~`/`ESC[201~` ONLY when BOTH the command
+/// asked for it (`bracket`, the `-p` flag) AND the TARGET pane's grid
+/// currently has bracketed-paste mode set (DECSET 2004,
+/// `pane_bracketed_paste` -- read via `Grid::bracketed_paste` at the call
+/// site). Otherwise returns `bytes` unchanged -- `-p` is a silent no-op
+/// wrapper when the pane never asked for it, matching real tmux
+/// (`docs/tmux-reference/copy-mode-and-buffers.md` §9.4 point 5). Extracted
+/// as a pure function (no `Pty`/I/O) so this exact decision is unit-testable
+/// without a real ConPTY pane -- see the doc comment on the `clipboard_tests`
+/// module below for why that matters here specifically.
+fn maybe_bracket_paste(bytes: Vec<u8>, bracket: bool, pane_bracketed_paste: bool) -> Vec<u8> {
+    if !(bracket && pane_bracketed_paste) {
+        return bytes;
+    }
+    let mut wrapped = Vec::with_capacity(bytes.len() + 12);
+    wrapped.extend_from_slice(b"\x1b[200~");
+    wrapped.extend_from_slice(&bytes);
+    wrapped.extend_from_slice(b"\x1b[201~");
+    wrapped
+}
+
+/// Hand-rolled base64 (standard alphabet, RFC 4648 §4, `=`-padded) for OSC
+/// 52's payload -- plan decision (b) in `.superpowers/sdd/task-13-brief.md`:
+/// no crate dependency for something this small.
+const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(BASE64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { BASE64_ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { BASE64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// OSC 52 clipboard-set escape for `text`, exact wire form per the task
+/// brief: `\x1b]52;c;<base64>\x07` -- `c` selects the "clipboard" buffer
+/// (as opposed to `p`rimary/`s`election), BEL-terminated (widely-supported
+/// alternative to the `ESC \` ST terminator, and the form real terminals
+/// including Windows Terminal recognize).
+fn osc52_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 16);
+    out.extend_from_slice(b"\x1b]52;c;");
+    out.extend_from_slice(base64_encode(text.as_bytes()).as_bytes());
+    out.push(0x07);
+    out
+}
+
+/// `copy-pipe`/`copy-pipe-and-cancel`'s pipe half (SP7 Task 13, closes
+/// follow-ups #53/#56): run `command` through `cmd.exe /C` (the natural
+/// Windows stand-in for tmux's `/bin/sh -c`, per `docs/tmux-reference/
+/// copy-mode-and-buffers.md` §11 "winmux applicability notes") with `data`
+/// written to its stdin, then closed (EOF) -- no console window
+/// (`CREATE_NO_WINDOW`), stdout/stderr discarded. Deliberately NOT waited
+/// on: real tmux's job system runs pipe commands asynchronously too (the
+/// dispatch loop must never block on an arbitrary external command); on
+/// Windows, dropping a `std::process::Child` does not kill the process, it
+/// only detaches Rust's handle to it, which is exactly the desired
+/// fire-and-forget semantics here. Spawn failure (bad command, `cmd.exe`
+/// missing, ...) is silently swallowed -- same "best effort, no user-facing
+/// error" contract as e.g. `swap_pane`'s pty-write failures elsewhere in
+/// this file.
+fn spawn_copy_pipe(command: &str, data: &str) {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", command]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(data.as_bytes());
+            // `stdin` drops here, closing the pipe -- the child sees EOF.
+        }
+        // Not waited on -- see doc comment above.
+    }
+}
+
 // ---- copy-mode search (Task 4, sub-project 4) ----
 
 /// Case-fold one char to lowercase for copy-mode search, taking only the
@@ -2203,8 +2307,84 @@ impl Server {
                 if let Some(t) = text {
                     if !t.is_empty() {
                         let limit = self.options.buffer_limit();
-                        self.buffers.add_automatic(t, limit);
+                        self.buffers.add_automatic(t.clone(), limit);
+                        // OSC 52 (SP7 Task 13, closes follow-up #53): every
+                        // copy destination, not just copy-pipe -- see
+                        // `Options::set_clipboard_emits`'s doc comment for
+                        // the gating rule.
+                        if self.options.set_clipboard_emits() {
+                            super::send_output(&client.tx, osc52_bytes(&t));
+                        }
                     }
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // SP7 Task 13 (closes follow-up #56): first non-blank column of
+            // the current view row -- emacs `M-m`. See `CopyAction::
+            // BackToIndentation`'s doc comment for the v1 no-line-wrap
+            // scoping this shares with `NextWord`/`PreviousWord` above.
+            CopyAction::BackToIndentation => {
+                let text = p.grid.view_row_text(cs.scroll, cs.cy);
+                let first_non_blank = text.chars().position(|c| c != ' ' && c != '\t');
+                cs.cx = first_non_blank.unwrap_or(0).min(cols.saturating_sub(1) as usize) as u16;
+            }
+            // SP7 Task 13 (closes follow-up #56): emacs `C-k` -- see
+            // `CopyAction::EndOfLineAndCancel`'s doc comment for why this is
+            // NOT the master-branch `copy-pipe-end-of-line-and-cancel`.
+            CopyAction::EndOfLineAndCancel => {
+                let text = extract_end_of_line_text(&p.grid, cs.cx, cs.cy, cs.scroll);
+                client.mode = ClientMode::Normal;
+                if !text.is_empty() {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(text.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(&text));
+                    }
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // `copy-pipe [command]` (SP7 Task 13, closes follow-ups
+            // #53/#56): copy destinations same as `SelectionAndCancel`
+            // (buffer + OSC 52), PLUS spawn `command` (if given) with the
+            // copied text on its stdin. Stays in copy mode; per real tmux's
+            // "copy-selection" (no `-no-clear`) precedent the selection
+            // itself is cleared after copying, same as a plain
+            // `clear-selection` would do.
+            CopyAction::CopyPipe(command) => {
+                let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
+                let text = sel_opt
+                    .map(|sel| extract_selection_text(&p.grid, &sel, ccx, ccy, cscroll))
+                    .filter(|t| !t.is_empty());
+                cs.sel = None;
+                if let Some(t) = &text {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(t.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(t));
+                    }
+                }
+                if let (Some(t), Some(cmd)) = (&text, &command) {
+                    spawn_copy_pipe(cmd, t);
+                }
+                return ExecOutcome::Ok(String::new());
+            }
+            // `copy-pipe-and-cancel [command]` (SP7 Task 13): same as
+            // `CopyPipe` above, then exits copy mode.
+            CopyAction::CopyPipeAndCancel(command) => {
+                let (sel_opt, ccx, ccy, cscroll) = (cs.sel, cs.cx, cs.cy, cs.scroll);
+                let text = sel_opt
+                    .map(|sel| extract_selection_text(&p.grid, &sel, ccx, ccy, cscroll))
+                    .filter(|t| !t.is_empty());
+                client.mode = ClientMode::Normal;
+                if let Some(t) = &text {
+                    let limit = self.options.buffer_limit();
+                    self.buffers.add_automatic(t.clone(), limit);
+                    if self.options.set_clipboard_emits() {
+                        super::send_output(&client.tx, osc52_bytes(t));
+                    }
+                }
+                if let (Some(t), Some(cmd)) = (&text, &command) {
+                    spawn_copy_pipe(cmd, t);
                 }
                 return ExecOutcome::Ok(String::new());
             }
@@ -3103,7 +3283,14 @@ impl Server {
     /// false` replaces every `\n` in the buffer with `\r` before writing —
     /// tmux's own default (`-r` disables it; see the `ParsedCmd::PasteBuffer`
     /// doc comment).
-    fn exec_paste_buffer(&mut self, name: Option<String>, target: Option<String>, no_replace: bool, cs: Option<&str>) -> Result<String, String> {
+    fn exec_paste_buffer(
+        &mut self,
+        name: Option<String>,
+        target: Option<String>,
+        no_replace: bool,
+        bracket: bool,
+        cs: Option<&str>,
+    ) -> Result<String, String> {
         let (_session, _wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
         let data = match &name {
             Some(n) => self.buffers.get(n).ok_or_else(|| format!("buffer not found: {n}"))?.to_string(),
@@ -3111,6 +3298,7 @@ impl Server {
         };
         let bytes = if no_replace { data.into_bytes() } else { data.replace('\n', "\r").into_bytes() };
         if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let bytes = maybe_bracket_paste(bytes, bracket, pane.grid.bracketed_paste());
             if let Some(pty) = pane.pty.as_mut() {
                 let _ = pty.write_input(&bytes);
             }
@@ -3823,7 +4011,7 @@ impl Server {
             KillServer => self.exec_kill_server(),
             CopyMode { .. } => Err("no current client".to_string()),
             CopyCmd(_) => Err("no current client".to_string()),
-            PasteBuffer { name, target, no_replace } => self.exec_paste_buffer(name, target, no_replace, None),
+            PasteBuffer { name, target, no_replace, bracket } => self.exec_paste_buffer(name, target, no_replace, bracket, None),
             ListBuffers => self.exec_list_buffers_headless(),
             DeleteBuffer { name } => self.exec_delete_buffer(name),
             SetBuffer { name, data } => self.exec_set_buffer(name, data),
@@ -4012,7 +4200,9 @@ impl Server {
             KillServer => wrap(self.exec_kill_server()),
             CopyMode { page_up, mouse } => self.exec_copy_mode(page_up, mouse, client, session_name),
             CopyCmd(action) => self.exec_copy_action(action, client),
-            PasteBuffer { name, target, no_replace } => wrap(self.exec_paste_buffer(name, target, no_replace, Some(session_name.as_str()))),
+            PasteBuffer { name, target, no_replace, bracket } => {
+                wrap(self.exec_paste_buffer(name, target, no_replace, bracket, Some(session_name.as_str())))
+            }
             ListBuffers => self.exec_list_buffers_client(),
             DeleteBuffer { name } => wrap(self.exec_delete_buffer(name)),
             SetBuffer { name, data } => wrap(self.exec_set_buffer(name, data)),
@@ -5641,5 +5831,77 @@ mod focus_activity_fix_tests {
 
         assert!(!server.pane_activity.contains_key(&other_pane), "the killed occupant's activity entry must be pruned");
         assert!(server.pane_activity.contains_key(&a), "the mover's own pane activity must be untouched");
+    }
+}
+
+/// SP7 Task 13 (closes follow-ups #53/#55/#56): the hand-rolled base64
+/// encoder, the OSC 52 wire form, cursor-to-EOL text extraction, and the
+/// `paste-buffer -p` bracket-wrap decision -- pure-function unit coverage.
+///
+/// `paste_p_brackets_when_pane_requested_2004`'s "pane DID request
+/// bracketed paste" case is deliberately NOT attempted as a
+/// `tests/server_proto.rs` real-ConPTY end-to-end test. Investigation during
+/// this task (empirical probes, since discarded) found the positive case
+/// fundamentally unprovable black-box over the wire protocol, for two
+/// independent reasons: (1) getting a REAL pane's grid to observe DECSET
+/// 2004 requires the child process to write `ESC[?2004h` to its own
+/// stdout, and Windows Console/ConPTY is known to intercept/re-synthesize
+/// certain VT private modes rather than relay them byte-for-byte (the same
+/// class of issue `mouse_dispatch_tests`' doc comment above documents for
+/// `?1049h` -- an empirical probe here observed the escape arriving
+/// mangled, not the well-formed `ESC[?2004h` PowerShell wrote); (2) even if
+/// delivery were reliable, a bracket-paste-AWARE reader (e.g. PSReadLine)
+/// is EXPECTED to consume/strip the `ESC[200~`/`ESC[201~` markers on a
+/// successful wrap, producing a client-visible result IDENTICAL to an
+/// unwrapped paste -- so even perfect delivery would not be distinguishable
+/// black-box from the "never requested, `-p` silently skipped" case. The
+/// negative case (`paste_p_plain_when_not_requested`) IS a genuine
+/// `tests/server_proto.rs` test (default state, no escape injection
+/// needed, fully reliable). The positive case's actual logic --
+/// `bracket && pane_bracketed_paste` both true -> wrap -- is proven here
+/// (`bracket_wraps_only_when_both_flag_and_pane_true`) plus
+/// `grid::tests::decset_2004_tracks_bracketed_paste` (the grid-state half).
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use crate::grid::Grid;
+
+    #[test]
+    fn base64_encode_rfc4648_vectors() {
+        // Classic RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn osc52_bytes_wraps_base64_with_c_selection_and_bel() {
+        assert_eq!(osc52_bytes("hi"), b"\x1b]52;c;aGk=\x07".to_vec());
+        assert_eq!(osc52_bytes(""), b"\x1b]52;c;\x07".to_vec());
+    }
+
+    #[test]
+    fn extract_end_of_line_trims_trailing_blanks_from_cursor() {
+        let mut g = Grid::new(10, 1, 0);
+        g.feed(b"hello");
+        // Row is "hello" + 5 trailing blank cells (10 cols total).
+        assert_eq!(extract_end_of_line_text(&g, 2, 0, 0), "llo");
+        assert_eq!(extract_end_of_line_text(&g, 0, 0, 0), "hello");
+        // Cursor past all real content -> empty (only blanks remain).
+        assert_eq!(extract_end_of_line_text(&g, 9, 0, 0), "");
+    }
+
+    #[test]
+    fn bracket_wraps_only_when_both_flag_and_pane_true() {
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), true, true), b"\x1b[200~hi\x1b[201~".to_vec());
+        // `-p` given but the pane never asked for it -> unchanged.
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), true, false), b"hi".to_vec());
+        // Pane DID ask for it, but `-p` wasn't given -> unchanged.
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, true), b"hi".to_vec());
+        assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, false), b"hi".to_vec());
     }
 }
