@@ -119,10 +119,14 @@ enum TitleSource {
 /// `rename_string` -- i.e. on the bare `ESC` byte itself, before the
 /// following byte (the expected `\`) is even read. `PostTitle` below
 /// reproduces this: the title is committed when `ESC` is seen, and the
-/// following byte is only checked to decide whether to swallow it as the
-/// completing `\` of the ST or replay it (plus the ESC) as ordinary input.
-/// Also per that same table: `BEL` (0x07) inside the title is mapped to a
-/// no-op (0x00-0x17 -> `NULL,NULL`), unlike OSC's dedicated
+/// following byte is only checked to decide among three outcomes: swallow
+/// it as the completing `\` of the ST; re-enter `Title` if it's `k` (the
+/// committing `ESC` was doing double duty as the opener of a SECOND,
+/// back-to-back `ESC k` -- the realistic pattern under conhost, which eats
+/// `ESC \`, per follow-up #52; SP7-B critical fix); or replay it (plus the
+/// ESC) as ordinary input for anything else. Also per that same table:
+/// `BEL` (0x07) inside the title is mapped to a no-op (0x00-0x17 ->
+/// `NULL,NULL`), unlike OSC's dedicated
 /// `{0x07,0x07,input_end_bel,&input_state_ground}` arm -- so BEL is
 /// dropped, never accumulated and never a terminator, while inside a title.
 enum EscKScan {
@@ -1256,6 +1260,14 @@ impl Grid {
                     if b == b'\\' {
                         // ST fully consumed; the title already committed.
                         self.esck_scan = EscKScan::Idle;
+                    } else if b == b'k' {
+                        // The committing ESC was doing double duty: it also
+                        // opens a SECOND `ESC k` capture (back-to-back
+                        // unterminated titles -- the realistic pattern under
+                        // conhost, which eats `ESC \`, per follow-up #52).
+                        // Start capturing the next title instead of
+                        // replaying `k...` as ordinary input.
+                        self.esck_scan = EscKScan::Title(Vec::new());
                     } else if b == 0x1b {
                         // Another bare ESC instead of the expected `\` --
                         // keep waiting rather than replaying (the title is
@@ -1263,8 +1275,9 @@ impl Grid {
                         // whether a stray non-`\` byte here leaks through).
                         self.esck_scan = EscKScan::PostTitle;
                     } else {
-                        // Not `ESC \` after all -- replay the consumed ESC
-                        // plus this byte as ordinary input.
+                        // Not `ESC \` (nor a new `ESC k`) after all --
+                        // replay the consumed ESC plus this byte as
+                        // ordinary input.
                         out.push(0x1b);
                         out.push(b);
                     }
@@ -2048,6 +2061,75 @@ mod tests {
         assert_eq!(g.title(), Some("hello")); // ST consumed; no further change
         assert!(!g.take_title_changed());
         // No title bytes leaked into the visible grid at any point.
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn back_to_back_esc_k_titles_update_without_leak() {
+        // Critical fix (SP7-B review of cae6af2): when the ESC that commits
+        // a title is ALSO the opening ESC of a second `ESC k`, the old
+        // `PostTitle` arm replayed the following `k` as ordinary input --
+        // leaking `title2` into the visible grid and leaving `title()`
+        // stuck on `title1`. The committing ESC must be recognized as
+        // double duty: title-terminator AND next-title-opener.
+        let mut g = Grid::new(30, 2, 0);
+        g.feed(b"\x1bktitle1\x1bktitle2\x1b\\");
+        assert_eq!(g.title(), Some("title2"));
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+        assert_eq!(row_str(&g, 1).trim_end(), "");
+
+        // Full chain: t1 -> t2 -> t3, ending on a real ST. Zero leaked cells
+        // and the final title is the last one committed.
+        let mut g2 = Grid::new(30, 2, 0);
+        g2.feed(b"\x1bkt1\x1bkt2\x1bkt3\x1b\\");
+        assert_eq!(g2.title(), Some("t3"));
+        assert_eq!(row_str(&g2, 0).trim_end(), "");
+        assert_eq!(row_str(&g2, 1).trim_end(), "");
+    }
+
+    #[test]
+    fn pending_esc_then_non_k_escape_passes_through_intact() {
+        // A lone trailing ESC at the end of one `feed` chunk, followed by a
+        // CSI sequence (NOT `k`) starting the next chunk, must be replayed
+        // byte-for-byte to `vte` rather than swallowed -- proving the
+        // `Esc`-state passthrough survives a chunk boundary.
+        let mut g = Grid::new(10, 2, 0);
+        g.feed(b"ab\x1b");
+        g.feed(b"[31mcd");
+        assert_eq!(row_str(&g, 0).trim_end(), "abcd");
+        assert_eq!(g.title(), None);
+    }
+
+    #[test]
+    fn literal_k_inside_csi_or_osc_passes_through() {
+        // A `k` byte that is NOT immediately preceded by a bare ESC (i.e.
+        // it's a parameter/data byte inside some other escape sequence)
+        // must never be mistaken for an `ESC k` opener.
+        let mut g = Grid::new(20, 2, 0);
+        // 'k' as an ordinary printable character after a CSI SGR sequence.
+        g.feed(b"\x1b[31mk\x1b[0m");
+        assert_eq!(row_str(&g, 0).trim_end(), "k");
+        assert_eq!(g.title(), None);
+
+        // 'k' inside an OSC 2 (set-title) string -- handled entirely by
+        // `vte`'s own OSC accumulation, not the ESC-k pre-scan, since the
+        // OSC's opening ESC is immediately followed by ']' not 'k'.
+        let mut g2 = Grid::new(20, 2, 0);
+        g2.feed(b"\x1b]2;kite\x07");
+        assert_eq!(g2.title(), Some("kite"));
+        assert_eq!(row_str(&g2, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn bel_mid_title_is_silent_noop() {
+        // BEL inside an `ESC k` title must neither ring the bell nor leak
+        // into the buffer -- tmux's `rename_string` state table has no BEL
+        // arm (unlike OSC's dedicated bell-terminator arm).
+        let mut g = Grid::new(20, 2, 0);
+        assert!(!g.take_bell());
+        g.feed(b"\x1bkfoo\x07bar\x1b\\");
+        assert_eq!(g.title(), Some("foobar"));
+        assert!(!g.take_bell());
         assert_eq!(row_str(&g, 0).trim_end(), "");
     }
 

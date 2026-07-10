@@ -6185,14 +6185,16 @@ fn allow_rename_off_ignores_esc_k_title_rename() {
 }
 
 /// Mirror of `allow_rename_off_ignores_esc_k_title_rename` with `allow-rename`
-/// turned on: the SAME `ESC k` escape now DOES rename the window (through
-/// the same `maybe_auto_rename`/`derive_auto_name` pipeline the OSC 0/2 path
-/// uses -- winmux's simplified model feeds an allowed ESC-k title into the
-/// same slot/pipeline as an OSC title, rather than tmux's literal direct
-/// `window_set_name` call). `allow-rename on` is loaded from a STARTUP
-/// config file (rather than a live `set` command after attaching) purely to
-/// keep the test shape minimal; see the sibling test's doc comment for the
-/// verified reason behind the two-statement command shape.
+/// turned on: the SAME `ESC k` escape now DOES rename the window, through
+/// `Server::rename_window_from_esc_k` (SP7-B review fix of cae6af2) -- a
+/// path SEPARATE from `maybe_auto_rename`/`derive_auto_name`, which uses the
+/// captured name as-is (`model::validate_name`-gated only, no
+/// basename/extension derivation), matching real tmux's literal direct
+/// `window_set_name` call in `input_exit_rename`. `allow-rename on` is
+/// loaded from a STARTUP config file (rather than a live `set` command after
+/// attaching) purely to keep the test shape minimal; see the sibling test's
+/// doc comment for the verified reason behind the two-statement command
+/// shape.
 #[test]
 fn allow_rename_on_esc_k_renames_window() {
     let name = unique_pipe_name();
@@ -6208,6 +6210,119 @@ fn allow_rename_on_esc_k_renames_window() {
             .to_vec(),
     ));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename` must gate `ESC k`
+/// INDEPENDENTLY of `automatic-rename` -- real tmux's `input_exit_rename`
+/// never reads `automatic-rename` before renaming
+/// (`docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what it
+/// actually gates", lines 358-374). Both options are set from a STARTUP
+/// config file: `allow-rename on` (so `ESC k` is honored) AND
+/// `automatic-rename off` (which would previously have blocked the rename,
+/// back when this path wrongly funneled through `maybe_auto_rename`, whose
+/// very first check is `automatic_rename()`).
+#[test]
+fn allow_rename_on_with_automatic_rename_off_still_renames_via_esc_k() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-auto-off");
+    std::fs::write(&conf_path, "set -g allow-rename on\nset -g automatic-rename off\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: an `ESC k` rename must clear the window's
+/// `auto_rename` flag exactly like a manual `rename-window`, so a LATER OSC
+/// 0/2 title change does not silently override it -- mirrors
+/// `manual_rename_disables_auto`, except the initial rename is the `ESC k`
+/// escape (`allow-rename on`) instead of a CLI `rename-window`. The
+/// title-setting command and the `done-osc-check` marker run as ONE
+/// PowerShell statement list so the marker appearing on screen proves the
+/// OSC has already had its chance to reach and be processed by the server
+/// before the assertion below runs.
+#[test]
+fn esc_k_rename_clears_window_auto_rename_flag() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-clears-flag");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"$Host.UI.RawUI.WindowTitle='mytool'; echo done-osc-check\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-osc-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "an ESC-k rename must survive a later OSC title change, same as a manual rename; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename`-gated `ESC k` must rename the
+/// window even if it was PREVIOUSLY manually renamed -- real tmux's
+/// `input_exit_rename` never consults any "has this window been manually
+/// renamed before" history, unlike the old (buggy) implementation, which
+/// funneled `ESC k` through `maybe_auto_rename` and was therefore blocked by
+/// `!window.auto_rename` the instant any manual rename (CLI, `,` prompt, or
+/// a prior `ESC k`) had ever happened.
+#[test]
+fn allow_rename_on_renames_previously_manually_renamed_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-after-manual");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "manual".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:manual*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:manual*")),
+        "an allow-rename ESC-k must override a prior manual rename, not be blocked by it; screen:\n{}",
+        lines.join("\n")
+    );
 
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");

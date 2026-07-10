@@ -1305,7 +1305,16 @@ impl Server {
                         let from_esc_k = p.grid.title_from_esc_k();
                         let title = p.grid.title().unwrap_or("").to_string();
                         p.title = title.clone();
-                        if !from_esc_k || self.options.allow_rename() {
+                        if from_esc_k {
+                            // `ESC k` goes through its OWN path (SP7-B
+                            // review fix of cae6af2), NOT `maybe_auto_rename`
+                            // -- see `rename_window_from_esc_k`'s doc
+                            // comment for why real tmux's `allow-rename`
+                            // gate is independent of `automatic-rename`.
+                            if self.options.allow_rename() {
+                                self.rename_window_from_esc_k(id, &title);
+                            }
+                        } else {
                             self.maybe_auto_rename(id, &title);
                         }
                     }
@@ -1425,6 +1434,20 @@ impl Server {
         }
     }
 
+    /// Locate the `(session name, window id)` of the window whose ACTIVE
+    /// pane (`window.layout.focused()`) is `pane_id`, if any -- shared by
+    /// `maybe_auto_rename` and `rename_window_from_esc_k` so a background
+    /// pane's title changing never renames anything, from either path,
+    /// matching tmux (only the active pane's title is ever tracked).
+    fn window_for_active_pane(&self, pane_id: PaneId) -> Option<(String, WindowId)> {
+        self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.focused() == pane_id)
+                .map(|w| (s.name.clone(), w.id))
+        })
+    }
+
     /// automatic-rename (Task 9, sub-project 4): if `pane_id` is the ACTIVE
     /// pane of some window (`window.layout.focused() == pane_id`), and both
     /// the global `automatic-rename` option and that window's own
@@ -1439,18 +1462,19 @@ impl Server {
     /// actual rename happens, so a title that keeps re-deriving to the
     /// SAME name never gets throttled against a later, genuinely different
     /// one.
+    ///
+    /// This function is used ONLY for OSC 0/2 titles (`automatic-rename`'s
+    /// actual gate). `ESC k` titles go through `rename_window_from_esc_k`
+    /// instead -- see that function's doc comment for why the two paths
+    /// must NOT share logic beyond the active-pane lookup above (SP7-B
+    /// review fix of cae6af2, which had wrongly routed `allow-rename`-gated
+    /// `ESC k` titles through this function).
     fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str) {
         if !self.options.automatic_rename() {
             return;
         }
         let Some(name) = derive_auto_name(title) else { return };
-        let target = self.registry.sessions().iter().find_map(|s| {
-            s.windows
-                .iter()
-                .find(|w| w.layout.focused() == pane_id)
-                .map(|w| (s.name.clone(), w.id))
-        });
-        let Some((session_name, wid)) = target else { return };
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
         let Some(session) = self.registry.session_mut(&session_name) else { return };
         let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
         if !window.auto_rename || window.name == name {
@@ -1464,6 +1488,45 @@ impl Server {
         }
         window.name = name;
         window.last_auto_rename = Some(now);
+    }
+
+    /// `ESC k <name> ESC \` rename escape, gated ONLY by `allow-rename`
+    /// (SP7-B review fix of cae6af2 -- the previous implementation routed
+    /// this through `maybe_auto_rename`, which wrongly made it ALSO require
+    /// `automatic-rename` to be on and blocked it once a window had ever
+    /// been manually renamed). Verified against real tmux's
+    /// `input_exit_rename` (input.c:2799-2830; see
+    /// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what
+    /// it actually gates", lines 358-374): when `allow-rename` is on and the
+    /// captured name is non-empty, tmux renames the window UNCONDITIONALLY
+    /// -- it never reads `automatic-rename` first, and a prior manual
+    /// rename never blocks it -- then sets `automatic-rename` off for that
+    /// window as a side effect
+    /// (`options_set_number(w->options, "automatic-rename", 0)`), exactly
+    /// like a manual `rename-window` does. Reproduced here: the name is
+    /// validated with the SAME `model::validate_name` gate the manual
+    /// `rename-window` path (`exec_rename_window` in
+    /// `src/server/dispatch.rs`) uses -- deliberately NOT
+    /// `derive_auto_name`'s basename/extension-stripping transform, since
+    /// real tmux's `window_set_name(w, ictx->input_buf, 1)` uses the
+    /// captured text as-is, with no derivation. An invalid name (empty,
+    /// containing `:`/`.`, or a control character -- `validate_name`'s
+    /// gate, a winmux-specific invariant since window names double as
+    /// `session:window`/`session.window` target syntax) is silently
+    /// ignored rather than surfaced as an error, since there is no
+    /// client-facing command invocation here to report one to; this also
+    /// means winmux does not (yet) reproduce tmux's special empty-name
+    /// case (reverting the window-local `automatic-rename` override) --
+    /// documented as a residual divergence in follow-up #52.
+    fn rename_window_from_esc_k(&mut self, pane_id: PaneId, title: &str) {
+        if crate::model::validate_name(title, "window").is_err() {
+            return;
+        }
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        window.name = title.to_string();
+        window.auto_rename = false;
     }
 
     fn handle_connected(&mut self, conn: PipeConn) {
