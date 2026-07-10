@@ -308,33 +308,230 @@ impl Registry {
         self.next_window_id += 1;
         id
     }
+
+    /// Cross-session `move-window -t <session>[:<index>]` (SP7 Task 11,
+    /// closes follow-up #45): lift window `id` wholesale out of session
+    /// `src_name` and insert it into session `dst_name` at `index`
+    /// (explicit) or `dst_name`'s lowest free slot. The `Window` OBJECT
+    /// (id, name, layout, `last_layout`, `auto_rename` state, every pane it
+    /// contains) moves untouched -- `WindowId`s are global and are never
+    /// re-minted (`docs/tmux-reference/windows-and-sessions.md`
+    /// §move-window/link-window: "the window keeps a back-list of all its
+    /// winlinks... a window is a global object").
+    ///
+    /// `select`: when `true` (winmux's `move-window` has no `-d`, so
+    /// dispatch always passes `true` today), the destination session's
+    /// `current` becomes the moved window and `last` becomes whatever WAS
+    /// current there, mirroring `new_window`'s own current/last shuffle.
+    ///
+    /// **Narrowing (documented, follow-up #45's own honest-scope note):**
+    /// unlike real tmux (which destroys a source session emptied by the
+    /// move, `server-fn.c:304-311`), this refuses outright
+    /// (`"can't move the only window out of its session"`) if `id` is
+    /// `src_name`'s ONLY window -- the same protective pattern
+    /// `Session::kill_window` already applies to a session's last window,
+    /// chosen here to avoid this task also having to solve session-teardown
+    /// client-eviction semantics for a case that has no floor-level bearing
+    /// on the required behavior (moving a window OUT of a multi-window
+    /// session, leaving the source alive).
+    ///
+    /// Errors: `"can't find session: <src_name/dst_name>"` if either
+    /// session doesn't exist; `"window not found"` if `id` isn't live in
+    /// `src_name`; `"can't move the only window out of its session"` (see
+    /// above); `"index in use: <i>"` if an explicit destination index
+    /// collides and `kill` is `false` (`kill == true` removes the occupant
+    /// first, same `-k` contract `Session::move_window`'s same-session path
+    /// already has -- the CALLER is responsible for snapshotting/cleaning up
+    /// the killed occupant's pane runtime state, same pattern
+    /// `exec_move_window` already follows for the same-session case).
+    /// `src_name == dst_name` is rejected too -- callers should route a
+    /// same-session move through `Session::move_window` instead, which this
+    /// method does not duplicate.
+    pub fn move_window_to_session(
+        &mut self,
+        src_name: &str,
+        id: WindowId,
+        dst_name: &str,
+        index: Option<u32>,
+        kill: bool,
+        select: bool,
+    ) -> Result<(), String> {
+        if src_name == dst_name {
+            return Err("move-window: source and destination sessions are the same".to_string());
+        }
+        let src_i = self
+            .sessions
+            .iter()
+            .position(|s| s.name == src_name)
+            .ok_or_else(|| format!("can't find session: {src_name}"))?;
+        let dst_i = self
+            .sessions
+            .iter()
+            .position(|s| s.name == dst_name)
+            .ok_or_else(|| format!("can't find session: {dst_name}"))?;
+        if !self.sessions[src_i].windows.iter().any(|w| w.id == id) {
+            return Err("window not found".to_string());
+        }
+        if self.sessions[src_i].windows.len() == 1 {
+            return Err("can't move the only window out of its session".to_string());
+        }
+        if let Some(i) = index {
+            let occupied = self.sessions[dst_i].windows.iter().any(|w| w.index == i);
+            if occupied && !kill {
+                return Err(format!("index in use: {i}"));
+            }
+        }
+        let window = self.sessions[src_i]
+            .take_window(id)
+            .expect("presence just checked above");
+        if let Some(i) = index {
+            // NOTE: uses `take_window`, not `kill_window` -- `kill_window`
+            // refuses to remove a session's ONLY window (a real UI-facing
+            // guard: killing it would leave zero windows visible), but the
+            // destination here is about to receive the incoming window
+            // immediately below, so it is never actually left empty. The
+            // detached `Window` (and its panes) is intentionally dropped --
+            // the CALLER (`server/dispatch.rs::exec_move_window`) is
+            // responsible for cleaning up its pane runtime state, same
+            // pre-snapshot-then-remove pattern the SAME-session path already
+            // follows for `Session::move_window`'s own `kill_window` call.
+            if let Some(occ_id) = self.sessions[dst_i].windows.iter().find(|w| w.index == i).map(|w| w.id) {
+                self.sessions[dst_i].take_window(occ_id);
+            }
+        }
+        let dst = &mut self.sessions[dst_i];
+        let dst_original_current = dst.current;
+        let new_id = dst.insert_window(window, index).expect("occupancy resolved above");
+        if select {
+            dst.last = Some(dst_original_current);
+            dst.current = new_id;
+        }
+        Ok(())
+    }
+
+    /// Build a fresh single-pane `Window` (same defaults as
+    /// `Session::new_window`) and insert it into session `session_name` at
+    /// `index` (explicit) or its lowest free slot -- the cross-session-
+    /// capable primitive `break-pane -t <session[:index]>` (SP7 Task 11,
+    /// closes follow-up #44) needs, since `Session::new_window` itself only
+    /// ever targets its OWN session at the lowest free slot and always
+    /// forces focus onto the new window. Does NOT touch `current`/`last` --
+    /// the caller decides focus (mirrors `Session::insert_window`, which
+    /// this delegates to after building the `Window` -- kept private to
+    /// `model.rs` so `Window`-construction defaults stay in one place, not
+    /// duplicated into `server/dispatch.rs`). `id` must come from
+    /// `mint_window_id`. Errors `"can't find session: <session_name>"` /
+    /// `"index in use: <i>"` (see `Session::insert_window`).
+    pub fn insert_new_window(
+        &mut self,
+        session_name: &str,
+        id: WindowId,
+        first_pane: PaneId,
+        index: Option<u32>,
+    ) -> Result<WindowId, String> {
+        let session = self
+            .session_mut(session_name)
+            .ok_or_else(|| format!("can't find session: {session_name}"))?;
+        let window = Session::build_window(id, first_pane);
+        session.insert_window(window, index)
+    }
 }
 
 impl Session {
-    /// Index = lowest unused >= this session's `base_index`. The new window
-    /// becomes current (`last` <- previous current).
-    pub fn new_window(&mut self, id: WindowId, first_pane: PaneId) -> &mut Window {
-        let index = lowest_unused_index(&self.windows, self.base_index);
-        let window = Window {
+    /// Build (but do not insert anywhere) a fresh single-pane `Window` with
+    /// the same defaults `new_window`/`Registry::create_session` use (tmux
+    /// default name "powershell", `auto_rename: true`, an empty option
+    /// overlay). `index` is left `0` -- the caller (`insert_window`, or
+    /// `Registry::insert_new_window` for a cross-session placement) always
+    /// overwrites it once it knows which index space the window lands in.
+    fn build_window(id: WindowId, first_pane: PaneId) -> Window {
+        Window {
             id,
-            index,
+            index: 0,
             name: "powershell".to_string(),
             layout: Layout::new(first_pane),
             last_layout: None,
             auto_rename: true,
             last_auto_rename: None,
             window_options: options::Overlay::new(),
-        };
-        let pos = self
-            .windows
-            .iter()
-            .position(|w| w.index > index)
-            .unwrap_or(self.windows.len());
-        self.windows.insert(pos, window);
+        }
+    }
 
+    /// Index = lowest unused >= this session's `base_index`. The new window
+    /// becomes current (`last` <- previous current).
+    pub fn new_window(&mut self, id: WindowId, first_pane: PaneId) -> &mut Window {
+        let window = Self::build_window(id, first_pane);
+        let new_id = self.insert_window(window, None).expect("a None index never collides");
         self.last = Some(self.current);
-        self.current = id;
-        self.windows.iter_mut().find(|w| w.id == id).expect("just inserted")
+        self.current = new_id;
+        self.windows.iter_mut().find(|w| w.id == new_id).expect("just inserted")
+    }
+
+    /// Insert an already-built `Window` (SP7 Task 11: `break-pane -t
+    /// <session[:index]>`/cross-session `move-window` both need to place a
+    /// Window OBJECT that already exists -- either freshly built by
+    /// `build_window`, or lifted wholesale from another session by
+    /// `take_window` -- rather than building one in place the way
+    /// `new_window` does) at `index` (explicit) or the lowest free slot >=
+    /// this session's `base_index`. Errors `"index in use: {i}"` if `index`
+    /// names an already-occupied slot (no kill/shuffle support -- matches
+    /// `move_window`'s own honest same-session scope). Does NOT touch
+    /// `current`/`last` -- every caller decides focus for itself (unlike
+    /// `new_window`, which is always a direct "create and switch to" user
+    /// action). `self.windows` stays sorted by index.
+    fn insert_window(&mut self, mut window: Window, index: Option<u32>) -> Result<WindowId, String> {
+        let idx = match index {
+            Some(i) => {
+                if self.windows.iter().any(|w| w.index == i) {
+                    return Err(format!("index in use: {i}"));
+                }
+                i
+            }
+            None => lowest_unused_index(&self.windows, self.base_index),
+        };
+        window.index = idx;
+        let id = window.id;
+        let pos = self.windows.iter().position(|w| w.index > idx).unwrap_or(self.windows.len());
+        self.windows.insert(pos, window);
+        Ok(id)
+    }
+
+    /// Remove window `id` from this session and hand the `Window` OBJECT
+    /// back to the caller, so it can be re-inserted elsewhere (SP7 Task 11:
+    /// `Registry::move_window_to_session`'s cross-session
+    /// `move-window`/`break-pane -t <session>` primitive). Unlike
+    /// `kill_window` (which DESTROYS the window outright and refuses to
+    /// remove a session's only window), this has no "only window" guard of
+    /// its own -- the caller (`move_window_to_session`) is responsible for
+    /// that decision, since whether emptying the session is acceptable
+    /// depends on what the caller plans to do about it. `current`/`last`
+    /// retargeting mirrors `kill_window`'s exactly (fall back to `last` if
+    /// still alive, else the nearest remaining window by index), except it
+    /// tolerates ending up with ZERO windows left (falls back to a
+    /// placeholder `0` — the caller is expected to have already decided
+    /// this session is being destroyed in that case, so the placeholder is
+    /// never observed). `None` if `id` isn't found.
+    fn take_window(&mut self, id: WindowId) -> Option<Window> {
+        let pos = self.windows.iter().position(|w| w.id == id)?;
+        let killed_index = self.windows[pos].index;
+        let window = self.windows.remove(pos);
+
+        if self.last == Some(id) {
+            self.last = None;
+        }
+        if self.current == id {
+            let fallback = self.last.take().filter(|&l| self.windows.iter().any(|w| w.id == l));
+            self.current = fallback.unwrap_or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(|w| w.index < killed_index)
+                    .max_by_key(|w| w.index)
+                    .or_else(|| self.windows.iter().min_by_key(|w| w.index))
+                    .map(|w| w.id)
+                    .unwrap_or(0)
+            });
+        }
+        Some(window)
     }
 
     /// Remove window `id`. If it was current, retarget current to `last`
@@ -973,6 +1170,144 @@ mod tests {
         let s = r.create_session(Some("s"), 1, SZ, 0).unwrap(); // id0 idx0
         assert!(s.move_window(0, 0, false));
         assert_eq!(s.windows[0].index, 0);
+    }
+
+    // ---- cross-session move-window (SP7 Task 11, closes #45) --------------
+
+    /// The window OBJECT (id, name) moves untouched into the destination
+    /// session, landing at the destination's LOWEST FREE index (no explicit
+    /// index given) -- "reindexes the destination" in the sense that the
+    /// window's `index` field is whatever the destination session assigns
+    /// it, independent of whatever index it held in the source. The source
+    /// session keeps its remaining window(s), current/last retargeted the
+    /// same way `kill_window` would.
+    #[test]
+    fn move_window_across_sessions_reindexes_destination() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap(); // src: id0 idx0
+        {
+            let s = r.session_mut("src").unwrap();
+            s.new_window(2, 10); // src: id2 idx1, current=2, last=Some(0)
+        }
+        let dst = r.create_session(Some("dst"), 100, SZ, 0).unwrap(); // dst: id_d idx0
+        let dst_first_id = dst.current;
+        dst.new_window(200, 20); // dst: id200 idx1, current=200, last=Some(dst_first_id)
+
+        // Move src's window 0 (id0) into dst with no explicit index -> lands
+        // at dst's lowest free slot (index 2, since 0 and 1 are taken).
+        assert!(r.move_window_to_session("src", 0, "dst", None, false, true).is_ok());
+
+        let dst = r.session_mut("dst").unwrap();
+        assert_eq!(
+            dst.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(),
+            vec![(dst_first_id, 0), (200, 1), (0, 2)]
+        );
+        // `select: true` -> the moved window becomes dst's current.
+        assert_eq!(dst.current, 0);
+        assert_eq!(dst.last, Some(200));
+
+        // Source session survives with its remaining window; current falls
+        // back the same way `kill_window` would (last, since it named the
+        // survivor).
+        let src = r.session_mut("src").unwrap();
+        assert_eq!(src.windows.iter().map(|w| w.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(src.current, 2);
+    }
+
+    /// An explicit destination index is honored exactly (not just "lowest
+    /// free").
+    #[test]
+    fn move_window_across_sessions_explicit_index() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap();
+        {
+            let s = r.session_mut("src").unwrap();
+            s.new_window(2, 10);
+        }
+        r.create_session(Some("dst"), 100, SZ, 0).unwrap();
+        assert!(r.move_window_to_session("src", 0, "dst", Some(7), false, true).is_ok());
+        let dst = r.session_mut("dst").unwrap();
+        assert!(dst.windows.iter().any(|w| w.id == 0 && w.index == 7));
+    }
+
+    /// An occupied explicit destination index without `kill` is an honest
+    /// error and changes nothing on either side.
+    #[test]
+    fn move_window_across_sessions_occupied_index_errors() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap();
+        {
+            let s = r.session_mut("src").unwrap();
+            s.new_window(2, 10);
+        }
+        r.create_session(Some("dst"), 100, SZ, 0).unwrap(); // dst: idx0 taken
+        let err = r.move_window_to_session("src", 0, "dst", Some(0), false, true).unwrap_err();
+        assert_eq!(err, "index in use: 0");
+        // Source untouched: window 0 is still there.
+        let src = r.session_mut("src").unwrap();
+        assert_eq!(src.windows.iter().map(|w| w.id).collect::<Vec<_>>(), vec![0, 2]);
+        // Destination's occupant is untouched too.
+        let dst = r.session_mut("dst").unwrap();
+        assert_eq!(dst.windows.len(), 1);
+    }
+
+    /// `kill: true` on an occupied explicit destination index removes the
+    /// occupant and the mover takes its place (mirrors the same-session
+    /// `move_window_kill_occupant` test's contract).
+    #[test]
+    fn move_window_across_sessions_kill_occupant() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap();
+        {
+            let s = r.session_mut("src").unwrap();
+            s.new_window(2, 10);
+        }
+        r.create_session(Some("dst"), 100, SZ, 0).unwrap(); // dst: id100 idx0
+        assert!(r.move_window_to_session("src", 0, "dst", Some(0), true, true).is_ok());
+        let dst = r.session_mut("dst").unwrap();
+        assert_eq!(dst.windows.iter().map(|w| (w.id, w.index)).collect::<Vec<_>>(), vec![(0, 0)]);
+    }
+
+    /// Moving a session's ONLY window across sessions is refused outright
+    /// (documented narrowing vs. real tmux, which destroys the emptied
+    /// source session -- see `move_window_to_session`'s doc comment).
+    #[test]
+    fn move_window_across_sessions_refuses_to_empty_source() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap(); // src's ONLY window
+        r.create_session(Some("dst"), 100, SZ, 0).unwrap();
+        let err = r.move_window_to_session("src", 0, "dst", None, false, true).unwrap_err();
+        assert_eq!(err, "can't move the only window out of its session");
+        assert_eq!(r.session_mut("src").unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn move_window_across_sessions_unknown_session_or_window_errors() {
+        let mut r = Registry::new();
+        r.create_session(Some("src"), 1, SZ, 0).unwrap();
+        r.create_session(Some("dst"), 100, SZ, 0).unwrap();
+        assert_eq!(
+            r.move_window_to_session("nope", 0, "dst", None, false, true).unwrap_err(),
+            "can't find session: nope"
+        );
+        assert_eq!(
+            r.move_window_to_session("src", 0, "nope", None, false, true).unwrap_err(),
+            "can't find session: nope"
+        );
+        assert_eq!(
+            r.move_window_to_session("src", 999, "dst", None, false, true).unwrap_err(),
+            "window not found"
+        );
+    }
+
+    #[test]
+    fn move_window_across_sessions_same_name_errors() {
+        let mut r = Registry::new();
+        r.create_session(Some("s"), 1, SZ, 0).unwrap();
+        assert_eq!(
+            r.move_window_to_session("s", 0, "s", None, false, true).unwrap_err(),
+            "move-window: source and destination sessions are the same"
+        );
     }
 
     // ---- swap-window (SP6 Task 5) ------------------------------------------

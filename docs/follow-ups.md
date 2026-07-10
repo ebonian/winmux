@@ -606,26 +606,41 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     horizontal border one column over). Documented, not treated as a bug —
     real tmux has the same class of single-cell ambiguity at a "+" junction
     and doesn't document a resolution rule either.
-41. **`swap-pane -s`/`-t` cannot move a pane between windows or sessions**
-    (Task 6, layout presets). `exec_swap_pane`'s explicit-target form now
-    ERRORS (`"swap-pane: can only swap panes within the same window"`)
-    rather than silently no-opping when `-s`/`-t` resolve to different
-    windows — but real tmux actually supports this (moving a pane to a
-    different window/session, swapping it there). Implementing it for real
-    would mean teaching `Layout` to remove a leaf from one tree and insert it
-    into another (today `Layout::swap_panes` only relabels leaf values within
-    a single tree) — worth doing for full tmux parity, but out of scope for
-    the Task 6 fix round, which only closed the "silent no-op" gap with an
-    honest error.
-42. **`swap-pane -U`/`-D` combined with `-s` is rejected, not implemented**
-    (Task 6, layout presets). Real tmux's full `swap-pane [-dDU] [-s
-    src-pane] [-t dst-pane]` semantics let `-s` additionally override which
-    pane a directional (`-U`/`-D`) swap is computed relative to. The Task 6
-    fix round implements the more common case (`-t` selects which pane is
-    swapped up/down, defaulting to the active pane when `-t` is absent) but
-    rejects `-U`/`-D` combined with `-s` with a usage error rather than
-    guessing at the full matrix. Worth revisiting if a real workflow needs
-    the `-s`-with-direction form.
+41. **RESOLVED** (SP7 Task 11, 2026-07-10, closes this follow-up).
+    *Original text:* `swap-pane -s`/`-t` cannot move a pane between windows
+    or sessions (Task 6, layout presets). `exec_swap_pane`'s explicit-target
+    form now ERRORS (`"swap-pane: can only swap panes within the same
+    window"`) rather than silently no-opping when `-s`/`-t` resolve to
+    different windows — but real tmux actually supports this (moving a pane
+    to a different window/session, swapping it there). *Resolution:* the
+    explicit `-s`/`-t` form now performs a real cross-window/session swap
+    when the two targets resolve to different windows —
+    `Layout::swap_leaf_across` (a new pure primitive: a coordinated leaf
+    relabel across two `Layout` trees, since `PaneId`s are global) swaps
+    the two panes' tree/screen SLOTS, keeping each pane's own id, and fixes
+    up each side's `focused` if it named the pane that just departed. The
+    old honest error is gone. See
+    `docs/specs/2026-07-06-mvp-interfaces.md`'s `## layout` amendment and
+    `docs/specs/2026-07-07-command-config-interfaces.md`'s `## Cross-
+    window/session structure ops` section. Tests: `layout.rs`'s
+    `cross_tree_swap_*` unit tests;
+    `tests/server_proto.rs::swap_pane_between_windows_swaps_content`.
+42. **RESOLVED** (SP7 Task 11, 2026-07-10, closes this follow-up).
+    *Original text:* `swap-pane -U`/`-D` combined with `-s` is rejected,
+    not implemented (Task 6, layout presets). Real tmux's full `swap-pane
+    [-dDU] [-s src-pane] [-t dst-pane]` semantics let `-s` additionally
+    override which pane a directional (`-U`/`-D`) swap is computed relative
+    to. The Task 6 fix round implements the more common case (`-t` selects
+    which pane is swapped up/down, defaulting to the active pane when `-t`
+    is absent) but rejects `-U`/`-D` combined with `-s` with a usage error
+    rather than guessing at the full matrix. *Resolution:* the `-U`/`-D`
+    pivot pane is now `-s` if given, else `-t` if given, else the acting
+    client's active pane — `-s`, when present, always wins the pivot role
+    (a co-supplied `-t` alongside BOTH `-s` and a direction plays no
+    distinct third role; see the same contract section's "documented
+    narrowings" note for why that specific three-flag corner isn't a
+    verified-against-tmux-source ruling). Test:
+    `tests/server_proto.rs::swap_pane_dash_s_with_direction_resolves_relative_to_s`.
 43. **`main-pane-width`/`main-pane-height` are baked into a ratio at
     `select-layout`/`next-layout` apply-time, not stored as an absolute
     size** (Task 6, layout presets). `Layout`'s tree only ever stores `f32`
@@ -643,27 +658,40 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     this same fix round (see `docs/specs/2026-07-07-parity-polish-interfaces.md`'s
     `layout-presets` section).
 
-44. **`break-pane` has no `-s`/`-t` pane-selector flag** (Task 7, window
-    ops). Real tmux's `break-pane` can target any pane via `-s`; winmux's
-    always acts on the resolved CURRENT pane (matches the design spec's
-    `## 6. Window ops` signature, which itself omits a pane selector —
-    smaller, honest scope, same pattern as `swap-pane`'s own documented
-    `-s`/`-t` deviations, follow-ups #41/#42). One-line fix framing: add an
-    optional pane target parsed the same way `kill-pane -t`/`swap-pane -t`
-    already are, threading it through `resolve_pane_target` instead of the
-    current hardcoded `None`.
+44. **RESOLVED** (SP7 Task 11, 2026-07-10, closes this follow-up).
+    *Original text:* `break-pane` has no `-s`/`-t` pane-selector flag (Task
+    7, window ops). Real tmux's `break-pane` can target any pane via `-s`;
+    winmux's always acts on the resolved CURRENT pane. *Resolution:*
+    `break-pane` gains `-s src` (the pane that breaks out, resolved via the
+    normal `resolve_pane_target` fallback chain, default: current pane) and
+    `-t dst` (a `[session:]index` window-index destination — explicit index
+    or the destination session's lowest free slot; a `session:` prefix
+    moves the new window into a DIFFERENT session). See
+    `docs/specs/2026-07-07-command-config-interfaces.md`'s `## Cross-
+    window/session structure ops` section. Test:
+    `src/cmd.rs::break_pane_src_dst_flags`;
+    `tests/server_proto.rs::break_pane_dash_s_moves_named_pane`.
 
-45. **`move-window` cannot move a window to a DIFFERENT session** (Task 7).
-    Real tmux's `move-window -t <session:index>` can relocate a window
-    across sessions; winmux's `move_window` (`model.rs`) is same-session
-    re-indexing only, and `exec_move_window` explicitly discards any
-    `session:` prefix on the `-t` value. Matches the design spec's `## 6.
-    Window ops` framing ("re-index current window"). One-line fix framing:
-    would need a cross-session variant of `Session::move_window` that lifts
-    the `Window` out of one `Session.windows` and into another's, re-minting
-    nothing (the `WindowId` stays valid — ids are global) but re-running the
-    destination session's `lowest_unused_index` floor if no explicit index
-    is given.
+45. **RESOLVED** (SP7 Task 11, 2026-07-10, closes this follow-up).
+    *Original text:* `move-window` cannot move a window to a DIFFERENT
+    session (Task 7). Real tmux's `move-window -t <session:index>` can
+    relocate a window across sessions; winmux's `move_window` (`model.rs`)
+    is same-session re-indexing only, and `exec_move_window` explicitly
+    discards any `session:` prefix on the `-t` value. *Resolution:* a
+    `session:` prefix on `move-window -t` that names a DIFFERENT session
+    now actually relocates the window there, via a new
+    `Registry::move_window_to_session` primitive (the `Window` object moves
+    wholesale — `WindowId`s are global, never re-minted — to the
+    destination's explicit or lowest-free index). Same-session behavior is
+    byte-identical to before. **Narrowing:** unlike real tmux, this refuses
+    to empty a session (`"can't move the only window out of its session"`)
+    rather than destroying it as a side effect — see the contract's
+    "documented narrowings" note. See
+    `docs/specs/2026-07-07-server-client-interfaces.md`'s `## model`
+    amendment and `docs/specs/2026-07-07-command-config-interfaces.md`'s
+    `## Cross-window/session structure ops` section. Tests: `model.rs`'s
+    `move_window_across_sessions_*`;
+    `tests/server_proto.rs::move_window_to_other_session_appears_there_and_leaves_source`.
 
 46. **`find-window` always jumps to the first match — no choose-list for
     multiple matches** (Task 7). The design spec's `## 6. Window ops`

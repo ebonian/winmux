@@ -289,6 +289,57 @@ impl Layout {
 }
 ```
 
+**Amendment (SP7 Task 11 — cross-window/session structure ops, closes
+follow-up #41):** two additions, both still pure (no I/O). `PaneId`s are
+global (unique across every window's tree), so a cross-window/session
+swap-pane is a coordinated relabel of one leaf in EACH of two independent
+`Layout` trees, not a remove/insert:
+
+```rust
+impl Layout {
+    /// Swap the CONTENTS of `self`'s leaf holding `mine` with `other`'s leaf
+    /// holding `theirs` -- the cross-tree generalization of `swap_panes`.
+    /// No tree-shape change on EITHER side (geometry/split ratios
+    /// untouched); only the two leaf VALUES trade places. Each side's
+    /// `focused` is fixed up if it named the pane that just departed
+    /// (redirected to the pane that just arrived in that exact tree
+    /// position, matching tmux's "the destination window's active pane
+    /// becomes the pane that moved into it"); a side whose focused pane
+    /// was NOT part of the swap is untouched. Clears zoom on both sides.
+    /// `false` (no-op, neither tree touched) if `mine == theirs`, or either
+    /// id isn't a leaf of its own layout.
+    pub fn swap_leaf_across(&mut self, mine: PaneId, other: &mut Layout, theirs: PaneId) -> bool;
+
+    /// Insert `new_pane` into this tree by splitting the leaf holding `at`
+    /// (`new_pane` takes the second child, mirroring `split`'s own rule).
+    /// The "insert a pane into ANOTHER tree at a given position" primitive
+    /// follow-up #41's fix sketch called for -- pairs with the EXISTING
+    /// `Layout::remove` (unchanged; it already "removes a leaf, collapsing
+    /// its parent split", exactly what that sketch's other half describes,
+    /// so no new removal method was needed). No `area`/minimum check (the
+    /// caller's job, same as `apply_preset`'s own placement). Does not
+    /// touch focus/zoom. Not called by any `dispatch.rs` command as of SP7
+    /// Task 11 (`break-pane` always creates a brand-new single-pane
+    /// window, per real tmux; cross-window `swap-pane` uses
+    /// `swap_leaf_across` instead) -- reserved for a future
+    /// `join-pane`/`move-pane`. `false` (no-op) if `at` isn't a leaf here,
+    /// or `new_pane` is already present.
+    pub fn insert_leaf_at(&mut self, at: PaneId, new_pane: PaneId, dir: SplitDir, ratio: f32) -> bool;
+}
+```
+
+Tests: `layout.rs`'s `remove_leaf_collapses_parent_split` (the EXISTING
+`remove` exercised under this name -- see above), `cross_tree_swap_
+preserves_geometry_slots`, `cross_tree_swap_relabels_only_the_two_affected_
+leaves`, `cross_tree_swap_fixes_up_focus_on_the_departed_side` /
+`cross_tree_swap_fixes_up_focus_when_the_focused_pane_departs`,
+`cross_tree_swap_clears_zoom_on_both_sides`, `cross_tree_swap_same_id_is_
+noop`, `cross_tree_swap_unknown_leaf_is_noop`, `insert_leaf_at_splits_
+target_leaf`, `insert_leaf_at_unknown_target_is_noop`, `insert_leaf_at_
+duplicate_pane_is_noop`. Consumer: `server/dispatch.rs`'s `exec_swap_pane`
+(cross-window branch) -- see the `## server-dispatch` section of
+[`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md).
+
 ## `grid` — per-pane terminal emulator
 
 **SUPERSEDED (sub-project 4, Task 1):** `Grid::new` gained a third

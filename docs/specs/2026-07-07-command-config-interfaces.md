@@ -2265,3 +2265,139 @@ rejected_same_as_global`, `overlay_user_option_roundtrip`,
 `set_without_g_targets_current_session`,
 `show_gqv_user_option_prints_value_only`,
 `pane_base_index_shifts_display_panes_digits_and_hash_p`.
+
+## Cross-window/session structure ops (SP7 Task 11, closes follow-ups #41, #42, #44, #45)
+
+`swap-pane`, `break-pane`, and `move-window` all gain real cross-window/
+cross-session behavior, replacing three SP4/Task-7-era honest-scope
+narrowings. Full spec: `docs/tmux-reference/panes-and-layout.md` §5.1
+(swap-pane) and `docs/tmux-reference/windows-and-sessions.md` (break-pane,
+move-window/link-window). The `layout` primitives these build on
+(`Layout::swap_leaf_across`, `Layout::insert_leaf_at`) are documented in
+the `## layout` amendment of
+[`2026-07-06-mvp-interfaces.md`](2026-07-06-mvp-interfaces.md); the `model`
+primitives (`Registry::move_window_to_session`, `Registry::insert_new_
+window`, and the new private `Session::insert_window`/`take_window`/
+`build_window`) are documented in the `## model` amendment of
+[`2026-07-07-server-client-interfaces.md`](2026-07-07-server-client-interfaces.md).
+
+### `cmd` (`src/cmd.rs`) — `BreakPane`'s shape changes
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]`. `src`/`dst`
+    /// are NEW fields (previously `BreakPane { detached: bool, name:
+    /// Option<String> }` only).
+    BreakPane { detached: bool, name: Option<String>, src: Option<String>, dst: Option<String> },
+}
+```
+
+- `usage("break-pane")`: `"usage: break-pane [-d] [-n name] [-s src] [-t dst]"`.
+- `resolve`: `scan_flags` with `bools: ["-d"]`, `values: ["-n", "-s", "-t"]`,
+  no positionals. `-s`/`-t` are both plain optional string flags (same
+  shape `swap-pane`'s own `-s`/`-t` already use) — `resolve` does no
+  further parsing of their contents; `server::dispatch::exec_break_pane`
+  interprets `-s` via `resolve_pane_target` (a pane selector) and `-t` via
+  its own `[session:]index` window-destination grammar (NOT a pane
+  selector — real tmux's own `break-pane` args string, `"abdPF:n:s:t:..."`,
+  gives `-s`/`-t` genuinely different target KINDS: `-s` is
+  `CMD_FIND_PANE`, `-t` is `CMD_FIND_WINDOW_INDEX`). Test:
+  `break_pane_flags` (existing cases, all four fields now asserted),
+  `break_pane_src_dst_flags` (new).
+- `SwapPane`/`MoveWindow` (`swap-pane`, `move-window`) themselves gain NO
+  new `ParsedCmd` fields — `swap-pane -s`/`-t`/`-U`/`-D` already carried
+  everything the new cross-window/direction-relative-to-`-s` dispatch logic
+  needs, and `move-window`'s existing `target: String` already accepts an
+  arbitrary `[session:]index` string (`exec_move_window` previously threw
+  the session part away; it doesn't anymore).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+**`exec_swap_pane`** (signature unchanged): the `-U`/`-D` branch's PIVOT
+pane is now `src.as_deref().or(dst.as_deref())` (closes follow-up #42) —
+previously a co-supplied `-s` was rejected outright
+(`cmd::usage("swap-pane")`). The explicit `-s`/`-t` branch no longer
+requires `w1 == w2` (closes follow-up #41): when the two resolved panes
+land in the SAME window, the swap is unchanged (`Layout::swap_panes`);
+when they land in DIFFERENT windows (same session or not), two new private
+helpers —
+
+```rust
+fn take_window_layout(&mut self, session_name: &str, wid: WindowId) -> Option<Layout>;
+fn put_window_layout(&mut self, session_name: &str, wid: WindowId, layout: Layout);
+```
+
+— pull each side's `Layout` out by VALUE (sidestepping the borrow checker,
+which can't hand out two live `&mut` into possibly the SAME session's
+`Vec<Window>`), call `Layout::swap_leaf_across` on the two owned values,
+and write both back. `apply_layout_for_session` is called for each DISTINCT
+session touched. The old "swap-pane: can only swap panes within the same
+window" error string is gone — it was the entire behavior this follow-up
+existed to replace.
+
+**`exec_break_pane`** (signature changed): gains `src: Option<String>, dst:
+Option<String>` parameters, inserted between `name` and `cs`:
+
+```rust
+fn exec_break_pane(&mut self, detached: bool, name: Option<String>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String>;
+```
+
+`src` resolves the SOURCE pane via the normal `resolve_pane_target`
+fallback chain (default: the resolved current pane, unchanged from
+pre-Task-11 — closes follow-up #44). `dst` is parsed as
+`split_session_prefix` + an optional trailing index (empty or absent index
+-> the destination session's lowest free slot, mirroring `move-window`'s
+own "explicit or lowest_unused_index" rule); no `session:` prefix keeps the
+new window in `src`'s own session (the pre-Task-11 default, now reached via
+`Registry::insert_new_window` instead of `Session::new_window`, since the
+destination session may no longer be the one hosting the ACTING client).
+Current/last bookkeeping (`!detached` -> destination's `current` becomes
+the new window, `last` becomes whatever WAS current there) is now owned
+directly by this handler instead of relying on `Session::new_window`'s
+own forced current-switch + an after-the-fact "restore to `wid`" undo (that
+undo silently assumed `wid == session.current`, an assumption `-s`
+targeting a NON-current window would have broken).
+
+**`exec_move_window`** (signature unchanged): branches on whether the
+`-t` target's `session:` prefix (if any) resolves to a DIFFERENT session
+than the acting session. Same session (or no prefix): pre-Task-11 code
+path, byte-identical (`Session::move_window`, index REQUIRED). Different
+session (closes follow-up #45): the index becomes OPTIONAL (absent ->
+lowest free slot), and the move is delegated to
+`Registry::move_window_to_session` — the same destination-occupant-pane
+pre-snapshot-then-clean-up-after pattern the same-session path already
+uses is repeated for the cross-session case. `renumber-windows` (if
+enabled) still only renumbers the SOURCE session (real tmux: `move-window`
+renumbers src only, never dst).
+
+### Tests
+
+`src/cmd.rs`: `break_pane_src_dst_flags`. `tests/server_proto.rs`:
+`swap_pane_between_windows_swaps_content` (replaces the now-obsolete
+`swap_pane_cross_window_errors`, same setup, opposite assertion),
+`swap_pane_dash_s_with_direction_resolves_relative_to_s`,
+`break_pane_dash_s_moves_named_pane`,
+`move_window_to_other_session_appears_there_and_leaves_source`.
+
+### Documented narrowings
+
+- **Cross-session `move-window`/`break-pane -t` refuse to empty a
+  session.** Real tmux destroys a source session left with zero windows
+  (`server_unlink_window` -> `session_detach`); winmux's
+  `Registry::move_window_to_session` instead errors `"can't move the only
+  window out of its session"` — deliberately avoiding this task also having
+  to solve session-teardown client-eviction semantics (which attached
+  client(s), if any, get reassigned/detached) for a case with no bearing on
+  the required behavior. See `docs/follow-ups.md` #45 and
+  `move_window_to_session`'s own doc comment in `src/model.rs`.
+- **`swap-pane -s` + `-t` + a direction (`-U`/`-D`) all three together**:
+  `-s` always wins the pivot role; a co-supplied `-t` plays no distinct
+  third role. Real tmux's exact three-flag interaction is not itself pinned
+  down by the parity doc (`docs/tmux-reference/panes-and-layout.md` §5.1's
+  own hedging language); this is a defensible, narrower reading, not a
+  verified-against-tmux-source ruling. See follow-up #42.
+- **`Layout::insert_leaf_at`** is a genuinely new, exhaustively unit-tested
+  primitive with NO current `dispatch.rs` caller (see its doc comment and
+  the `## layout` amendment above) — reserved for a future
+  `join-pane`/`move-pane` implementation.
