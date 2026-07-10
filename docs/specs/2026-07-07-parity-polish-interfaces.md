@@ -53,7 +53,18 @@ impl Grid {
     /// "lines-ever-captured" coordinate system copy-mode selection anchors
     /// are pinned to (see the `## copy-mode` Task 3 selection-math
     /// amendment). Stays 0 when `history_limit == 0` (nothing is ever
-    /// captured).
+    /// captured). **Caveat (SP7 review fix):** this invariant holds only
+    /// across mutations that do NOT change the grid's width —
+    /// `reflow_to_width` (see "Reflow on resize" below) does not increment
+    /// `history_total` to match the non-uniform row restructuring it
+    /// performs, so a coordinate (e.g. a copy-mode selection anchor) pinned
+    /// before a width-changing resize cannot be repaired by any single
+    /// corrected shift count afterward. The server layer does not attempt
+    /// to: it clears any copy-mode selection bound to a pane that actually
+    /// gets resized (`Server::apply_layout_for_session`), matching real
+    /// tmux's `window_copy_size_changed` (`window-copy.c`), which
+    /// unconditionally clears the copy-mode selection on ANY resize of the
+    /// pane (width or height), not just width changes.
     pub fn history_total(&self) -> u64;
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen), clamped to `history_len()`.
@@ -588,6 +599,22 @@ model:
   `Grid::view_row_text`/`view_cell` that reproduces a CURRENT key in view
   coordinates (`Grid` clamps `scroll_back` to its actual `history_len`
   internally, so an over-large value is harmless).
+- **SP7 review fix — width-changing resize invalidates the anchor, it is
+  NOT remapped:** `anchor_key_now`'s `history_total` delta is only exact
+  across mutations that don't change the grid's width; a width-changing
+  resize reflows scrollback non-uniformly (`reflow_to_width`, `## grid-v2`
+  amendment above) without bumping `history_total` to match, so there is no
+  single corrected shift count that could keep a stored anchor pointing at
+  the same content afterward. Rather than attempt that repair,
+  `Server::apply_layout_for_session` (`src/server.rs`) clears (`cs.sel =
+  None`) any client's active copy-mode selection whose pane actually gets
+  resized — matching real tmux's `window_copy_size_changed`
+  (`window-copy.c:1174-1193`, called unconditionally from
+  `window_copy_resize` whenever `window_pane_resize` fires, i.e. on ANY
+  actual resize of the pane, width or height, not just width changes; see
+  `window_copy_clear_selection`, `window-copy.c:5914-5929`). The copy
+  cursor (`scroll`/`cx`/`cy`) is left as-is (already view-relative) and
+  copy mode itself stays active — only the selection is dropped.
 
 **Task 3 amendment — text extraction** (`extract_selection_text` in
 `src/server/dispatch.rs`, a free `fn(grid: &Grid, sel: &SelState, cx: u16,

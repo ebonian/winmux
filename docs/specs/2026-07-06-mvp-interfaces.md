@@ -326,6 +326,18 @@ superseded section — is the contract's actual current authority on `resize`
 and `view_cell`'s history semantics, and leaving its "no reflow" claim
 uncorrected there would misdocument the real behavior).
 
+**Caveat (SP7 review fix):** `history_total()`'s "difference between two
+readings = view rows shifted" invariant (see its own doc comment) holds only
+for mutations that do NOT change the grid's width — `reflow_to_width` does
+not bump `history_total` to match the (non-uniform) restructuring it
+performs, so a coordinate pinned across a width-changing resize (e.g. a
+copy-mode selection anchor) cannot be repaired by any single corrected shift
+count. The server layer treats a width-changing resize of a pane bound to an
+active copy-mode selection as invalidating that selection outright (clears
+it) rather than attempting to remap it — see `Server::apply_layout_for_session`
+in `src/server.rs`, which matches real tmux's `window_copy_size_changed`
+(unconditional selection clear on ANY resize of the pane, width or height).
+
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color { Default, Idx(u8), Rgb(u8, u8, u8) }

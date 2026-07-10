@@ -1052,6 +1052,26 @@ impl Grid {
     /// the view by one; eviction shifts nothing) — the coordinate system
     /// copy-mode selection anchors are pinned to (Task 3 review fix; see
     /// the `## grid-v2` contract amendment).
+    ///
+    /// **Caveat (SP7 review fix):** this invariant holds only across
+    /// mutations that do NOT change the grid's WIDTH. `reflow_to_width`
+    /// (called from `resize` on a column-width change) rewrites the
+    /// combined history+screen buffer by re-splitting logical lines at the
+    /// new width — a non-uniform restructuring — and does NOT go through
+    /// `push_history`, so it never bumps `history_total` to match. A
+    /// width-changing resize can therefore make `history_total`'s delta
+    /// undercount (or simply not correspond to) how far content actually
+    /// moved, and there is no single corrected shift count that could
+    /// repair a coordinate pinned before such a resize (the reflow can
+    /// split/merge lines, not just shift them). Consumers pinning
+    /// coordinates across grid mutations (copy-mode selection anchors) must
+    /// treat a width-changing resize of the bound pane as invalidating any
+    /// stored anchor, not just re-shift it — see
+    /// `Server::apply_layout_for_session` in `src/server.rs`, which clears
+    /// a client's active copy-mode selection whenever its pane is actually
+    /// resized (matching real tmux's `window_copy_size_changed`, which
+    /// unconditionally clears the copy-mode selection on ANY resize of the
+    /// pane, width or height).
     pub fn history_total(&self) -> u64 {
         self.state.history_total
     }

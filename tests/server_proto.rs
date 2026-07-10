@@ -6040,3 +6040,93 @@ fn pane_title_format_expands() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+/// SP7 review fix: a width-changing resize while a copy-mode selection is
+/// active must CLEAR the selection, not silently keep it pointing at
+/// whatever content its (now-stale) anchor resolves to. `Grid`'s
+/// `history_total()` shift invariant (used by `anchor_key_now` to keep a
+/// selection anchor pinned to content) only holds across mutations that
+/// don't change the grid's width -- `reflow_to_width` restructures rows
+/// non-uniformly and never bumps `history_total` to match, so there is no
+/// corrected shift count that could repair a stored anchor after such a
+/// resize.
+///
+/// Verified against real tmux (`window-copy.c`): `window_pane_resize`
+/// (`window.c:1362-1388`) calls the active mode's `resize` callback whenever
+/// a pane's width OR height actually changes; for copy mode that's
+/// `window_copy_resize` (`window-copy.c:1196-1227`), which unconditionally
+/// ends by calling `window_copy_size_changed` (`window-copy.c:1174-1193`) --
+/// and THAT unconditionally clears the selection
+/// (`window_copy_clear_selection`, `window-copy.c:5914-5929`) regardless of
+/// whether the resize actually reflowed anything (the cursor is separately
+/// remapped/preserved via `grid_wrap_position`/`grid_unwrap_position`, only
+/// when width changed, but the clear itself is unconditional). winmux's
+/// `Server::apply_layout_for_session` mirrors this: it clears `cs.sel`
+/// whenever a pane bound to an active copy-mode selection is actually
+/// resized, but leaves copy mode itself active and the copy cursor
+/// (`scroll`/`cx`/`cy`) untouched.
+///
+/// This test builds a selection over known non-blank text ("selmark4"),
+/// resizes the client's terminal width (80 -> 60, rows unchanged -- a pure
+/// width-changing resize, the exact case that breaks the anchor), then
+/// tries to copy the selection (`Enter`, vi table's
+/// `copy-selection-and-cancel`). If the selection had survived the resize
+/// (the pre-fix bug), this would extract SOME text (right or wrong -- the
+/// point of the bug is the anchor can't be trusted either way) into a new
+/// automatic paste buffer; `list-buffers` reporting "no buffers" instead
+/// proves the selection was cleared rather than silently carried across the
+/// reflow.
+#[test]
+fn copy_mode_selection_clears_on_width_resize() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Known non-blank marker lines to select against.
+    c.send(&ClientMsg::Stdin(b"1..5 | ForEach-Object { \"selmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("selmark5")));
+
+    // Enter copy mode (cursor seeds from the live cursor -- the fresh
+    // prompt row just below the marker lines).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // vi table: move up 2 rows onto a marker line ("selmark4"), jump to
+    // start-of-line (`0`), begin a selection (`Space`), then extend right
+    // 5 columns across the marker text (`l` x5) -- all in one Stdin frame,
+    // same coalesced-Forward-blob pattern as the existing `KKK`/vi tests.
+    c.send(&ClientMsg::Stdin(b"kk0 lllll".to_vec()));
+
+    // Pure WIDTH-changing resize (rows unchanged) -- the exact case that
+    // breaks the selection anchor. The local mirror grid is resized
+    // in lockstep (a real terminal resizes itself instantly, independent of
+    // the server's re-render), and frame ordering on this single connection
+    // guarantees the server has fully processed the selection keys above
+    // before it sees this Resize frame.
+    c.send(&ClientMsg::Resize { cols: 60, rows: 24 });
+    grid.resize(60, 24);
+
+    // Try to copy the (should now be cleared) selection and exit copy mode.
+    c.send(&ClientMsg::Stdin(vec![b'\r']));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, ""));
+
+    // No buffer should have been created: query via a separate headless CLI
+    // connection (`list-buffers`'s headless path returns an EMPTY string
+    // when there are no buffers -- see `exec_list_buffers_headless` -- a
+    // deterministic assertion, unlike waiting on the attached client's
+    // transient status-line message).
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, err) = expect_cli_done(&cli2, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "", "a buffer was created from a selection that should have been cleared by the width resize");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}

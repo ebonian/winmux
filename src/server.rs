@@ -1046,13 +1046,19 @@ fn derive_auto_name(title: &str) -> Option<String> {
 /// Resize every pane whose computed rect changed (pty + grid), caching the
 /// last applied rect per pane so unchanged panes are skipped. Same shape as
 /// `app.rs`'s `apply_layout`, keyed by `HashMap` instead of a `Vec` (panes
-/// now span every session/window, not just one flat list).
+/// now span every session/window, not just one flat list). Returns the
+/// `PaneId`s that were actually resized (rect changed, either axis) so the
+/// caller (`apply_layout_for_session`) can invalidate any copy-mode
+/// selection bound to one of them -- see that function's doc comment for
+/// why (SP7 review fix, closes the `Grid::history_total()` width-reflow
+/// regression).
 fn apply_layout(
     layout: &Layout,
     area: Rect,
     panes: &mut HashMap<PaneId, PaneRuntime>,
     last_rects: &mut HashMap<PaneId, Rect>,
-) {
+) -> Vec<PaneId> {
+    let mut resized = Vec::new();
     for (id, rect) in layout.rects(area) {
         if last_rects.get(&id) == Some(&rect) {
             continue;
@@ -1064,7 +1070,9 @@ fn apply_layout(
             p.grid.resize(rect.w.max(1), rect.h.max(1));
         }
         last_rects.insert(id, rect);
+        resized.push(id);
     }
+    resized
 }
 
 /// Writer thread: owns the write half of the connection, drains an
@@ -1856,13 +1864,45 @@ impl Server {
         }
     }
 
+    /// Resizes every pane of `name`'s current window whose rect changed, then
+    /// (SP7 review fix, tmux ruling) clears any copy-mode selection bound to
+    /// one of those panes: real tmux's `window_pane_resize`
+    /// (`window.c:1362-1388`) calls the active mode's `resize` callback
+    /// whenever a pane's width OR height actually changes at all; for copy
+    /// mode that's `window_copy_resize` (`window-copy.c:1196-1227`), which
+    /// unconditionally ends by calling `window_copy_size_changed`
+    /// (`window-copy.c:1174-1193`) -- and THAT unconditionally clears the
+    /// selection (`window_copy_clear_selection`, `window-copy.c:5914-5929`)
+    /// regardless of whether the resize actually reflowed anything. `Grid`'s
+    /// `history_total()` shift-invariant (see its doc comment) only holds
+    /// for mutations that don't change the grid's WIDTH -- a width-changing
+    /// resize reflows scrollback non-uniformly (`reflow_to_width`), so a
+    /// stored selection anchor keyed to a pre-reflow `(anchor_scroll,
+    /// anchor_y, anchor_total)` can silently resolve to unrelated content
+    /// after such a resize (there is no single "shift count" that could
+    /// repair it). Rather than attempt that repair, this matches tmux
+    /// exactly: any actual resize of the bound pane drops the selection
+    /// (`cs.sel = None`) and leaves copy mode itself active, with the copy
+    /// cursor (`scroll`/`cx`/`cy`) left as-is (already view-relative, same
+    /// simplification the pre-existing "new pane output mid-selection"
+    /// handling uses).
     fn apply_layout_for_session(&mut self, name: &str) {
         let area_y = self.pane_area_y();
         let Some(session) = self.registry.session_mut(name) else { return };
         let size = session.size;
         let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
         let window = session.current_window_mut();
-        apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        let resized = apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        if resized.is_empty() {
+            return;
+        }
+        for client in self.clients.values_mut() {
+            if let ClientMode::Copy(cs) = &mut client.mode {
+                if resized.contains(&cs.pane) {
+                    cs.sel = None;
+                }
+            }
+        }
     }
 
     /// Natural pane exit: tmux `remain-on-exit off` parity. If other panes in
