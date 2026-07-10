@@ -4902,12 +4902,16 @@ fn rotate_window_ctrl_o() {
 
 // ---- Task 6 fix round: swap-pane review findings --------------------------
 
-/// Review finding #1: cross-window `swap-pane -s`/`-t` used to silently
-/// no-op (exit 0, nothing changed). Must now be an explicit, honest error --
-/// winmux does not (yet) support moving a pane between windows via
-/// `swap-pane`, unlike real tmux.
+/// SP7 Task 11 (closes follow-up #41): `swap-pane -s`/`-t` resolving to
+/// DIFFERENT windows used to be an honest error ("swap-pane: can only swap
+/// panes within the same window"). It's now a real cross-window swap --
+/// panes keep their own ids, only their tree/screen SLOTS trade places, so
+/// window 1 (the client's current window, unchanged) ends up showing window
+/// 0's OLD content, and vice versa. This replaces the old
+/// `swap_pane_cross_window_errors` test (same setup) now that the behavior
+/// it pinned is gone.
 #[test]
-fn swap_pane_cross_window_errors() {
+fn swap_pane_between_windows_swaps_content() {
     let name = unique_pipe_name();
     let server = start_server(&name);
     let mut c = Client::connect(&name);
@@ -4924,18 +4928,21 @@ fn swap_pane_cross_window_errors() {
     c.recv_output_until(&mut grid, |g| marker_col(g, "win1mark").is_some());
 
     // `swap-pane -s 0.0 -t 1.0` targets window 0's pane and window 1's pane
-    // -- a cross-window pair. Must fail loudly, not silently succeed.
+    // -- a cross-window pair. Must actually swap now.
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-s".into(), "0.0".into(), "-t".into(), "1.0".into()]));
-    let (_, err) = expect_cli_done(&cli, 1);
-    assert_eq!(err, "swap-pane: can only swap panes within the same window");
+    expect_cli_done(&cli, 0);
 
-    // Both panes are untouched: window 1 (still current) still shows
-    // win1mark, and switching back to window 0 still shows win0mark.
-    assert!(marker_col(&grid, "win1mark").is_some(), "window 1's pane must be unchanged after the rejected swap");
+    // Window 1 (still current, tree/geometry unchanged) now shows window 0's
+    // OLD content -- win1mark is gone, win0mark has arrived.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+    assert!(marker_col(&grid, "win1mark").is_none(), "window 1's pane must show window 0's content after the swap, not its own");
+
+    // Switching to window 0 shows the opposite: win1mark's content moved in.
     c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
-    c.recv_output_until(&mut grid, |g| marker_col(g, "win0mark").is_some());
+    c.recv_output_until(&mut grid, |g| marker_col(g, "win1mark").is_some());
+    assert!(marker_col(&grid, "win0mark").is_none(), "window 0's pane must show window 1's content after the swap, not its own");
 
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
@@ -7782,5 +7789,221 @@ fn monitor_silence_flags_after_interval() {
     let mut cli_k = cli_client(&name);
     cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+// ---- SP7 Task 11: cross-window/session structure ops --------------------
+// (closes follow-ups #41, #42, #44, #45)
+
+/// Closes follow-up #42: `swap-pane -U`/`-D` combined with `-s` computes
+/// the neighbor relative to `-s`'s pane, not `-t`'s (nor the acting
+/// client's focus) -- previously any `-s` co-supplied with a direction was
+/// a usage error. Mirrors `swap_pane_updown_with_target`'s 3-pane setup,
+/// but supplies BOTH `-s 0` and a DIFFERENT `-t 2`: the resulting swap must
+/// follow `-s` (position 0, pane1) and its `-D` neighbor (position 1,
+/// pane2), proving `-t`'s different pane (position 2, pane3 -- also the
+/// focused/current pane) played no part.
+#[test]
+fn swap_pane_dash_s_with_direction_resolves_relative_to_s() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // H(1, V(2,3)): pane1 {0,0,40,24} (leaf 0), pane2 {41,0,39,12} (leaf 1),
+    // pane3 {41,13,39,11} (leaf 2, focused after the second split).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "0".into(), "echo one111".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "one111").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "1".into(), "echo two222".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").is_some());
+    cli.send(&ClientMsg::Cli(vec!["send-keys".into(), "-t".into(), "2".into(), "echo three333".into(), "Enter".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| marker_col(g, "three333").is_some());
+
+    // Focus (pane3, position 2) must stay exactly where it is: the pivot is
+    // `-s 0` (pane1), NOT the active pane, and NOT `-t 2` (which also names
+    // pane3).
+    let cursor_before = grid.cursor();
+    assert!(cursor_before.0 > 40 && cursor_before.1 >= 13, "sanity: cursor starts in pane3 (bottom-right)");
+
+    cli.send(&ClientMsg::Cli(vec!["swap-pane".into(), "-D".into(), "-s".into(), "0".into(), "-t".into(), "2".into()]));
+    expect_cli_done(&cli, 0);
+
+    // pane1 (position 0, left) now shows pane2's content ("two222");
+    // pane2's old spot (position 1, top-right) now shows pane1's content
+    // ("one111") -- pane3's spot (position 2, bottom-right) is untouched,
+    // proving `-t 2` (which ALSO names pane3) was ignored once `-s` was
+    // present.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "two222").map(|c| c < 40).unwrap_or(false));
+    c.recv_output_until(&mut grid, |g| marker_col_in_rows(g, "one111", 0, 12).is_some());
+    assert!(marker_col_in_rows(&grid, "three333", 13, 24).is_some(), "pane3's content must stay in the bottom-right pane");
+    assert_eq!(grid.cursor(), cursor_before, "focus/cursor must not move: the pivot was -s (position 0), not the active pane");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Closes follow-up #44: `break-pane -s <target>` selects WHICH pane
+/// breaks out -- previously break-pane always acted on the resolved
+/// CURRENT (focused) pane, with no `-s` selector at all. This test focuses
+/// pane1 (left) but targets pane2 (right, `-s 1`) explicitly: the pane
+/// that leaves must be pane2's content, not pane1's (the focused one).
+#[test]
+fn break_pane_dash_s_moves_named_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Split: pane1 (left, leaf 0) | pane2 (right, leaf 1, focused --
+    // split-window gives the new pane focus).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    c.send(&ClientMsg::Stdin(b"echo rightmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "rightmark").is_some());
+
+    // Click into pane1 (left) to focus it -- the DEFAULT target (no `-s`)
+    // would now be pane1, proving `-s` is doing the selecting below.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+    c.send(&ClientMsg::Stdin(b"echo leftmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "leftmark").is_some());
+
+    // `break-pane -s 1` (leaf-order index 1 = the right pane) -- NOT the
+    // focused pane (index 0, left).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["break-pane".into(), "-s".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    // The new (current) window shows the RIGHT pane's content, and both
+    // windows are back down to a single pane.
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")) && !has_vertical_border(g)
+    });
+    c.recv_output_until(&mut grid, |g| marker_col(g, "rightmark").is_some());
+
+    // Window 0 (source) kept the LEFT pane -- its own single remaining pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "leftmark").is_some());
+    assert!(!has_vertical_border(&grid), "source window must be back to a single pane");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Regression for a self-caught atomicity bug in the `-t` destination-index
+/// occupancy check: an OCCUPIED explicit `-t` index must fail the WHOLE
+/// command before the source pane is touched, not partway through (which
+/// would otherwise orphan the pane -- detached from its source window's
+/// layout, but never landing anywhere else either). Targets `-t :0` --
+/// window 0's OWN index, still occupied by window 0 itself (only a PANE is
+/// being removed from it, not the whole window) -- from a single-window,
+/// two-pane session.
+#[test]
+fn break_pane_occupied_dst_index_does_not_orphan_source_pane() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    c.send(&ClientMsg::Stdin(b"echo bothmark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "bothmark").is_some());
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["break-pane".into(), "-t".into(), ":0".into()]));
+    let (_, err) = expect_cli_done(&cli, 1);
+    assert_eq!(err, "index in use: 0");
+
+    // Nothing changed: still one window, still two panes, both echoed
+    // markers survive in place (the source pane was never removed).
+    assert!(has_vertical_border(&grid), "the split must survive the rejected break-pane intact");
+    assert!(marker_col(&grid, "bothmark").is_some());
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    let (out, _) = expect_cli_done(&cli2, 0);
+    assert_eq!(out.lines().count(), 1, "still exactly one window -- break-pane must not have partially executed");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Closes follow-up #45: `move-window -t <session>:<index>` relocates a
+/// window ACROSS sessions -- previously any `session:` prefix on
+/// move-window's `-t` was silently discarded (same-session re-indexing
+/// only). Session "srcS" starts with two windows (0 default, 1 created via
+/// prefix-c); window 1 is moved into session "dstS" at index 5. Afterward:
+/// a fresh client attaching to "dstS" sees the moved window (its content,
+/// at index 5, and CURRENT there -- real tmux's "without -d, the new
+/// window becomes the destination's current window"); the acting client
+/// (still attached to "srcS") falls back to window 0 automatically (its own
+/// current window just left), proving the source session SURVIVED with its
+/// remaining window intact ("leaves source").
+#[test]
+fn move_window_to_other_session_appears_there_and_leaves_source() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "srcS", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    c.send(&ClientMsg::Stdin(b"echo srcw0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw0mark").is_some());
+
+    // prefix-c creates window 1 and switches the client to it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[srcS] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo srcw1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw1mark").is_some());
+
+    // A second, independent session "dstS" already exists with its own
+    // window (index 0) -- proving the move doesn't disturb it.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "dstS".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Move window 1 (current, "srcw1mark") from srcS into dstS at index 5,
+    // via the attached client's `prefix-:` command prompt (NOT a plain
+    // headless `ClientMsg::Cli` -- unlike the interactive prompt/keybinding
+    // path, a headless CLI invocation resolves its acting session via
+    // "most recently created", not this client's own attached session,
+    // which would target the WRONG session here since "dstS" was created
+    // more recently than "srcS").
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"move-window -t dstS:5\r".to_vec()));
+
+    // srcS's client falls back to window 0 automatically -- the window it
+    // was looking at just left.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[srcS] 0:powershell*")));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "srcw0mark").is_some());
+
+    // A fresh client attaching to dstS sees the moved window: it's CURRENT
+    // there (index 5, alongside dstS's own original window 0), and its
+    // content (srcw1mark) is on screen.
+    let mut c2 = Client::connect(&name);
+    attach(&mut c2, AttachMode::Existing, "dstS", 80, 24);
+    let mut grid2 = Grid::new(80, 24, 0);
+    c2.recv_output_until(&mut grid2, |g| screen_text(g).iter().any(|l| l.contains("[dstS] 0:powershell- 5:powershell*")));
+    c2.recv_output_until(&mut grid2, |g| marker_col(g, "srcw1mark").is_some());
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
     server.join().expect("server exits after kill-server");
 }

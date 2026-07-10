@@ -276,16 +276,21 @@ pub enum ParsedCmd {
     /// directions -- see `Layout::rotate`'s doc comment for the exact
     /// permutation each maps to.
     RotateWindow { down: bool, target: Option<String> },
-    /// `break-pane|breakp [-d] [-n name]` (Task 7, sub-project 4): the
-    /// target session/window's FOCUSED pane leaves its window and becomes a
-    /// new window (next free index >= the session's `base-index`), which
-    /// becomes current unless `-d` (`detached`) is given. `-n` names the new
-    /// window. No pane target flag: winmux's break-pane always acts on the
-    /// resolved current pane (matches the design spec's `## 6. Window ops`
-    /// section, which omits a `-s`/`-t` pane selector entirely -- smaller,
-    /// honest scope, same pattern as `swap-pane`'s own documented
-    /// deviations).
-    BreakPane { detached: bool, name: Option<String> },
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]` (Task 7, sub-
+    /// project 4; `-s`/`-t` added SP7 Task 11, closes follow-up #44): the
+    /// pane named by `-s` (default: the resolved current pane, same
+    /// `resolve_pane_target` fallback chain as `kill-pane -t`/`swap-pane
+    /// -s`/`-t`) leaves its window and becomes a new window, which becomes
+    /// current unless `-d` (`detached`) is given. `-n` names the new window.
+    /// `-t` is the DESTINATION -- a `[session:]index` window-index target
+    /// (real tmux's `-t` grammar for `break-pane`, distinct from `-s`'s
+    /// pane grammar): an explicit index places the new window there (error
+    /// if occupied); an absent index (or a bare `session:` with nothing
+    /// after the colon) falls back to the destination session's lowest free
+    /// slot. A `session:` prefix on `-t` moves the new window into a
+    /// DIFFERENT session entirely; no prefix keeps it in `-s`'s own
+    /// session (today's pre-Task-11 default).
+    BreakPane { detached: bool, name: Option<String>, src: Option<String>, dst: Option<String> },
     /// `move-window|movew [-k] -t index` (Task 7): re-index the CURRENT
     /// window (of the target session) to `target` (required -- there is
     /// nothing to do without one, unlike real tmux's fuller cross-session
@@ -659,7 +664,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "next-layout" => "usage: next-layout [-t target]",
         "swap-pane" => "usage: swap-pane [-U] [-D] [-s src] [-t dst]",
         "rotate-window" => "usage: rotate-window [-D] [-t target]",
-        "break-pane" => "usage: break-pane [-d] [-n name]",
+        "break-pane" => "usage: break-pane [-d] [-n name] [-s src] [-t dst]",
         "move-window" => "usage: move-window [-k] -t index",
         "swap-window" => "usage: swap-window [-d] [-s src] -t dst",
         "find-window" => "usage: find-window pattern",
@@ -1237,11 +1242,16 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             Ok(ParsedCmd::RotateWindow { down: has(&b, "-D"), target: value_of(&v, "-t") })
         }
         "break-pane" => {
-            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-n"]) else { return Err(bad()) };
+            let Ok((b, v, p)) = scan_flags(&raw.args, &["-d"], &["-n", "-s", "-t"]) else { return Err(bad()) };
             if !p.is_empty() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::BreakPane { detached: has(&b, "-d"), name: value_of(&v, "-n") })
+            Ok(ParsedCmd::BreakPane {
+                detached: has(&b, "-d"),
+                name: value_of(&v, "-n"),
+                src: value_of(&v, "-s"),
+                dst: value_of(&v, "-t"),
+            })
         }
         "move-window" => {
             let Ok((b, v, p)) = scan_flags(&raw.args, &["-k"], &["-t"]) else { return Err(bad()) };
@@ -1653,20 +1663,46 @@ mod tests {
 
     #[test]
     fn break_pane_flags() {
-        assert_eq!(resolve(&raw("break-pane", &[])).unwrap(), ParsedCmd::BreakPane { detached: false, name: None });
+        assert_eq!(
+            resolve(&raw("break-pane", &[])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: None, dst: None }
+        );
         assert_eq!(
             resolve(&raw("breakp", &["-d"])).unwrap(),
-            ParsedCmd::BreakPane { detached: true, name: None }
+            ParsedCmd::BreakPane { detached: true, name: None, src: None, dst: None }
         );
         assert_eq!(
             resolve(&raw("break-pane", &["-n", "logs"])).unwrap(),
-            ParsedCmd::BreakPane { detached: false, name: Some("logs".to_string()) }
+            ParsedCmd::BreakPane { detached: false, name: Some("logs".to_string()), src: None, dst: None }
         );
         assert_eq!(
             resolve(&raw("break-pane", &["-d", "-n", "logs"])).unwrap(),
-            ParsedCmd::BreakPane { detached: true, name: Some("logs".to_string()) }
+            ParsedCmd::BreakPane { detached: true, name: Some("logs".to_string()), src: None, dst: None }
         );
         assert_eq!(resolve(&raw("break-pane", &["extra"])).unwrap_err(), usage("break-pane").unwrap());
+    }
+
+    /// SP7 Task 11 (closes follow-up #44): `-s`/`-t` parse as plain optional
+    /// string flags, same shape `swap-pane`'s `-s`/`-t` already use.
+    #[test]
+    fn break_pane_src_dst_flags() {
+        assert_eq!(
+            resolve(&raw("break-pane", &["-s", "0.1"])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: Some("0.1".to_string()), dst: None }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-t", "other:3"])).unwrap(),
+            ParsedCmd::BreakPane { detached: false, name: None, src: None, dst: Some("other:3".to_string()) }
+        );
+        assert_eq!(
+            resolve(&raw("break-pane", &["-s", "0.1", "-t", "other:3", "-d"])).unwrap(),
+            ParsedCmd::BreakPane {
+                detached: true,
+                name: None,
+                src: Some("0.1".to_string()),
+                dst: Some("other:3".to_string())
+            }
+        );
     }
 
     #[test]

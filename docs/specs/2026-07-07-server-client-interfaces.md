@@ -261,6 +261,9 @@ impl Registry {
     pub fn auto_name(&self) -> String;                      // lowest unused non-negative integer as string
     pub fn neighbor_session(&self, current: &str, next: bool) -> Option<&str>; // for ( / ) switch-client, wraps
     pub fn mint_window_id(&mut self) -> WindowId;           // fresh id from the SAME counter create_session uses internally
+    // Amendment (SP7 Task 11, cross-window/session structure ops) -- see below.
+    pub fn move_window_to_session(&mut self, src_name: &str, id: WindowId, dst_name: &str, index: Option<u32>, kill: bool, select: bool) -> Result<(), String>;
+    pub fn insert_new_window(&mut self, session_name: &str, id: WindowId, first_pane: crate::layout::PaneId, index: Option<u32>) -> Result<WindowId, String>;
 }
 impl Session {
     pub fn new_window(&mut self, id: WindowId, first_pane: crate::layout::PaneId) -> &mut Window; // index = lowest unused, becomes current, updates last
@@ -456,6 +459,71 @@ impl Session {
     end to end, `tests/server_proto.rs`'s
     `swap_window_relative_target_moves_current_window` /
     `swap_window_without_d_keeps_focus_on_index`.
+- **Amendment (SP7 Task 11, cross-window/session structure ops, closes
+  follow-up #45):** `Registry` gains a cross-session `move-window`
+  primitive, plus two supporting building blocks (one on `Registry`, two
+  new PRIVATE `Session` methods that are NOT part of this locked contract
+  — listed here only for context, since `move_window_to_session` is
+  implemented in terms of them):
+
+  ```rust
+  impl Registry {
+      /// Lift window `id` wholesale out of session `src_name` and insert it
+      /// into session `dst_name` at `index` (explicit) or `dst_name`'s
+      /// lowest free slot. The `Window` OBJECT (id, name, layout, every
+      /// pane) moves untouched -- `WindowId`s are global, never re-minted.
+      /// `select: true` makes the moved window `dst_name`'s new `current`
+      /// (mirrors `move-window`'s "no -d" default; `last` becomes whatever
+      /// WAS current there). `kill: true` removes an occupied `index`'s
+      /// occupant first (same `-k` contract `Session::move_window` already
+      /// has for the same-session case) -- the CALLER is responsible for
+      /// cleaning up the killed occupant's pane runtime state (same
+      /// pre-snapshot-then-remove pattern `server/dispatch.rs::exec_move_
+      /// window` already follows for the same-session `-k` case).
+      /// **Narrowing** (documented, follow-up #45's own honest-scope note):
+      /// refuses (`"can't move the only window out of its session"`) rather
+      /// than destroying an emptied source session the way real tmux does
+      /// -- avoids this task also solving session-teardown client-eviction
+      /// semantics for a case with no bearing on the required behavior.
+      /// Errors: `"can't find session: <name>"` (either session missing),
+      /// `"window not found"`, `"can't move the only window out of its
+      /// session"`, `"index in use: <i>"` (explicit index occupied, `kill:
+      /// false`), `"move-window: source and destination sessions are the
+      /// same"` (route a same-session move through `Session::move_window`
+      /// instead -- this method does not duplicate it).
+      pub fn move_window_to_session(&mut self, src_name: &str, id: WindowId, dst_name: &str, index: Option<u32>, kill: bool, select: bool) -> Result<(), String>;
+
+      /// Build a fresh single-pane `Window` (same defaults as `Session::
+      /// new_window`) and insert it into session `session_name` at `index`
+      /// (explicit) or its lowest free slot -- `break-pane -t
+      /// <session[:index]>`'s primitive (closes follow-up #44), since
+      /// `Session::new_window` itself only ever targets its OWN session and
+      /// always forces focus onto the new window. Does NOT touch
+      /// `current`/`last`. `id` must come from `mint_window_id`. Errors:
+      /// `"can't find session: <session_name>"` / `"index in use: <i>"`.
+      pub fn insert_new_window(&mut self, session_name: &str, id: WindowId, first_pane: crate::layout::PaneId, index: Option<u32>) -> Result<WindowId, String>;
+  }
+  ```
+
+  Both delegate to two new PRIVATE `Session` methods (`insert_window`,
+  `take_window`) plus a private `Session::build_window` associated
+  function that `new_window` was refactored to share — `new_window`'s own
+  signature/behavior is UNCHANGED (still index = lowest unused, becomes
+  current, updates last). Full spec:
+  `docs/tmux-reference/windows-and-sessions.md` §move-window/link-window,
+  §break-pane. `server::dispatch`'s consumers
+  (`exec_move_window`'s cross-session branch, `exec_break_pane`) are
+  documented in the `## Cross-window/session structure ops` section of
+  [`2026-07-07-command-config-interfaces.md`](2026-07-07-command-config-interfaces.md).
+  Tests: `model.rs`'s `move_window_across_sessions_reindexes_destination`,
+  `move_window_across_sessions_explicit_index`,
+  `move_window_across_sessions_occupied_index_errors`,
+  `move_window_across_sessions_kill_occupant`,
+  `move_window_across_sessions_refuses_to_empty_source`,
+  `move_window_across_sessions_unknown_session_or_window_errors`,
+  `move_window_across_sessions_same_name_errors`; end to end,
+  `tests/server_proto.rs`'s
+  `move_window_to_other_session_appears_there_and_leaves_source`.
 
 **Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
 APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends

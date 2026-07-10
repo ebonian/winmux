@@ -34,7 +34,7 @@ use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
 use crate::keys::{Key, KeyCode, MouseEvent, MouseKeyKind, MouseKeyLoc, MouseKind};
-use crate::layout::{PaneId, SplitDir};
+use crate::layout::{Layout, PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::{self, FormatCtx};
 use crate::protocol::ServerMsg;
@@ -1492,39 +1492,46 @@ impl Server {
         Ok(String::new())
     }
 
-    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap a target pane with the
+    /// `swap-pane`. `-U`/`-D` (`dir: Some`) swap a PIVOT pane with the
     /// previous/next pane in creation order (wrapping), operating only on
-    /// that pane's own window (matches the `{`/`}` bindings' intent; tmux
+    /// the pivot's own window (matches the `{`/`}` bindings' intent; tmux
     /// itself scopes `-U`/`-D` to the target window's own pane list too).
-    /// The target pane is `-t` if given (SP4 fix round: previously silently
-    /// discarded alongside `-U`/`-D` -- see `docs/follow-ups.md`), else the
-    /// acting client's active pane (tmux's own default when `-t` is
-    /// omitted). A co-supplied `-s` is REJECTED with a usage error rather
-    /// than silently ignored: real tmux additionally lets `-s` override the
-    /// "which pane is `-U`/`-D` relative to" side of the swap, but winmux
-    /// does not implement that fuller matrix yet -- smaller, honest scope
-    /// chosen over a silent partial implementation.
+    /// The pivot is `-s` if given, else `-t` if given (SP4 fix round: `-t`
+    /// previously silently discarded alongside `-U`/`-D`), else the acting
+    /// client's active pane (tmux's own default when both are omitted). SP7
+    /// Task 11 (closes follow-up #42): a co-supplied `-s` used to be
+    /// REJECTED outright; real tmux's `cmd-swap-pane.c:80-91` computes the
+    /// `-U`/`-D` neighbor relative to whichever pane is the "target" of the
+    /// computation, and `-s` (when given) plays that role instead of `-t` --
+    /// see `docs/tmux-reference/panes-and-layout.md` §5.1. A co-supplied
+    /// `-t` alongside BOTH `-s` and a direction is not itself a distinct
+    /// third pivot (an intentionally narrower scope than the full tmux
+    /// matrix, per follow-up #42's own honest-scope note) -- `-s` always
+    /// wins the pivot once present.
     ///
     /// The explicit `-s`/`-t` form (`dir: None`) resolves two independent
-    /// pane targets via the normal `resolve_pane_target` fallback chain and
-    /// REQUIRES both to resolve to the same window (SP4 fix round: this used
-    /// to silently no-op cross-window instead of erroring -- see
-    /// `docs/follow-ups.md`). Real tmux supports moving a pane to a
-    /// different window this way; winmux does not yet.
+    /// pane targets via the normal `resolve_pane_target` fallback chain.
+    /// When they land in the SAME window, this is the original same-window
+    /// leaf relabel (`Layout::swap_panes`). SP7 Task 11 (closes follow-up
+    /// #41): when they land in DIFFERENT windows (or sessions), this is now
+    /// a genuine cross-window swap (`Layout::swap_leaf_across` -- panes keep
+    /// their own ids, only their tree/screen SLOTS trade places, matching
+    /// tmux's real "swap positions in the pane list... layout cells, and
+    /// geometry; when the windows differ they also swap window membership"
+    /// behavior) instead of the SP4-era honest error ("swap-pane: can only
+    /// swap panes within the same window").
     fn exec_swap_pane(&mut self, dir: Option<Direction>, src: Option<String>, dst: Option<String>, cs: Option<&str>) -> Result<String, String> {
-        let (session_name, a, b, target_wid) = if let Some(d) = dir {
-            if src.is_some() {
-                return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string());
-            }
-            let (session_name, wid, target) = self.resolve_pane_target(cs, dst.as_deref())?;
-            let Some(session) = self.registry.session_mut(&session_name) else {
-                return Err(format!("can't find session: {session_name}"));
+        let (s1, w1, a, s2, w2, b) = if let Some(d) = dir {
+            let pivot_target = src.as_deref().or(dst.as_deref());
+            let (pivot_session, pivot_wid, pivot_pane) = self.resolve_pane_target(cs, pivot_target)?;
+            let Some(session) = self.registry.session_mut(&pivot_session) else {
+                return Err(format!("can't find session: {pivot_session}"));
             };
-            let Some(window) = session.windows.iter().find(|w| w.id == wid) else {
+            let Some(window) = session.windows.iter().find(|w| w.id == pivot_wid) else {
                 return Err("window not found".to_string());
             };
             let order = Self::panes_in_creation_order(window);
-            let Some(pos) = order.iter().position(|&p| p == target) else {
+            let Some(pos) = order.iter().position(|&p| p == pivot_pane) else {
                 return Err("pane not found".to_string());
             };
             let n = order.len();
@@ -1535,22 +1542,71 @@ impl Server {
                 // `-U`/`-D`; any other `Direction` is unreachable.
                 _ => return Err(cmd::usage("swap-pane").expect("swap-pane has a usage string").to_string()),
             };
-            (session_name, target, other, wid)
+            (pivot_session.clone(), pivot_wid, pivot_pane, pivot_session, pivot_wid, other)
         } else {
             let (s1, w1, pa) = self.resolve_pane_target(cs, src.as_deref())?;
-            let (_s2, w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
-            if w1 != w2 {
-                return Err("swap-pane: can only swap panes within the same window".to_string());
-            }
-            (s1, pa, pb, w1)
+            let (s2, w2, pb) = self.resolve_pane_target(cs, dst.as_deref())?;
+            (s1, w1, pa, s2, w2, pb)
         };
-        if let Some(session) = self.registry.session_mut(&session_name) {
-            if let Some(window) = session.windows.iter_mut().find(|w| w.id == target_wid) {
-                window.layout.swap_panes(a, b);
+
+        if w1 == w2 {
+            if let Some(session) = self.registry.session_mut(&s1) {
+                if let Some(window) = session.windows.iter_mut().find(|w| w.id == w1) {
+                    window.layout.swap_panes(a, b);
+                }
+            }
+            self.apply_layout_for_session(&s1);
+        } else {
+            // Cross-window/session: pull both Layouts out (temporarily
+            // replacing each with a harmless placeholder -- pane id 0 is
+            // never minted, `Server::next_pane_id` starts at 1 -- so no
+            // other code can observe it mid-swap on this single-threaded
+            // main loop), swap leaves across the two owned Layout values
+            // (sidesteps needing two simultaneous `&mut` borrows into
+            // possibly the SAME session's `Vec<Window>`), then write both
+            // back.
+            let mut layout1 = self.take_window_layout(&s1, w1).ok_or_else(|| "window not found".to_string())?;
+            let mut layout2 = self.take_window_layout(&s2, w2).ok_or_else(|| "window not found".to_string())?;
+            let swapped = layout1.swap_leaf_across(a, &mut layout2, b);
+            self.put_window_layout(&s1, w1, layout1);
+            self.put_window_layout(&s2, w2, layout2);
+            if !swapped {
+                // Defensive: `a`/`b` were just resolved live via
+                // `resolve_pane_target`, so this should be unreachable.
+                return Err("pane not found".to_string());
+            }
+            self.apply_layout_for_session(&s1);
+            if s2 != s1 {
+                self.apply_layout_for_session(&s2);
             }
         }
-        self.apply_layout_for_session(&session_name);
         Ok(String::new())
+    }
+
+    /// Temporarily remove window `wid`'s `Layout` out of session
+    /// `session_name`, replacing it with a throwaway placeholder (SP7 Task
+    /// 11: `exec_swap_pane`'s cross-window path needs to hold TWO `Layout`
+    /// values at once, possibly both leaves of the SAME session's
+    /// `Vec<Window>`, which the borrow checker can't give out as two live
+    /// `&mut` at the same time -- taking each by VALUE sidesteps that).
+    /// Must be paired with [`Self::put_window_layout`] before any other code
+    /// observes the placeholder. `None` if the session/window isn't found.
+    fn take_window_layout(&mut self, session_name: &str, wid: WindowId) -> Option<Layout> {
+        let session = self.registry.session_mut(session_name)?;
+        let window = session.windows.iter_mut().find(|w| w.id == wid)?;
+        Some(std::mem::replace(&mut window.layout, Layout::new(0)))
+    }
+
+    /// Restore a `Layout` taken by [`Self::take_window_layout`]. A no-op
+    /// (silently drops `layout`) if the session/window has somehow vanished
+    /// in between -- unreachable in practice (single-threaded main loop, no
+    /// other mutation runs between a `take`/`put` pair).
+    fn put_window_layout(&mut self, session_name: &str, wid: WindowId, layout: Layout) {
+        if let Some(session) = self.registry.session_mut(session_name) {
+            if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
+                window.layout = layout;
+            }
+        }
     }
 
     fn exec_rotate_window(&mut self, down: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
@@ -1577,22 +1633,36 @@ impl Server {
     // ---- window ops (Task 7, sub-project 4): break-pane, move-window,
     // find-window ----
 
-    /// `break-pane|breakp [-d] [-n name]`: the resolved CURRENT pane leaves
-    /// its window and becomes a new window (next free index, via
-    /// `Session::new_window`'s existing `lowest_unused_index` floor). Errors
-    /// `"can't break with only one pane"` (verbatim from the task brief,
-    /// itself quoting real tmux's own message -- design spec `## 6. Window
-    /// ops` doesn't spell out a refusal string) if the source window has
-    /// only that one pane -- checked
-    /// BEFORE any mutation, regardless of how many OTHER windows the
+    /// `break-pane|breakp [-d] [-n name] [-s src] [-t dst]`: the pane named
+    /// by `-s` (default: the resolved current pane -- SP7 Task 11 closes
+    /// follow-up #44, which used to hardcode this to `None`/current only)
+    /// leaves its window and becomes a new window. `-t` (SP7 Task 11) is a
+    /// `[session:]index` destination: an explicit index places the new
+    /// window there in the named session (defaulting to `-s`'s own session
+    /// when no `session:` prefix is given), erroring `"index in use: <n>"`
+    /// on collision (no kill/shuffle); an absent index falls back to the
+    /// destination session's lowest free slot (`Session::insert_window`'s
+    /// existing `lowest_unused_index` floor, same as the pre-Task-11
+    /// `Session::new_window` path this replaces). Errors `"can't break with
+    /// only one pane"` (verbatim from the task brief, itself quoting real
+    /// tmux's own message) if the source window has only that one pane --
+    /// checked BEFORE any mutation, regardless of how many OTHER windows the
     /// session has (a window can never be left with zero panes; matches
     /// `Layout::remove`'s own "the only pane" refusal, which
-    /// `kill_pane_by_id` relies on the same way). Focus follows the pane
-    /// into the new window (`Session::new_window` makes it current) unless
-    /// `-d`, which restores the source window as current and only updates
-    /// `last`.
-    fn exec_break_pane(&mut self, detached: bool, name: Option<String>, cs: Option<&str>) -> Result<String, String> {
-        let (session_name, wid, pane_id) = self.resolve_pane_target(cs, None)?;
+    /// `kill_pane_by_id` relies on the same way). Without `-d`, the new
+    /// window becomes the DESTINATION session's current window (real tmux's
+    /// `session_select`, `cmd-break-pane.c:177-180`); with `-d` it stays in
+    /// the background and neither session's current/last changes as a
+    /// result of the new window's creation.
+    fn exec_break_pane(
+        &mut self,
+        detached: bool,
+        name: Option<String>,
+        src: Option<String>,
+        dst: Option<String>,
+        cs: Option<&str>,
+    ) -> Result<String, String> {
+        let (session_name, wid, pane_id) = self.resolve_pane_target(cs, src.as_deref())?;
         let pane_count = self
             .registry
             .session_mut(&session_name)
@@ -1605,6 +1675,48 @@ impl Server {
         if let Some(n) = &name {
             crate::model::validate_name(n, "window")?;
         }
+        // Resolve the destination BEFORE any mutation, so a bad `-t`
+        // (unknown session, unparseable index) fails atomically -- nothing
+        // changed.
+        let (dst_sess_part, dst_win_spec) = match &dst {
+            Some(d) => {
+                let (s, r) = split_session_prefix(d);
+                (s, if r.is_empty() { None } else { Some(r) })
+            }
+            None => (None, None),
+        };
+        let dst_session_name = match dst_sess_part {
+            Some(s) => self.registry.find(s).map(|s| s.name.clone())?,
+            None => session_name.clone(),
+        };
+        let dst_index: Option<u32> = match dst_win_spec {
+            Some(w) => Some(
+                w.strip_prefix('=')
+                    .unwrap_or(w)
+                    .parse::<u32>()
+                    .map_err(|_| cmd::usage("break-pane").expect("break-pane has a usage string").to_string())?,
+            ),
+            None => None,
+        };
+        // An explicit destination index's occupancy is ALSO checked here,
+        // before the source pane is touched -- `Session::insert_window`
+        // (via `insert_new_window` below) checks the SAME thing, but only
+        // AFTER this function has already removed the pane from its source
+        // window. Without this early check, a rejected `insert_new_window`
+        // would leave the pane orphaned (detached from every window's
+        // layout, its `PaneRuntime` still alive in `self.panes` but
+        // unreachable) instead of the whole command failing atomically.
+        if let Some(i) = dst_index {
+            let occupied = self
+                .registry
+                .session_mut(&dst_session_name)
+                .map(|s| s.windows.iter().any(|w| w.index == i))
+                .unwrap_or(false);
+            if occupied {
+                return Err(format!("index in use: {i}"));
+            }
+        }
+
         // NOTE (fix round 3): the source window's `Layout::remove` may hand
         // focus to a surviving sibling -- deliberately NOT stamped, same
         // `window_lost_pane` no-bump rule as `kill_pane_by_id` (the moved
@@ -1623,22 +1735,29 @@ impl Server {
             return Err("can't break with only one pane".to_string());
         }
         let new_wid = self.registry.mint_window_id();
-        if let Some(session) = self.registry.session_mut(&session_name) {
-            let w = session.new_window(new_wid, pane_id);
-            if let Some(n) = name {
-                w.name = n;
-                // Explicit naming at creation is manual naming too (Task 9)
-                // -- matches `exec_rename_window`/`exec_new_window`.
-                w.auto_rename = false;
+        let new_id = self.registry.insert_new_window(&dst_session_name, new_wid, pane_id, dst_index)?;
+        if let Some(session) = self.registry.session_mut(&dst_session_name) {
+            if let Some(w) = session.windows.iter_mut().find(|w| w.id == new_id) {
+                if let Some(n) = name {
+                    w.name = n;
+                    // Explicit naming at creation is manual naming too
+                    // (Task 9) -- matches `exec_rename_window`/`exec_new_window`.
+                    w.auto_rename = false;
+                }
             }
-            // `new_window` always makes the new window current -- `-d`
-            // (`detached`) means focus should stay in the SOURCE window
-            // instead (tmux: the pane still moves, but the client's
-            // displayed window doesn't follow it).
-            if detached {
-                session.current = wid;
-                session.last = Some(new_wid);
-                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
+            // `insert_new_window` never touches current/last (SP7 Task 11:
+            // unlike the `Session::new_window` this replaces, it has to
+            // serve a DESTINATION session that may differ from the acting
+            // client's own) -- this handler owns that bookkeeping instead.
+            // Real tmux: without `-d` the new window becomes the
+            // destination's current window; with `-d`, nothing changes.
+            if !detached {
+                session.last = Some(session.current);
+                session.current = new_id;
+                // SP7 Task 17 (#74): clear-on-visit whenever `current`
+                // changes (no-op for a brand-new window, kept for the
+                // invariant's uniformity across every current-mutation site).
+                session.clear_alerts_for(new_id);
             }
         }
         // NOTE (fix round 4): the moved pane becoming the new window's
@@ -1652,52 +1771,118 @@ impl Server {
         // `window_set_active_pane` at cmd-break-pane.c:80 belongs to the
         // `-W` floating-window feature, which winmux doesn't implement.)
         self.apply_layout_for_session(&session_name);
+        if dst_session_name != session_name {
+            self.apply_layout_for_session(&dst_session_name);
+        }
         Ok(String::new())
     }
 
-    /// `move-window|movew [-k] -t index`: re-index the target session's
-    /// CURRENT window to `target` (parsed as a bare/`:`-prefixed index --
-    /// any `session:` prefix is accepted but IGNORED, since winmux's
-    /// `move-window` only re-indexes within the SAME session, per the
-    /// design spec). Occupied index -> `index in use: <n>` unless `kill`.
+    /// `move-window|movew [-k] -t [session:]index`: re-index the target
+    /// session's CURRENT window to `target`. A bare/`:`-prefixed index with
+    /// NO `session:` part keeps the pre-Task-11 same-session re-indexing
+    /// behavior exactly (`Session::move_window`, index REQUIRED). SP7 Task
+    /// 11 (closes follow-up #45): an explicit `session:` prefix that names a
+    /// DIFFERENT session now actually moves the window there
+    /// (`Registry::move_window_to_session`) instead of silently discarding
+    /// the prefix -- the index becomes OPTIONAL on this path (absent ->
+    /// destination's lowest free slot, same "explicit or lowest_unused_
+    /// index" rule the doc spec calls for). Occupied index -> `index in
+    /// use: <n>` unless `-k` (`kill`), on EITHER path.
     fn exec_move_window(&mut self, kill: bool, target: String, cs: Option<&str>) -> Result<String, String> {
         let session_name = self.resolve_session_name(None, cs)?;
-        let (_, win_spec) = split_session_prefix(&target);
-        let idx: u32 = win_spec
-            .strip_prefix('=')
-            .unwrap_or(win_spec)
-            .parse()
-            .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?;
-        let Some(session) = self.registry.session_mut(&session_name) else {
-            return Err(format!("can't find session: {session_name}"));
+        let (sess_part, win_spec) = split_session_prefix(&target);
+        let dst_session_name = match sess_part {
+            Some(s) => self.registry.find(s).map(|s| s.name.clone())?,
+            None => session_name.clone(),
         };
-        let wid = session.current;
-        // Snapshot the occupant's panes (if any) BEFORE the move, so a
-        // killed occupant's pane runtimes/rects can be cleaned up after --
-        // once `Session::move_window` kills it, its `Window`/`Layout` is
-        // gone from the registry.
-        let occupant_panes: Vec<PaneId> = session
-            .windows
-            .iter()
-            .find(|w| w.index == idx && w.id != wid)
-            .map(|w| w.layout.panes())
-            .unwrap_or_default();
-        if !session.move_window(wid, idx, kill) {
-            return Err(format!("index in use: {idx}"));
-        }
-        // renumber-windows is session-scoped (#26).
-        if self.renumber_windows_for_session(&session_name) {
-            if let Some(s) = self.registry.session_mut(&session_name) {
-                s.renumber();
+
+        if dst_session_name == session_name {
+            // Unchanged same-session path: an explicit index is REQUIRED
+            // (real tmux itself accepts a bare `-t <session>` with no index
+            // for the cross-session form, but this SAME-session shape keeps
+            // its pre-Task-11 contract byte-for-byte).
+            let idx: u32 = win_spec
+                .strip_prefix('=')
+                .unwrap_or(win_spec)
+                .parse()
+                .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?;
+            let Some(session) = self.registry.session_mut(&session_name) else {
+                return Err(format!("can't find session: {session_name}"));
+            };
+            let wid = session.current;
+            // Snapshot the occupant's panes (if any) BEFORE the move, so a
+            // killed occupant's pane runtimes/rects can be cleaned up after
+            // -- once `Session::move_window` kills it, its `Window`/`Layout`
+            // is gone from the registry.
+            let occupant_panes: Vec<PaneId> = session
+                .windows
+                .iter()
+                .find(|w| w.index == idx && w.id != wid)
+                .map(|w| w.layout.panes())
+                .unwrap_or_default();
+            if !session.move_window(wid, idx, kill) {
+                return Err(format!("index in use: {idx}"));
             }
+            // renumber-windows is session-scoped (#26).
+            if self.renumber_windows_for_session(&session_name) {
+                if let Some(s) = self.registry.session_mut(&session_name) {
+                    s.renumber();
+                }
+            }
+            for pid in occupant_panes {
+                self.panes.remove(&pid);
+                self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
+            }
+            self.apply_layout_for_session(&session_name);
+            Ok(String::new())
+        } else {
+            // SP7 Task 11 cross-session path (closes follow-up #45).
+            let idx: Option<u32> = if win_spec.is_empty() {
+                None
+            } else {
+                Some(
+                    win_spec
+                        .strip_prefix('=')
+                        .unwrap_or(win_spec)
+                        .parse::<u32>()
+                        .map_err(|_| cmd::usage("move-window").expect("move-window has a usage string").to_string())?,
+                )
+            };
+            let wid = self
+                .registry
+                .session_mut(&session_name)
+                .ok_or_else(|| format!("can't find session: {session_name}"))?
+                .current;
+            // Snapshot the destination occupant's panes (if any) BEFORE the
+            // move, same reasoning as the same-session path above.
+            let occupant_panes: Vec<PaneId> = idx
+                .and_then(|i| {
+                    self.registry
+                        .session_mut(&dst_session_name)
+                        .and_then(|s| s.windows.iter().find(|w| w.index == i))
+                        .map(|w| w.layout.panes())
+                })
+                .unwrap_or_default();
+            self.registry
+                .move_window_to_session(&session_name, wid, &dst_session_name, idx, kill, true)?;
+            // renumber-windows is session-scoped (#26): real tmux renumbers
+            // the SOURCE session only (`windows-and-sessions.md`
+            // §renumber-windows), never the destination.
+            if self.renumber_windows_for_session(&session_name) {
+                if let Some(s) = self.registry.session_mut(&session_name) {
+                    s.renumber();
+                }
+            }
+            for pid in occupant_panes {
+                self.panes.remove(&pid);
+                self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid);
+            }
+            self.apply_layout_for_session(&session_name);
+            self.apply_layout_for_session(&dst_session_name);
+            Ok(String::new())
         }
-        for pid in occupant_panes {
-            self.panes.remove(&pid);
-            self.last_rects.remove(&pid);
-            self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
-        }
-        self.apply_layout_for_session(&session_name);
-        Ok(String::new())
     }
 
     /// `swap-window|swapw [-d] [-s src] -t dst` (SP6 Task 5,
@@ -3646,7 +3831,7 @@ impl Server {
             NextLayout { target } => self.exec_next_layout(target, None),
             SwapPane { dir, src, dst } => self.exec_swap_pane(dir, src, dst, None),
             RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
-            BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
+            BreakPane { detached, name, src, dst } => self.exec_break_pane(detached, name, src, dst, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
             SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst, detach, None),
             FindWindow { pattern } => self.exec_find_window(pattern, None),
@@ -3835,7 +4020,7 @@ impl Server {
             NextLayout { target } => wrap(self.exec_next_layout(target, Some(session_name.as_str()))),
             SwapPane { dir, src, dst } => wrap(self.exec_swap_pane(dir, src, dst, Some(session_name.as_str()))),
             RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
-            BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
+            BreakPane { detached, name, src, dst } => wrap(self.exec_break_pane(detached, name, src, dst, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
             SwapWindow { src, dst, detach } => wrap(self.exec_swap_window(src, dst, detach, Some(session_name.as_str()))),
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
@@ -5386,7 +5571,7 @@ mod focus_activity_fix_tests {
         let before_max = max_activity(&server);
         set_focus(&mut server, &session_name, wid, b);
 
-        server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
+        server.exec_break_pane(false, None, None, None, Some(&session_name)).expect("break-pane");
 
         let source_focus = focused_pane(&mut server, &session_name, wid);
         assert_eq!(source_focus, a, "test setup sanity: only A remains in the source window");
