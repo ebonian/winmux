@@ -2313,24 +2313,32 @@ impl Server {
     /// Route one decoded [`MouseEvent`] for `client` (already resolved to
     /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
     /// option is off (design spec: "mouse events with mouse off are
-    /// dropped"), or while `client` has an active confirm/prompt/choose-
-    /// tree/display-panes overlay (Task 5 decision, undecided by the brief:
-    /// real tmux's mouse-during-prompt behavior is a can of worms out of
-    /// scope here -- winmux swallows mouse events in those modes so a stray
-    /// click can never race a confirm's y/n capture or act on pane geometry
-    /// the overlay is currently hiding; documented deviation, see
-    /// `docs/follow-ups.md` #38). `ChooseTree`/`DisplayPanes` (Task 8,
-    /// added later) joined this guard in the final SP4 review fix round --
-    /// both draw full-screen, so the exact same "hidden pane geometry" risk
-    /// applies: a click/drag/wheel would otherwise focus/resize/copy-mode a
-    /// pane the user cannot currently see. Dismissal policy mirrors the
-    /// keyboard policy documented in `## overlays` of
-    /// `docs/specs/2026-07-07-parity-polish-interfaces.md`: mouse events
-    /// never dismiss either overlay (unlike display-panes' "any non-digit
-    /// KEY dismisses" rule) and never navigate/select a choose-tree row --
-    /// they are swallowed outright, same as `ConfirmCmd`/`Prompt`. Real
-    /// tmux-style mouse routing into choose-tree (click selects a row,
-    /// wheel scrolls the list) is ticketed, `docs/follow-ups.md` #61.
+    /// dropped"), or while `client` has an active confirm/prompt/display-
+    /// panes overlay, OR a choose-tree kill-confirm prompt is pending (Task
+    /// 5 decision, undecided by the brief: real tmux's mouse-during-prompt
+    /// behavior is a can of worms out of scope here -- winmux swallows
+    /// mouse events in those modes so a stray click can never race a
+    /// confirm's y/n capture or act on pane geometry the overlay is
+    /// currently hiding; documented deviation, see `docs/follow-ups.md`
+    /// #38). `DisplayPanes` (Task 8, added later) joined this guard in the
+    /// final SP4 review fix round -- it draws full-screen, so the same
+    /// "hidden pane geometry" risk applies: a click/drag/wheel would
+    /// otherwise focus/resize/copy-mode a pane the user cannot currently
+    /// see; no `docs/tmux-reference/*.md` source pins any display-panes
+    /// mouse behavior at all (`cmd_display_panes_key` is a KEY-only
+    /// handler), so this stays swallowed rather than guessed at. `ChooseTree`
+    /// (SP7 Task 10, closes follow-up #61) now routes `Down(1)` into the
+    /// tree list itself -- see [`dispatch_choose_tree_mouse`] -- UNLESS a
+    /// kill-confirm prompt is currently pending on it, which absorbs mouse
+    /// exactly like `ConfirmCmd`/`Prompt` for the same race-safety reason.
+    /// Every other choose-tree mouse event kind (wheel, drag, non-left
+    /// buttons) is still swallowed: `docs/tmux-reference/choose-tree.md`
+    /// §7.4 documents real tmux's mouse branch as click/double-click/
+    /// right-click ONLY (wheel is UNREACHABLE via mouse with `mouse on` --
+    /// "matching tmux exactly means click/double-click/right-click only");
+    /// right-click (context menu) and drag are out of scope (winmux has no
+    /// context-menu system, and `mouse.md` §2.5's drag-selection semantics
+    /// don't apply to a list overlay).
     pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         // `mouse` is session-scoped (#26).
         let mouse_on = match self.acting_session_overlay(Some(session_name)) {
@@ -2356,10 +2364,25 @@ impl Server {
             client.mode = ClientMode::Normal;
             return ExecOutcome::Ok(String::new());
         }
-        if matches!(
-            client.mode,
-            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
-        ) {
+        // SP7 Task 10 (closes follow-up #61): choose-tree gets its OWN
+        // guard, routing `Down(1)` into the tree list rather than swallowing
+        // it outright -- see `dispatch_choose_tree_mouse`. Still swallows
+        // everything (including `Down(1)`) while a kill-confirm prompt is
+        // pending on it, matching `ConfirmCmd`/`Prompt` below.
+        if let ClientMode::ChooseTree(state) = &client.mode {
+            let no_pending_kill = state.pending_kill.is_none();
+            // #64: a drag armed before the overlay opened must not survive
+            // across it (see the sibling guard below for the full
+            // rationale); `end_drag` also stops the edge-autoscroll timer.
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            if no_pending_kill && matches!(ev.kind, MouseKind::Down(1)) {
+                return self.dispatch_choose_tree_mouse(ev, client, session_name);
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(client.mode, ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::DisplayPanes(_)) {
             // #64: a drag armed before the overlay opened (keyboard-
             // triggered mid-drag) must not survive across the overlay's
             // lifetime -- clear it just like the sibling "outside pane
@@ -3133,12 +3156,27 @@ impl Server {
     /// `server::render_one` does (format/style overrides, each window's own
     /// active pane -- see #26/#71) and maps `x` through `status::
     /// status_tab_columns`, the SAME layout core `status_spans` draws from,
-    /// so the hit-test always agrees with what's actually on screen. Still
-    /// deliberately does NOT replicate `render::compose_back`'s final
-    /// spatial truncation when left+right don't fit the terminal width (a
-    /// click past that truncation point on an extremely narrow terminal may
-    /// resolve to a tab that isn't actually drawn there -- documented v1
-    /// gap, `docs/follow-ups.md`).
+    /// so the hit-test always agrees with what's actually on screen.
+    ///
+    /// VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39): this used to
+    /// carry a caveat that it doesn't replicate `render::compose_back`'s
+    /// final spatial right-truncation (when left+right don't fit the
+    /// terminal width). Re-investigated: it doesn't need to. `left`/
+    /// `right_len`/`width` (`session.size.0`) are constructed IDENTICALLY
+    /// here and in `render_one`'s status-row build (same `expand_format`/
+    /// `truncate_visible`/`truncate_chars` calls, same option reads), so
+    /// both feed `plan_tab_layout` the exact same inputs; `plan_tab_layout`
+    /// itself guarantees `left_width + list_avail == width - right_len`
+    /// whenever the list fits, and produces ZERO tab hitboxes at all
+    /// whenever it doesn't (the overflow branch's `content_w` saturates to
+    /// 0 before any clip window is computed) -- so `compose_back`'s own
+    /// final truncation step is a provable no-op under matching inputs, not
+    /// a residual gap. `status_click_past_truncation_is_noop`
+    /// (`tests/server_proto.rs`) proves the one place a hit-test bug (as
+    /// opposed to a `compose_back`-truncation-specifically bug) COULD hide
+    /// -- a click on the `<`/`>` overflow marker character itself -- is
+    /// also a no-op, matching real hitboxes (markers are drawn outside
+    /// every `TabColumn` range).
     fn mouse_status_click(&mut self, x: u16, session_name: &str) -> ExecOutcome {
         let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
             return ExecOutcome::Ok(String::new());
@@ -4610,6 +4648,100 @@ impl Server {
             h = sy_i; // mode_tree_draw's own box-size guard
         }
         h.clamp(0, sy_i.max(0)) as u16
+    }
+
+    /// Map a choose-tree overlay click's screen row `y` to an index into
+    /// `rows` (already rebuilt fresh by the caller from LIVE registry
+    /// state, `build_tree_rows`), mirroring `server::render_one`'s
+    /// `RenderOverlay::Tree` -> `render::ListOverlay` layout EXACTLY (SP7
+    /// Task 10, closes follow-up #61) so a click always resolves to the row
+    /// actually drawn there: choose-tree's `ListOverlay::title` is ALWAYS
+    /// empty (`render_one` never sets it), so there is no header-row
+    /// offset to account for; `list_height`/`preview`/`msg_reserved`/`top`
+    /// are all recomputed the SAME way `render_one`'s own `RenderOverlay::
+    /// Tree` arm does. `None` on a click outside the row list (an empty
+    /// list, the preview box below it, a reserved kill-confirm-prompt row,
+    /// or past the last row).
+    fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        let ClientMode::ChooseTree(state) = &client.mode else { return None };
+        let sel = resolve_tree_sel(rows, &state.selected, state.sel);
+        let list_height = Server::choose_tree_list_height(client.rows, client.cols, rows.len(), state.preview);
+        let preview_shown = list_height < client.rows;
+        // Mirrors `render_one`'s own `message` resolution for `ClientMode::
+        // ChooseTree`: the pending kill-confirm prompt takes priority over
+        // an ordinary transient `client.message`, but either one reserves
+        // the panel's last row exactly when no preview is showing.
+        let has_message = state.pending_kill.is_some() || client.message.is_some();
+        let msg_reserved: usize = if has_message && !preview_shown { 1 } else { 0 };
+        let visible = (list_height as usize).saturating_sub(msg_reserved);
+        if visible == 0 {
+            return None;
+        }
+        let top = sel.saturating_sub(visible.saturating_sub(1));
+        let start = top.min(rows.len());
+        let end = (start + visible).min(rows.len());
+        let idx = start + y as usize;
+        if idx < end {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Route a `Down(1)` mouse event into the acting client's open
+    /// choose-tree overlay (SP7 Task 10, closes follow-up #61;
+    /// `docs/tmux-reference/choose-tree.md` §7.4): a click on a list row
+    /// selects it (`mode_tree_key`'s mouse branch: "Click (MouseDown1) on a
+    /// list row: select that row (no choose)"); a second click on the SAME
+    /// row/button within the click-run window (`advance_click_run`, the
+    /// SAME double/triple-click tracker `mouse_down` uses for pane clicks --
+    /// choose-tree isn't touching `client.mouse` for anything else while
+    /// open, since the overlay guard in `dispatch_mouse` clears any stale
+    /// drag before ever reaching here) COMMITS it (doc: "Double-click on a
+    /// list row: select + rewrite the key to `\r` -> Enter (choose)").
+    /// `dispatch_mouse`'s caller already filtered to `Down(1)` and to "no
+    /// kill-confirm pending" before calling this, so neither is re-checked
+    /// here. A click that misses every row (blank area, the preview box, a
+    /// reserved message row) is a no-op -- no selection change, matching
+    /// real tmux's `mode_tree_key` returning early when the click doesn't
+    /// land in the list rect at all.
+    fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let (view, expanded) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone()),
+            _ => return ExecOutcome::Ok(String::new()),
+        };
+        let rows = self.build_tree_rows(session_name, view, &expanded);
+        let Some(row_idx) = self.choose_tree_row_at(client, &rows, ev.y) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(target) = rows.get(row_idx).map(|r| r.target.clone()) else {
+            return ExecOutcome::Ok(String::new());
+        };
+
+        let run = advance_click_run(&mut client.mouse, Instant::now(), ev.x, ev.y, 1);
+        if let ClientMode::ChooseTree(state) = &mut client.mode {
+            state.sel = row_idx;
+            state.selected = Some(target.clone());
+        }
+        if run < 2 {
+            return ExecOutcome::Ok(String::new());
+        }
+        // Commit (double-click): mirrors `dispatch_choose_tree_key`'s
+        // `ChooseTreeAction::Commit` arm exactly (mode -> Normal, then
+        // `exec_tree_commit`). `exec_tree_commit` needs `&mut String` only
+        // to hand a `SwitchedSession`-producing target its OLD session name
+        // to mutate-and-restore locally -- this function only has `&str`
+        // (mirrors `dispatch_mouse_cmds`'s identical `let mut sn = ...`
+        // pattern just above in this same file), and the caller applies the
+        // real session switch from the returned `ExecOutcome::
+        // SwitchedSession` regardless, same as every other mouse dispatch
+        // path here.
+        client.mode = ClientMode::Normal;
+        let mut sn = session_name.to_string();
+        self.exec_tree_commit(target, client, &mut sn)
     }
 
     /// The selected tree row's live preview content (SP6 wave 2, Task 8;

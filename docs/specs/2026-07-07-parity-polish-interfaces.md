@@ -1246,24 +1246,27 @@ simpler, and satisfies the same observable contract (the client's next
 `server::handle_stdin`'s `KeyInputEvent::Mouse` arm):**
 1. `!options.mouse()` → dropped (`Ok`, no-op) — see the `keys` amendment's
    "consume-always" note for why this drop happens here, not at decode time.
-2. `client.mode` is `ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` →
-   dropped (documented deviation: real tmux's mouse-during-prompt behavior
-   was left undecided by the task brief; winmux swallows mouse events during
-   these overlays so a stray click/drag can never race a confirm's y/n
-   capture or act on pane geometry the overlay is hiding). **Final SP4
-   review, MUST-FIX (NEW-1):** `ChooseTree`/`DisplayPanes` (Task 8, added
-   after this guard was written) joined the match arm in the merge-gate fix
-   round — both overlays draw full-screen exactly like `ConfirmCmd`/
-   `Prompt`, so the identical "hidden pane geometry" risk applies (a click
-   would silently focus, a border-drag would silently resize, a wheel would
-   silently enter copy mode on a pane the user cannot currently see). See
-   the `## overlays` section's "server::dispatch amendment: key routing"
-   subsection for the analogous KEYBOARD dismissal policy this mirrors —
-   mouse dismisses NEITHER overlay and never navigates/selects a
-   choose-tree row (a pure swallow, matching `ConfirmCmd`/`Prompt` exactly,
-   not display-panes' "any non-digit KEY dismisses" rule). Real tmux-style
-   mouse routing into choose-tree is out of scope here, ticketed
-   `docs/follow-ups.md` #61 (amends #38's scope to all four modal states).
+2. `client.mode` is `ConfirmCmd`/`Prompt`/`DisplayPanes` → dropped
+   (documented deviation: real tmux's mouse-during-prompt behavior was left
+   undecided by the task brief; winmux swallows mouse events during these
+   overlays so a stray click/drag can never race a confirm's y/n capture or
+   act on pane geometry the overlay is hiding). **Final SP4 review, MUST-FIX
+   (NEW-1):** `DisplayPanes` (Task 8, added after this guard was written)
+   joined the match arm in the merge-gate fix round — it draws full-screen
+   exactly like `ConfirmCmd`/`Prompt`, so the identical "hidden pane
+   geometry" risk applies (a click would silently focus, a border-drag
+   would silently resize, a wheel would silently enter copy mode on a pane
+   the user cannot currently see); no `docs/tmux-reference/*.md` source
+   pins any display-panes mouse behavior at all (`cmd_display_panes_key` is
+   KEY-only), so this stays a pure swallow rather than a guess.
+   `ChooseTree` gets its OWN branch: mouse dismisses it neither by key nor
+   mouse (unchanged), but **SP7 Task 10 (closes follow-up #61, amending
+   this section)** now routes `Down(1)` into `dispatch_choose_tree_mouse`
+   — click selects a row, double-click commits — UNLESS a kill-confirm
+   prompt is pending on it (`state.pending_kill.is_some()`), which still
+   swallows mouse entirely for the same y/n-race-safety reason as
+   `ConfirmCmd`/`Prompt`. See the `## overlays` section's "SP7 Task 10
+   amendment" subsection below for the full design.
 3. `y` equals the status row for THIS client (`mouse_status_row`: row 0 if
    `status-position top` else `client.rows - 1`, `None` if `status` off) →
    `dispatch_mouse_status`.
@@ -1465,10 +1468,22 @@ reconstructed the tab layout itself (unscrolled, a hardcoded
 predated SP7 Task 7's overflow scrolling and disagreed with it the moment a
 real window list actually scrolled, so a click on the visually-current tab
 could resolve to the wrong window (`tests/server_proto.rs::status_click_
-selects_correct_window_when_list_scrolled` is the regression test). Still
-does NOT replicate `render::compose_back`'s final spatial right-truncation
-(when left+right don't fit the terminal width) — documented v1 gap,
-`docs/follow-ups.md`. `WheelUp`/`WheelDown` on the status row →
+selects_correct_window_when_list_scrolled` is the regression test).
+**VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39):** re-investigated
+whether this still doesn't replicate `render::compose_back`'s final
+spatial right-truncation (when left+right don't fit the terminal width) —
+it doesn't need to. `mouse_status_click` and `render_one`'s status-row
+build construct `left`/`right_len`/`width` IDENTICALLY (same
+`expand_format`/`truncate_visible`/`truncate_chars` calls reading the same
+options, same `session.size.0`), so both feed the SAME inputs into
+`plan_tab_layout`, whose own math guarantees `left_width + list_avail ==
+width - right_len` whenever the list fits and produces ZERO tab hitboxes
+at all whenever it doesn't — `compose_back`'s own final truncation is a
+provable no-op under matching inputs. `status_click_past_truncation_is_noop`
+(`tests/server_proto.rs`) proves the one place a genuine hit-test bug
+could still hide — a click landing exactly on a `<`/`>` overflow marker
+character, which is drawn outside every `TabColumn` range — is also
+correctly a no-op. `WheelUp`/`WheelDown` on the status row →
 `exec_step_window(false, ..)` / `exec_step_window(true, ..)` (previous-window
 / next-window — tmux's default `WheelUpStatus`/`WheelDownStatus` bindings).
 
@@ -2227,20 +2242,91 @@ one difference from copy mode's own precedent, below.
   "not reprocessed" simplification).
 
 **Mouse dismissal policy while either overlay is open (final SP4 review,
-MUST-FIX NEW-1):** `server::dispatch::dispatch_mouse`'s modal guard (see the
-`## mouse` section's routing-step-2 amendment above) swallows EVERY mouse
-event — click, drag, wheel — outright while `client.mode` is `ChooseTree`
-or `DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
-handling. This is deliberately NOT the same policy as the keyboard rules
-just above: a click never dismisses either overlay (unlike display-panes'
-"any non-digit KEY dismisses" rule) and never navigates or selects a
-choose-tree row (unlike an unbound key, which is silently ignored but at
-least leaves the possibility of a future bound mouse action open — today
-there is none). The simplest, safest policy given the brief left real
-tmux's mouse-during-overlay behavior undecided: a stray click/drag/wheel
-can never act on the pane geometry either overlay is currently hiding.
-Real tmux-style routing (click selects a choose-tree row, wheel scrolls the
-list) is out of scope here — ticketed `docs/follow-ups.md` #61.
+MUST-FIX NEW-1; AMENDED by SP7 Task 10 for `ChooseTree`, see below):**
+`server::dispatch::dispatch_mouse`'s modal guard (see the `## mouse`
+section's routing-step-2 amendment above) still swallows EVERY mouse
+event — click, drag, wheel — outright while `client.mode` is
+`DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
+handling: a click never dismisses it (unlike display-panes' own "any
+non-digit KEY dismisses" keyboard rule), consistent with no
+`docs/tmux-reference/*.md` source pinning any display-panes mouse
+behavior at all. `ChooseTree` no longer follows this same blanket swallow
+— see the `## overlays` section's "SP7 Task 10 amendment" subsection
+immediately below for its real routing (closes follow-up #61).
+
+### SP7 Task 10 amendment: choose-tree mouse routing (closes follow-up #61)
+
+`docs/tmux-reference/choose-tree.md` §7.4 (`mode_tree_key`'s mouse branch):
+click selects a row (no choose), double-click selects AND commits
+(rewrites the key to Enter), right-click is a context menu (out of scope —
+winmux has no context-menu system anywhere), and **wheel is a documented
+NO-OP with `mouse on`** — tmux's mouse branch swallows every mouse key
+except the three click types before its key switch is even reached, so
+`WheelUp`/`DownPane`'s `mode_tree_up`/`_down` cases are UNREACHABLE via a
+real mouse event; the doc's own words: "matching tmux exactly means
+click/double-click/right-click only" (a wheel-scrolls-the-list mapping is
+explicitly called out as "a (defensible) divergence", not what real tmux
+does). Given this project's stated guiding principle ("be exactly like
+tmux"), winmux implements wheel as a no-op here too — a deliberate
+deviation from the task brief's own more casual "wheel scrolls the list"
+phrasing, in favor of the doc's more rigorously researched ruling.
+
+```rust
+// server::dispatch (new, private methods)
+fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize>;
+fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+```
+
+`choose_tree_row_at` maps a click's screen row `y` to an index into a
+freshly-rebuilt `rows` (`build_tree_rows`), mirroring `server::render_one`'s
+`RenderOverlay::Tree` → `render::ListOverlay` layout exactly: choose-tree's
+`ListOverlay::title` is ALWAYS empty (no header-row offset to account for),
+and `list_height`/`preview`-shown/`msg_reserved`/`top`/the visible `[start,
+end)` window are recomputed the SAME way `render_one`'s own `RenderOverlay::
+Tree` arm does (same `choose_tree_list_height` call, same
+`pending_kill.is_some() || client.message.is_some()` message-reservation
+rule). `None` (no row) on a click outside the list — an empty list, the
+preview box, a reserved kill-confirm row, or past the last row.
+
+`dispatch_choose_tree_mouse` is called from `dispatch_mouse`'s
+`ChooseTree` guard branch ONLY for `Down(1)` with no kill-confirm pending
+(both already checked by the caller). It resolves the row under `ev.y`,
+updates `state.sel`/`state.selected` to it unconditionally (a plain click
+always at least selects), then uses the SAME `advance_click_run` click-run
+tracker `mouse_down` uses for pane double/triple-clicks (choose-tree isn't
+using `client.mouse` for anything else while open) to detect a same-cell
+second press within the click window — on a `run >= 2`, it sets
+`client.mode = ClientMode::Normal` and calls `exec_tree_commit`, exactly
+mirroring `dispatch_choose_tree_key`'s `ChooseTreeAction::Commit` arm. A
+plain single click (`run == 1`) returns `Ok` with no further action —
+selection only, no choose, per the doc.
+
+`dispatch_mouse`'s `ChooseTree` guard (amended): checks
+`state.pending_kill.is_none()` BEFORE calling `dispatch_choose_tree_mouse`
+— a kill-confirm prompt (`x` was pressed, awaiting y/n) still swallows
+`Down(1)` too, exactly like `ConfirmCmd`/`Prompt`, so a stray click can
+never silently re-arm the selection out from under a pending confirm
+answer. Every other mouse event kind (wheel, `Drag`, `Up`, non-left
+buttons) reaching a `ChooseTree` client is still a pure swallow, matching
+the doc's click/double-click-only ruling above; `Drag`/`Up` additionally
+still run `end_drag` first (#64: a drag armed before the overlay opened
+must not survive across it — unchanged from the pre-existing guard).
+
+TDD evidence (`tests/server_proto.rs`): `choose_tree_click_selects_row`
+(a plain click on a non-current row, then a bare keyboard Enter, switches
+to THAT row — proving the click alone changed the selection, since a
+no-op click would leave Enter re-committing the already-current window, a
+silent non-event), `choose_tree_double_click_commits_switch` (two presses
+on the same row within the click window switches with NO keyboard
+involved at all), `choose_tree_wheel_is_noop_matching_tmux` (wheel events
+followed by a bare Enter still commit the ORIGINAL default selection, not
+whatever wheel might have moved it to), `choose_tree_click_swallowed_
+during_pending_kill_confirm` (a click during a pending `x` kill-confirm
+doesn't disrupt the confirm flow). `mouse_ignored_under_choose_tree_
+overlay` (pre-existing, Task 8 era) still passes unmodified — its click
+lands on a blank/no-row area of an (only one window) tree panel, so it's
+still a no-op for row selection too, and its actual claim (no leak-through
+to the hidden pane underneath) is unaffected by this task either way.
 
 **Task 8 review fix (Important #2) — interception applies to EVERY `Key`
 event, not just `table: Root`:** the original `Key{table, ..}` arm gated
