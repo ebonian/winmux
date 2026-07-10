@@ -43,6 +43,49 @@ pub enum KeyCode {
     Tab,
     BSpace,
     BTab,
+    /// A synthesized tmux mouse pseudo-key name (`MouseDown1Pane`,
+    /// `WheelUpStatus`, ...) -- Task 8, SP7 wave 3: table-driven mouse
+    /// bindings (closes follow-ups #57, #67(a)/(b)). `0` is the conventional
+    /// button placeholder for the two button-less kinds (`WheelUp`/
+    /// `WheelDown` -- real tmux has no "WheelUp1", `docs/tmux-reference/
+    /// mouse.md` §2.6); real button values are 1-3, matching the button
+    /// numbering [`MouseKind`] already uses for press/drag/release. Carried
+    /// in `Key.code` exactly like any other key so mouse pseudo-keys share
+    /// `Key`'s existing modifier fields (`C-`/`M-`/`S-` prefixes parse/
+    /// format identically, e.g. `C-MouseDown1Status`, matching real tmux's
+    /// key-string.c grammar).
+    MouseKey(MouseKeyKind, u8, MouseKeyLoc),
+}
+
+/// tmux's synthesized mouse pseudo-key TYPE (`docs/tmux-reference/mouse.md`
+/// §2.7/§7). Only the types winmux's `server::dispatch` classification can
+/// actually produce -- `MouseMove`/`SecondClick`/button numbers 6-11 are real
+/// tmux key-string.c entries but never arise from winmux's SGR-1002 (button-
+/// event, not all-motion) tracking, so they are not modeled.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyKind {
+    Down,
+    Up,
+    Drag,
+    DragEnd,
+    DoubleClick,
+    TripleClick,
+    WheelUp,
+    WheelDown,
+}
+
+/// tmux's synthesized mouse pseudo-key LOCATION -- the subset winmux's
+/// classification produces. The scrollbar/`ControlN` locations (post-3.5
+/// tmux features per `docs/tmux-reference/mouse.md`'s vintage note) are out
+/// of scope.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyLoc {
+    Pane,
+    Border,
+    Status,
+    StatusLeft,
+    StatusRight,
+    StatusDefault,
 }
 
 fn plain(code: KeyCode) -> Key {
@@ -117,6 +160,12 @@ pub fn parse_key(s: &str) -> Option<Key> {
             .and_then(|n| n.parse::<u8>().ok())
             .map(KeyCode::F),
     };
+    // Mouse pseudo-key names (`MouseDown1Pane`, `WheelUpStatus`, ...) are
+    // multi-char tokens like the named keys above, so they must be tried
+    // before the single-char `parse_char` fallback below (Task 8, SP7 wave
+    // 3). Case-insensitive, matching real tmux's `strcasecmp`-based
+    // `key_string_search_table` (`key-string.c`).
+    let code = code.or_else(|| parse_mouse_key_name(rest));
 
     match code {
         Some(code) => Some(Key {
@@ -127,6 +176,88 @@ pub fn parse_key(s: &str) -> Option<Key> {
         }),
         None => parse_char(rest, ctrl, meta, shift),
     }
+}
+
+/// Parse a tmux mouse pseudo-key name (`<Type><Button><Location>`, e.g.
+/// `MouseDown1Pane`, `WheelUpStatus` -- no button digit for the two wheel
+/// types). Case-insensitive. Longer/more-specific type prefixes are tried
+/// first so `MouseDragEnd...` is never misparsed as `MouseDrag` + a bogus
+/// `End...` location (`docs/tmux-reference/mouse.md` §2.7/§7 is the exact
+/// name list this reproduces).
+fn parse_mouse_key_name(s: &str) -> Option<KeyCode> {
+    const TYPES: &[(&str, MouseKeyKind, bool)] = &[
+        ("mousedragend", MouseKeyKind::DragEnd, true),
+        ("mousedown", MouseKeyKind::Down, true),
+        ("mouseup", MouseKeyKind::Up, true),
+        ("mousedrag", MouseKeyKind::Drag, true),
+        ("doubleclick", MouseKeyKind::DoubleClick, true),
+        ("tripleclick", MouseKeyKind::TripleClick, true),
+        ("wheelup", MouseKeyKind::WheelUp, false),
+        ("wheeldown", MouseKeyKind::WheelDown, false),
+    ];
+    let lower = s.to_ascii_lowercase();
+    for (prefix, kind, has_button) in TYPES {
+        let Some(rest) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let (button, loc_str) = if *has_button {
+            let mut chars = rest.chars();
+            let b = chars.next()?;
+            if !('1'..='3').contains(&b) {
+                return None; // this prefix is uniquely matched; a bad button
+                             // digit is a malformed name, not "try the next
+                             // candidate type" (no two type prefixes collide).
+            }
+            (b as u8 - b'0', &rest[1..])
+        } else {
+            (0u8, rest)
+        };
+        let loc = parse_mouse_loc(loc_str)?;
+        return Some(KeyCode::MouseKey(*kind, button, loc));
+    }
+    None
+}
+
+fn parse_mouse_loc(s: &str) -> Option<MouseKeyLoc> {
+    match s {
+        "pane" => Some(MouseKeyLoc::Pane),
+        "border" => Some(MouseKeyLoc::Border),
+        "statusleft" => Some(MouseKeyLoc::StatusLeft),
+        "statusright" => Some(MouseKeyLoc::StatusRight),
+        "statusdefault" => Some(MouseKeyLoc::StatusDefault),
+        "status" => Some(MouseKeyLoc::Status),
+        _ => None,
+    }
+}
+
+fn mouse_kind_str(k: MouseKeyKind) -> &'static str {
+    match k {
+        MouseKeyKind::Down => "MouseDown",
+        MouseKeyKind::Up => "MouseUp",
+        MouseKeyKind::Drag => "MouseDrag",
+        MouseKeyKind::DragEnd => "MouseDragEnd",
+        MouseKeyKind::DoubleClick => "DoubleClick",
+        MouseKeyKind::TripleClick => "TripleClick",
+        MouseKeyKind::WheelUp => "WheelUp",
+        MouseKeyKind::WheelDown => "WheelDown",
+    }
+}
+
+fn mouse_loc_str(l: MouseKeyLoc) -> &'static str {
+    match l {
+        MouseKeyLoc::Pane => "Pane",
+        MouseKeyLoc::Border => "Border",
+        MouseKeyLoc::Status => "Status",
+        MouseKeyLoc::StatusLeft => "StatusLeft",
+        MouseKeyLoc::StatusRight => "StatusRight",
+        MouseKeyLoc::StatusDefault => "StatusDefault",
+    }
+}
+
+/// `WheelUp`/`WheelDown` carry no button digit in tmux's naming (there is no
+/// "WheelUp1") -- every other mouse-key type does.
+fn mouse_kind_has_button(k: MouseKeyKind) -> bool {
+    !matches!(k, MouseKeyKind::WheelUp | MouseKeyKind::WheelDown)
 }
 
 fn parse_char(rest: &str, ctrl: bool, meta: bool, shift: bool) -> Option<Key> {
@@ -182,6 +313,13 @@ pub fn key_name(k: &Key) -> String {
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::BSpace => "BSpace".to_string(),
         KeyCode::BTab => "BTab".to_string(),
+        KeyCode::MouseKey(kind, btn, loc) => {
+            if mouse_kind_has_button(kind) {
+                format!("{}{}{}", mouse_kind_str(kind), btn, mouse_loc_str(loc))
+            } else {
+                format!("{}{}", mouse_kind_str(kind), mouse_loc_str(loc))
+            }
+        }
     };
     format!("{prefix}{body}")
 }
@@ -283,6 +421,10 @@ fn encode_named(code: KeyCode) -> Option<Vec<u8>> {
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
             unreachable!("arrows are handled by encode_key before reaching encode_named")
         }
+        // A mouse pseudo-key isn't a byte sequence `send-keys` can write to a
+        // pane -- same "unsupported combination" contract as ctrl-on-a-
+        // named-key above.
+        KeyCode::MouseKey(..) => None,
     }
 }
 
@@ -805,6 +947,85 @@ mod tests {
         assert_eq!(parse_key("C-"), None);
         assert_eq!(parse_key("Fxx"), None);
         assert_eq!(parse_key("ab"), None);
+    }
+
+    // ---- mouse pseudo-key names (Task 8, SP7 wave 3) ----
+
+    #[test]
+    fn parse_mouse_key_names_roundtrip() {
+        let button_kinds: &[MouseKeyKind] = &[
+            MouseKeyKind::Down,
+            MouseKeyKind::Up,
+            MouseKeyKind::Drag,
+            MouseKeyKind::DragEnd,
+            MouseKeyKind::DoubleClick,
+            MouseKeyKind::TripleClick,
+        ];
+        let wheel_kinds: &[MouseKeyKind] = &[MouseKeyKind::WheelUp, MouseKeyKind::WheelDown];
+        let locs: &[MouseKeyLoc] = &[
+            MouseKeyLoc::Pane,
+            MouseKeyLoc::Border,
+            MouseKeyLoc::Status,
+            MouseKeyLoc::StatusLeft,
+            MouseKeyLoc::StatusRight,
+            MouseKeyLoc::StatusDefault,
+        ];
+        for &kind in button_kinds {
+            for btn in 1..=3u8 {
+                for &loc in locs {
+                    let key = Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false };
+                    let name = key_name(&key);
+                    assert_eq!(parse_key(&name), Some(key), "round-trip of {name:?}");
+                }
+            }
+        }
+        for &kind in wheel_kinds {
+            for &loc in locs {
+                let key = Key { code: KeyCode::MouseKey(kind, 0, loc), ctrl: false, meta: false, shift: false };
+                let name = key_name(&key);
+                assert_eq!(parse_key(&name), Some(key), "round-trip of {name:?}");
+            }
+        }
+
+        // Exact canonical spellings.
+        assert_eq!(
+            key_name(&Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Pane), ctrl: false, meta: false, shift: false }),
+            "MouseDown1Pane"
+        );
+        assert_eq!(
+            key_name(&Key {
+                code: KeyCode::MouseKey(MouseKeyKind::DragEnd, 1, MouseKeyLoc::Pane),
+                ctrl: false,
+                meta: false,
+                shift: false
+            }),
+            "MouseDragEnd1Pane"
+        );
+        assert_eq!(
+            key_name(&Key { code: KeyCode::MouseKey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status), ctrl: false, meta: false, shift: false }),
+            "WheelUpStatus"
+        );
+
+        // Case-insensitive parse (tmux's `strcasecmp`-based lookup).
+        assert_eq!(
+            parse_key("mousedown1pane"),
+            Some(Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Pane), ctrl: false, meta: false, shift: false })
+        );
+
+        // Modifier prefixes combine with mouse keys exactly like any other key.
+        assert_eq!(
+            parse_key("C-MouseDown1Status"),
+            Some(Key { code: KeyCode::MouseKey(MouseKeyKind::Down, 1, MouseKeyLoc::Status), ctrl: true, meta: false, shift: false })
+        );
+    }
+
+    #[test]
+    fn invalid_mouse_name_rejected() {
+        assert_eq!(parse_key("MouseDown4Pane"), None, "button out of 1-3 range");
+        assert_eq!(parse_key("MouseDown1Nowhere"), None, "unrecognized location");
+        assert_eq!(parse_key("MouseClickPane"), None, "unrecognized type");
+        assert_eq!(parse_key("WheelUp1Pane"), None, "wheel types carry no button digit");
+        assert_eq!(parse_key("MouseDown"), None, "type with no button/location at all");
     }
 
     // ---- key_name / round-trip ----

@@ -2265,3 +2265,159 @@ rejected_same_as_global`, `overlay_user_option_roundtrip`,
 `set_without_g_targets_current_session`,
 `show_gqv_user_option_prints_value_only`,
 `pane_base_index_shifts_display_panes_digits_and_hash_p`.
+
+## `mouse-bindings` — table-driven mouse bindings (SP7 Task 8, closes follow-ups #57, #67(a)/(b))
+
+Parity authority: `docs/tmux-reference/mouse.md` §2.6-2.7 (key-synthesis
+grammar), §7.1/§7.3 (default binding tables). Before this task every mouse
+behavior (click-focus, border-drag-resize, wheel-scroll, drag-select,
+double/triple-click, status-row click/wheel) was a hardcoded `match` in
+`server::dispatch::dispatch_mouse` and its helpers — this task moves the
+ACTION side of that dispatch onto `Bindings` (keyed by a new mouse pseudo-key
+`KeyCode` variant), while classification (hit-testing pane/border/status,
+drag-state-machine transitions, click-run/double-triple-click counting) stays
+exactly as it was — per the task brief, "hit-testing, drag lifecycle,
+double/triple-click detection STAYS in dispatch; only the action lookup moves
+to the table."
+
+```rust
+// src/keys.rs (additions)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KeyCode {
+    // ...existing variants unchanged...
+    /// `0` is the button placeholder for `WheelUp`/`WheelDown` (real tmux
+    /// has no "WheelUp1"); real button values are 1-3.
+    MouseKey(MouseKeyKind, u8, MouseKeyLoc),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyKind { Down, Up, Drag, DragEnd, DoubleClick, TripleClick, WheelUp, WheelDown }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MouseKeyLoc { Pane, Border, Status, StatusLeft, StatusRight, StatusDefault }
+```
+
+`parse_key`/`key_name` grew mouse-pseudo-key support (`<Type><Button><Location>`,
+case-insensitive on parse, canonical tmux capitalization on format — e.g.
+`MouseDown1Pane`, `WheelUpStatus`, `C-MouseDown1Status`); `encode_key` returns
+`None` for a mouse key (not sendable via `send-keys`, same "unsupported
+combination" contract as ctrl-on-a-named-key). Only the subset winmux's SGR
+button-event (`?1002h`) classification can actually produce is modeled —
+`MouseMove`/`SecondClick`/buttons 6-11/scrollbar-and-`ControlN` locations
+(all real tmux `key-string.c` entries) are out of scope, matching the parity
+doc's own "for classic winmux purposes" location list.
+
+```rust
+// src/bindings.rs (additions)
+// Sentinel default-action generators for mouse defaults that need
+// dispatch-local context (which pane, drag anchor, click-run state) no
+// static RawCmd can carry -- server::dispatch compares a resolved binding's
+// cmds against these EXACT values to pick "run the built-in Rust default"
+// vs "the user rebound this, run it generically". Four of the ten (wheel
+// in-pane x2 tables, drag-end-in-copy, wheel-in-status x2) are instead
+// expressed as REAL, generically-executable command lists and need no such
+// comparison -- dispatch always runs whatever's bound for those.
+pub(crate) fn mouse_default_drag_border() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_drag_pane_enter_copy() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_drag_pane_select() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_double_click_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_triple_click_pane() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_status_select_window() -> Vec<RawCmd>;
+pub(crate) fn mouse_default_wheel_up_pane_root() -> Vec<RawCmd>;   // [copy-mode -e, copy-scroll-up x5]
+pub(crate) fn mouse_default_wheel_up_pane_copy() -> Vec<RawCmd>;   // [copy-scroll-up x5]
+pub(crate) fn mouse_default_wheel_down_pane_copy() -> Vec<RawCmd>; // [copy-scroll-down x5]
+pub(crate) fn mouse_default_drag_end_pane_copy() -> Vec<RawCmd>;   // [copy-selection-and-cancel]
+pub(crate) fn mouse_default_wheel_up_status() -> Vec<RawCmd>;      // [previous-window]
+pub(crate) fn mouse_default_wheel_down_status() -> Vec<RawCmd>;    // [next-window]
+```
+
+`Bindings::default()`'s root table is no longer empty: it gains
+`MouseDrag1Border`, `MouseDrag1Pane`, `WheelUpPane`, `MouseDown1Status`,
+`WheelUpStatus`, `WheelDownStatus` (6 entries — `WheelDownPane` is
+deliberately absent at root, matching real tmux). The copy-mode and
+copy-mode-vi tables each gain 6 mouse entries, byte-identical between the two
+(matching real tmux): `MouseDrag1Pane`, `MouseDragEnd1Pane`, `WheelUpPane`,
+`WheelDownPane`, `DoubleClick1Pane`, `TripleClick1Pane`.
+
+```rust
+// src/server/dispatch.rs (additions, all private)
+impl Server {
+    fn mouse_table_for_pane(&self, client: &ClientState, pane: PaneId) -> WhichTable;
+    fn mouse_lookup(&self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Option<Vec<RawCmd>>;
+    fn dispatch_mouse_cmds(&mut self, cmds: &[RawCmd], client: &mut ClientState, session_name: &str) -> ExecOutcome;
+    fn dispatch_mouse_bound(&mut self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+}
+```
+
+`mouse_lookup` always synthesizes the UNMODIFIED key form (`ctrl`/`meta`/
+`shift: false`) regardless of the physical event's own modifier bits — the
+pre-existing hardcoded dispatch never branched on them either, so this
+reproduces that exactly; modifier-specific tmux defaults (`C-MouseDown1Pane`,
+`M-MouseDrag1Pane`) are a documented gap, not modeled. `mouse_up`'s signature
+grew a `session_name: &str` parameter (needed to reach `dispatch_mouse_bound`
+for `MouseDragEnd1Pane`); its only caller (`dispatch_mouse`) already had one.
+
+### The default/custom/unbound three-way (per gated key)
+
+For keys whose default needs bespoke Rust state (drag anchor, word/line
+select, status-column resolution): `None` (unbound) is a no-op (or, for
+`MouseDrag1Pane`'s two PendingSelect arms and `DoubleClick`/`TripleClick`,
+falls back to plain-click semantics — no default in real tmux either);
+`Some(cmds) if cmds == default` runs the SAME Rust logic this task found
+hardcoded, now gated; `Some(cmds)` (a user override) runs generically via
+`dispatch_mouse_cmds`. For keys whose default is fully expressible as real
+commands (`WheelUp`/`DownPane` in both tables, `MouseDragEnd1Pane` in the
+copy tables, `WheelUp`/`DownStatus`): `dispatch_mouse_bound` always runs
+whatever's bound, default or custom, uniformly — no comparison needed.
+
+### Scoping decisions (NOT gated — documented, low-risk simplifications)
+
+- **Click-to-focus** (`MouseDown{1,2,3}Pane`'s `select-pane` and
+  `MouseDown{1,2,3}Border`'s arm-time bookkeeping) stays unconditional —
+  the highest-traffic code path in every mouse test, with no required test
+  exercising an unbound click; gating it was judged the highest-risk,
+  lowest-value change in scope.
+- **Border-drag resize** (`MouseDrag1Border`) is gated only at ARM time
+  (the `Down` event on a border checks existence — bound vs unbound — once);
+  `mouse_drag`/`mouse_drag_border`'s per-motion resize logic is untouched
+  and unconditional once armed, matching real tmux's own "bindings are
+  bypassed for every motion event during a callback drag"
+  (`docs/tmux-reference/mouse.md` §2.5) more closely than re-checking every
+  event would. A user's custom `MouseDrag1Border` command is therefore
+  NOT run (only bound-vs-unbound is honored) — border resize inherently
+  needs continuous per-motion state a static command list can't replace.
+- **Selection continuation** (`MouseDrag::Selecting{..}`'s per-motion
+  cursor/autoscroll updates once a drag is underway) stays unconditional,
+  for the same "bypass during an active drag" reason and to minimize
+  regression surface — only the FIRST motion event of a drag (the
+  `PendingSelect` -> `Selecting` transition) is gated.
+- **`DoubleClick`/`TripleClick1Pane`, `MouseDown1Status`** — gated with the
+  full default/custom/unbound three-way (bespoke Rust default: word/line
+  select, or the click-column-to-window resolution respectively).
+
+### Follow-up #67(a): `unbind-key -q`
+
+`cmd::ParsedCmd::UnbindKey` gained a `quiet: bool` field (`-q`, parsed
+alongside the pre-existing `-a`/`-n`/`-T`); `dispatch::exec_unbind_key` now
+errors `unknown key: <tok>` for a token `keys::parse_key` rejects, unless
+`quiet` is set (matching real tmux, `docs/tmux-reference/
+commands-config-options-formats.md:442`) — the prior unconditional silent-
+no-op behavior (a workaround for mouse pseudo-keys not parsing at all) is
+gone now that those keys parse for real.
+
+### Tests
+
+`src/keys.rs`: `parse_mouse_key_names_roundtrip`, `invalid_mouse_name_rejected`.
+`src/bindings.rs`: `default_root_table_contains_mouse_bindings`,
+`copy_mode_mouse_defaults_exact` (plus updated length assertions in
+`defaults_cover_current_behavior`/`copy_mode_emacs_defaults_exact`/
+`copy_mode_vi_defaults_exact`). `src/cmd.rs`: `unbind_key_quiet_flag_parses`.
+`src/server/dispatch.rs`: `bind_unbind_copy_mode_tables` updated (a real
+mouse pseudo-key now actually removes a real default binding; the "bad key"
+example moved to a genuinely unparseable token). `tests/server_proto.rs`:
+`unbind_copy_mode_vi_dragend_disables_release_copy` (the user's real conf
+idiom, full SGR drag+release, no buffer created, copy mode stays active),
+`bind_wheelup_pane_custom_command_overrides_default`,
+`unbind_unknown_key_errors_without_q`, `unbind_unknown_key_quiet_with_q` —
+plus every pre-existing `mouse_*`/`click_*`/`drag_*`/`release_*` test in that
+file is the regression net (all pass unchanged).

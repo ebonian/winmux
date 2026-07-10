@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::cmd::RawCmd;
 use crate::input::WhichTable;
-use crate::keys::{self, Key, KeyCode};
+use crate::keys::{self, Key, KeyCode, MouseKeyKind, MouseKeyLoc};
 
 /// One bound command: the command(s) to run when the binding fires (stored
 /// unresolved) and whether the binding is repeatable (`-r`; matches tmux's
@@ -58,6 +58,110 @@ fn char_key(c: char) -> Key {
 
 fn named(s: &str) -> Key {
     keys::parse_key(s).unwrap_or_else(|| panic!("bad default-binding key notation: {s}"))
+}
+
+fn mkey(kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Key {
+    Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false }
+}
+
+// ---- mouse default-action sentinels (Task 8, SP7 wave 3: table-driven
+// mouse bindings, closes follow-ups #57, #67(a)/(b)) ----
+//
+// Some tmux mouse defaults need dispatch-local context (which pane is under
+// the pointer, the drag anchor position, click-run state) that can't be
+// expressed as static `RawCmd` args -- `server::dispatch::dispatch_mouse`
+// compares a resolved binding's `cmds` against the exact values these
+// functions return to decide "run the built-in Rust default logic" (the
+// SAME code that ran unconditionally before this task) vs "the user rebound
+// this key, execute whatever they bound generically". The sentinel command
+// names below (`mouse-drag-border` etc.) are not real `cmd::resolve`
+// commands -- they exist purely as unique, stable markers.
+//
+// The other four mouse defaults below (`mouse_default_wheel_up_pane_copy`
+// and friends) need NO bespoke Rust logic at all: they're expressed as real,
+// generically-executable command lists (`copy-mode -e`, `copy-scroll-up`,
+// `copy-selection-and-cancel`, `previous-window`, `next-window` -- all
+// pre-existing commands), so `dispatch_mouse` always runs whatever's bound
+// for these through the normal command pipeline, default or overridden
+// alike, with no separate comparison. See the `## mouse` contract section
+// amendment for the full tmux-default -> winmux-substitution table.
+pub(crate) fn mouse_default_drag_border() -> Vec<RawCmd> {
+    vec![cmd1("mouse-drag-border", &[])]
+}
+pub(crate) fn mouse_default_drag_pane_enter_copy() -> Vec<RawCmd> {
+    vec![cmd1("mouse-drag-pane-enter-copy", &[])]
+}
+pub(crate) fn mouse_default_drag_pane_select() -> Vec<RawCmd> {
+    vec![cmd1("mouse-drag-pane-select", &[])]
+}
+pub(crate) fn mouse_default_double_click_pane() -> Vec<RawCmd> {
+    vec![cmd1("mouse-double-click-pane", &[])]
+}
+pub(crate) fn mouse_default_triple_click_pane() -> Vec<RawCmd> {
+    vec![cmd1("mouse-triple-click-pane", &[])]
+}
+pub(crate) fn mouse_default_status_select_window() -> Vec<RawCmd> {
+    vec![cmd1("mouse-status-select-window", &[])]
+}
+
+/// `copy-mode -e` (enters copy mode with `scroll_exit` armed) then 5x
+/// `copy-scroll-up` -- `5` mirrors `server::MOUSE_WHEEL_STEP`, a private
+/// `server.rs` const this module can't reach across the crate's privacy
+/// boundary; keep the two in sync by hand if either changes.
+pub(crate) fn mouse_default_wheel_up_pane_root() -> Vec<RawCmd> {
+    let mut v = vec![cmd1("copy-mode", &["-e"])];
+    v.extend(std::iter::repeat_with(|| cmd1("copy-scroll-up", &[])).take(5));
+    v
+}
+pub(crate) fn mouse_default_wheel_up_pane_copy() -> Vec<RawCmd> {
+    std::iter::repeat_with(|| cmd1("copy-scroll-up", &[])).take(5).collect()
+}
+pub(crate) fn mouse_default_wheel_down_pane_copy() -> Vec<RawCmd> {
+    std::iter::repeat_with(|| cmd1("copy-scroll-down", &[])).take(5).collect()
+}
+pub(crate) fn mouse_default_drag_end_pane_copy() -> Vec<RawCmd> {
+    vec![cmd1("copy-selection-and-cancel", &[])]
+}
+pub(crate) fn mouse_default_wheel_up_status() -> Vec<RawCmd> {
+    vec![cmd1("previous-window", &[])]
+}
+pub(crate) fn mouse_default_wheel_down_status() -> Vec<RawCmd> {
+    vec![cmd1("next-window", &[])]
+}
+
+/// Root-table mouse defaults (`docs/tmux-reference/mouse.md` §7.1, the
+/// subset winmux's dispatch classification actually reproduces -- see the
+/// task report's substitution table for what's intentionally NOT bindable
+/// yet, e.g. plain click-to-focus, which stays unconditional).
+fn root_mouse_defaults() -> HashMap<Key, Binding> {
+    let mut t: HashMap<Key, Binding> = HashMap::new();
+    let mut b = |k: Key, cmds: Vec<RawCmd>| {
+        t.insert(canonical_key(k), Binding { cmds, repeat: false });
+    };
+    b(mkey(MouseKeyKind::Drag, 1, MouseKeyLoc::Border), mouse_default_drag_border());
+    b(mkey(MouseKeyKind::Drag, 1, MouseKeyLoc::Pane), mouse_default_drag_pane_enter_copy());
+    b(mkey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Pane), mouse_default_wheel_up_pane_root());
+    b(mkey(MouseKeyKind::Down, 1, MouseKeyLoc::Status), mouse_default_status_select_window());
+    b(mkey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status), mouse_default_wheel_up_status());
+    b(mkey(MouseKeyKind::WheelDown, 0, MouseKeyLoc::Status), mouse_default_wheel_down_status());
+    t
+}
+
+/// Copy-mode mouse defaults, shared verbatim between the emacs and vi tables
+/// -- real tmux's mouse bindings are "byte-identical" between the two
+/// (`docs/tmux-reference/mouse.md` §7.3).
+fn copy_mode_mouse_defaults() -> HashMap<Key, Binding> {
+    let mut t: HashMap<Key, Binding> = HashMap::new();
+    let mut b = |k: Key, cmds: Vec<RawCmd>| {
+        t.insert(canonical_key(k), Binding { cmds, repeat: false });
+    };
+    b(mkey(MouseKeyKind::Drag, 1, MouseKeyLoc::Pane), mouse_default_drag_pane_select());
+    b(mkey(MouseKeyKind::DragEnd, 1, MouseKeyLoc::Pane), mouse_default_drag_end_pane_copy());
+    b(mkey(MouseKeyKind::WheelUp, 0, MouseKeyLoc::Pane), mouse_default_wheel_up_pane_copy());
+    b(mkey(MouseKeyKind::WheelDown, 0, MouseKeyLoc::Pane), mouse_default_wheel_down_pane_copy());
+    b(mkey(MouseKeyKind::DoubleClick, 1, MouseKeyLoc::Pane), mouse_default_double_click_pane());
+    b(mkey(MouseKeyKind::TripleClick, 1, MouseKeyLoc::Pane), mouse_default_triple_click_pane());
+    t
 }
 
 impl Default for Bindings {
@@ -191,7 +295,7 @@ impl Default for Bindings {
         // tmux's default `prefix t` (`key-bindings.c:433`).
         b(char_key('t'), vec![cmd1("clock-mode", &[])], false);
 
-        Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
+        Bindings { root: root_mouse_defaults(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
 
@@ -248,6 +352,7 @@ fn copy_mode_emacs_defaults() -> HashMap<Key, Binding> {
     b(char_key('n'), "copy-search-again", &[]);
     b(char_key('N'), "copy-search-reverse", &[]);
 
+    t.extend(copy_mode_mouse_defaults());
     t
 }
 
@@ -320,6 +425,7 @@ fn copy_mode_vi_defaults() -> HashMap<Key, Binding> {
     b(char_key('n'), "copy-search-again", &[]);
     b(char_key('N'), "copy-search-reverse", &[]);
 
+    t.extend(copy_mode_mouse_defaults());
     t
 }
 
@@ -529,8 +635,36 @@ mod tests {
         // ... and nothing else: the prefix table is exactly this set.
         assert_eq!(b.prefix.len(), expected.len());
 
-        // Root table has no defaults in SP3.
-        assert!(b.root.is_empty());
+        // Root table: SP3 had none; Task 8 (SP7 wave 3) adds the mouse
+        // defaults asserted in detail by `default_root_table_contains_mouse_bindings`
+        // below -- and nothing else (no keyboard `bind -n` defaults exist).
+        assert_eq!(b.root.len(), 6);
+    }
+
+    /// Task 8 (SP7 wave 3, closes #57/#67): the root table's mouse defaults,
+    /// reproducing exactly the tmux-default behaviors winmux's dispatch
+    /// classification wires up (`docs/tmux-reference/mouse.md` §7.1
+    /// subset -- see the task report's substitution table for the rest).
+    #[test]
+    fn default_root_table_contains_mouse_bindings() {
+        let b = Bindings::default();
+        let expected: &[(&str, Vec<RawCmd>)] = &[
+            ("MouseDrag1Border", mouse_default_drag_border()),
+            ("MouseDrag1Pane", mouse_default_drag_pane_enter_copy()),
+            ("WheelUpPane", mouse_default_wheel_up_pane_root()),
+            ("MouseDown1Status", mouse_default_status_select_window()),
+            ("WheelUpStatus", mouse_default_wheel_up_status()),
+            ("WheelDownStatus", mouse_default_wheel_down_status()),
+        ];
+        for (k, cmds) in expected {
+            let binding = b.lookup(WhichTable::Root, &key(k)).unwrap_or_else(|| panic!("default root mouse binding missing for {k}"));
+            assert_eq!(&binding.cmds, cmds, "wrong command for root {k}");
+            assert!(!binding.repeat);
+        }
+        assert_eq!(b.root.len(), expected.len());
+        // `WheelDownPane` is deliberately unbound at root (real tmux has no
+        // default there either -- see `docs/tmux-reference/mouse.md` §6).
+        assert!(b.lookup(WhichTable::Root, &key("WheelDownPane")).is_none());
     }
 
     /// #34 (Space/`Char(' ')` binding equivalence): a binding registered
@@ -692,7 +826,32 @@ mod tests {
             );
             assert!(!binding.repeat);
         }
-        assert_eq!(b.copy_mode.len(), expected.len());
+        // + 6: the copy-mode mouse defaults (Task 8, SP7 wave 3), asserted
+        // in detail by `copy_mode_mouse_defaults_exact` below.
+        assert_eq!(b.copy_mode.len(), expected.len() + 6);
+    }
+
+    /// Task 8 (SP7 wave 3): the copy-mode/copy-mode-vi mouse defaults are
+    /// "byte-identical" in real tmux (`docs/tmux-reference/mouse.md` §7.3) --
+    /// asserted once here for both tables via the shared sentinel
+    /// generators.
+    #[test]
+    fn copy_mode_mouse_defaults_exact() {
+        let b = Bindings::default();
+        let expected: &[(&str, Vec<RawCmd>)] = &[
+            ("MouseDrag1Pane", mouse_default_drag_pane_select()),
+            ("MouseDragEnd1Pane", mouse_default_drag_end_pane_copy()),
+            ("WheelUpPane", mouse_default_wheel_up_pane_copy()),
+            ("WheelDownPane", mouse_default_wheel_down_pane_copy()),
+            ("DoubleClick1Pane", mouse_default_double_click_pane()),
+            ("TripleClick1Pane", mouse_default_triple_click_pane()),
+        ];
+        for table in [WhichTable::CopyMode, WhichTable::CopyModeVi] {
+            for (k, cmds) in expected {
+                let binding = b.lookup(table, &key(k)).unwrap_or_else(|| panic!("default {table:?} mouse binding missing for {k}"));
+                assert_eq!(&binding.cmds, cmds, "wrong command for {table:?} {k}");
+            }
+        }
     }
 
     /// Copy-mode-vi default table: same exactness check.
@@ -748,7 +907,9 @@ mod tests {
                 "wrong command for copy-mode-vi {k}"
             );
         }
-        assert_eq!(b.copy_mode_vi.len(), expected.len());
+        // + 6: the copy-mode-vi mouse defaults (Task 8, SP7 wave 3),
+        // asserted in detail by `copy_mode_mouse_defaults_exact` above.
+        assert_eq!(b.copy_mode_vi.len(), expected.len() + 6);
     }
 
     #[test]

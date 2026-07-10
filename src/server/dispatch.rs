@@ -26,11 +26,14 @@ use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 
-use crate::bindings::Binding;
+use crate::bindings::{
+    mouse_default_double_click_pane, mouse_default_drag_pane_enter_copy, mouse_default_drag_pane_select,
+    mouse_default_status_select_window, mouse_default_triple_click_pane, Binding,
+};
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
-use crate::keys::{Key, KeyCode, MouseEvent, MouseKind};
+use crate::keys::{Key, KeyCode, MouseEvent, MouseKeyKind, MouseKeyLoc, MouseKind};
 use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::{self, FormatCtx};
@@ -2021,7 +2024,77 @@ impl Server {
         ExecOutcome::Ok(String::new())
     }
 
-    // ---- mouse (Task 5, sub-project 4) ----
+    // ---- mouse (Task 5, sub-project 4; table-driven since Task 8, SP7 wave 3) ----
+
+    /// Which key table a `Pane`-location mouse key resolves against: the
+    /// pane's copy-mode table (emacs/vi per `mode-keys`) if `pane` is the
+    /// SAME pane the client is currently in copy mode on, else `Root` --
+    /// mirrors the keyboard `Key`-event substitution rule at
+    /// `server.rs::process_key_events`'s `KeyInputEvent::Key` arm, and real
+    /// tmux's own "target pane in a mode uses the mode table" dispatch rule
+    /// (`docs/tmux-reference/mouse.md` `## 3`). `Border`/`Status*` locations
+    /// have no target pane and are always resolved against `Root` directly
+    /// by their call sites (this helper is only for `Pane`-location keys).
+    fn mouse_table_for_pane(&self, client: &ClientState, pane: PaneId) -> WhichTable {
+        if let ClientMode::Copy(cs) = &client.mode {
+            if cs.pane == pane {
+                return if self.mode_keys_vi_for_pane(pane) { WhichTable::CopyModeVi } else { WhichTable::CopyMode };
+            }
+        }
+        WhichTable::Root
+    }
+
+    /// Resolve a synthesized mouse pseudo-key against `table`, ignoring the
+    /// event's own modifier bits (Task 8 scoping decision: winmux's PRE-
+    /// existing hardcoded mouse dispatch never branched on `MouseEvent::
+    /// ctrl/meta/shift` at all, so always looking up the UNMODIFIED key form
+    /// here reproduces that exactly -- modifier-specific tmux defaults like
+    /// `C-MouseDown1Pane`/`M-MouseDrag1Pane` are a documented gap, not
+    /// modeled). `None` = unbound (silent no-op, matching real tmux's
+    /// "unbound mouse key -> forwarded to the pane app or dropped" -- winmux
+    /// has no app-mouse passthrough yet, follow-up #72).
+    fn mouse_lookup(&self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Option<Vec<RawCmd>> {
+        let key = Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false };
+        self.bindings.lookup(table, &key).map(|b| b.cmds.clone())
+    }
+
+    /// Execute an already-resolved binding's `cmds` (default OR user-
+    /// overridden) through the SAME command pipeline keyboard bindings use
+    /// (`dispatch_client`/`cmd::resolve`/`execute_for_client`) -- used for
+    /// every mouse default that's expressible as real, generically-
+    /// executable commands (`copy-mode -e`, `copy-scroll-up`,
+    /// `copy-selection-and-cancel`, `previous-window`, `next-window`), so a
+    /// user override "just works" with no special-casing. `session_name` is
+    /// a throwaway local copy (`dispatch_client` takes `&mut String` for its
+    /// bare-rename-prompt special case) -- a mouse-bound command that
+    /// SWITCHES the acting session is a documented non-goal of this task
+    /// (out of scope: no required test exercises it, and `dispatch_mouse`'s
+    /// own signature -- shared with `server.rs`, outside this task's file
+    /// scope -- takes `session_name: &str`, not `&mut`).
+    fn dispatch_mouse_cmds(&mut self, cmds: &[RawCmd], client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let mut sn = session_name.to_string();
+        self.dispatch_client(cmds, client, &mut sn)
+    }
+
+    /// Look up `kind`/`btn`/`loc` in `table` and, if bound, execute it via
+    /// [`Self::dispatch_mouse_cmds`]; unbound is a silent no-op. The uniform
+    /// "always dispatch whatever's bound" helper for the mouse defaults that
+    /// need no bespoke Rust logic at all (see `bindings::mouse_default_*`'s
+    /// module doc comment).
+    fn dispatch_mouse_bound(
+        &mut self,
+        table: WhichTable,
+        kind: MouseKeyKind,
+        btn: u8,
+        loc: MouseKeyLoc,
+        client: &mut ClientState,
+        session_name: &str,
+    ) -> ExecOutcome {
+        match self.mouse_lookup(table, kind, btn, loc) {
+            None => ExecOutcome::Ok(String::new()),
+            Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+        }
+    }
 
     /// Route one decoded [`MouseEvent`] for `client` (already resolved to
     /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
@@ -2125,7 +2198,7 @@ impl Server {
         match ev.kind {
             MouseKind::Down(btn) => self.mouse_down(ev, btn, &rects, client, session_name),
             MouseKind::Drag(_) => self.mouse_drag(ev, &rects, client, session_name),
-            MouseKind::Up(_) => self.mouse_up(ev, &rects, client),
+            MouseKind::Up(_) => self.mouse_up(ev, &rects, client, session_name),
             MouseKind::WheelUp => self.mouse_wheel(ev, true, &rects, client, session_name),
             MouseKind::WheelDown => self.mouse_wheel(ev, false, &rects, client, session_name),
         }
@@ -2190,13 +2263,25 @@ impl Server {
         // leftover would otherwise keep scrolling a selection nothing is
         // dragging anymore).
         client.mouse.autoscroll = None;
+        // Border-drag existence gate (Task 8, SP7 wave 3): `MouseDrag1Border`
+        // must be BOUND (default or a user's own binding -- winmux can't
+        // meaningfully replace the continuous per-motion resize logic with a
+        // static command list, so only bound-vs-unbound is honored, not
+        // WHICH command it's bound to; see the task report) for a border
+        // press to arm live resizing at all. Checked once here, at arm time,
+        // rather than on every subsequent `Drag` motion event -- real tmux
+        // itself only consults the key table on the FIRST motion event of a
+        // drag (`docs/tmux-reference/mouse.md` §2.5's "bindings are
+        // completely bypassed" rule); `mouse_drag`/`mouse_drag_border` stay
+        // exactly as before once armed.
+        let border_drag_enabled = self.mouse_lookup(WhichTable::Root, MouseKeyKind::Drag, 1, MouseKeyLoc::Border).is_some();
         match hit_test(rects, ev.x, ev.y) {
             MouseHit::VBorder { left } => {
-                client.mouse.drag = MouseDrag::Border { pane: left, vertical: true };
+                client.mouse.drag = if border_drag_enabled { MouseDrag::Border { pane: left, vertical: true } } else { MouseDrag::None };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::HBorder { top } => {
-                client.mouse.drag = MouseDrag::Border { pane: top, vertical: false };
+                client.mouse.drag = if border_drag_enabled { MouseDrag::Border { pane: top, vertical: false } } else { MouseDrag::None };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::Pane(pane_id) => {
@@ -2234,21 +2319,47 @@ impl Server {
                     client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
                     return ExecOutcome::Ok(String::new());
                 }
-                let Some(p) = self.panes.get(&pane_id) else {
-                    return ExecOutcome::Ok(String::new());
-                };
-                let history_total = p.grid.history_total();
-                let cols = p.grid.cols();
-                let seps = self.word_separators_for_session(session_name);
-                if let ClientMode::Copy(cs) = &mut client.mode {
-                    cs.cx = cx;
-                    cs.cy = cy;
-                    match run {
-                        2 => select_word_at(cs, &p.grid, history_total, seps),
-                        _ => select_line_at(cs, cols, history_total),
+                // Table-driven since Task 8, SP7 wave 3: `DoubleClick1Pane`/
+                // `TripleClick1Pane` resolved against the pane's copy-mode
+                // table (`mode_keys_vi_for_pane`, matching real tmux --
+                // `docs/tmux-reference/mouse.md` §7.3). Unbound falls back
+                // to plain-click semantics (no default in real tmux either,
+                // so the press just re-arms a normal char-selection anchor);
+                // bound-to-a-user-override runs that command generically;
+                // bound-to-the-default runs the EXACT same select-word/-line
+                // logic this task found here, now gated.
+                let table = self.mouse_table_for_pane(client, pane_id);
+                let kind = if run == 2 { MouseKeyKind::DoubleClick } else { MouseKeyKind::TripleClick };
+                let default = if run == 2 { mouse_default_double_click_pane() } else { mouse_default_triple_click_pane() };
+                match self.mouse_lookup(table, kind, 1, MouseKeyLoc::Pane) {
+                    None => {
+                        client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
+                    }
+                    Some(cmds) if cmds == default => {
+                        let Some(p) = self.panes.get(&pane_id) else {
+                            return ExecOutcome::Ok(String::new());
+                        };
+                        let history_total = p.grid.history_total();
+                        let cols = p.grid.cols();
+                        let seps = self.word_separators_for_session(session_name);
+                        if let ClientMode::Copy(cs) = &mut client.mode {
+                            cs.cx = cx;
+                            cs.cy = cy;
+                            match run {
+                                2 => select_word_at(cs, &p.grid, history_total, seps),
+                                _ => select_line_at(cs, cols, history_total),
+                            }
+                        }
+                        client.mouse.drag = MouseDrag::Selecting { moved: false };
+                    }
+                    Some(cmds) => {
+                        let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                        if matches!(outcome, ExecOutcome::Err(_)) {
+                            return outcome;
+                        }
+                        client.mouse.drag = MouseDrag::Selecting { moved: false };
                     }
                 }
-                client.mouse.drag = MouseDrag::Selecting { moved: false };
                 ExecOutcome::Ok(String::new())
             }
             MouseHit::None => {
@@ -2275,6 +2386,29 @@ impl Server {
             }
             MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy } => {
                 if enter_copy {
+                    // Root `MouseDrag1Pane` (Task 8, SP7 wave 3: table-driven
+                    // -- was unconditional through SP6). Unbound: abandon,
+                    // no copy-mode entry (matches real tmux: an unbound
+                    // mouse key is forwarded to the app / dropped, never
+                    // "enter copy mode anyway"). Bound to a user override:
+                    // run it generically and abandon winmux's own
+                    // anchor-install tail (the override fully replaces the
+                    // default's "enter copy mode + begin selecting" pair).
+                    // Bound to the default: fall through to the EXACT same
+                    // logic this task found here, now gated.
+                    let default = mouse_default_drag_pane_enter_copy();
+                    match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Drag, 1, MouseKeyLoc::Pane) {
+                        None => {
+                            client.mouse.drag = MouseDrag::None;
+                            return ExecOutcome::Ok(String::new());
+                        }
+                        Some(cmds) if cmds != default => {
+                            let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                            client.mouse.drag = MouseDrag::Selecting { moved: true };
+                            return outcome;
+                        }
+                        _ => {}
+                    }
                     // (c) SP6 Task 6: enter copy mode on `pane` NOW, at the
                     // first motion event (tmux's drag-START classification,
                     // `mouse.md` §2.5) -- mirrors the root binding `if
@@ -2300,6 +2434,26 @@ impl Server {
                         client.mode = ClientMode::Normal;
                         client.mouse.drag = MouseDrag::None;
                         return ExecOutcome::Ok(String::new());
+                    }
+                } else {
+                    // Copy-mode table's `MouseDrag1Pane` (begin-selection).
+                    // Unbound: leave `PendingSelect` exactly as-is -- a
+                    // sticky no-op matching real tmux's "no default ->
+                    // nothing happens", and consistent with `mouse_down`'s
+                    // own plain-click-stays-PendingSelect rule (a later
+                    // motion event will re-check this same lookup). Bound to
+                    // a user override: run it generically and abandon the
+                    // anchor-install tail.
+                    let table = self.mouse_table_for_pane(client, pane);
+                    let default = mouse_default_drag_pane_select();
+                    match self.mouse_lookup(table, MouseKeyKind::Drag, 1, MouseKeyLoc::Pane) {
+                        None => return ExecOutcome::Ok(String::new()),
+                        Some(cmds) if cmds != default => {
+                            let outcome = self.dispatch_mouse_cmds(&cmds, client, session_name);
+                            client.mouse.drag = MouseDrag::Selecting { moved: true };
+                            return outcome;
+                        }
+                        _ => {}
                     }
                 }
                 // Install the anchor at the PRESS position (tmux's
@@ -2437,7 +2591,7 @@ impl Server {
     /// `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of which require actual
     /// motion). The click's `select-pane` (`mouse_down`'s unconditional
     /// focus) still stands -- only the "release" side is a no-op.
-    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState) -> ExecOutcome {
+    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
         // Task 7, SP6 wave 2: releasing always ends any armed drag
         // autoscroll timer, whether or not this `Up` ends up copying.
@@ -2455,8 +2609,16 @@ impl Server {
                 // `MouseDragEnd1Pane` binding for a non-copy-mode pane, so
                 // no copy happens; the origin pane keeps its selection and
                 // stays in copy mode.
+                //
+                // Table-driven since Task 8, SP7 wave 3 (closes the user's
+                // real conf idiom `unbind -T copy-mode-vi MouseDragEnd1Pane`,
+                // follow-up #67(b)): the default (`copy-selection-and-
+                // cancel`, a real command) and any user override both run
+                // through the SAME generic pipeline; unbound is a silent
+                // no-op -- no copy, selection and copy mode both survive.
                 if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == cs.pane) {
-                    self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+                    let table = self.mouse_table_for_pane(client, cs.pane);
+                    self.dispatch_mouse_bound(table, MouseKeyKind::DragEnd, 1, MouseKeyLoc::Pane, client, session_name)
                 } else {
                     ExecOutcome::Ok(String::new())
                 }
@@ -2544,16 +2706,34 @@ impl Server {
             return ExecOutcome::Ok(String::new());
         }
 
+        // Table-driven since Task 8, SP7 wave 3 (required regression:
+        // `bind_wheelup_pane_custom_command_overrides_default`). The four
+        // wheel-in-pane defaults are all expressible as real, generically-
+        // executable commands (`copy-mode -e` + `copy-scroll-up`/`-down` x5,
+        // see `bindings::mouse_default_wheel_*`), so `dispatch_mouse_bound`
+        // always runs whatever's bound -- default or a user override --
+        // through the SAME pipeline, uniformly; no separate "is this the
+        // default" branch is needed here.
+        // `bindings::mouse_default_wheel_*` hardcodes this same step count
+        // as a literal `5` (bindings.rs can't reach this private `server.rs`
+        // const across the module boundary) -- this keeps the two in sync.
+        debug_assert_eq!(MOUSE_WHEEL_STEP, 5);
+
         let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
         if in_copy_here {
-            let action = if up { CopyAction::ScrollUp } else { CopyAction::ScrollDown };
-            for _ in 0..MOUSE_WHEEL_STEP {
-                self.exec_copy_action(action, client);
+            let table = self.mouse_table_for_pane(client, pane_id);
+            let kind = if up { MouseKeyKind::WheelUp } else { MouseKeyKind::WheelDown };
+            let outcome = self.dispatch_mouse_bound(table, kind, 0, MouseKeyLoc::Pane, client, session_name);
+            if matches!(outcome, ExecOutcome::Err(_)) {
+                return outcome;
             }
             if !up {
                 // tmux's scroll-to-bottom auto-exit: only when THIS copy-mode
                 // session was entered by the wheel (`CopyState::scroll_exit`,
-                // a Task 2 placeholder whose first consumer is Task 5).
+                // a Task 2 placeholder whose first consumer is Task 5). This
+                // check runs regardless of whether the DEFAULT or a user
+                // override just ran -- it's a property of how copy mode was
+                // ENTERED, not of which command scrolled it.
                 let should_exit = matches!(&client.mode, ClientMode::Copy(cs) if cs.scroll == 0 && cs.scroll_exit);
                 if should_exit {
                     client.mode = ClientMode::Normal;
@@ -2562,38 +2742,35 @@ impl Server {
             return ExecOutcome::Ok(String::new());
         }
 
-        if !up {
-            // WheelDown on a live (non-copy-mode) pane: no-op (design spec's
-            // documented v1 decision -- there is no "downward" scrollback
-            // direction to enter copy mode from at the live bottom).
-            return ExecOutcome::Ok(String::new());
-        }
-
-        // WheelUp on a live pane: enter copy mode scrolled MOUSE_WHEEL_STEP
-        // lines (tmux's WheelUpPane default); `mouse: true` sets
-        // `scroll_exit` (via `exec_copy_mode`'s wiring) so scrolling back
-        // down to the live bottom by wheel auto-exits.
-        let outcome = self.exec_copy_mode(false, true, client, session_name);
-        if matches!(outcome, ExecOutcome::Err(_)) {
-            return outcome;
-        }
-        for _ in 0..MOUSE_WHEEL_STEP {
-            self.exec_copy_action(CopyAction::ScrollUp, client);
-        }
-        ExecOutcome::Ok(String::new())
+        // WheelDownPane is deliberately unbound at ROOT by default (real
+        // tmux has no default there either, `docs/tmux-reference/mouse.md`
+        // §6) -- `dispatch_mouse_bound` naturally reproduces that no-op
+        // while still honoring a user's own `bind -n WheelDownPane ...`.
+        // WheelUpPane's default enters copy mode scrolled 5 lines (tmux's
+        // `WheelUpPane` default, `mouse: true`/`-e` sets `scroll_exit` so
+        // scrolling back down to the live bottom by wheel auto-exits).
+        let kind = if up { MouseKeyKind::WheelUp } else { MouseKeyKind::WheelDown };
+        self.dispatch_mouse_bound(WhichTable::Root, kind, 0, MouseKeyLoc::Pane, client, session_name)
     }
 
     /// A click or wheel event on the status row (tmux default status-table
     /// bindings: `MouseDown1Status` -> select the clicked window tab;
     /// `WheelUpStatus`/`WheelDownStatus` -> previous-window/next-window).
-    fn dispatch_mouse_status(&mut self, ev: MouseEvent, _client: &mut ClientState, session_name: &str) -> ExecOutcome {
-        // No client-mode state is needed for status-row routing today; the
-        // parameter is kept (unused) so the call site in `dispatch_mouse`
-        // stays symmetric with the pane-area dispatch methods.
+    /// Table-driven since Task 8, SP7 wave 3.
+    fn dispatch_mouse_status(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         match ev.kind {
-            MouseKind::Down(1) => self.mouse_status_click(ev.x, session_name),
-            MouseKind::WheelUp => wrap(self.exec_step_window(false, Some(session_name))),
-            MouseKind::WheelDown => wrap(self.exec_step_window(true, Some(session_name))),
+            MouseKind::Down(1) => {
+                let default = mouse_default_status_select_window();
+                match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Down, 1, MouseKeyLoc::Status) {
+                    None => ExecOutcome::Ok(String::new()),
+                    Some(cmds) if cmds == default => self.mouse_status_click(ev.x, session_name),
+                    Some(cmds) => self.dispatch_mouse_cmds(&cmds, client, session_name),
+                }
+            }
+            MouseKind::WheelUp => self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelUp, 0, MouseKeyLoc::Status, client, session_name),
+            MouseKind::WheelDown => {
+                self.dispatch_mouse_bound(WhichTable::Root, MouseKeyKind::WheelDown, 0, MouseKeyLoc::Status, client, session_name)
+            }
             _ => ExecOutcome::Ok(String::new()),
         }
     }
@@ -3098,7 +3275,15 @@ impl Server {
         Ok(String::new())
     }
 
-    fn exec_unbind_key(&mut self, all: bool, table: String, key: Option<String>) -> Result<String, String> {
+    /// `quiet` (`-q`, follow-up #67(a)): real tmux errors `unknown key: %s`
+    /// on an unparseable key token unless `-q` is given
+    /// (`docs/tmux-reference/commands-config-options-formats.md:442`) --
+    /// winmux used to swallow this unconditionally (a "no such binding can
+    /// exist anyway" rationalization that predates mouse pseudo-keys
+    /// actually parsing for real, Task 8, SP7 wave 3: those now resolve via
+    /// `keys::parse_key` like any other key, so this path is purely about
+    /// genuinely malformed tokens, e.g. a typo like `unbind Ct-x`).
+    fn exec_unbind_key(&mut self, all: bool, table: String, key: Option<String>, quiet: bool) -> Result<String, String> {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
@@ -3111,22 +3296,14 @@ impl Server {
             return Ok(String::new());
         }
         let key = key.expect("cmd::resolve guarantees a key unless -a is given");
-        // A key token that isn't valid winmux key notation (e.g. tmux's
-        // mouse pseudo-keys like `MouseDragEnd1Pane` -- real tmux keys, but
-        // winmux's mouse handling is hardcoded dispatch logic, not
-        // table-driven via named pseudo-keys, so no such binding could ever
-        // exist here to remove) is a silent no-op on UNBIND, not an error:
-        // removing something that structurally can never be bound is at
-        // least as harmless as removing something merely unbound (doc:
-        // "Removing a key that isn't bound is a silent no-op"; an
-        // unrecognized key is also one of the things real tmux's `-q`
-        // suppresses). `bind-key` (above) still errors on a bad key --
-        // CREATING a binding to a garbage key is a real mistake worth
-        // reporting; removing a no-op binding is not.
-        if let Some(k) = crate::keys::parse_key(&key) {
-            self.bindings.unbind(which, &k);
+        match crate::keys::parse_key(&key) {
+            Some(k) => {
+                self.bindings.unbind(which, &k);
+                Ok(String::new())
+            }
+            None if quiet => Ok(String::new()),
+            None => Err(format!("unknown key: {key}")),
         }
-        Ok(String::new())
     }
 
     /// Load and dispatch every config candidate in order, joining line
@@ -3425,7 +3602,7 @@ impl Server {
             SetOption { global, window, append, unset, name, value } => self.exec_set_option(global, window, append, unset, name, value, None),
             ShowOptions { global, window, quiet, value_only, name } => self.exec_show_options(global, window, quiet, value_only, name, None),
             BindKey { table, repeat, key, tail } => self.exec_bind_key(table, repeat, key, tail),
-            UnbindKey { all, table, key } => self.exec_unbind_key(all, table, key),
+            UnbindKey { all, table, key, quiet } => self.exec_unbind_key(all, table, key, quiet),
             ListKeys => Ok(self.bindings.list()),
             SourceFile { path } => self.execute_source_file_headless(&path),
             NewSession { detached, name, cols, rows } => self.exec_new_session(detached, name, cols, rows),
@@ -3614,7 +3791,7 @@ impl Server {
                 wrap(self.exec_show_options(global, window, quiet, value_only, name, Some(session_name.as_str())))
             }
             BindKey { table, repeat, key, tail } => wrap(self.exec_bind_key(table, repeat, key, tail)),
-            UnbindKey { all, table, key } => wrap(self.exec_unbind_key(all, table, key)),
+            UnbindKey { all, table, key, quiet } => wrap(self.exec_unbind_key(all, table, key, quiet)),
             ListKeys => ExecOutcome::Ok(self.bindings.list()),
             SourceFile { path } => wrap(self.execute_source_file_headless(&path)),
             NewSession { detached, name, cols, rows } => wrap(self.exec_new_session(detached, name, cols, rows)),
@@ -4915,23 +5092,30 @@ mod sp6_config_compat_tests {
         assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_some());
 
         server
-            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()))
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()), false)
             .expect("unbind from copy-mode-vi");
         assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_none());
 
         // The user's actual fixture line: `unbind -T copy-mode-vi
-        // MouseDragEnd1Pane`. `MouseDragEnd1Pane` is a real tmux mouse
-        // pseudo-key, but winmux's mouse handling is hardcoded dispatch
-        // logic, not table-driven via named pseudo-keys, so `parse_key`
-        // rejects it -- unbinding it must still succeed as a silent no-op
-        // (nothing could ever have been bound there).
+        // MouseDragEnd1Pane`. Mouse pseudo-keys now parse for real (Task 8,
+        // SP7 wave 3, closes #57/#67(b)) -- this actually removes the real
+        // default `MouseDragEnd1Pane` binding (proven end to end, including
+        // the resulting behavior change, by
+        // `server_proto.rs::unbind_copy_mode_vi_dragend_disables_release_copy`).
+        let dragend = crate::keys::parse_key("MouseDragEnd1Pane").expect("mouse pseudo-key now parses");
+        assert!(
+            server.bindings.lookup(WhichTable::CopyModeVi, &dragend).is_some(),
+            "default MouseDragEnd1Pane binding must be present before unbind"
+        );
         server
-            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()))
-            .expect("unbind of an unparseable pseudo-key is a silent no-op, not an error");
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()), false)
+            .expect("unbind of a real mouse pseudo-key succeeds");
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &dragend).is_none());
 
-        // A copy-mode-vi bind still errors on a genuinely bad key.
+        // A copy-mode-vi bind still errors on a genuinely unparseable key
+        // (#67(a): errors unless `-q`).
         let tail2 = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
-        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "MouseDragEnd1Pane".to_string(), tail2).is_err());
+        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "Ct-x".to_string(), tail2).is_err());
     }
 
     /// `source-file ~/xyz.conf` expands the leading `~/` via `USERPROFILE`

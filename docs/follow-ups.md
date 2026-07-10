@@ -877,8 +877,25 @@ None block the sub-project 4 merge.
     mode`: "`C-k` copy to end of line and cancel (defer, not in v1 tables)").
     Both are real tmux emacs-table bindings; winmux's emacs copy-mode table
     covers the more commonly used subset only.
-57. **Mouse bindings have no bindable NAMES** (`MouseDown1Pane`,
-    `MouseDrag1Border`, etc.) **in `bind-key`** (Task 5, mouse; design spec
+57. **RESOLVED** (SP7 Task 8, 2026-07-10). Was: mouse bindings had no
+    bindable NAMES in `bind-key`. `keys::KeyCode` gained a
+    `MouseKey(MouseKeyKind, u8, MouseKeyLoc)` variant with full
+    `parse_key`/`key_name` support for tmux's `<Type><Button><Location>`
+    grammar (`MouseDown1Pane`, `WheelUpStatus`, ...); `Bindings::default()`'s
+    root/copy-mode/copy-mode-vi tables now carry real mouse default entries
+    (`MouseDrag1Border`, `MouseDrag1Pane`, `WheelUpPane`, `MouseDown1Status`,
+    `WheelUp/DownStatus` at root; `MouseDrag1Pane`, `MouseDragEnd1Pane`,
+    `WheelUp/DownPane`, `Double/TripleClick1Pane` in both copy tables); and
+    `server::dispatch::dispatch_mouse` resolves the ACTION side of every one
+    of those through `Bindings` (classification/hit-testing/drag-lifecycle
+    stays hardcoded, per design). `bind-key -T root MouseDown1... <command>`-
+    style customization now works for the gated subset — see the
+    `## mouse-bindings` section of
+    `docs/specs/2026-07-07-command-config-interfaces.md` for exactly which
+    mouse actions are gated vs left unconditional (click-to-focus and
+    per-motion drag continuation are documented, low-risk exceptions).
+    *Original text:* Mouse bindings have no bindable NAMES (`MouseDown1Pane`,
+    `MouseDrag1Border`, etc.) in `bind-key` (Task 5, mouse; design spec
     `## 4. Mouse`: "Mouse \"bindings\" are HARDCODED v1 ... the bindings
     table stays keyboard-only"). Every mouse behavior (click-focus,
     border-drag-resize, wheel-scroll, etc.) is wired directly in
@@ -1189,22 +1206,41 @@ None block the sub-project 4 merge.
     out waiting for the border to move) before the fix and pass GREEN after.
     Full `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.
 
-67. **`unbind` on an unparseable key is unconditionally silent (not `-q`-gated), and
-    mouse pseudo-keys are not table-driven** (found in SP6 Task 2 review, 2026-07-10).
-    Two related fidelity gaps behind one shim: (a) `exec_unbind_key`
-    (`src/server/dispatch.rs`) silently no-ops for ANY token `keys::parse_key`
-    rejects — real tmux errors on `unknown key: %s` unless `-q` is given
-    (docs/tmux-reference/commands-config-options-formats.md:442), so a typo like
-    `unbind Ct-x` is swallowed today. Fix sketch: silence only tokens matching the
-    tmux mouse-pseudo-key name grammar (`MouseDown/Up/Drag/DragEnd{1,2,3}`,
-    `WheelUp/Down`, `Double/TripleClick{1,2,3}` × `Pane/Border/Status/StatusLeft/
-    StatusRight/StatusDefault`), error otherwise unless `-q`. (b) Deeper: winmux's
-    mouse actions are hardcoded in dispatch rather than resolved through the key
-    tables, so `unbind -T copy-mode-vi MouseDragEnd1Pane` (the user's real config —
-    tmux idiom for "don't copy/jump on mouse release in vi copy mode") parses clean
-    but cannot have its tmux effect. Real fix is table-driven mouse bindings
-    (synthesized mouse key names resolved through `Bindings` like tmux); sizeable,
-    interacts with SP6 Tasks 6-7's release-semantics work. LOW/MEDIUM.
+67. **RESOLVED** (SP7 Task 8, 2026-07-10). Was: two related fidelity gaps
+    behind one shim. (a) `exec_unbind_key` now errors `unknown key: <tok>`
+    for any token `keys::parse_key` rejects, unless the new `-q` flag is
+    given (`cmd::ParsedCmd::UnbindKey` gained a `quiet: bool` field) —
+    matching real tmux (`docs/tmux-reference/
+    commands-config-options-formats.md:442`). (b) Mouse pseudo-key names now
+    parse for real (`keys::KeyCode::MouseKey`) and `server::dispatch::
+    dispatch_mouse` resolves its actions through `Bindings` (see the
+    `## mouse-bindings` resolution of #57 just above), so the user's real
+    conf idiom `unbind -T copy-mode-vi MouseDragEnd1Pane` now has its actual
+    tmux effect — proven end to end by
+    `tests/server_proto.rs::unbind_copy_mode_vi_dragend_disables_release_copy`
+    (a full SGR press-drag-release after the unbind creates no paste buffer
+    and leaves copy mode active). See the `## mouse-bindings` section of
+    `docs/specs/2026-07-07-command-config-interfaces.md` for the full
+    default-table/gating design.
+    *Original text:* `unbind` on an unparseable key is unconditionally
+    silent (not `-q`-gated), and mouse pseudo-keys are not table-driven
+    (found in SP6 Task 2 review, 2026-07-10). Two related fidelity gaps
+    behind one shim: (a) `exec_unbind_key` (`src/server/dispatch.rs`)
+    silently no-ops for ANY token `keys::parse_key` rejects — real tmux
+    errors on `unknown key: %s` unless `-q` is given
+    (docs/tmux-reference/commands-config-options-formats.md:442), so a typo
+    like `unbind Ct-x` is swallowed today. Fix sketch: silence only tokens
+    matching the tmux mouse-pseudo-key name grammar
+    (`MouseDown/Up/Drag/DragEnd{1,2,3}`, `WheelUp/Down`,
+    `Double/TripleClick{1,2,3}` × `Pane/Border/Status/StatusLeft/
+    StatusRight/StatusDefault`), error otherwise unless `-q`. (b) Deeper:
+    winmux's mouse actions are hardcoded in dispatch rather than resolved
+    through the key tables, so `unbind -T copy-mode-vi MouseDragEnd1Pane`
+    (the user's real config — tmux idiom for "don't copy/jump on mouse
+    release in vi copy mode") parses clean but cannot have its tmux effect.
+    Real fix is table-driven mouse bindings (synthesized mouse key names
+    resolved through `Bindings` like tmux); sizeable, interacts with SP6
+    Tasks 6-7's release-semantics work. LOW/MEDIUM.
 
 68. **RESOLVED** (SP7 Task 6, 2026-07-10). Was: `show-options -v`/`-q` CLI
     flags not wired into dispatch. `cmd.rs`'s `show-options` arm now parses

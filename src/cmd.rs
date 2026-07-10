@@ -200,7 +200,11 @@ pub enum ParsedCmd {
     /// (`-v`) prints just the value, no `name ` prefix.
     ShowOptions { global: bool, window: bool, quiet: bool, value_only: bool, name: Option<String> },
     BindKey { table: String, repeat: bool, key: String, tail: Vec<RawCmd> },
-    UnbindKey { all: bool, table: String, key: Option<String> },
+    /// `quiet` (`-q`, follow-up #67(a)): suppresses the `unknown key: <tok>`
+    /// error an unparseable `key` token would otherwise produce -- matching
+    /// real tmux's `unbind-key -q` (`docs/tmux-reference/
+    /// commands-config-options-formats.md:442`).
+    UnbindKey { all: bool, table: String, key: Option<String>, quiet: bool },
     ListKeys,
     SourceFile { path: String },
     // SP2 CLI commands, folded into the same table.
@@ -637,7 +641,7 @@ pub fn usage(name: &str) -> Option<&'static str> {
         "set-option" => "usage: set-option [-g] [-w] [-a] [-u] option [value]",
         "show-options" => "usage: show-options [-g] [-w] [-q] [-v] [option]",
         "bind-key" => "usage: bind-key [-n] [-r] [-T table] key command ...",
-        "unbind-key" => "usage: unbind-key [-a] [-n] [-T table] [key]",
+        "unbind-key" => "usage: unbind-key [-aq] [-n] [-T table] [key]",
         "list-keys" => "usage: list-keys",
         "source-file" => "usage: source-file path",
         "new-session" => "usage: new-session [-d] [-s name] [-x cols] [-y rows]",
@@ -1066,12 +1070,17 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
         }
         "unbind-key" => {
             let mut all = false;
+            let mut quiet = false;
             let mut table: Option<String> = None;
             let mut i = 0;
             while i < raw.args.len() {
                 match raw.args[i].as_str() {
                     "-a" => {
                         all = true;
+                        i += 1;
+                    }
+                    "-q" => {
+                        quiet = true;
                         i += 1;
                     }
                     "-n" => {
@@ -1098,7 +1107,7 @@ pub fn resolve(raw: &RawCmd) -> Result<ParsedCmd, String> {
             if !all && key.is_none() {
                 return Err(bad());
             }
-            Ok(ParsedCmd::UnbindKey { all, table: table.unwrap_or_else(|| "prefix".to_string()), key })
+            Ok(ParsedCmd::UnbindKey { all, table: table.unwrap_or_else(|| "prefix".to_string()), key, quiet })
         }
         "list-keys" => {
             if !raw.args.is_empty() {
@@ -1541,9 +1550,22 @@ mod tests {
         );
         assert_eq!(
             resolve(&raw("unbind-key", &["-a"])).unwrap(),
-            ParsedCmd::UnbindKey { all: true, table: "prefix".to_string(), key: None }
+            ParsedCmd::UnbindKey { all: true, table: "prefix".to_string(), key: None, quiet: false }
         );
         assert_eq!(resolve(&raw("unbind-key", &[])).unwrap_err(), usage("unbind-key").unwrap());
+    }
+
+    /// #67(a): `-q` parses and is threaded through, independent of `-a`.
+    #[test]
+    fn unbind_key_quiet_flag_parses() {
+        assert_eq!(
+            resolve(&raw("unbind-key", &["-q", "x"])).unwrap(),
+            ParsedCmd::UnbindKey { all: false, table: "prefix".to_string(), key: Some("x".to_string()), quiet: true }
+        );
+        assert_eq!(
+            resolve(&raw("unbind-key", &["-n", "-q", "x"])).unwrap(),
+            ParsedCmd::UnbindKey { all: false, table: "root".to_string(), key: Some("x".to_string()), quiet: true }
+        );
     }
 
     #[test]
