@@ -181,6 +181,112 @@ fn e2e_tmux_conf_roundtrip() {
     });
 }
 
+/// `user_tmux_conf_loads_without_errors` (Task 9, SP6 parity wave 2 closeout):
+/// the exact `.tmux.conf` a real winmux user brought over from tmux
+/// (`tests/fixtures/user.tmux.conf` -- remapped prefix, `|`/`-` split
+/// rebinds, mouse on, custom status styling, `@`-user options, a `-T
+/// copy-mode-vi` unbind, etc.) loads via `-f` at server-startup autostart
+/// with ZERO config errors, AND the loaded config actually TAKES EFFECT end
+/// to end: the fixture's remapped prefix (`C-a`, not the default `C-b`)
+/// combined with its `bind | split-window -h` rebind together produce a
+/// vertical split border -- proof the whole file applied, not just that it
+/// parsed. `tests/server_proto.rs`'s `user_config_loads_clean` already
+/// proves the zero-errors half via the headless `source-file` runtime path;
+/// this is the full-stack, real-binary, `-f`-at-startup proof, plus the
+/// "did it actually take effect" half that a parse-only check can't cover.
+///
+/// Discrimination: run this test against a build with the fixture's `bind
+/// C-a` line REMOVED (i.e. only `set -g prefix C-a` without the
+/// `unbind C-a` / `bind C-a send-prefix` lines still present, prefix still
+/// remaps) -- verified by hand that sending the DEFAULT prefix (`C-b`,
+/// `0x02`) instead of `C-a` here does NOT produce a split border (the
+/// config's remapped prefix wins, so `0x02` is just forwarded to the shell
+/// as an ordinary keystroke) -- i.e. the split-border assertion below
+/// genuinely requires BOTH the remapped prefix AND the config's `|` rebind,
+/// not just one or the other.
+#[test]
+fn user_tmux_conf_loads_without_errors() {
+    let socket = unique_socket("user-conf");
+    let _guard = ServerGuard { socket: socket.clone() };
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user.tmux.conf");
+    let fixture_str = fixture.to_str().expect("fixture path is valid UTF-8");
+
+    let (mut pty, _proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", fixture_str]);
+    let mut grid = Grid::new(COLS, ROWS, 0);
+    let mut raw: Vec<u8> = Vec::new();
+
+    // Poll for the initial status row's normal window-tab content
+    // ("powershell", from the fixture's custom window-status-format ' #I #W
+    // #F ') to appear -- while asserting, on every poll, that no line on
+    // screen ever contains "error" (case-insensitive). A config-load error
+    // would replace the ENTIRE status-row content with a one-shot
+    // "config: N error(s), see server.log" transient message
+    // (`src/server.rs`'s `finish_attach`/`pending_config_message`), which
+    // would win this race against the normal status content appearing --
+    // this loop fails FAST (inside the closure) the moment any such banner
+    // is seen, rather than waiting out the full timeout.
+    let mut saw_normal_status = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            let lines = screen_text(&grid);
+            assert!(
+                !lines.iter().any(|l| l.to_lowercase().contains("error")),
+                "a config-error banner appeared on screen while loading the user's .tmux.conf; screen:\n{}",
+                lines.join("\n")
+            );
+            if lines.iter().any(|l| l.contains("powershell")) {
+                saw_normal_status = true;
+            }
+            saw_normal_status
+        }),
+        "normal status-row content ('powershell' window tab) never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    // Belt-and-braces: also check the raw byte stream (covers any error text
+    // that scrolled off the visible grid before a poll caught it).
+    let raw_text = String::from_utf8_lossy(&raw);
+    assert!(
+        !raw_text.to_lowercase().contains("error"),
+        "raw output stream contained \"error\" while loading the user's .tmux.conf; got:\n{raw_text:?}"
+    );
+
+    // Pane ready.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            screen_text(&grid).iter().any(|l| l.contains("PS "))
+        }),
+        "PowerShell prompt never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // The fixture's remapped prefix (C-a, 0x01) plus its `bind | split-window
+    // -h` rebind: sending C-a | must produce a vertical split border. Under
+    // the DEFAULT prefix (C-b) this exact byte sequence would just forward
+    // "C-a" then a literal "|" character to the shell -- no border -- so
+    // this assertion genuinely discriminates the remapped-prefix config
+    // having applied (see the discrimination note in this test's doc
+    // comment).
+    pty.write_input(b"\x01|").expect("send C-a | (config bind: split-window -h)");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump_raw(&mut grid, &rx, &mut raw);
+            has_vertical_border(&grid)
+        }),
+        "vertical split border never appeared after C-a | (config prefix + bind); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Best-effort cleanup: detach under the remapped prefix (the fixture has
+    // no explicit `d` rebind, so the default `d` -> detach still applies).
+    let _ = pty.write_input(b"\x01d");
+}
+
 /// `e2e_command_prompt`: with config disabled (`-f -`, default prefix
 /// `Ctrl-b`/base-index 0), `prefix-:` opens the `:` command-prompt line
 /// editor (proven by the status row itself becoming the editor's `:` label),

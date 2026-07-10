@@ -94,6 +94,51 @@ A further sub-project — TPM-style plugin support — has been researched but
 is future work, not part of the planned scope above: see
 [`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`](superpowers/plans/2026-07-08-tpm-plugin-support.md).
 
+## SP6: tmux parity wave 2 — DELIVERED
+
+A second, narrower parity-hardening pass over sub-project 4's delivered
+surface — real-world tmux-config fidelity and mouse/focus fixes discovered
+after the original four sub-projects shipped, not a new feature area, so it
+extends the existing four interface-contract files rather than adding a
+fifth. Plan:
+[`docs/superpowers/plans/2026-07-10-sp6-tmux-parity-wave2.md`](superpowers/plans/2026-07-10-sp6-tmux-parity-wave2.md).
+
+Delivered:
+
+- Mouse drag-state lifecycle fixes — stale `MouseDrag` state surviving the
+  overlay guard, the status-row short-circuit, and a border-miss early
+  return (#64) — plus a fix for leftward/upward border drags, which had been
+  a silent no-op (#66)
+- Config-compatibility batch: `setw` alias, space-delimited style
+  attributes, `@`-user options, `bind`/`unbind -T copy-mode`/`-vi`, `~`
+  expansion in `source-file`, 13 new options — a real user `.tmux.conf`
+  (`tests/fixtures/user.tmux.conf`) now loads with zero errors, proven both
+  headlessly (`tests/server_proto.rs`'s `user_config_loads_clean`) and
+  through the real binary under `-f` at startup
+  (`tests/e2e_config.rs`'s `user_tmux_conf_loads_without_errors`)
+- Directional-navigation edge wrap plus a real per-pane tmux `active_point`
+  MRU for `select-pane -L/-R/-U/-D` (closes #65)
+- Status-line rendering: `status-justify` (4 values), per-side
+  `status-left`/`status-right` style, `window-status-format`/
+  `-current-format` with inline `#[...]` styles, `window-status-separator`,
+  a width-stable default window tab
+- `swap-window` with relative wrapping targets and tmux's `-d` focus
+  semantics
+- Copy-mode mouse feel: click purity, release-pane targeting (resolved
+  against the pane under the pointer AT release), drag-on-a-live-pane
+  auto-entering copy mode, edge autoscroll, word/line drag extension with a
+  3-class word model and a `word-separators` option
+- `choose-tree`: a real session/window tree with expand/collapse, an
+  active-item default selection, and a live preview box (tmux sizing/box
+  chrome, `v` toggle between off/BIG/normal)
+- `clock-mode` (`prefix-t`, `clock-mode-colour`/`-style`, any key or mouse
+  exits)
+- Half-border active-pane indication for exactly-two-pane windows, plus
+  `pane-border-indicators`
+
+New follow-up tickets from this wave: #67-#73. Resolved this wave: #64,
+#65, #66. See `docs/follow-ups.md` for the full accounting.
+
 ## Specs
 
 - [`specs/2026-07-06-multiplexing-mvp-design.md`](specs/2026-07-06-multiplexing-mvp-design.md) — sub-project 1 (delivered); companion interface contract [`specs/2026-07-06-mvp-interfaces.md`](specs/2026-07-06-mvp-interfaces.md)

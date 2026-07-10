@@ -43,6 +43,7 @@
 
 mod common;
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
@@ -307,6 +308,162 @@ fn mouse_click_focuses_pane_e2e() {
     );
 
     // Best-effort cleanup.
+    let _ = pty.write_input(b"\x02d");
+}
+
+/// `mouse_drag_select_copies_release_text` (Task 9, SP6 parity wave 2
+/// closeout): with `mouse on`, on a LIVE (non-copy-mode) unsplit pane, a
+/// press-drag-release across a known word (SGR press, then an SGR
+/// button-1-motion "Drag" event, then release) must: (1) enter copy mode on
+/// the very first `Drag` event (SP6 Task 6's `MouseDrag1Pane -> copy-mode
+/// -M` on a live pane -- proven by the `[scroll/history]` position indicator
+/// appearing after the drag but before the release), (2) copy the
+/// dragged-over text and exit back to copy mode's cancelled/Normal state on
+/// release (SP6 Task 6/7's `MouseDragEnd1Pane -> copy-selection-and-cancel`,
+/// resolved against the RELEASE-time pane -- proven by the indicator
+/// disappearing again), and (3) actually paste the exact dragged word
+/// (`prefix-]`), proving the selected TEXT -- not just the mode transition
+/// -- was captured correctly.
+///
+/// Discrimination (RED verified by hand before writing this comment, per
+/// the task brief's "verify each assertion actually discriminates"):
+/// - Sending the press+release WITHOUT any intervening `Drag` byte sequence
+///   (a plain click, no motion) does NOT enter copy mode at all (SP6 Task 6:
+///   `mouse_down`'s `PendingSelect{enter_copy:true}` only becomes real copy
+///   mode on the first actual `Drag` event) -- so the step-1 indicator
+///   assertion below genuinely requires the `Drag` byte, not just press+release.
+/// - Releasing over a DIFFERENT pane/position than the drag's own pane (an
+///   `Up` event whose coordinates don't hit-test back to the dragging pane)
+///   does not copy (SP6 Task 6 part (b): `mouse_up` resolves
+///   `MouseDragEnd1Pane` against the pane under the pointer AT RELEASE) --
+///   this test's release coordinates deliberately match the drag's own
+///   (single, unsplit) pane, so this exact path is exercised; a prior
+///   manual run releasing outside the pane rect left the copy-mode indicator
+///   still showing (no copy, no cancel) instead of disappearing, confirming
+///   the indicator-disappearance assertion in step 2 discriminates release
+///   targeting.
+/// - Pasting BEFORE clearing the screen would trivially "pass" even with a
+///   no-op copy (the original marker line is still sitting on screen from
+///   the echo that printed it) -- this test explicitly clears the screen
+///   (`cls`) and confirms the marker is GONE before pasting, exactly
+///   mirroring `copy_mode_roundtrip`'s own distinctness-before-paste
+///   safeguard.
+#[test]
+fn mouse_drag_select_copies_release_text() {
+    let conf = TempConf::write("mouse-drag-select", "set -g mouse on\n");
+    let socket = unique_socket("mouse-drag-select");
+    let _guard = ServerGuard { socket: socket.clone() };
+
+    let (mut pty, _proc_raw, rx) = spawn_winmux_pty(&["-L", &socket, "-f", conf.path_str()]);
+    let mut grid = Grid::new(COLS, ROWS, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            screen_text(&grid).iter().any(|l| l.contains("PS "))
+        }),
+        "PowerShell prompt never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Print a distinctive, easy-to-locate word on its own output line (NOT
+    // the typed command line, which would also contain the substring
+    // prefixed by "echo ") so we can compute exact grid coordinates to drag
+    // across.
+    const MARKER: &str = "dragselectme";
+    pty.write_input(format!("echo {MARKER}\r").as_bytes()).expect("send echo marker");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            screen_text(&grid).iter().any(|l| l.contains(MARKER) && !l.contains("echo"))
+        }),
+        "echoed marker line never appeared; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+    let lines = screen_text(&grid);
+    let row = lines
+        .iter()
+        .position(|l| l.contains(MARKER) && !l.contains("echo"))
+        .expect("marker output line must be present (checked by wait_until above)") as u16;
+    let start_col = lines[row as usize].find(MARKER).expect("marker column must be findable") as u16;
+    let end_col = start_col + MARKER.len() as u16 - 1;
+
+    // SGR press (button 1) at the marker's first character, "Drag" motion
+    // (Cb = 32: button 1 + the 0x20 motion bit) to its last character, then
+    // release at that same position -- 1-based SGR coordinates.
+    let down = format!("\x1b[<0;{};{}M", start_col + 1, row + 1);
+    let drag = format!("\x1b[<32;{};{}M", end_col + 1, row + 1);
+    let up = format!("\x1b[<0;{};{}m", end_col + 1, row + 1);
+
+    pty.write_input(down.as_bytes()).expect("send SGR mouse-down");
+    // A bare press with no Drag yet must NOT enter copy mode (SP6 Task 6: a
+    // plain click on a live pane only focuses -- see this test's
+    // discrimination note). Give the server a moment to process the press,
+    // then check once before sending the drag.
+    pump(&mut grid, &rx);
+    thread::sleep(Duration::from_millis(150));
+    pump(&mut grid, &rx);
+    assert!(
+        parse_indicator(&screen_text(&grid)[0]).is_none(),
+        "copy mode entered on a bare press with no Drag event yet; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    pty.write_input(drag.as_bytes()).expect("send SGR drag (button-1 motion)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            parse_indicator(&screen_text(&grid)[0]).is_some()
+        }),
+        "drag over a live pane never entered copy mode (no '[scroll/history]' indicator); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    pty.write_input(up.as_bytes()).expect("send SGR mouse-up (release)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            parse_indicator(&screen_text(&grid)[0]).is_none()
+        }),
+        "copy-mode indicator did not disappear after release (copy-selection-and-cancel never fired); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Clear the screen so the ORIGINAL marker line is gone, then confirm
+    // that -- otherwise a paste-assertion "pass" could be a false positive
+    // from the original still being on screen (see the discrimination note
+    // above).
+    pty.write_input(b"cls\r").expect("send cls");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            !screen_text(&grid).iter().any(|l| l.contains(MARKER))
+        }),
+        "screen still showed '{MARKER}' after cls (cleanup/clear step); screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Paste: prefix (0x02) + ']'. `paste-buffer -p` writes the buffer's raw
+    // bytes into the focused pane's stdin (plain write, no trailing Enter),
+    // so the marker appears typed on the current (empty) prompt line.
+    pty.write_input(b"\x02]").expect("send prefix-] (paste-buffer)");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    assert!(
+        wait_until(deadline, || {
+            pump(&mut grid, &rx);
+            screen_text(&grid).iter().any(|l| l.contains(MARKER))
+        }),
+        "pasted text '{MARKER}' never appeared on screen after drag-select copy; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Best-effort cleanup: clear the pasted (unexecuted) line, then detach.
+    let _ = pty.write_input(b"\x15"); // C-u: PowerShell's kill-whole-line
     let _ = pty.write_input(b"\x02d");
 }
 

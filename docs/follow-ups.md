@@ -470,6 +470,18 @@ None block the sub-project 4 merge.
     overlay is a flat, unfilterable, untaggable list with plain up/down
     navigation and no session/window content preview pane, unlike real
     tmux's `choose-tree`.
+
+    **NARROWED (SP6 parity wave 2, Task 8, 2026-07-10).** The tree-shape and
+    preview halves of this gap are now closed: `choose-tree` is a real
+    session/window tree with `Left`/`Right` expand/collapse (sessions
+    collapsed by default in `s`-view), the default selection lands on the
+    CURRENT item (not always the first row), and `v` cycles a live preview
+    box through off → BIG → normal with tmux's own sizing and full 4-sided
+    box chrome. What remains open from the original text: **tagging** (no
+    way to mark multiple rows for a bulk action) and **sort options** (real
+    tmux's `O`/`r` cycle the sort key and reverse it; winmux has no sort
+    concept at all, rows are always in registry-insertion order) — filtering
+    (`/`-style incremental search within the list) is also still absent.
 51. **No right-click context menus** (mouse, Task 5). Real tmux (recent
     versions) can show a right-click menu over a pane/status-line/border;
     winmux's mouse routing has no menu concept at all — every mouse event
@@ -729,7 +741,8 @@ None block the sub-project 4 merge.
     — not itself a regression target of this task, still an
     untested-but-unchanged edge per the original note.
 
-66. **Mouse border-drag toward the top/left edge never resizes** (found while
+66. **RESOLVED** (SP6 parity wave 2, Task 1b). *Original text:* Mouse
+    border-drag toward the top/left edge never resizes (found while
     building Task 1's regression tests, SP6 parity wave 2; separate root
     cause from #64's staleness class, out of that task's scope). A vertical
     border drag's reference pane, from `mouse_down`'s `MouseHit::VBorder {
@@ -881,3 +894,34 @@ None block the sub-project 4 merge.
     shows a full-height list. Defensible (winmux's behavior is arguably more
     useful — no dead rows) and reachable only in degenerate geometries; ticketed
     for the record. TINY. LOW.
+
+## Follow-ups from Task 9 (SP6 parity wave 2 closeout, 2026-07-10)
+
+74. **Alerts subsystem (`visual-activity`/`visual-bell`/`visual-silence`/
+    `bell-action`/`monitor-activity`) is accepted/stored but has zero runtime
+    effect.** `src/options.rs` has typed getters for all five
+    (`visual_activity`/`visual_bell`/`visual_silence`/`bell_action`/
+    `monitor_activity`), round-tripping through `set`/`show` with tmux's real
+    defaults, but no other module in the codebase calls any of them (`grep`
+    confirms every reference outside `options.rs` itself is in that same
+    file's own unit tests) — there is no bell/activity DETECTION at all (no
+    code watches for a BEL byte, an inactive window's pane producing new
+    output, or a window going silent for `silence-monitor` seconds), let
+    alone the window-flag (`#F` `~`/`#`/`!`) or visual-flash/message
+    reaction real tmux would produce. The user's real `.tmux.conf` fixture
+    (`tests/fixtures/user.tmux.conf`) sets all five to their
+    least-surprising values (`off`/`off`/`off`/`none`/`off`) precisely
+    because they don't want alerts, so this gap is invisible to that
+    config's own test coverage — SP6's config-compat batch made every one of
+    these options PARSE cleanly (closing the "unknown option" class of
+    error), but implementing the alert-detection/reaction behavior itself
+    was out of that batch's scope. Fix sketch: bell detection needs a BEL
+    (`\x07`) hook in `grid`'s VT parser surfaced as a pane event; activity
+    detection needs an "this pane produced output and its window isn't
+    focused" check in the server's output-handling path; both would then
+    feed a window-flags bit (already partially modeled via `#F`'s existing
+    `*`/`-` flags, `src/options.rs`'s `expand_format`) plus, for the visual-*
+    variants, a status-line flash/message. MEDIUM effort (new detection
+    machinery, not just wiring an existing signal to an existing option).
+    LOW priority (no known user config actually turns these on and depends
+    on the behavior; the one polled fixture explicitly turns them off).
