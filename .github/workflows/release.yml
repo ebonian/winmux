@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+          $manifestVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tagVersion -ne $manifestVersion) {
+            Write-Error "Tag version '$tagVersion' does not match Cargo.toml version '$manifestVersion'"
+            exit 1
+          }
+          Write-Host "Releasing version $manifestVersion"
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (lint gate)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Same flake-aware thread cap as ci.yml (see CLAUDE.md, follow-up #89).
+      - name: Test
+        run: cargo test -- --test-threads=4
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          $zip = "winmux-$version-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path target\release\winmux.exe -DestinationPath "dist\$zip"
+          $hash = (Get-FileHash "dist\$zip" -Algorithm SHA256).Hash.ToLower()
+          # Two-space separator: standard sha256sum format, so
+          # `sha256sum -c SHA256SUMS` works too.
+          [IO.File]::WriteAllText("dist\SHA256SUMS", "$hash  $zip`n")
+          Get-Content dist\SHA256SUMS
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            --title "winmux $env:GITHUB_REF_NAME" `
+            --generate-notes `
+            (Get-ChildItem dist\* | ForEach-Object FullName)

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Lint and test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (lint gate)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # --test-threads=4 is the project's documented flake-aware cap: several
+      # e2e/protocol tests poll transient output or compare wall-clock margins
+      # and flake under full parallelism on loaded machines (see CLAUDE.md,
+      # follow-up #89). Hosted runners are exactly that case.
+      - name: Test
+        run: cargo test -- --test-threads=4
