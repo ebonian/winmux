@@ -6178,21 +6178,16 @@ fn config_bind_space_reachable_by_real_spacebar() {
 /// entirely -- the bound command fires and the character never reaches the
 /// shell. Verifies winmux's root-table dispatch order does the same for a
 /// bare, unmodified printable character (previously unexercised by any
-/// test -- follow-up #30 flagged this as "unverified").
+/// test -- follow-up #30 flagged this as "unverified", then confirmed a
+/// real gap by this same test's earlier `#[ignore]`d form in SP7 Task 5).
 ///
-/// CONFIRMED RED, currently `#[ignore]`d (see follow-up #30 for the full
-/// diagnosis): `input::is_plain_forwardable` always coalesces an unmodified
-/// printable into a `KeyInputEvent::Forward` blob with no root-table
-/// lookup at all, so a bare `x` keystroke leaks straight to the shell
-/// (`PS ...> x`) instead of firing the `-n` binding. A real fix needs
-/// either a live `Bindings` query hook wired into `KeyMachine`, or a
-/// root-table re-decode-and-lookup pass in `server.rs`'s live-pane
-/// `Forward` branch (mirroring what its `Copy`/`ChooseTree` branches
-/// already do) -- both require editing `src/server.rs`, out of this task's
-/// file scope. Left in the suite (ignored, not deleted) so the repro and
-/// diagnosis travel with the code for whoever picks up the real fix.
+/// FIXED (SP7 Wave 2 opener): `process_key_events`'s live-pane `Forward`
+/// arm in `src/server.rs` now re-decodes the coalesced blob and consults
+/// `self.bindings.lookup(WhichTable::Root, ..)` for every key, exactly
+/// mirroring the pre-existing `Copy`/`ChooseTree` arms just above it. Bound
+/// keys dispatch and are swallowed; unbound runs are still batched into one
+/// `input_tx.send` to preserve typing throughput.
 #[test]
-#[ignore = "confirmed real gap (follow-up #30): fixing requires src/server.rs, out of this task's scope -- see doc comment"]
 fn bind_dash_n_printable_shadows_typing() {
     let name = unique_pipe_name();
     let _server = start_server(&name);
@@ -6213,6 +6208,21 @@ fn bind_dash_n_printable_shadows_typing() {
     // -- NOT get typed onto the shell's command line.
     c.send(&ClientMsg::Stdin(b"x".to_vec()));
     c.recv_output_until(&mut grid, has_vertical_border);
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.trim_end().ends_with("> x")),
+        "the bound 'x' must not have been typed onto either pane's prompt; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    // Unbind now so the rest of this test -- which needs to type text
+    // containing the letter 'x' (the marker below, and `exit`) -- is not
+    // itself intercepted by a still-armed `-n x` binding (that would split
+    // AGAIN on every 'x' typed, which is correct tmux behavior but not what
+    // this test is checking). A separate test,
+    // `unbind_n_restores_plain_forwarding`, exercises the unbind path
+    // itself end to end.
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "x".into()]));
+    expect_cli_done(&cli, 0);
 
     // Prove "x" never reached either pane's shell: an "echo" run in the
     // now-focused (new, right-hand) pane must echo cleanly, not as a
@@ -6225,11 +6235,14 @@ fn bind_dash_n_printable_shadows_typing() {
         "a leaked 'x' must not have reached the shell; screen:\n{}",
         screen_text(&grid).join("\n")
     );
-
-    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
-    c.expect_exit(0, "[exited]");
-    // The other pane (left) is still alive; leave the server thread running
-    // rather than juggling both exits, matching this file's convention.
+    // Deliberately no `exit`/`expect_exit` here: two panes are live (the
+    // split from earlier), so exiting only the focused (right) pane's shell
+    // would just close that one pane and reflow the layout -- the CLIENT
+    // stays attached and never receives a ServerMsg::Exit, so
+    // `expect_exit` would hang. `start_server` runs the server as an
+    // in-process background thread (a detached `JoinHandle`, never
+    // joined) -- leaving it running past test end is this file's existing
+    // convention for tests that don't need to prove full shutdown.
 }
 
 /// Regression guard for the #34 canonicalization fix: with NO binding
@@ -6247,6 +6260,111 @@ fn unbound_space_still_forwards_to_pane() {
     c.send(&ClientMsg::Stdin(vec![0x20])); // a real spacebar byte
     c.send(&ClientMsg::Stdin(b"b\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("a b")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #30 fix: a runtime `bind -n <printable>` (no config file, no server
+/// restart) must shadow typing IMMEDIATELY -- the fix consults the CURRENT
+/// `self.bindings` at dispatch time (`Server::forward_raw_to_focused_pane`'s
+/// caller, `process_key_events`'s `Forward` arm), not a snapshot taken
+/// somewhere earlier. Uses `rename-window` (rather than `split-window`, as
+/// the main repro test does) so the assertion is a single-pane status-line
+/// check with no multi-pane exit complications.
+#[test]
+fn bind_n_printable_shadows_typing_runtime() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "z".into(),
+        "rename-window".into(),
+        "zoomed".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    // A bare "z" keypress with no prefix must fire the runtime binding.
+    c.send(&ClientMsg::Stdin(b"z".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("zoomed")));
+
+    // Prove "z" itself never reached the shell: subsequent typing must echo
+    // cleanly, not as a leaked "zecho ...".
+    c.send(&ClientMsg::Stdin(b"echo runtime-marker\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("runtime-marker")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("zecho")),
+        "the bound 'z' must not have leaked into the shell; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// #30 fix, other direction: `unbind -n` on a previously-shadowed printable
+/// must restore plain forwarding immediately -- proving the dispatch path
+/// re-checks CURRENT bindings on every keystroke rather than caching
+/// "this key is bound" once.
+#[test]
+fn unbind_n_restores_plain_forwarding() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "bind".into(),
+        "-n".into(),
+        "z".into(),
+        "rename-window".into(),
+        "zoomed".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+    cli.send(&ClientMsg::Cli(vec!["unbind".into(), "-n".into(), "z".into()]));
+    expect_cli_done(&cli, 0);
+
+    // With the binding removed again, "z" must forward as ordinary typed
+    // input, batched with the rest of the line exactly as if it had never
+    // been bound.
+    c.send(&ClientMsg::Stdin(b"echo before-z-after\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("before-z-after")));
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("zoomed")),
+        "unbound 'z' must not still fire the removed binding; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Regression guard for the #30 fix: a long burst of ordinary (fully
+/// unbound) printable typing sent in a SINGLE `Stdin` frame must still
+/// arrive at the pane intact as one piece of text -- the new per-key
+/// root-table lookup in `process_key_events`'s `Forward` arm re-decodes the
+/// blob, but unbound runs must still be batched into one `input_tx.send`
+/// rather than regressing to one send per keystroke.
+#[test]
+fn long_unbound_typing_burst_forwards_intact() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let burst = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let cmd = format!("echo {burst}\r");
+    c.send(&ClientMsg::Stdin(cmd.into_bytes()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains(burst)));
 
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");

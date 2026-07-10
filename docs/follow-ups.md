@@ -343,41 +343,47 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     from SP2), not on the configured interval — a custom `status-right`
     format with sub-minute-sensitive content (were the format engine to
     support one, see #27) would not refresh on schedule.
-30. **CONFIRMED, STILL OPEN** (SP7, Task 5 verification pass). `bind -n`
-    (no-prefix bindings) can't be given a bare printable character. The `-n`
-    (root-table, no-prefix-required) binding path exists and is tested
-    against non-printable/special keys, but tmux's real semantics — binding
-    a bare letter with `-n` shadows normal typing in that pane entirely —
-    was previously unexercised for printable characters ("SP3's key-machine
-    dispatch order for that case is unverified"). SP7 Task 5 added
+30. **RESOLVED** (SP7 Wave 2 opener). `bind -n` (no-prefix, root-table
+    bindings) can now be given a bare printable character, and it shadows
+    normal typing in that pane entirely, exactly like real tmux. SP7 Task 5
+    had confirmed the gap was real (not just "unverified") via
     `tests/server_proto.rs::bind_dash_n_printable_shadows_typing`
-    (`bind -n x split-window -h`, then a bare `x` keystroke with no prefix)
-    and confirmed the gap is REAL, not just unverified: the keystroke leaks
-    straight to the shell prompt (`PS ...> x`), no split occurs. Root
-    cause: `input::is_plain_forwardable` (`src/input.rs`) is a *static*
+    (`bind -n x split-window -h`, then a bare `x` keystroke leaked straight
+    to the shell prompt, no split) but left it open because the fix needed
+    `src/server.rs`, out of that task's file scope. Root cause (unchanged):
+    `input::is_plain_forwardable` (`src/input.rs`) is a *static*
     per-key-shape check with no knowledge of the live `Bindings` table — any
     unmodified `Char`/`Enter`/`Tab`/`Space`/`BSpace` key in `Normal` state
-    always resolves to a coalesced `KeyInputEvent::Forward` blob, which
-    `src/server.rs`'s live-pane branch (`process_key_events`, the
-    non-modal/non-`Copy`/non-`ChooseTree` arm) writes straight to the pty
-    with **no root-table lookup at all** — unlike the `Copy`/`ChooseTree`/
-    `DisplayPanes` branches just above it, which already re-decode a
-    `Forward` blob and resolve each key against their own table. A `Key`
-    event only ever reaches `Bindings::lookup` for keys `is_plain_forwardable`
-    excludes (i.e. anything carrying a modifier, or a named/special key
-    outside that set) — confirming the current code comment's "documented
-    deviation" is accurate and not merely theoretical.
-    **Not fixed in SP7 Task 5**: doing so requires either (a) giving
-    `KeyMachine` a live query hook into `Bindings` (a `feed`/`new` signature
-    change plus a `src/server.rs` call-site update to wire it), or (b)
-    adding a root-table re-decode-and-lookup pass to `process_key_events`'s
-    live-pane `Forward` branch, mirroring what the `Copy`/`ChooseTree`
-    branches already do. Both require editing `src/server.rs`, which was
-    out of Task 5's file scope (isolated to `src/bindings.rs`/`src/input.rs`
-    to avoid stepping on parallel SP7 tracks). The reproduction test is kept
-    in the suite as `#[ignore]` (with the diagnosis above in its doc
-    comment) rather than left red, so `cargo test` stays green until a
-    task with `src/server.rs` in scope closes this out.
+    always resolves to a coalesced `KeyInputEvent::Forward` blob.
+    **Fix**: `process_key_events`'s live-pane `Forward` arm in
+    `src/server.rs` (previously the one arm with no root-table lookup at
+    all, unlike the `Copy`/`ChooseTree`/`DisplayPanes` arms just above it)
+    now re-decodes the blob with a fresh `KeyDecoder` and looks up every
+    decoded key against the CURRENT `self.bindings.lookup(WhichTable::Root,
+    ..)` before deciding what to do with it — a bound key dispatches its
+    command and is swallowed; consecutive unbound keys are still batched
+    into one `input_tx.send` (a new private helper,
+    `Server::forward_raw_to_focused_pane`, re-derives the focused pane fresh
+    on every flush so a mid-blob bound command that itself changes focus —
+    e.g. `split-window`/`switch-client` — is honored for the rest of the
+    blob too) — preserving the original coalescing/throughput for ordinary
+    typing. `input.rs`/`KeyMachine` were **not** touched: the coalescing
+    behavior and the `## input-v2` contract's documented Forward-blob rule
+    are unchanged; only the server's consumption of that blob changed, so
+    no public signature moved and no `KeyMachine` query hook was needed.
+    Because the lookup reads `self.bindings` directly at dispatch time, a
+    runtime `bind -n`/`unbind -n` takes effect immediately, no server
+    restart required. The former `#[ignore]`d repro test
+    (`bind_dash_n_printable_shadows_typing`) is un-ignored and green; three
+    more tests were added alongside it:
+    `bind_n_printable_shadows_typing_runtime` (runtime bind, no config),
+    `unbind_n_restores_plain_forwarding` (unbind restores plain forwarding
+    immediately), and `long_unbound_typing_burst_forwards_intact` (a
+    regression guard proving a long burst of ordinary unbound typing still
+    arrives as one intact batch, not one send per keystroke). Interface
+    contract updated: `docs/specs/2026-07-07-command-config-interfaces.md`'s
+    `## input-v2` "Root-table throughput simplification" bullet, which
+    previously documented this as an open deviation.
 31. **`status-right`'s inline `#[...]` per-segment style overrides are not
     parsed.** Real tmux lets `status-right`/`status-left` embed
     `#[fg=red,bold]`-style directives mid-string to change color partway

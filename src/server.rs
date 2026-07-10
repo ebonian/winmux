@@ -2282,16 +2282,55 @@ impl Server {
                         if detach || destroy {
                             break 'events;
                         }
-                    } else if let Some(session) = self.registry.session_mut(&session_name) {
-                        let fid = session.current_window().layout.focused();
-                        if let Some(pane) = self.panes.get(&fid) {
-                            // Follow-up #14: enqueue onto the pane's OWN
-                            // writer thread instead of calling
-                            // `pty.write_input` inline here — this is the
-                            // server's single main-loop thread, which must
-                            // never block on one pane's (possibly stalled)
-                            // stdin.
-                            let _ = pane.input_tx.send(data);
+                    } else {
+                        // Follow-up #30: a coalesced Forward blob (built from
+                        // ANY run of plain-forwardable keys, per
+                        // `is_plain_forwardable`'s doc comment) used to be
+                        // written straight to the pane with no root-table
+                        // lookup at all, so a `bind -n <printable>` binding
+                        // could never shadow typing -- unlike the
+                        // Copy/ChooseTree/DisplayPanes arms above, which
+                        // already re-decode a Forward blob and resolve each
+                        // key against their own table. Mirror that pattern
+                        // here for the live-pane case: re-decode the blob and
+                        // consult the CURRENT `self.bindings` root table
+                        // (so a runtime `bind -n`/`unbind -n` takes effect
+                        // immediately) for every key. Bound keys dispatch
+                        // their command and are swallowed (never reach the
+                        // pane) exactly like tmux. Runs of UNBOUND keys are
+                        // still batched into a single `input_tx.send` --
+                        // preserving the original coalescing/throughput --
+                        // and only flushed early when a bound key interrupts
+                        // the run or at the end of the blob.
+                        let mut dec = crate::keys::KeyDecoder::new();
+                        let mut decoded = dec.feed(&data);
+                        decoded.extend(dec.flush());
+                        let mut pending_raw: Vec<u8> = Vec::new();
+                        for item in decoded {
+                            let crate::keys::DecodedInput::Key(dk) = item else {
+                                debug_assert!(false, "Forward blob decoded to a Mouse item");
+                                continue;
+                            };
+                            let binding = self.bindings.lookup(WhichTable::Root, &dk.key).cloned();
+                            match binding {
+                                Some(b) => {
+                                    if !pending_raw.is_empty() {
+                                        self.forward_raw_to_focused_pane(&session_name, std::mem::take(&mut pending_raw));
+                                    }
+                                    let outcome = self.dispatch_client(&b.cmds, &mut client, &mut session_name);
+                                    if b.repeat {
+                                        client.key_machine.arm_repeat(now);
+                                    }
+                                    dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                                    if detach || destroy {
+                                        break 'events;
+                                    }
+                                }
+                                None => pending_raw.extend_from_slice(&dk.raw),
+                            }
+                        }
+                        if !pending_raw.is_empty() {
+                            self.forward_raw_to_focused_pane(&session_name, pending_raw);
                         }
                     }
                 }
@@ -2499,6 +2538,28 @@ impl Server {
         // this OR another client may have just removed the session/window
         // this client had a kill confirm armed on.
         self.cancel_stale_choose_trees();
+    }
+
+    /// Follow-up #30 helper: write raw bytes to whatever pane is currently
+    /// focused in `session_name`'s current window. Deliberately re-derives
+    /// the focused pane fresh on every call (not cached by the caller)
+    /// because a root-table binding dispatched earlier in the same
+    /// `process_key_events` Forward-blob loop may itself have changed the
+    /// focused pane, the current window, or even the session (e.g. a
+    /// `bind -n` command that splits or switches) — subsequent unbound keys
+    /// in the same blob must follow that change, matching tmux processing
+    /// keys one at a time. A no-op if the session or pane no longer exists.
+    /// Follow-up #14 still applies: this enqueues onto the pane's own writer
+    /// thread instead of calling `pty.write_input` inline, since this is the
+    /// server's single main-loop thread and must never block on one pane's
+    /// (possibly stalled) stdin.
+    fn forward_raw_to_focused_pane(&mut self, session_name: &str, data: Vec<u8>) {
+        if let Some(session) = self.registry.session_mut(session_name) {
+            let fid = session.current_window().layout.focused();
+            if let Some(pane) = self.panes.get(&fid) {
+                let _ = pane.input_tx.send(data);
+            }
+        }
     }
 
     /// Precompute per-client overlay render data (Task 8) for every

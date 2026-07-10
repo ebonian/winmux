@@ -937,15 +937,29 @@ and Task 9's `lone_escape_flushes_after_escape_time`,
   arrows/F-keys/Escape/BTab/Home/End/PPage/NPage/IC/DC) is emitted as `Key {
   table: Root, .. }` instead, even though nothing preceded it — the server
   looks it up in the root table and forwards it raw itself if unbound.
-  **Consequence (documented, matches the design spec's `bind -n`
-  deviation):** `bind -n` on a bare unmodified printable char, Enter, Tab,
-  Space, or BSpace is accepted by `cmd::resolve`/`bindings::Bindings::bind`
-  but can **never fire** in SP3, because `KeyMachine` never emits a `Key`
-  event for such a key in the first place — only keys carrying a modifier,
-  or a named/special key outside this set, can be bound in the root table.
-  Revisit if SP4 needs full `bind -n` coverage (would require dropping the
-  coalescing optimization or making it conditional on whether the root
-  table currently has any such binding).
+  **Consequence, RESOLVED SP7 (follow-up #30):** `KeyMachine` itself still
+  never emits a `Key { table: Root, .. }` event for a bare unmodified
+  printable char/Enter/Tab/Space/BSpace — the coalescing described above is
+  unchanged, `input.rs` was not touched by this fix, and this remains the
+  only way such a key is emitted from `feed()`. What changed is on the
+  server side: `process_key_events`'s live-pane `Forward` arm
+  (`src/server.rs`) no longer writes a coalesced `Forward` blob straight to
+  the pane. It re-decodes the blob (mirroring the pre-existing
+  Copy-mode/choose-tree/display-panes arms just above it in the same match)
+  and looks up **every** decoded key against the CURRENT
+  `self.bindings.lookup(WhichTable::Root, ..)` before deciding what to do
+  with it: a bound key dispatches its command and is swallowed (never
+  reaches the pane), matching tmux's real `bind -n <printable>` semantics
+  exactly, including runtime `bind -n`/`unbind -n` taking effect
+  immediately (no snapshot). Consecutive UNBOUND keys are still batched into
+  a single `input_tx.send` (via the new private helper
+  `Server::forward_raw_to_focused_pane`) to preserve the original
+  coalescing/throughput for ordinary typing — only a bound key interrupts a
+  batch. No public signature changed (this helper is private); see
+  `tests/server_proto.rs::bind_dash_n_printable_shadows_typing` /
+  `bind_n_printable_shadows_typing_runtime` /
+  `unbind_n_restores_plain_forwarding` /
+  `long_unbound_typing_burst_forwards_intact`.
 - **Capture mode (`set_capture`):** while on, `feed()` bypasses ALL of the
   above — every byte, including the raw prefix byte and escape sequences,
   passes through verbatim as `Captured(bytes)`, coalesced per `feed()` call
