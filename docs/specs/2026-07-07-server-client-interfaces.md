@@ -459,7 +459,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4, SP7 Task 7)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4, SP7 Task 7, SP7 parity wave 3 fix)
 
 ```rust
 // status.rs
@@ -529,7 +529,62 @@ pub fn strip_style_markers(text: &str) -> String;
 /// existing `strip_style_markers`-then-plain-char-count-cap treatment
 /// unchanged (no markers survive to bisect by the time it's capped).
 pub fn truncate_visible(text: &str, max: u16) -> String;
+
+/// NEW (SP7 parity wave 3 fix, review of 128cfc0). One window's tab column
+/// span in the FINAL rendered status row (0-based, `end` exclusive).
+/// `window_pos` is the window's position in the `windows` slice passed to
+/// `status_tab_columns`/`status_spans` — NOT its tmux `#I` index. A window
+/// scrolled fully off-screen under overflow scrolling has no entry.
+pub struct TabColumn {
+    pub window_pos: usize,
+    pub start: u16,
+    pub end: u16,
+}
+
+/// NEW (SP7 parity wave 3 fix, review of 128cfc0, closes the `mouse_status_
+/// click` hit-test regression). Column ranges a status-row click hit-test
+/// can map through: mirrors `status_spans`'s layout exactly (same private
+/// `window_tab_texts`/`plan_tab_layout` core, so it's byte-for-byte what's
+/// actually drawn, including window-list overflow scrolling and its `<`/`>`
+/// markers) but skips style resolution entirely, since a click doesn't care
+/// what color a tab is.
+pub fn status_tab_columns(
+    left: &str,
+    windows: &[WindowEntry],
+    ctx: &crate::options::FormatCtx,
+    window_format: &str,
+    window_current_format: &str,
+    separator: &str,
+    justify: &str,
+    width: u16,
+    right_len: usize,
+) -> Vec<TabColumn>;
 ```
+
+**AMENDMENT (SP7 parity wave 3 fix — review of 128cfc0):** `mouse_status_click`
+(`src/server/dispatch.rs`, see `## server-dispatch` below) used to
+reconstruct the tab hit-boxes ITSELF — walking `session.windows` in original
+order starting right after `status-left`, using its own hardcoded
+`"{index}:{name}{flags}"` text-length guess — which predated (and was left
+untouched by) SP7 Task 7's window-list overflow scrolling in `status_spans`.
+Once a real window list actually scrolled, the two disagreed: a click on the
+visually-current tab could resolve to the WRONG window. The fix factors the
+LAYOUT MATH (not the styling) out of `status_spans` into two private
+helpers — `window_tab_texts` (per-window expanded text + visible width,
+format-override-aware) and `plan_tab_layout` (the justify/scroll/marker
+decision, given only widths) — that `status_spans` and the new public
+`status_tab_columns` both call, so there is exactly one place that decides
+what's visible where. `status_spans`'s own behavior/output is byte-for-byte
+unchanged (every pre-existing test still passes unmodified); only its
+internal structure changed. Two new unit tests close a documented edge-case
+gap: `overflow_boundary_exactly_fits_no_markers_no_scroll` (`list_width ==
+list_avail` exactly must take the fit branch, not overflow) and
+`single_window_wider_than_budget_overflows_with_both_markers` (a single tab
+wider than the entire budget still overflows correctly with both markers
+when the visible sliver lands strictly inside it). A third,
+`status_tab_columns_matches_rendered_overflow_scroll`, proves the new
+function's columns agree with `status_spans`'s rendered row for the exact
+same fixture as `window_list_scrolls_to_keep_current_visible_with_markers`.
 
 **AMENDMENT (SP3 Task 8, historical):** the original Task 5 signature was
 `status_spans(session_name: &str, windows: &[WindowEntry]) ->

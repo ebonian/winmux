@@ -4062,6 +4062,95 @@ fn drag_after_double_click_extends_by_words() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Coverage gap closed (follow-up #37): the `word-separators` option is
+/// USED by `select_word_at`/`word_bounds_at` (see their doc comments'
+/// `CharClass` model — a character is `Separator` iff it's in the live
+/// `word-separators` string, `Word` otherwise) but had no test proving a
+/// NON-DEFAULT value actually moves a double-click word boundary. Follows
+/// `drag_after_double_click_extends_by_words`'s harness pattern above
+/// (press, release, press = the double-click sequence installing the word
+/// anchor on the second press; one more `Drag` at the SAME column flips
+/// `MouseDrag::Selecting` to `moved: true` so `mouse_up` actually copies,
+/// without extending the selection to a different word).
+///
+/// Text is `foo_bar` (no spaces): tmux's real default `word-separators`
+/// (`!"#$%&'()*+,-./:;<=>?@[\]^`{|}~`) does NOT include `_`, so `_` is in
+/// the `Word` class along with alphanumerics — double-clicking anywhere in
+/// `foo_bar` with the DEFAULT selects the WHOLE string as one word. Setting
+/// `word-separators` to that same default PLUS `_` reclassifies `_` as
+/// `Separator`; double-clicking column 5 (`'a'` of `bar`) now stops the run
+/// at the `_` boundary, selecting only `bar` (a DIFFERENT column than the
+/// first phase's click 1, deliberately: `advance_click_run`'s multi-click
+/// window keys off `(x, y)` matching the PRIOR click too, so reusing the
+/// exact same column across the two phases — with the CLI round-trips in
+/// between taking negligible wall-clock time — would keep incrementing the
+/// SAME click run into a triple-click/line-select instead of starting a
+/// fresh double-click).
+#[test]
+fn word_separators_option_moves_double_click_word_boundary() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo foo_bar\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "foo_bar"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "foo_bar").unwrap() as u16;
+
+    // ---- default word-separators: double-click col 1 ('o') selects the
+    // WHOLE "foo_bar" (`_` is in the Word class by default). ----
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 1, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 1, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("\"foo_bar\""),
+        "default word-separators must NOT split on '_': {out:?}"
+    );
+
+    // ---- word-separators = default + '_': same double-click now stops at
+    // the '_' boundary, selecting only "foo". ----
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "set".into(),
+        "-g".into(),
+        "word-separators".into(),
+        "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~_".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    let newest = out.lines().last().unwrap_or("");
+    assert!(
+        newest.contains("\"bar\"") && !newest.contains("foo_bar"),
+        "word-separators including '_' must stop the double-click word run at the boundary: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `docs/tmux-reference/mouse.md` :636-640 (SEL_LINE branch) /
 /// `copy-mode-and-buffers.md` :440-447: after TripleClick installs a
 /// `SelKind::Line` anchor (`select_line_at`), continuing to drag snaps the
@@ -4163,6 +4252,103 @@ fn mouse_status_click_selects_window() {
         let row = row_text(g, status_row);
         row.contains("0:w0*") && row.contains("1:w1-")
     });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// TDD regression test for a review finding on 128cfc0: `mouse_status_click`
+/// (`src/server/dispatch.rs`) computed tab hit-boxes by walking
+/// `session.windows` in original order starting right after `status-left`,
+/// assuming an unscrolled, full-width window list. `status::status_spans`'s
+/// NEW window-list overflow scrolling (128cfc0, closes follow-up #69a) can
+/// scroll that list and prepend a `<` marker, so the two disagree the moment
+/// the list actually scrolls -- a click on the visually-current tab could
+/// select the WRONG window.
+///
+/// Every width-affecting option is pinned to something exactly
+/// hand-computable: `status-left`/`status-right` cleared (0 columns each),
+/// `window-status-format` set to the bare `#I` (each NON-current tab is
+/// exactly 1 column: just its digit), `window-status-current-format` set to
+/// `#I*` (the CURRENT tab is 2 columns -- a literal `*` distinguishes it
+/// on-screen without needing `#F`/conditionals), default
+/// `window-status-separator` (one space) left alone. 5 windows (indices
+/// 0-4, current = 4, the last one `c` creates) at terminal width 8:
+///
+/// - unclipped tab+separator sequence (widths 1,1,1,1,2 + 4 separators):
+///   window i's raw span is `[2i, 2i+1)` for i=0..3, window 4's is `[8,10)`.
+///   `list_width` = 10.
+/// - `list_avail` = width(8) - left(0) - right(0) = 8; 10 > 8 -> overflow.
+/// - focus (window 4) = [8,10), `focus_centre` = 8 + (10-8)/2 = 9.
+/// - fixed-point marker search: pass 1 (both markers assumed) finds
+///   `content_w=6, start=4, end=10` -> `new_right=false` (disagrees with the
+///   assumption) -> pass 2 (`marker_left` only) finds `content_w=7,
+///   start=3, end=10`, which agrees -> converged: `start=3, end=10,
+///   marker_left=true, marker_right=false`.
+/// - visible slice = raw columns [3,10): window 0 ([0,1)) and window 1
+///   ([2,3)) are fully scrolled off (window 1's span ends exactly at the
+///   clip start -> zero overlap); the content is `<sep><'2'><sep><'3'><sep>
+///   <'4'><'*'>` = `" 2 3 4*"` (7 cols) with `<` prepended (marker_left)
+///   and nothing appended (marker_right false) -> row = `"< 2 3 4*"` (8
+///   cols, exactly the terminal width).
+/// - absolute columns (`content_start_col` = left(0) + marker_left(1) = 1):
+///   window 2's `'2'` = col 2, window 3's `'3'` = col 4, window 4's `'4*'`
+///   = cols 6-7.
+///
+/// Clicking column 4 (window 3's ONLY visible column) must select window 3.
+/// The OLD reconstruction — `cursor` starting at `left_len`(0) and walking
+/// `session.windows` in order using ITS OWN hardcoded `"{index}:{name}
+/// {flags}"` text-length guess (which doesn't even match the REAL
+/// `window-status-format` this test set, let alone the scroll) — resolves
+/// column 4 to some other window entirely (empirically window 0, since its
+/// wrongly-guessed width already covers column 4), so the pre-fix server
+/// leaves window 4 current instead of switching to window 3: the second
+/// `recv_output_until` below times out pre-fix and passes post-fix.
+///
+/// After the switch, window 3 becomes current (2-column `"3*"` tab, widths
+/// now 1,1,1,2,1) and the scroll re-centers on it: `raw_spans` = w0[0,1)
+/// w1[2,3) w2[4,5) w3[6,8) w4[9,10), `list_width`=10, `list_avail`=8,
+/// `focus_centre` = 6+(8-6)/2 = 7. Pass 1 (both markers) gives
+/// `start=4,end=10` -> `new_right=false` (disagrees) -> pass 2
+/// (`marker_left` only) gives `content_w=7, start=3, end=10`, which agrees
+/// -> converged. Visible raw `[3,10)` = sep,'2',sep,'3','*',sep,'4' =
+/// `" 2 3* 4"` (7 cols); `<` prepended, nothing appended -> final row =
+/// `"< 2 3* 4"` (8 cols).
+#[test]
+fn status_click_selects_correct_window_when_list_scrolled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 8, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-left".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-format".into(), "#I".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-current-format".into(), "#I*".into()]));
+    expect_cli_done(&cli, 0);
+
+    // 4 more windows on top of the initial one -> indices 0-4, current = 4.
+    for _ in 0..4 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    }
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3 4*");
+
+    // Column 4 = window 3's visible tab (see doc comment's column table).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 4, status_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 4, status_row, true)));
+
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3* 4");
 
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));

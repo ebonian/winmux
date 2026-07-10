@@ -35,12 +35,13 @@ use crate::layout::{PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::{self, FormatCtx};
 use crate::protocol::ServerMsg;
+use crate::status;
 
 use super::{
     advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
-    send_msg, spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
-    ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode,
-    PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
+    send_msg, spawn_pane, system_time_parts, truncate_chars, AutoscrollState, ChooseTreeState, ChooseTreeView,
+    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag,
+    PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
     MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::{Cell, Grid, Style};
@@ -2600,14 +2601,23 @@ impl Server {
     /// Left click on the status row at column `x`: select the window tab
     /// under it, if any. A click on the `status-left` prefix, a separator
     /// space, or past the last tab is a no-op (design spec: "Down-click on a
-    /// status-line area with no window: no-op"). Rebuilds the SAME left-
-    /// prefix-width-then-per-window-span layout `render_one`/`status_spans`
-    /// draws (one space between tabs, none after the last) so hit-testing
-    /// always agrees with what's actually on screen; deliberately does NOT
-    /// replicate `render::compose_back`'s final spatial truncation when
-    /// left+right don't fit the terminal width (a click past the truncation
-    /// point on an extremely narrow terminal may resolve to a tab that isn't
-    /// actually drawn there -- documented v1 gap, `docs/follow-ups.md`).
+    /// status-line area with no window: no-op").
+    ///
+    /// FIX (review of 128cfc0, SP7 parity wave 3): this used to rebuild the
+    /// tab layout ITSELF (unscrolled, hardcoded `"{index}:{name}{flags}"`
+    /// text), which predated -- and disagreed with -- `status::status_spans`'s
+    /// window-list overflow scrolling (closes follow-up #69a): once the list
+    /// actually scrolled, a click on the visually-current tab could resolve
+    /// to the wrong window. It now builds the exact same per-window inputs
+    /// `server::render_one` does (format/style overrides, each window's own
+    /// active pane -- see #26/#71) and maps `x` through `status::
+    /// status_tab_columns`, the SAME layout core `status_spans` draws from,
+    /// so the hit-test always agrees with what's actually on screen. Still
+    /// deliberately does NOT replicate `render::compose_back`'s final
+    /// spatial truncation when left+right don't fit the terminal width (a
+    /// click past that truncation point on an extremely narrow terminal may
+    /// resolve to a tab that isn't actually drawn there -- documented v1
+    /// gap, `docs/follow-ups.md`).
     fn mouse_status_click(&mut self, x: u16, session_name: &str) -> ExecOutcome {
         let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
             return ExecOutcome::Ok(String::new());
@@ -2632,36 +2642,71 @@ impl Server {
             now: system_time_parts(),
             pane_title: &pane_title,
         };
-        // status-left/-left-length are session-scoped (#26).
+        // status-left/-right/-length are session-scoped (#26). `right_len`
+        // feeds the SAME justify/overflow math `render_one` computes with
+        // (previously ignored entirely here, which also meant `status-
+        // justify` other than the default "left" was silently wrong for
+        // hit-testing).
         let left = crate::options::expand_format(self.options.status_left_for(&session.session_options), &fctx);
-        let left_len = left.chars().count().min(self.options.status_left_length_for(&session.session_options) as usize) as u16;
-        if x < left_len {
-            return ExecOutcome::Ok(String::new());
-        }
+        let left = status::truncate_visible(&left, self.options.status_left_length_for(&session.session_options));
+        let right_expanded = status::strip_style_markers(&crate::options::expand_format(
+            self.options.status_right_for(&session.session_options),
+            &fctx,
+        ));
+        let right_len =
+            truncate_chars(&right_expanded, self.options.status_right_length_for(&session.session_options)).chars().count();
 
-        let mut cursor = left_len;
-        let last_idx = session.windows.len().saturating_sub(1);
-        let mut target: Option<WindowId> = None;
-        for (i, w) in session.windows.iter().enumerate() {
-            let mut flags = String::new();
-            if w.id == session.current {
-                flags.push('*');
-            } else if Some(w.id) == session.last {
-                flags.push('-');
-            }
-            if w.layout.is_zoomed() {
-                flags.push('Z');
-            }
-            let text_len = format!("{}:{}{}", w.index, w.name, flags).chars().count() as u16;
-            if x >= cursor && x < cursor + text_len {
-                target = Some(w.id);
-                break;
-            }
-            cursor += text_len;
-            if i != last_idx {
-                cursor += 1; // separator space
-            }
-        }
+        // Per-window entries: the SAME construction `render_one` uses (SP7
+        // Task 6/7 -- format/style overrides and each window's OWN active
+        // pane), so `status::status_tab_columns` sees exactly what `status::
+        // status_spans` would draw for this session right now. `style_override`
+        // is left `None`: `status_tab_columns` never reads it (a click
+        // doesn't care what color a tab is), so resolving it here would only
+        // be wasted work.
+        let entries: Vec<status::WindowEntry> = session
+            .windows
+            .iter()
+            .map(|w| {
+                let is_current = w.id == session.current;
+                let fmt = if is_current {
+                    self.options.window_status_current_format_for(&w.window_options)
+                } else {
+                    self.options.window_status_format_for(&w.window_options)
+                };
+                let w_focused = w.layout.focused();
+                let w_pane_index = w.layout.panes().iter().position(|p| *p == w_focused).unwrap_or(0) as u32
+                    + self.options.pane_base_index_for(&w.window_options);
+                let w_pane_title = self.panes.get(&w_focused).map(|p| p.title.clone()).unwrap_or_default();
+                status::WindowEntry {
+                    index: w.index,
+                    name: w.name.clone(),
+                    current: is_current,
+                    last: Some(w.id) == session.last,
+                    zoomed: w.layout.is_zoomed(),
+                    format_override: Some(fmt.to_string()),
+                    style_override: None,
+                    pane_index: w_pane_index,
+                    pane_title: w_pane_title,
+                }
+            })
+            .collect();
+
+        let columns = status::status_tab_columns(
+            &left,
+            &entries,
+            &fctx,
+            self.options.window_status_format_for(&window.window_options),
+            self.options.window_status_current_format_for(&window.window_options),
+            self.options.window_status_separator_for(&window.window_options),
+            self.options.status_justify_for(&session.session_options),
+            session.size.0,
+            right_len,
+        );
+        let target = columns
+            .iter()
+            .find(|c| x >= c.start && x < c.end)
+            .and_then(|c| session.windows.get(c.window_pos))
+            .map(|w| w.id);
         let Some(wid) = target else {
             return ExecOutcome::Ok(String::new());
         };

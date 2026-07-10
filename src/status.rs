@@ -55,6 +55,22 @@
 //! evaluates directly, so the width-stable one-space-when-flagless behavior
 //! falls out of the format string itself (closes follow-ups #27/#70).
 //!
+//! **Fix (review of 128cfc0, SP7 parity wave 3):** the window-list overflow
+//! scrolling added by SP7 Task 7 below (item (1)) was a `status_spans`-only
+//! change — `server::dispatch::mouse_status_click`'s status-row click
+//! hit-test kept its OWN, unrelated reconstruction of the tab layout
+//! (unscrolled, hardcoded `"{index}:{name}{flags}"` text), so the two could
+//! disagree the moment a real list actually scrolled: a click on the
+//! visually-current tab could resolve to the wrong window. The layout MATH
+//! (not the styling) is now factored into two private helpers —
+//! [`window_tab_texts`] (per-window expanded text + visible width, format-
+//! override-aware) and `plan_tab_layout` (the justify/scroll/marker
+//! decision, given only widths) — that `status_spans` and the new public
+//! [`status_tab_columns`] both call, so there is exactly one place that
+//! decides what's visible where; `mouse_status_click` now maps its click
+//! column through [`status_tab_columns`]'s [`TabColumn`] ranges instead of
+//! reconstructing anything itself.
+//!
 //! **SP7 Task 7 (status-line residuals):** three more gaps closed. (1)
 //! **Window-list overflow scrolling** (closes #69a): when `left` + the
 //! window list + `right` together exceed the terminal width, `status_spans`
@@ -265,42 +281,25 @@ fn list_offset(justify: &str, width: usize, left_width: usize, right_width: usiz
     }
 }
 
-/// Build the status-bar spans, ready for `render::compose_back` to draw
-/// left-to-right from column 0 (see the module docs for the full SP6 Task 4
-/// design). `ctx` supplies every format-expansion field EXCEPT
-/// `window_index`/`window_name`/`window_flags`, which are overridden per
-/// window in the loop below (`ctx`'s own values for those three fields, if
-/// any, are ignored). `width` is the terminal's column count; `right_len` is
-/// the char count of the (already length-capped, already
-/// `strip_style_markers`-cleaned) `status-right` text the caller will draw
-/// right-aligned — needed for the `centre`/`right`/`absolute-centre` offset
-/// math but otherwise unused here.
-#[allow(clippy::too_many_arguments)]
-pub fn status_spans(
-    left: &str,
-    left_style: &PartialStyle,
+/// Expand every window's tab text ONCE (format-override-aware) and measure
+/// its visible width -- shared by [`status_spans`] (drawing) and
+/// [`status_tab_columns`] (hit-testing) so there is exactly one place that
+/// decides what a tab's text is, instead of two parallel reimplementations
+/// that can silently drift apart (the bug this fixes: `mouse_status_click`
+/// used to reimplement this loop with its own hardcoded format guess).
+/// Returns `(expanded text per window -- `#[...]` markers still verbatim,
+/// for [`styled_runs`] to split; VISIBLE width per window -- chars outside
+/// any marker, a marker draws zero columns; the `windows` slice position of
+/// the current window, if any)`.
+fn window_tab_texts(
     windows: &[WindowEntry],
     ctx: &FormatCtx,
     window_format: &str,
     window_current_format: &str,
-    base: Style,
-    win_style: &PartialStyle,
-    win_current_style: &PartialStyle,
-    separator: &str,
-    justify: &str,
-    width: u16,
-    right_len: usize,
-) -> Vec<(String, Style)> {
-    let left_base = left_style.apply_to(base);
-    let mut left_spans = styled_runs(left, left_base);
-    let left_width: usize = left_spans.iter().map(|(t, _)| t.chars().count()).sum();
-
-    let non_current = win_style.apply_to(base);
-    let current = win_current_style.apply_to(base);
-
-    let mut tab_spans: Vec<Vec<(String, Style)>> = Vec::with_capacity(windows.len());
-    let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
-    let mut current_idx: Option<usize> = None;
+) -> (Vec<String>, Vec<usize>, Option<usize>) {
+    let mut texts = Vec::with_capacity(windows.len());
+    let mut widths = Vec::with_capacity(windows.len());
+    let mut current_idx = None;
     for (i, w) in windows.iter().enumerate() {
         if w.current {
             current_idx = Some(i);
@@ -337,122 +336,292 @@ pub fn status_spans(
             pane_title: &w.pane_title,
         };
         let text = expand_format(fmt, &per_window_ctx);
-        let tab_base = match &w.style_override {
-            Some(s) => s.apply_to(base),
-            None if w.current => current,
-            None => non_current,
-        };
-        let spans = styled_runs(&text, tab_base);
-        let width: usize = spans.iter().map(|(t, _)| t.chars().count()).sum();
-        tab_spans.push(spans);
-        tab_widths.push(width);
+        widths.push(strip_style_markers(&text).chars().count());
+        texts.push(text);
     }
-    let sep_width = separator.chars().count();
-    let list_width: usize =
-        tab_widths.iter().sum::<usize>() + sep_width.saturating_mul(windows.len().saturating_sub(1));
+    (texts, widths, current_idx)
+}
 
-    // `list_avail` is the total budget the window-list BLOCK (tabs plus, if
-    // it overflows, its `<`/`>` markers) may occupy: everything between
-    // `left` and `right` (`docs/tmux-reference/status-line-and-messages.md`
-    // §1.4's "what gets cut first" summary -- the list is trimmed before
-    // `left`, after `right`). When the raw list fits, this is unused by the
-    // no-overflow branch below (which keeps the pre-Task-7 `list_offset`
-    // justify math byte-for-byte); it only matters once overflow is
-    // detected.
+/// Pure layout decision shared by [`status_spans`] and
+/// [`status_tab_columns`] -- fix for a review finding on 128cfc0 (see the
+/// module docs' "Fix" note): given each tab's visible width, decide where
+/// the window-list content begins, whether it's clipped/scrolled, and (if
+/// so) which end marker(s) are needed. This is the ONE place the SP7 Task 7
+/// overflow-scrolling algorithm (§1.4's cell-granularity scroll-to-keep-
+/// current-visible model) lives; both callers derive their answer from the
+/// SAME [`TabLayout`], which is what makes a status-row click hit-test
+/// agree with what's actually drawn.
+struct TabLayout {
+    /// Absolute column (0-based, in the final status row) where the tab
+    /// list's VISIBLE content begins: right after `left` + justify padding
+    /// (fit case), or right after `left` + a leading `<` marker (overflow
+    /// case, which never pads).
+    content_start_col: usize,
+    /// `Some((start, end))` -- the RAW (unclipped) flattened tab+separator
+    /// coordinate range that's actually visible -- when the list had to be
+    /// scrolled/cropped; `None` when everything fit as-is (nothing to clip).
+    clip: Option<(usize, usize)>,
+    marker_left: bool,
+    marker_right: bool,
+    /// Per-window (slice-index-aligned) `[start, end)` span in the RAW
+    /// (unclipped) flattened tab+separator coordinate space.
+    raw_spans: Vec<(usize, usize)>,
+}
+
+fn plan_tab_layout(
+    tab_widths: &[usize],
+    current_idx: Option<usize>,
+    sep_width: usize,
+    left_width: usize,
+    right_len: usize,
+    justify: &str,
+    width: u16,
+) -> TabLayout {
+    let mut raw_spans = Vec::with_capacity(tab_widths.len());
+    let mut cursor = 0usize;
+    let last_idx = tab_widths.len().saturating_sub(1);
+    for (i, w) in tab_widths.iter().enumerate() {
+        let start = cursor;
+        cursor += w;
+        raw_spans.push((start, cursor));
+        if i != last_idx {
+            cursor += sep_width;
+        }
+    }
+    let list_width = cursor;
     let list_avail = (width as usize).saturating_sub(left_width).saturating_sub(right_len);
+
+    if list_width <= list_avail {
+        // Fits (or nothing to show): the justify math decides a start
+        // column; the caller realizes the gap as literal padding spaces, no
+        // markers.
+        let offset = list_offset(justify, width as usize, left_width, right_len, list_width);
+        let content_start_col = offset.max(left_width);
+        return TabLayout { content_start_col, clip: None, marker_left: false, marker_right: false, raw_spans };
+    }
+
+    // Overflow (SP7 Task 7, closes follow-up #69a): §1.4's
+    // `format_draw_put_list` scrolls the window list at CELL granularity to
+    // keep the CURRENT window's centre visible, drawing `<`/`>` markers
+    // wherever content still exists beyond that edge. No padding is ever
+    // used in this branch: an overflowing list, by definition, consumes its
+    // entire allotted budget with nothing left over for any justify's gap.
+    let (focus_start, focus_end) = current_idx.and_then(|i| raw_spans.get(i).copied()).unwrap_or((0, 0));
+    let focus_centre = focus_start + (focus_end.saturating_sub(focus_start)) / 2;
+
+    // Fixed-point search for which end marker(s) are actually needed:
+    // reserving a marker's column shrinks the visible content window, which
+    // can flip whether the OTHER end is still off-screen (and vice versa).
+    // This converges because `reserved` (and hence every value derived from
+    // it below) is a PURE function of `(marker_left, marker_right)`, which
+    // only ever takes one of 3 values (`reserved` ∈ {0, 1, 2} -- `true,true`
+    // and `false,false` both aren't reachable as a STARTING guess here, but
+    // the search still only ever visits a handful of the 4 boolean-pair
+    // states before repeating one) -- capped at 4 passes as a documented
+    // upper bound on that convergence, not a heuristic guess.
+    let mut marker_left = true;
+    let mut marker_right = true;
+    let mut start = 0usize;
+    let mut content_w = 0usize;
+    for _ in 0..4 {
+        let reserved = marker_left as usize + marker_right as usize;
+        content_w = list_avail.saturating_sub(reserved);
+        start = if content_w == 0 {
+            focus_centre.min(list_width)
+        } else {
+            let half = content_w / 2;
+            let raw_start = focus_centre.saturating_sub(half);
+            let max_start = list_width.saturating_sub(content_w);
+            raw_start.min(max_start)
+        };
+        let end = (start + content_w).min(list_width);
+        let new_left = start > 0;
+        let new_right = end < list_width;
+        if new_left == marker_left && new_right == marker_right {
+            break;
+        }
+        marker_left = new_left;
+        marker_right = new_right;
+    }
+    let end = (start + content_w).min(list_width);
+    // Defensive final-consistency check (review finding on 128cfc0): the
+    // loop only `break`s when the flags it just recomputed from THIS pass's
+    // `start`/`end` already match the flags that pass assumed, so
+    // `marker_left`/`marker_right` and `start`/`content_w`/`end` can never
+    // end up paired across two different passes (a "knife-edge" 2-cycle
+    // would instead just never satisfy the `break` condition and run the
+    // full 4 passes, still ending on a self-consistent pair). Assert the
+    // invariant rather than trust it silently, so a future edit that
+    // reorders/shortcuts this loop trips a debug build instead of quietly
+    // emitting a mismatched marker.
+    debug_assert_eq!(marker_left, start > 0, "TabLayout: marker_left must match final start");
+    debug_assert_eq!(marker_right, end < list_width, "TabLayout: marker_right must match final end");
+
+    let content_start_col = left_width + marker_left as usize;
+    TabLayout { content_start_col, clip: Some((start, end)), marker_left, marker_right, raw_spans }
+}
+
+/// One window's tab column span in the FINAL rendered status row (0-based,
+/// end exclusive). Returned by [`status_tab_columns`], the single source of
+/// truth a status-row click hit-test (`server::dispatch::
+/// mouse_status_click`) maps through — see the module docs' "Fix" note for
+/// why this replaced an ad hoc reconstruction that broke under window-list
+/// overflow scrolling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabColumn {
+    /// This window's position in the `windows` slice passed to
+    /// [`status_tab_columns`]/[`status_spans`] -- NOT its tmux `#I` index. A
+    /// caller that built `windows` from (e.g.) `session.windows` in order
+    /// can index back into that same slice to recover the `WindowId`.
+    pub window_pos: usize,
+    /// First visible column this tab's text occupies.
+    pub start: u16,
+    /// One past the last visible column (exclusive). May be narrower than
+    /// the tab's full expanded width if the overflow branch's scroll window
+    /// clips one edge of it; a window scrolled fully off-screen has no
+    /// entry in the returned `Vec` at all.
+    pub end: u16,
+}
+
+/// Column ranges a status-row click hit-test can map through -- see
+/// [`TabColumn`]'s doc comment. Mirrors [`status_spans`]'s layout exactly
+/// (same [`window_tab_texts`]/`plan_tab_layout` core, so it's byte-for-byte
+/// what's actually drawn, including window-list overflow scrolling and its
+/// `<`/`>` markers) but skips style resolution entirely, since a click
+/// doesn't care what color a tab is.
+#[allow(clippy::too_many_arguments)]
+pub fn status_tab_columns(
+    left: &str,
+    windows: &[WindowEntry],
+    ctx: &FormatCtx,
+    window_format: &str,
+    window_current_format: &str,
+    separator: &str,
+    justify: &str,
+    width: u16,
+    right_len: usize,
+) -> Vec<TabColumn> {
+    let left_width = strip_style_markers(left).chars().count();
+    let sep_width = separator.chars().count();
+    let (_texts, tab_widths, current_idx) = window_tab_texts(windows, ctx, window_format, window_current_format);
+    let layout = plan_tab_layout(&tab_widths, current_idx, sep_width, left_width, right_len, justify, width);
+    let base_offset = layout.clip.map(|(s, _)| s).unwrap_or(0);
+
+    let mut out = Vec::with_capacity(windows.len());
+    for (i, &(raw_start, raw_end)) in layout.raw_spans.iter().enumerate() {
+        let (vis_start, vis_end) = match layout.clip {
+            None => (raw_start, raw_end),
+            Some((cstart, cend)) => {
+                let s = raw_start.max(cstart);
+                let e = raw_end.min(cend);
+                if s >= e {
+                    continue; // scrolled fully off-screen: no hit box
+                }
+                (s, e)
+            }
+        };
+        let abs_start = layout.content_start_col + (vis_start - base_offset);
+        let abs_end = layout.content_start_col + (vis_end - base_offset);
+        out.push(TabColumn { window_pos: i, start: abs_start as u16, end: abs_end as u16 });
+    }
+    out
+}
+
+/// Build the status-bar spans, ready for `render::compose_back` to draw
+/// left-to-right from column 0 (see the module docs for the full SP6 Task 4
+/// design). `ctx` supplies every format-expansion field EXCEPT
+/// `window_index`/`window_name`/`window_flags`, which are overridden per
+/// window in the loop below (`ctx`'s own values for those three fields, if
+/// any, are ignored). `width` is the terminal's column count; `right_len` is
+/// the char count of the (already length-capped, already
+/// `strip_style_markers`-cleaned) `status-right` text the caller will draw
+/// right-aligned — needed for the `centre`/`right`/`absolute-centre` offset
+/// math but otherwise unused here.
+#[allow(clippy::too_many_arguments)]
+pub fn status_spans(
+    left: &str,
+    left_style: &PartialStyle,
+    windows: &[WindowEntry],
+    ctx: &FormatCtx,
+    window_format: &str,
+    window_current_format: &str,
+    base: Style,
+    win_style: &PartialStyle,
+    win_current_style: &PartialStyle,
+    separator: &str,
+    justify: &str,
+    width: u16,
+    right_len: usize,
+) -> Vec<(String, Style)> {
+    let left_base = left_style.apply_to(base);
+    let mut left_spans = styled_runs(left, left_base);
+    let left_width: usize = left_spans.iter().map(|(t, _)| t.chars().count()).sum();
+
+    let non_current = win_style.apply_to(base);
+    let current = win_current_style.apply_to(base);
+
+    let (tab_texts, tab_widths, current_idx) = window_tab_texts(windows, ctx, window_format, window_current_format);
+    let tab_spans: Vec<Vec<(String, Style)>> = windows
+        .iter()
+        .zip(tab_texts.iter())
+        .map(|(w, text)| {
+            let tab_base = match &w.style_override {
+                Some(s) => s.apply_to(base),
+                None if w.current => current,
+                None => non_current,
+            };
+            styled_runs(text, tab_base)
+        })
+        .collect();
+
+    let sep_width = separator.chars().count();
+    let layout = plan_tab_layout(&tab_widths, current_idx, sep_width, left_width, right_len, justify, width);
 
     let mut spans = Vec::with_capacity(left_spans.len() + tab_spans.len() * 2);
     spans.append(&mut left_spans);
 
-    if windows.is_empty() || list_width <= list_avail {
-        // Fits (or nothing to show): unchanged pre-Task-7 behavior -- the
-        // justify math decides a start column, realized as literal padding
-        // spaces, no markers.
-        let offset = list_offset(justify, width as usize, left_width, right_len, list_width);
-        let pad = offset.saturating_sub(left_width);
-        if pad > 0 {
-            spans.push((" ".repeat(pad), base));
-        }
-        let last_idx = windows.len().saturating_sub(1);
-        for (i, ts) in tab_spans.into_iter().enumerate() {
-            spans.extend(ts);
-            if i != last_idx {
-                spans.push((separator.to_string(), base));
+    match layout.clip {
+        None => {
+            // Fits (or nothing to show): unchanged pre-Task-7 behavior -- the
+            // justify math decides a start column, realized as literal
+            // padding spaces, no markers.
+            let pad = layout.content_start_col.saturating_sub(left_width);
+            if pad > 0 {
+                spans.push((" ".repeat(pad), base));
+            }
+            let last_idx = windows.len().saturating_sub(1);
+            for (i, ts) in tab_spans.into_iter().enumerate() {
+                spans.extend(ts);
+                if i != last_idx {
+                    spans.push((separator.to_string(), base));
+                }
             }
         }
-    } else {
-        // Overflow (SP7 Task 7, closes follow-up #69a): §1.4's
-        // `format_draw_put_list` scrolls the window list at CELL
-        // granularity to keep the CURRENT window's centre visible, drawing
-        // `<`/`>` markers wherever content still exists beyond that edge.
-        // Flatten the full (unclipped) tab+separator sequence into one
-        // per-char `(char, Style)` run so the scroll window can land
-        // mid-tab exactly like real tmux's (a documented simplification
-        // from tmux's own eight-screen model is that winmux scrolls the
-        // WHOLE left/list/right block as a single fixed budget rather than
-        // tmux's justify-specific trim order -- see the status-line report
-        // for the ruling). No padding is ever inserted in this branch: an
-        // overflowing list, by definition, consumes its entire allotted
-        // budget with nothing left over for any justify's gap.
-        let mut flat: Vec<(char, Style)> = Vec::with_capacity(list_width);
-        let mut focus_start = 0usize;
-        let mut focus_end = 0usize;
-        let last_idx = tab_spans.len().saturating_sub(1);
-        for (i, ts) in tab_spans.into_iter().enumerate() {
-            let start_col = flat.len();
-            for (text, style) in &ts {
-                flat.extend(text.chars().map(|c| (c, *style)));
+        Some((start, end)) => {
+            // Flatten the full (unclipped) tab+separator sequence into one
+            // per-char `(char, Style)` run so `plan_tab_layout`'s scroll
+            // window can land mid-tab exactly like real tmux's (a documented
+            // simplification from tmux's own eight-screen model is that
+            // winmux scrolls the WHOLE left/list/right block as a single
+            // fixed budget rather than tmux's justify-specific trim order --
+            // see the status-line report for the ruling).
+            let mut flat: Vec<(char, Style)> = Vec::with_capacity(tab_widths.iter().sum());
+            let last_idx = tab_spans.len().saturating_sub(1);
+            for (i, ts) in tab_spans.into_iter().enumerate() {
+                for (text, style) in &ts {
+                    flat.extend(text.chars().map(|c| (c, *style)));
+                }
+                if i != last_idx {
+                    flat.extend(separator.chars().map(|c| (c, base)));
+                }
             }
-            let end_col = flat.len();
-            if current_idx == Some(i) {
-                focus_start = start_col;
-                focus_end = end_col;
+            if layout.marker_left {
+                spans.push(("<".to_string(), base));
             }
-            if i != last_idx {
-                flat.extend(separator.chars().map(|c| (c, base)));
+            spans.extend(group_runs(&flat[start..end]));
+            if layout.marker_right {
+                spans.push((">".to_string(), base));
             }
-        }
-        let focus_centre = focus_start + (focus_end.saturating_sub(focus_start)) / 2;
-
-        // Fixed-point search for which end marker(s) are actually needed:
-        // reserving a marker's column shrinks the visible content window,
-        // which can flip whether the OTHER end is still off-screen (and
-        // vice versa). Converges quickly in practice; capped at 4 passes as
-        // a documented simplification (four states -- both/left-only/
-        // right-only/neither -- so a fixed point is reached well within
-        // that bound for every case exercised by this task's tests).
-        let mut marker_left = true;
-        let mut marker_right = true;
-        let mut start = 0usize;
-        let mut content_w = 0usize;
-        for _ in 0..4 {
-            let reserved = marker_left as usize + marker_right as usize;
-            content_w = list_avail.saturating_sub(reserved);
-            start = if content_w == 0 {
-                focus_centre.min(list_width)
-            } else {
-                let half = content_w / 2;
-                let raw_start = focus_centre.saturating_sub(half);
-                let max_start = list_width.saturating_sub(content_w);
-                raw_start.min(max_start)
-            };
-            let end = (start + content_w).min(list_width);
-            let new_left = start > 0;
-            let new_right = end < list_width;
-            if new_left == marker_left && new_right == marker_right {
-                break;
-            }
-            marker_left = new_left;
-            marker_right = new_right;
-        }
-        let end = (start + content_w).min(list_width);
-
-        if marker_left {
-            spans.push(("<".to_string(), base));
-        }
-        spans.extend(group_runs(&flat[start..end]));
-        if marker_right {
-            spans.push((">".to_string(), base));
         }
     }
     spans
@@ -1263,5 +1432,118 @@ mod tests {
         // The whole text fits under the cap already: returned unchanged,
         // marker included.
         assert_eq!(truncate_visible("#[fg=red]ab", 5), "#[fg=red]ab");
+    }
+
+    // ---- edge cases for the overflow/fit boundary (review of 128cfc0, Minor 2) ----
+
+    /// Exactly-fits boundary: `list_width == list_avail` must take the FIT
+    /// branch (`list_width <= list_avail`), not the overflow branch -- no
+    /// `<`/`>` markers, no scrolling, even though there is exactly zero
+    /// slack. 2 windows, bare `#I` format (1 char each), separator " " (1
+    /// char): `list_width` = 1+1+1 = 3 (two tabs + one separator). left=""
+    /// (width 0), right_len=0, width=3 -> `list_avail` = 3-0-0 = 3 ==
+    /// `list_width`.
+    #[test]
+    fn overflow_boundary_exactly_fits_no_markers_no_scroll() {
+        let windows = vec![win(0, "a", false, false, false), win(1, "b", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "#I",
+            "#I",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            3,
+            0,
+        );
+        let joined: String = spans.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "0 1", "exact-fit boundary must not scroll or draw markers: {joined:?}");
+        assert!(!joined.contains('<') && !joined.contains('>'));
+    }
+
+    /// A SINGLE window whose own tab is wider than the entire list budget
+    /// still overflows correctly, including BOTH markers when the visible
+    /// sliver lands strictly inside the tab (neither its start nor its end
+    /// column). left="" (width 0), right_len=0, width=3; one (current)
+    /// window whose format is the literal `WIDE` (4 chars, width > budget).
+    ///
+    /// `list_width` = 4, `list_avail` = 3-0-0 = 3, 4 > 3 -> overflow.
+    /// `focus_start`=0, `focus_end`=4, `focus_centre` = 0 + (4-0)/2 = 2.
+    /// Pass 1 (both markers assumed): `reserved`=2, `content_w`=3-2=1,
+    /// `half`=0, `raw_start`=2-0=2, `max_start`=4-1=3, `start`=min(2,3)=2,
+    /// `end`=min(2+1,4)=3 -> `new_left`=(2>0)=true, `new_right`=(3<4)=true
+    /// -- matches the (true,true) assumption -> converged on pass 1:
+    /// `start`=2, `content_w`=1, `end`=3.
+    /// Visible slice = raw column [2,3) = `"WIDE"`'s 3rd char, `'D'`. Both
+    /// markers drawn (content is strictly inside the tab) -> `"<D>"` (3
+    /// columns, exactly `width`).
+    #[test]
+    fn single_window_wider_than_budget_overflows_with_both_markers() {
+        let windows = vec![win(0, "w", true, false, false)];
+        let (_, wcs) = default_partials();
+        let base_style = base();
+        let spans = status_spans(
+            "",
+            &PartialStyle::default(),
+            &windows,
+            &ctx0(),
+            "WIDE",
+            "WIDE",
+            base_style,
+            &PartialStyle::default(),
+            &wcs,
+            " ",
+            "left",
+            3,
+            0,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                (String::new(), base_style),
+                ("<".to_string(), base_style),
+                ("D".to_string(), Style { underline: true, ..base_style }),
+                (">".to_string(), base_style),
+            ]
+        );
+    }
+
+    // ---- status_tab_columns agrees with status_spans under overflow (review of 128cfc0) ----
+
+    /// Same fixture as `window_list_scrolls_to_keep_current_visible_with_
+    /// markers` above (5 windows, bare `#I`, width 5, current = array
+    /// position 4): that test already establishes the rendered row is
+    /// `"< 3 4"`-shaped -- visible raw columns [5,9), windows 0/1/2 entirely
+    /// scrolled off (window 2's raw span (4,5) ends exactly at the clip
+    /// start, zero overlap), window 3's `'3'` at raw col 6, window 4's `'4'`
+    /// at raw col 8. `content_start_col` equals `left_width`(0) plus
+    /// `marker_left`(1), i.e. 1, so `status_tab_columns` must report window
+    /// 3 at absolute column `1+(6-5)=2` and window 4 at `1+(8-5)=4`, and
+    /// nothing at all for windows 0/1/2, proving a click can never resolve
+    /// to a scrolled-off window.
+    #[test]
+    fn status_tab_columns_matches_rendered_overflow_scroll() {
+        let windows = vec![
+            win(0, "a", false, false, false),
+            win(1, "b", false, false, false),
+            win(2, "c", false, false, false),
+            win(3, "d", false, false, false),
+            win(4, "e", true, false, false),
+        ];
+        let cols = status_tab_columns("", &windows, &ctx0(), "#I", "#I", " ", "left", 5, 0);
+        assert_eq!(
+            cols,
+            vec![
+                TabColumn { window_pos: 3, start: 2, end: 3 },
+                TabColumn { window_pos: 4, start: 4, end: 5 },
+            ]
+        );
     }
 }

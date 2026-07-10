@@ -1450,19 +1450,27 @@ match any branch (degrade to `None`), tolerating a too-small terminal.
   scrollback direction to enter copy mode from at the live bottom).
 
 **Status-row routing (`dispatch_mouse_status`):** `Down(1)` →
-`mouse_status_click`, which rebuilds the SAME left-prefix-width-then-per-
-window-span layout `render_one`/`status::status_spans` draws (one separator
-space between tabs, none after the last) to hit-test which window tab (if
-any) column `x` falls in — a click on the `status-left` prefix, a separator,
-or past the last tab is a no-op (design spec: "Down-click on a status-line
-area with no window: no-op"); a hit selects that window
-(`session.current`/`session.last` updated directly, then
-`apply_layout_for_session`). Does NOT replicate `render::compose_back`'s
-final spatial right-truncation (when left+right don't fit the terminal
-width) — documented v1 gap, `docs/follow-ups.md`. `WheelUp`/`WheelDown` on
-the status row → `exec_step_window(false, ..)` / `exec_step_window(true,
-..)` (previous-window / next-window — tmux's default `WheelUpStatus`/
-`WheelDownStatus` bindings).
+`mouse_status_click`, which maps click column `x` through `status::
+status_tab_columns` (SP7 parity wave 3 fix, see the `## status` section's
+amendment in `2026-07-07-server-client-interfaces.md`) — the SAME layout
+core `render_one`/`status::status_spans` draws from, including window-list
+overflow scrolling and its `<`/`>` markers — to hit-test which window tab
+(if any) column `x` falls in; a click on the `status-left` prefix, a
+separator, a `<`/`>` marker, or past the last tab is a no-op (design spec:
+"Down-click on a status-line area with no window: no-op"); a hit selects
+that window (`session.current`/`session.last` updated directly, then
+`apply_layout_for_session`). Prior to this fix, `mouse_status_click`
+reconstructed the tab layout itself (unscrolled, a hardcoded
+`"{index}:{name}{flags}"` text-length guess) — a reconstruction that
+predated SP7 Task 7's overflow scrolling and disagreed with it the moment a
+real window list actually scrolled, so a click on the visually-current tab
+could resolve to the wrong window (`tests/server_proto.rs::status_click_
+selects_correct_window_when_list_scrolled` is the regression test). Still
+does NOT replicate `render::compose_back`'s final spatial right-truncation
+(when left+right don't fit the terminal width) — documented v1 gap,
+`docs/follow-ups.md`. `WheelUp`/`WheelDown` on the status row →
+`exec_step_window(false, ..)` / `exec_step_window(true, ..)` (previous-window
+/ next-window — tmux's default `WheelUpStatus`/`WheelDownStatus` bindings).
 
 **Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
 forwarding a click/drag to the pane's own mouse-reporting application (the
@@ -1502,7 +1510,16 @@ scroll would produce alone); `drag_after_double_click_extends_by_words`
 row, asserts the copied text includes that word's WHOLE trailing text, not
 truncated at the drop column); `drag_after_triple_click_extends_by_lines`
 (triple-clicks a line, drags onto a later row, asserts both the full first
-and full second line were captured).
+and full second line were captured); `word_separators_option_moves_double_
+click_word_boundary` (SP7 parity wave 3 fix, closes follow-up #37's coverage
+gap — a NON-DEFAULT `word-separators` value including `_` moves the
+double-click word boundary: `foo_bar` selects whole with the default, only
+`bar` once `_` is added as a separator). **SP7 parity wave 3 fix (review of
+128cfc0):** `status_click_selects_correct_window_when_list_scrolled` (the
+`mouse_status_click` hit-test regression test — a narrow terminal with 5
+windows forces the status-line window list to scroll; a click on the
+visually-current tab must select that SAME window, not whatever the old
+unscrolled-order reconstruction resolved to).
 Unit tests (`src/server/dispatch.rs::mouse_dispatch_tests`):
 `exec_copy_mode_wires_mouse_flag_to_scroll_exit` (fix round: the Minor
 finding — `exec_copy_mode`'s `mouse` parameter is genuinely read now).
