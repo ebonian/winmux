@@ -136,6 +136,18 @@ enum EscKScan {
     PostTitle,
 }
 
+/// Cap on `EscKScan::Title`'s in-progress capture buffer (correctness
+/// review SHOULD-FIX #7): the COMMITTED title is already capped at 256
+/// chars by `clean_title`, but the capture buffer itself had no bound while
+/// accumulating -- a pane program that emits `ESC k` and then never sends a
+/// terminator (`ESC \` or a fresh `ESC k`) while continuing to produce
+/// output would grow `buf` unboundedly for the rest of the pane's lifetime.
+/// Matches `clean_title`'s cap (tmux itself also caps window names); once
+/// the buffer reaches this many bytes, further bytes are silently dropped
+/// (not accumulated) until a terminator is seen, exactly like `clean_title`
+/// truncates a too-long committed title rather than erroring.
+const ESC_K_TITLE_CAP: usize = 256;
+
 #[derive(Clone, Copy)]
 struct SavedCursor {
     col: u16,
@@ -403,9 +415,35 @@ impl TermState {
         }
     }
 
+    /// Correctness review MUST-FIX #2: `erase_chars`/`erase_line`/
+    /// `erase_display`/`insert_chars`/`delete_chars` mutate a row's cells
+    /// in place without touching `row_wrapped`, which can leave a
+    /// previously-`true` ("this row is fully used, its content continues
+    /// onto the next row with no real newline") flag stale after the row's
+    /// true last column has been blanked out from underneath it --
+    /// `reflow_to_width` trusts a `true` flag to mean "don't trim trailing
+    /// blanks", so a stale flag splices phantom blank cells into the
+    /// reflowed text on the next width-changing resize. Call this after any
+    /// in-place cell mutation that could leave `row`'s LAST column blank;
+    /// it only clears the flag (never sets a false one back to true), and
+    /// is a no-op (already false, or the last column is still genuinely
+    /// non-blank -- e.g. a partial `insert_chars`/`erase_chars` whose
+    /// blanking didn't reach the true end of the row) the rest of the time.
+    fn clear_wrapped_if_tail_blank(&mut self, row: usize) {
+        if !self.row_wrapped[row] {
+            return;
+        }
+        let cols = self.cols as usize;
+        let last = row * cols + cols - 1;
+        if self.cells[last] == Cell::default() {
+            self.row_wrapped[row] = false;
+        }
+    }
+
     fn insert_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let n = (n as usize).min(cols - col);
         for c in (col..cols).rev() {
@@ -415,11 +453,13 @@ impl TermState {
                 self.cells[start + c] = Cell::default();
             }
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn delete_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let n = (n as usize).min(cols - col);
         for c in col..cols {
@@ -429,16 +469,19 @@ impl TermState {
                 self.cells[start + c] = Cell::default();
             }
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn erase_chars(&mut self, n: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         let end = (col + n as usize).min(cols);
         for c in col..end {
             self.cells[start + c] = Cell::default();
         }
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn insert_lines(&mut self, n: u16) {
@@ -519,21 +562,38 @@ impl TermState {
 
     fn erase_display(&mut self, mode: u16) {
         let total = self.cols as usize * self.rows as usize;
+        let rows = self.rows as usize;
+        let cursor_row = self.cursor_row as usize;
         let cur = self.idx(self.cursor_col, self.cursor_row);
         match mode {
             0 => {
                 for i in cur..total {
                     self.cells[i] = Cell::default();
                 }
+                // MUST-FIX #2: rows strictly below the cursor are now
+                // ENTIRELY blank -- never "fully used" -- and the cursor's
+                // own row was blanked from its column to the true end, so
+                // both need the same staleness treatment as `erase_line`.
+                for r in (cursor_row + 1)..rows {
+                    self.row_wrapped[r] = false;
+                }
+                self.clear_wrapped_if_tail_blank(cursor_row);
             }
             1 => {
                 for i in 0..=cur {
                     self.cells[i] = Cell::default();
                 }
+                for r in 0..cursor_row {
+                    self.row_wrapped[r] = false;
+                }
+                self.clear_wrapped_if_tail_blank(cursor_row);
             }
             _ => {
                 for i in 0..total {
                     self.cells[i] = Cell::default();
+                }
+                for r in 0..rows {
+                    self.row_wrapped[r] = false;
                 }
             }
         }
@@ -541,7 +601,8 @@ impl TermState {
 
     fn erase_line(&mut self, mode: u16) {
         let cols = self.cols as usize;
-        let start = self.cursor_row as usize * cols;
+        let row = self.cursor_row as usize;
+        let start = row * cols;
         let col = self.cursor_col as usize;
         match mode {
             0 => {
@@ -560,6 +621,11 @@ impl TermState {
                 }
             }
         }
+        // MUST-FIX #2: any of the three modes can blank the row's true last
+        // column (mode 0/2 always do; mode 1 does iff `col == cols - 1`) --
+        // `clear_wrapped_if_tail_blank` re-examines that one cell rather
+        // than assuming which mode did it.
+        self.clear_wrapped_if_tail_blank(row);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -1269,7 +1335,9 @@ impl Grid {
                         // no BEL arm, unlike OSC's).
                         self.esck_scan = EscKScan::Title(buf);
                     } else {
-                        buf.push(b);
+                        if buf.len() < ESC_K_TITLE_CAP {
+                            buf.push(b);
+                        }
                         self.esck_scan = EscKScan::Title(buf);
                     }
                 }
@@ -1453,12 +1521,20 @@ impl Grid {
 
     /// `true` while the pane's application has switched to the alternate
     /// screen (`CSI ?1049h`/`?47h`/`?1047h`), `false` on the primary screen.
-    /// Mouse wheel routing (Task 5, sub-project 4) uses this to decide
-    /// whether a wheel event should scroll winmux's own scrollback/copy-mode
-    /// (primary screen) or be translated into synthesized arrow-key presses
-    /// sent to the pane (alt screen — tmux's own wheel-in-alt-screen
-    /// behavior, since alt-screen apps like `less`/vim have no scrollback of
-    /// their own to reveal).
+    /// Mouse wheel routing (`Server::mouse_wheel`, `src/server/dispatch.rs`)
+    /// uses this to decide how to handle a wheel event over this pane: on
+    /// the PRIMARY screen, wheel-up enters/scrolls winmux's own copy-mode
+    /// scrollback. On the ALT screen, SP7 Task 9 (closes follow-ups #35/
+    /// #72) replaced an earlier unconditional "translate the wheel into 3
+    /// synthesized arrow-key presses" behavior (a SP6-era hack) with real
+    /// tmux parity: `docs/tmux-reference/mouse.md` §9 states tmux never
+    /// converts wheel to arrow keys at all. Current behavior: if the pane
+    /// has requested mouse reporting (`mouse_proto()` != `Off`, e.g. an
+    /// alt-screen app like `less -M`/`vim`/tmux-inside-tmux that called
+    /// DECSET 1000/1002/1003), the wheel event is forwarded to the app
+    /// as a real mouse escape sequence (`forward_mouse_to_pane`); otherwise
+    /// it is silently swallowed — no bytes written, no copy-mode entry,
+    /// no arrow-key synthesis.
     pub fn alt_screen(&self) -> bool {
         self.state.alt_screen
     }
@@ -1629,6 +1705,114 @@ mod tests {
         g.feed(b"abcde");
         g.feed(b"\x1b[2K");
         assert_eq!(row_str(&g, 0), "     ");
+    }
+
+    // ---- correctness review MUST-FIX #2: row_wrapped must not go stale
+    // under in-place erase, or a later width-reflow splices stale content
+    // into the middle of a logical line. Each test below hand-derives the
+    // WRONG (pre-fix) result in a comment alongside the correct one, so a
+    // regression is easy to recognize if it reappears. ------------------
+
+    #[test]
+    fn erase_line_all_clears_row_wrapped_before_reflow() {
+        // 10 cols: 11 chars ("abcdefghijk") autowraps once -- row0 = "abcdefghij"
+        // (wrapped=true), row1 = "k" (wrapped=false). CUP back to row0 col0,
+        // `CSI 2K` blanks the whole of row0 (all 10 cells) but must ALSO
+        // clear row_wrapped[0] now that row0's true last column is blank.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        assert!(!g.state.row_wrapped[1]);
+        g.feed(b"\x1b[1;1H\x1b[2K"); // CUP row0 col0, erase whole line
+        assert!(!g.state.row_wrapped[0], "row_wrapped[0] must clear once its true last column is blank");
+        g.feed(b"xy"); // row0 now "xy" + 8 blanks; too short to re-autowrap
+
+        // Reflow to 5 cols. FIXED behavior: row0 ("xy") and row1 ("k") are
+        // two separate logical lines (row_wrapped[0] is false), so they
+        // re-split independently: "xy" -> 1 row of "xy   "; "k" -> 1 row of
+        // "k    ". (Pre-fix BUG: row_wrapped[0] stays stale-true, so reflow
+        // treats row0+row1 as ONE logical line = untrimmed row0 (10 chars:
+        // "xy" + 8 literal blanks) + trimmed row1 ("k") = "xy" + 8 spaces +
+        // "k" (11 chars) -- which at 5 cols re-splits into 3 rows:
+        // "xy   ", "     ", "k    ", spuriously pushing "k" onto a THIRD
+        // row instead of the second.)
+        g.resize(5, 3);
+        assert_eq!(row_str(&g, 0).trim_end(), "xy");
+        assert_eq!(row_str(&g, 1).trim_end(), "k");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_chars_full_tail_clears_row_wrapped_before_reflow() {
+        // Same 10-col autowrap setup as above, but this time `CSI nX`
+        // (erase-chars) blanks row0 from its current column to the true end
+        // instead of `CSI 2K`. Cursor placed at col2 of row0, then `CSI 8X`
+        // erases exactly the remaining 8 cells (col2..=col9) -- the whole
+        // tail, so row0's true last column goes blank too.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        g.feed(b"\x1b[1;3H\x1b[8X"); // CUP row0 col2 (1-based col3), erase 8 chars
+        assert_eq!(row_str(&g, 0), "ab        ");
+        assert!(!g.state.row_wrapped[0], "row_wrapped[0] must clear once erase_chars blanks its true last column");
+
+        // Reflow to 5 cols: row0 ("ab") and row1 ("k") stay two separate
+        // logical lines. (Pre-fix BUG: same 3-row splice as the CSI-2K case
+        // above, with "ab" in place of "xy".)
+        g.resize(5, 3);
+        assert_eq!(row_str(&g, 0).trim_end(), "ab");
+        assert_eq!(row_str(&g, 1).trim_end(), "k");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_chars_partial_tail_keeps_row_wrapped_true() {
+        // Negative case: `CSI nX` that does NOT reach the row's true last
+        // column must NOT clear row_wrapped -- the row is still genuinely
+        // "fully used" (the blanked cells are in the middle, not the tail),
+        // so reflow must still join it with the next physical row.
+        let mut g = Grid::new(10, 3, 100);
+        g.feed(b"abcdefghijk"); // row0 = "abcdefghij" (wrapped=true), row1 = "k"
+        g.feed(b"\x1b[1;3H\x1b[3X"); // CUP row0 col2, erase 3 chars (col2..=col4 only)
+        assert_eq!(row_str(&g, 0), "ab   fghij");
+        assert!(g.state.row_wrapped[0], "row_wrapped[0] must stay true -- the true last column ('j') is still non-blank");
+
+        // Reflow to 6 cols: row0+row1 are still correctly ONE logical line
+        // ("ab   fghij" + "k" = "ab   fghijk", 11 chars) -> ceil(11/6)=2
+        // rows ("ab   f", "ghijk "), leaving room for row2's separate blank
+        // logical line within the unchanged 3-row screen (no scrollback
+        // eviction to account for, unlike a narrower target width would
+        // need -- this test is about the row_wrapped flag, not eviction).
+        g.resize(6, 3);
+        assert_eq!(row_str(&g, 0), "ab   f");
+        assert_eq!(row_str(&g, 1).trim_end(), "ghijk");
+        assert_eq!(row_str(&g, 2).trim_end(), "");
+    }
+
+    #[test]
+    fn erase_display_below_clears_row_wrapped_for_fully_blanked_rows() {
+        // 5 cols, 4 rows, history disabled. Fill row0 (wrapped, "abcde"),
+        // row1 (wrapped, "fghij"), row2 ("k" + 4 blanks, terminal) -- 11
+        // chars total autowrap across 3 rows, row3 left untouched/blank.
+        let mut g = Grid::new(5, 4, 100);
+        g.feed(b"abcdefghijk");
+        assert!(g.state.row_wrapped[0]);
+        assert!(g.state.row_wrapped[1]);
+        assert!(!g.state.row_wrapped[2]);
+        // CUP to row0 col0, `CSI 0J` (erase cursor..end of screen): blanks
+        // ALL of row0 (cursor is at its very start) plus every row below.
+        g.feed(b"\x1b[1;1H\x1b[0J");
+        assert!(!g.state.row_wrapped[0], "row0 fully blanked -- must clear");
+        assert!(!g.state.row_wrapped[1], "row1 fully blanked -- must clear");
+        g.feed(b"z"); // row0 now "z" + 4 blanks
+
+        // Reflow to 3 cols: row0 ("z") is now its OWN logical line, not
+        // chained into row1 (blank) or beyond. (Pre-fix BUG: row_wrapped[0]
+        // and [1] would stay stale-true, splicing "z" + 4 blanks + 4 blanks
+        // + ... into one long phantom-padded logical line.)
+        g.resize(3, 4);
+        assert_eq!(row_str(&g, 0).trim_end(), "z");
+        assert_eq!(row_str(&g, 1).trim_end(), "");
     }
 
     #[test]
@@ -2101,6 +2285,31 @@ mod tests {
         assert_eq!(g.title(), Some("hello")); // ST consumed; no further change
         assert!(!g.take_title_changed());
         // No title bytes leaked into the visible grid at any point.
+        assert_eq!(row_str(&g, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn esc_k_title_capture_buffer_is_capped() {
+        // Correctness review SHOULD-FIX #7: an in-progress `ESC k` capture
+        // (no terminator sent yet) must not grow its buffer unboundedly.
+        // Feed well past `ESC_K_TITLE_CAP` (256) bytes with no terminator,
+        // then commit -- the committed title must be exactly capped-length,
+        // not the full uncapped input.
+        let mut g = Grid::new(20, 1, 0);
+        g.feed(b"\x1bk");
+        g.feed(&vec![b'x'; 1000]); // way past the 256-byte cap, no terminator yet
+        g.feed(b"\x1b\\"); // now commit
+        let title = g.title().expect("title must have committed");
+        assert_eq!(title.len(), 256, "capture buffer must stop growing past the cap");
+        assert!(title.chars().all(|c| c == 'x'));
+
+        // Still correctly captures a SHORT title (cap is an upper bound,
+        // not a fixed/padded length).
+        let mut g2 = Grid::new(20, 1, 0);
+        g2.feed(b"\x1bkshort\x1b\\");
+        assert_eq!(g2.title(), Some("short"));
+
+        // No title bytes leaked into visible cells despite the overflow.
         assert_eq!(row_str(&g, 0).trim_end(), "");
     }
 

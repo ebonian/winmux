@@ -46,9 +46,9 @@ use crate::status;
 use super::{
     advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
     send_msg, spawn_pane, system_time_parts, truncate_chars, AutoscrollState, ChooseTreeState, ChooseTreeView,
-    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MenuRow, MenuState,
-    MouseDrag, PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, SortKey,
-    TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
+    ClientId, ClientMode, ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MenuAnchor, MenuRow,
+    MenuState, MouseDrag, PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server,
+    SortKey, TreeTarget, MONTHS, MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
 use crate::grid::{Cell, Grid, MouseProto, Style};
 use std::time::Duration;
@@ -600,8 +600,19 @@ fn spawn_copy_pipe(command: &str, data: &str) {
     cmd.stderr(Stdio::null());
     if let Ok(mut child) = cmd.spawn() {
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(data.as_bytes());
-            // `stdin` drops here, closing the pipe -- the child sees EOF.
+            // Final-gate regression review MUST-FIX #2: `write_all` blocks
+            // until the child drains its stdin pipe buffer -- for a large
+            // selection piped to a slow/hung user-configured command, that
+            // write must NOT run on the server's single main dispatch
+            // thread (same bug class as follow-up #14). Move it to its own
+            // short-lived, detached thread; the command itself is already
+            // fire-and-forget (not waited on), so a detached writer thread
+            // is consistent with the rest of this function's semantics.
+            let data = data.to_owned();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(data.as_bytes());
+                // `stdin` drops here, closing the pipe -- the child sees EOF.
+            });
         }
         // Not waited on -- see doc comment above.
     }
@@ -1603,10 +1614,13 @@ impl Server {
                 bytes.extend(encoded.unwrap_or_else(|| k.as_bytes().to_vec()));
             }
         }
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        if let Some(pane) = self.panes.get(&pane_id) {
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread (follow-up #14's mechanism), not a synchronous
+            // `pty.write_input` on the main dispatch thread -- `send-keys
+            // -l` can carry an arbitrarily large literal payload, exactly
+            // the "huge paste" scenario #14 was written to guard against.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -2218,10 +2232,10 @@ impl Server {
             Err(_) => self.options.prefix(),
         };
         let bytes = crate::keys::encode_key(&prefix).unwrap_or_default();
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        if let Some(pane) = self.panes.get(&pane_id) {
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread, not a synchronous main-thread `pty.write_input`.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -2816,10 +2830,14 @@ impl Server {
         let py = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
         let rel = MouseEvent { x: px, y: py, ..ev };
         let bytes = keys::encode_mouse(&rel, encoding);
-        if let Some(pane) = self.panes.get_mut(&pane) {
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+        if let Some(pane) = self.panes.get(&pane) {
+            // Follow-up #14: route through the per-pane writer thread, not a
+            // synchronous `pty.write_input` on the main dispatch thread — a
+            // mouse-owning app that stops draining stdin must not be able to
+            // block every session on the server (see forward_raw_to_focused_pane
+            // and the Forward-blob arm in process_key_events for the same
+            // pattern on the keyboard path).
+            let _ = pane.input_tx.send(bytes);
         }
         true
     }
@@ -3643,11 +3661,13 @@ impl Server {
             None => self.buffers.newest().map(|(_, d)| d.to_string()).ok_or_else(|| "no buffer".to_string())?,
         };
         let bytes = if no_replace { data.into_bytes() } else { data.replace('\n', "\r").into_bytes() };
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
+        if let Some(pane) = self.panes.get(&pane_id) {
             let bytes = maybe_bracket_paste(bytes, bracket, pane.grid.bracketed_paste());
-            if let Some(pty) = pane.pty.as_mut() {
-                let _ = pty.write_input(&bytes);
-            }
+            // Correctness review SHOULD-FIX #5: route through the per-pane
+            // writer thread, not a synchronous main-thread `pty.write_input`
+            // -- `paste-buffer` can carry an arbitrarily large buffer, the
+            // exact "huge paste" scenario follow-up #14 targeted.
+            let _ = pane.input_tx.send(bytes);
         }
         Ok(String::new())
     }
@@ -5329,13 +5349,16 @@ impl Server {
     /// state, `build_choose_rows`), mirroring `server::render_one`'s
     /// `RenderOverlay::Tree` -> `render::ListOverlay` layout EXACTLY (SP7
     /// Task 10, closes follow-up #61) so a click always resolves to the row
-    /// actually drawn there: choose-tree's `ListOverlay::title` is ALWAYS
-    /// empty (`render_one` never sets it), so there is no header-row
-    /// offset to account for; `list_height`/`preview`/`msg_reserved`/`top`
+    /// actually drawn there: `list_height`/`preview`/`msg_reserved`/`top`
     /// are all recomputed the SAME way `render_one`'s own `RenderOverlay::
-    /// Tree` arm does. `None` on a click outside the row list (an empty
-    /// list, the preview box below it, a reserved kill-confirm-prompt row,
-    /// or past the last row).
+    /// Tree` arm does. **Updated by SP7 Task 15** (the sort/filter title
+    /// row, `build_choose_title`, is always non-empty and always painted as
+    /// the panel's first row): `title_reserved = 1` below accounts for that
+    /// header row exactly as `render_one` does, and a click landing on the
+    /// title row itself (`y < title_reserved`) is correctly a miss. `None`
+    /// on a click outside the row list (the title row, an empty list, the
+    /// preview box below it, a reserved kill-confirm-prompt row, or past
+    /// the last row).
     fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize> {
         if rows.is_empty() {
             return None;
@@ -5719,8 +5742,19 @@ impl Server {
             // client's focused pane and exit (the caller already sets
             // `client.mode = Normal` before calling this, matching
             // `Session`/`Window`'s own "commit switches, then the caller
-            // closes the overlay" shape).
-            TreeTarget::Buffer(name) => wrap(self.exec_paste_buffer(Some(name), None, false, false, Some(session_name.as_str()))),
+            // closes the overlay" shape). `-p` IS present in the real
+            // template (`docs/tmux-reference/choose-tree.md:790,820` and
+            // `copy-mode-and-buffers.md:849`), so `bracket` must be `true`
+            // here (final-gate correctness review MUST-FIX #1 — this was
+            // hardcoded `false` at merge time, contradicted by the cited
+            // docs and by `exec_paste_buffer`'s own three other call sites,
+            // which all thread the caller-supplied `-p` value through
+            // correctly). Note `maybe_bracket_paste` still gates the actual
+            // wrap on the TARGET pane's own DECSET 2004 state
+            // (`Grid::bracketed_paste()`), so passing `true` here only
+            // wraps when the receiving app actually asked for bracketed
+            // paste — it does not force-wrap unconditionally.
+            TreeTarget::Buffer(name) => wrap(self.exec_paste_buffer(Some(name), None, false, true, Some(session_name.as_str()))),
             // SP7 Task 14 (#49): choose-client's default template is
             // `detach-client -t '%%'` (`## 9`) — Enter DETACHES the
             // selected client, same as its `x`/`d` extra key (`## 9`'s
@@ -6189,7 +6223,7 @@ impl Server {
         client: &mut ClientState,
     ) -> ExecOutcome {
         let entries = menu_entries_from_parsed(&items);
-        self.open_menu(client, title.unwrap_or_default(), entries, x, y, None)
+        self.open_menu(client, title.unwrap_or_default(), entries, x, y, None, None)
     }
 
     /// Build a [`ClientMode::Menu`] from an already-finalized entry list
@@ -6203,6 +6237,7 @@ impl Server {
     /// (tmux's `cmd_display_menu_get_pos`: "if the popup is too big, stop
     /// now"; `menu_prepare`'s own `c->tty.sx < menu->width+4` check is the
     /// same guard restated).
+    #[allow(clippy::too_many_arguments)]
     fn open_menu(
         &mut self,
         client: &mut ClientState,
@@ -6211,6 +6246,7 @@ impl Server {
         x: cmd::MenuPos,
         y: cmd::MenuPos,
         trigger: Option<(u16, u16)>,
+        anchor: Option<MenuAnchor>,
     ) -> ExecOutcome {
         if entries.is_empty() {
             return ExecOutcome::Ok(String::new());
@@ -6223,7 +6259,7 @@ impl Server {
         }
         let px = resolve_menu_axis(x, w, client.cols, trigger.map(|(mx, _)| mx));
         let py = resolve_menu_axis(y, h, client.rows, trigger.map(|(_, my)| my));
-        client.mode = ClientMode::Menu(MenuState { rect: Rect { x: px, y: py, w, h }, title, rows, sel: -1 });
+        client.mode = ClientMode::Menu(MenuState { rect: Rect { x: px, y: py, w, h }, title, rows, sel: -1, anchor });
         ExecOutcome::Ok(String::new())
     }
 
@@ -6286,7 +6322,7 @@ impl Server {
         }
 
         let title = format!("Pane {pane_index}");
-        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)), Some(MenuAnchor::Pane(pane_id)))
     }
 
     /// Right-click default WINDOW context menu (`MouseDown3Status`, a
@@ -6340,7 +6376,15 @@ impl Server {
         b.sep();
         b.item("New Window", Some("w"), "new-window");
 
-        self.open_menu(client, title, b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+        self.open_menu(
+            client,
+            title,
+            b.into_entries(),
+            cmd::MenuPos::Mouse,
+            cmd::MenuPos::Mouse,
+            Some((mx, my)),
+            Some(MenuAnchor::Window(session_name.to_string(), wid)),
+        )
     }
 
     /// Right-click default SESSION context menu (`MouseDown3StatusLeft`).
@@ -6368,7 +6412,15 @@ impl Server {
         b.item("New Session", Some("s"), "new-session");
         b.item("New Window", Some("w"), "new-window");
 
-        self.open_menu(client, session_name.to_string(), b.into_entries(), cmd::MenuPos::Mouse, cmd::MenuPos::Mouse, Some((mx, my)))
+        self.open_menu(
+            client,
+            session_name.to_string(),
+            b.into_entries(),
+            cmd::MenuPos::Mouse,
+            cmd::MenuPos::Mouse,
+            Some((mx, my)),
+            Some(MenuAnchor::Session(session_name.to_string())),
+        )
     }
 
     /// Run one menu item's raw command TEXT: re-tokenized (`cmd::parse_line`
@@ -6390,24 +6442,43 @@ impl Server {
     /// separators — mirrors `menu.c`'s `KEYC_UP`/`KEYC_DOWN` cases exactly
     /// (`down: true` = `KEYC_DOWN`/`j`, `false` = `KEYC_UP`/`k`/`KEYC_BTAB`).
     /// A no-op if there are no rows, or if every OTHER row is a separator
-    /// (the loop wraps back to the untouched original selection).
+    /// (the scan wraps back to the untouched original selection).
+    ///
+    /// Correctness review MUST-FIX #3: this used to compute a "starting
+    /// point" sentinel as `let old = if state.sel == -1 { 0 } else {
+    /// state.sel };` and terminate the wrap/skip loop on `state.sel ==
+    /// old` — but `0` is ALSO the very first candidate index a `Down` press
+    /// from `sel == -1` (a freshly-opened menu) lands on, so if row 0
+    /// happened to be a separator (a legitimate, documented tmux idiom for
+    /// a leading header row via a user-authored `display-menu ""  ...`),
+    /// the loop's termination check fired on its very first iteration and
+    /// got permanently stuck on the separator, even with a real command on
+    /// row 1+. Fixed by bounding the scan at `count` iterations (enough to
+    /// visit every row exactly once) instead of aliasing "no previous
+    /// selection" to a real index; the true starting selection (`-1` or a
+    /// real index) is restored verbatim if the whole scan comes up empty
+    /// (every row is a separator).
     fn menu_move(&mut self, client: &mut ClientState, down: bool) {
         let ClientMode::Menu(state) = &mut client.mode else { return };
         let count = state.rows.len() as i32;
         if count == 0 {
             return;
         }
-        let old = if state.sel == -1 { 0 } else { state.sel };
-        loop {
+        let start = state.sel;
+        for _ in 0..count {
             if state.sel == -1 || state.sel == if down { count - 1 } else { 0 } {
                 state.sel = if down { 0 } else { count - 1 };
             } else {
                 state.sel += if down { 1 } else { -1 };
             }
-            if state.rows[state.sel as usize].command.is_some() || state.sel == old {
-                break;
+            if state.rows[state.sel as usize].command.is_some() {
+                return;
             }
         }
+        // Every row is a separator -- restore the untouched starting
+        // selection instead of leaving `sel` wherever the bounded scan
+        // stopped.
+        state.sel = start;
     }
 
     /// Choose row `idx`: close the menu, then (unless it's a separator, or
@@ -6808,11 +6879,14 @@ mod copy_search_tests {
 ///
 /// Per the brief's own documented fallback, this instead builds a real
 /// `Server` + `Registry` session/pane directly (no ConPTY, no background
-/// threads: `PaneRuntime.pty` is `None`, which is fine — `dispatch_mouse`'s
-/// alt-screen branch only ever calls `pty.write_input`, gated behind an `if
-/// let Some(pty) = ..`, so a `None` pty just makes the arrow-writes a silent
-/// no-op instead of a panic) and feeds `\x1b[?1049h` straight into the
-/// pane's `Grid` via its own public `feed` — exercising the EXACT same
+/// threads: `PaneRuntime.pty` is `None`, which is fine — any forwarding
+/// write goes through `pane.input_tx.send(..)` (`forward_mouse_to_pane`,
+/// final-fix-wave update: previously a direct `pty.write_input` call, now
+/// routed through the per-pane writer channel per follow-up #14), an
+/// unbounded `mpsc::Sender` that happily accepts sends with no receiver
+/// ever spawned, so a `None` pty/no writer thread just makes the write a
+/// silent no-op instead of a panic) and feeds `\x1b[?1049h` straight into
+/// the pane's `Grid` via its own public `feed` — exercising the EXACT same
 /// `p.grid.alt_screen()` check `mouse_wheel` branches on, with no
 /// ConPTY-passthrough uncertainty anywhere in the test.
 #[cfg(test)]
@@ -7827,5 +7901,58 @@ mod clipboard_tests {
         // Pane DID ask for it, but `-p` wasn't given -> unchanged.
         assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, true), b"hi".to_vec());
         assert_eq!(maybe_bracket_paste(b"hi".to_vec(), false, false), b"hi".to_vec());
+    }
+
+    /// Final-gate correctness review MUST-FIX #1: `exec_tree_commit`'s
+    /// `TreeTarget::Buffer` arm (choose-buffer's Enter key) must run tmux's
+    /// real default template `paste-buffer -p -b '%%'` -- i.e. `-p` IS
+    /// present, so `bracket` must be `true`, not the `false` this shipped
+    /// with at merge time. Exercised end-to-end through `exec_tree_commit`
+    /// (not just `maybe_bracket_paste` in isolation, which was already
+    /// covered by `bracket_wraps_only_when_both_flag_and_pane_true` but
+    /// couldn't catch a caller passing the wrong constant) against a target
+    /// pane whose `Grid` has DECSET 2004 set (fed directly, no ConPTY --
+    /// same "grid state, no real pty" pattern `test_server_with_pane_mouse`
+    /// establishes, and the same reason the POSITIVE case can't be a real
+    /// `tests/server_proto.rs` end-to-end test: see this module's own doc
+    /// comment above for the ConPTY-DECSET-relay ceiling).
+    #[test]
+    fn choose_buffer_commit_pastes_bracketed_when_pane_requested_2004() {
+        use std::sync::mpsc::channel;
+
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        let pane_id = server.mint_pane_id();
+        let mut grid = Grid::new(20, 10, 100);
+        grid.feed(b"\x1b[?2004h");
+        assert!(grid.bracketed_paste(), "test setup: grid must report bracketed_paste after CSI ?2004h");
+        let (input_tx, input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
+        let mut session_name = server.registry.create_session(Some("0"), pane_id, (20, 10), 0).expect("create_session").name.clone();
+        server.buffers.set_named("buffer0", "hello".to_string());
+
+        let (client_tx, _client_rx) = channel::<Vec<u8>>();
+        let mut client = ClientState {
+            session: Some(session_name.clone()),
+            cols: 20,
+            rows: 10,
+            renderer: crate::render::Renderer::new(20, 10),
+            key_machine: crate::input::KeyMachine::new(crate::keys::parse_key("C-b").unwrap()),
+            mode: ClientMode::Normal,
+            message: None,
+            tx: client_tx,
+            mouse: super::super::MouseClientState::default(),
+            attached_at: std::time::Instant::now(),
+        };
+
+        let outcome = server.exec_tree_commit(TreeTarget::Buffer("buffer0".to_string()), &mut client, &mut session_name, 0);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)), "expected Ok(_) from exec_tree_commit's Buffer arm");
+
+        let written = input_rx.try_recv().expect("exec_paste_buffer must write via the pane's input_tx");
+        // `-r` defaults off, so `\n`->`\r` replacement runs first, THEN the
+        // whole (replaced) payload is bracket-wrapped -- "hello" has no
+        // newline so the replacement is a no-op here, isolating the
+        // assertion to the bracket-wrap behavior under test.
+        assert_eq!(written, b"\x1b[200~hello\x1b[201~".to_vec());
     }
 }

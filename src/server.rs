@@ -471,6 +471,22 @@ struct MenuState {
     /// `-1` = no row highlighted (tmux's `md->choice == -1`, the initial
     /// state before any Up/Down/mouse-hover/key-shortcut selects one).
     sel: i32,
+    /// What live entity this menu is scoped to, if any (SP7 final-fix wave,
+    /// correctness review SHOULD-FIX #6) — consulted by
+    /// [`Server::cancel_stale_menus`], the same staleness-sweep pattern
+    /// `cancel_stale_confirms`/`_copy_modes`/`_clock_modes`/`_choose_trees`
+    /// already apply to every other modal overlay. `None` for a generic
+    /// user-authored `display-menu` (`exec_display_menu_client`), which
+    /// isn't scoped to any single pane/window/session and so has nothing to
+    /// go stale.
+    anchor: Option<MenuAnchor>,
+}
+
+/// See [`MenuState::anchor`].
+enum MenuAnchor {
+    Pane(PaneId),
+    Window(String, WindowId),
+    Session(String),
 }
 
 /// One row of an open [`MenuState`] — a snapshot of one [`crate::cmd::
@@ -1851,7 +1867,7 @@ impl Server {
         let Some(session) = self.registry.session_mut(&session_name) else { return };
         let is_current = session.current == wid;
         let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
-        window.last_output = Instant::now();
+        window.note_output();
         if !self.options.monitor_activity_for(&window.window_options) {
             return;
         }
@@ -1904,7 +1920,18 @@ impl Server {
                     continue;
                 }
                 let is_current = window.id == current;
-                window.mark_silence(is_current);
+                // SP7 final-fix wave, correctness review SHOULD-FIX #4:
+                // gate on `mark_silence`'s return -- it's now `false` once
+                // this window's silence-reaction latch has already fired
+                // (see `Window::mark_silence`'s doc comment), which is the
+                // ONLY thing that stopped the CURRENT window (whose
+                // `alert_silence` display flag never sets, so the top-of-
+                // loop `if window.alert_silence { continue; }` guard above
+                // never engages for it) from forcing `dirty = true` and
+                // re-running the reaction on every single 50ms tick.
+                if !window.mark_silence(is_current) {
+                    continue;
+                }
                 dirty = true;
                 let action = self.options.silence_action_for(&session.session_options);
                 if !Server::alert_action_applies(action, is_current) {
@@ -2433,6 +2460,42 @@ impl Server {
         }
     }
 
+    /// Cancel any attached client's open `display-menu` overlay (Task 16)
+    /// whose anchor (`MenuState::anchor` — the pane/window/session it was
+    /// opened against, e.g. a right-click default context menu) no longer
+    /// exists, killed by another client while the menu was still open (SP7
+    /// final-fix wave, correctness review SHOULD-FIX #6: this overlay had
+    /// no equivalent to `cancel_stale_confirms`/`_copy_modes`/
+    /// `_clock_modes`/`_choose_trees` at all). A menu with no anchor (a
+    /// generic user-authored `display-menu`, not scoped to any single
+    /// pane/window/session) is never considered stale here. Called from the
+    /// same two sites as the other three sweeps.
+    fn cancel_stale_menus(&mut self) {
+        let live_sessions: HashSet<String> = self.registry.sessions().iter().map(|s| s.name.clone()).collect();
+        let live_windows: HashSet<(String, WindowId)> =
+            self.registry.sessions().iter().flat_map(|s| s.windows.iter().map(move |w| (s.name.clone(), w.id))).collect();
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        for client in self.clients.values_mut() {
+            let stale = match &client.mode {
+                ClientMode::Menu(state) => match &state.anchor {
+                    Some(MenuAnchor::Pane(p)) => !live_panes.contains(p),
+                    Some(MenuAnchor::Window(sn, wid)) => !live_windows.contains(&(sn.clone(), *wid)),
+                    Some(MenuAnchor::Session(sn)) => !live_sessions.contains(sn),
+                    None => false,
+                },
+                _ => false,
+            };
+            if stale {
+                client.mode = ClientMode::Normal;
+            }
+        }
+    }
+
     /// Session's shared size = min over its attached clients of
     /// `(cols, rows - status_rows)` (the status row, when on, is not part of
     /// the pane area; `status off` gives panes the full height — Task 8).
@@ -2587,6 +2650,7 @@ impl Server {
         self.cancel_stale_copy_modes();
         self.cancel_stale_clock_modes();
         self.cancel_stale_choose_trees();
+        self.cancel_stale_menus();
         true
     }
 
@@ -3053,6 +3117,10 @@ impl Server {
         // this OR another client may have just removed the session/window
         // this client had a kill confirm armed on.
         self.cancel_stale_choose_trees();
+        // Same idea for an open display-menu (Task 16): another client may
+        // have just killed the pane/window/session this menu was opened
+        // against (SP7 final-fix wave, correctness review SHOULD-FIX #6).
+        self.cancel_stale_menus();
     }
 
     /// Follow-up #30 helper: write raw bytes to whatever pane is currently

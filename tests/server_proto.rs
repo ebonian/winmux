@@ -1537,8 +1537,16 @@ fn stalled_pane_stdin_does_not_block_other_sessions() {
     let (out, _) = expect_cli_done(&cli, 0);
     let elapsed = cli_start.elapsed();
     assert!(out.contains("stalled"), "out: {out:?}");
+    // Tests report (final-gate review): the pre-fix (blocked-main-loop) RED
+    // baseline is ~3.8-4s, GREEN (fixed) is ~1s -- a >3x gap that leaves
+    // comfortable discriminating power well above 3s. The original `< 3s`
+    // threshold had near-zero margin under load (observed failing by 46ms
+    // at 3.045s on a contended machine during that review) despite this
+    // test having nothing to do with the actual regression; widened to 6s,
+    // still far below the RED baseline, to make this robust under full-
+    // parallelism `cargo test` contention without weakening what it proves.
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(6),
         "CLI round trip took {elapsed:?} -- main loop was blocked by pane B's stalled stdin"
     );
 
@@ -7797,6 +7805,76 @@ fn copy_mode_selection_clears_on_width_resize() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Tests report SHOULD-FIX (final-gate review): the only pre-existing
+/// resize-adjacent server_proto coverage either resizes window LAYOUT
+/// geometry (`main_pane_width_survives_window_resize`, a split-border
+/// position, not pane content) or asserts a SIDE EFFECT of a width resize
+/// (`copy_mode_selection_clears_on_width_resize`, selection invalidation) --
+/// neither actually proves a real, already-wrapped shell line RE-WRAPS
+/// correctly through a live client-driven `ClientMsg::Resize`.
+/// `Grid::reflow_to_width`'s algorithm itself is exhaustively unit-tested in
+/// isolation (`src/grid.rs`), but the WIRING (server pane -> real ConPTY
+/// output -> `Server::handle_resize` -> `reflow_to_width` -> composited
+/// client output) had zero behavioral proof. Prints a known 140-char line
+/// through a real PowerShell pane at 80 cols (autowraps into exactly 2
+/// physical rows: 80 + 60 chars), resizes the client to 40 cols, and
+/// asserts the EXACT re-wrapped 4-row (40+40+40+20) content byte-for-byte.
+/// The pattern is a monotonic zero-padded counter (`"000102...69"`), NOT a
+/// short repeating unit like `"0123456789"` -- a periodic pattern would
+/// make every 40-char-aligned chunk byte-identical to every other, so a
+/// mis-wrapped/shifted split could still accidentally satisfy an
+/// `assert_eq!` against the wrong chunk. The command itself stays short
+/// (a PowerShell range+format expression) so only the ECHOED OUTPUT wraps
+/// -- the typed command line never does, avoiding any ambiguity about
+/// which wrapped text is which.
+#[test]
+fn resize_rewraps_real_pane_content() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // "000102030405...69" -- 70 zero-padded 2-digit numbers, 140 chars,
+    // non-periodic (every substring is globally unique) so a corrupted/
+    // shifted reflow can't accidentally satisfy an equality assertion.
+    let pattern: String = (0..70u32).map(|i| format!("{i:02}")).collect();
+    assert_eq!(pattern.len(), 140);
+    c.send(&ClientMsg::Stdin(b"echo ((0..69|%{$_.ToString('00')}) -join '')\r".to_vec()));
+
+    // At 80 cols (single, unsplit pane -- full client width), the echoed
+    // 140-char line autowraps into exactly 2 physical rows: chars[0..80]
+    // (wrapped) then chars[80..140] (60 chars, terminal). Wait for the
+    // second (trailing, terminal) chunk to land, proving the whole line
+    // arrived.
+    let tail60 = pattern[80..140].to_string();
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == tail60));
+    let before = screen_text(&grid);
+    let row0 = before.iter().position(|l| l == &pattern[0..80]).expect("first 80-char physical row must be on screen, unmangled");
+    assert_eq!(before[row0 + 1].trim_end(), tail60, "second physical row must hold exactly the trailing 60 chars, nothing else");
+
+    // Resize to 40 cols: reflow must re-split the SAME logical 140-char
+    // line into 40+40+40+20 with exact content -- no phantom blank cells
+    // spliced in, no lost/duplicated characters.
+    c.send(&ClientMsg::Resize { cols: 40, rows: 24 });
+    grid.resize(40, 24);
+    let last20 = pattern[120..140].to_string();
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == last20));
+    let after = screen_text(&grid);
+    let r0 = after
+        .iter()
+        .position(|l| l == &pattern[0..40])
+        .expect("first 40-char physical row must be on screen after reflow, unmangled");
+    assert_eq!(after[r0], pattern[0..40]);
+    assert_eq!(after[r0 + 1], pattern[40..80]);
+    assert_eq!(after[r0 + 2], pattern[80..120]);
+    assert_eq!(after[r0 + 3].trim_end(), last20);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `allow-rename` (SP7 Task 3, closes follow-up #52): default is OFF (tmux
 /// since 2.6), and it gates ONLY the historical `ESC k <name> ESC \` rename
 /// escape -- the OSC 0/2 path (`pane_title_updates_window_name`, above)
@@ -9093,6 +9171,50 @@ fn display_menu_opens_and_enter_runs_selected() {
     server.join().expect("server exits after kill-server");
 }
 
+/// Correctness review MUST-FIX #3 regression test: a user-authored
+/// `display-menu` whose FIRST row is a separator (a documented, legitimate
+/// tmux idiom for a leading header/divider -- an empty-string name token,
+/// `cmd.rs`'s `MenuEntry::Separator` parse) must not get `Down` navigation
+/// stuck on that separator. Pre-fix, `menu_move`'s "starting point"
+/// sentinel aliased "no previous selection" (`sel == -1`) to the SAME index
+/// (`0`) a single `Down` press from a fresh menu lands on, so if row 0 was
+/// a separator the wrap/skip loop's termination check fired on its very
+/// first iteration and got stuck there -- Enter would then silently close
+/// the menu (a separator row runs no command) instead of running "First"'s
+/// `select-window`. This test sends exactly ONE `j` then Enter and asserts
+/// the switch actually happened, which only passes if `j` skipped past the
+/// leading separator onto "First".
+#[test]
+fn display_menu_leading_separator_does_not_stick_down_navigation() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let (mut c, mut grid) = setup_two_named_windows(&name);
+    // setup_two_named_windows leaves window 1 ("w1") current.
+    assert!(row_text(&grid, grid.rows() - 1).contains("1:w1*"));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(
+        b"display-menu -T MenuTest \"\" First f \"select-window -t :=0\" Second s \"select-window -t :=1\"\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("MenuTest")));
+    assert!(screen_text(&grid).iter().any(|l| l.contains("First")));
+
+    // ONE Down press: pre-fix, this got stuck on the leading separator row
+    // (index 0); post-fix, it must skip straight to "First" (index 1).
+    c.send(&ClientMsg::Stdin(b"j".to_vec()));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+    // The menu box is gone -- a command actually ran (a stuck-on-separator
+    // Enter would ALSO close the menu, so this alone wouldn't discriminate
+    // -- the window-switch assertion above is the discriminating one).
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("MenuTest")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 /// `MouseDown3Pane` (the default right-click binding, table-driven since
 /// Task 8): a press on a live pane opens winmux's default PANE context
 /// menu — asserts the box renders with the expected item text.
@@ -9238,6 +9360,80 @@ fn right_click_on_window_tab_opens_menu_and_kills_that_window() {
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Correctness review SHOULD-FIX #6 regression test: `ClientMode::Menu` had
+/// no equivalent to `cancel_stale_confirms`/`_copy_modes`/`_clock_modes`/
+/// `_choose_trees` -- an open menu anchored to a pane/window/session that
+/// gets killed by a DIFFERENT client while the menu is still showing stayed
+/// open on stale state. Mirrors `stale_confirm_after_pane_exit_is_
+/// canceled`'s two-client pattern for the analogous confirm-prompt case:
+/// client A opens the default WINDOW context menu on window 0 (right-click
+/// its tab); client B (same session) kills window 0 out from under it via
+/// the `:` prompt. Proves the new `Server::cancel_stale_menus` sweep.
+#[test]
+fn stale_window_menu_after_other_client_kills_window_is_canceled() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut a = Client::connect(&name);
+    attach(&mut a, AttachMode::NewNamed, "stalemenu", 80, 24);
+    let mut grid_a = Grid::new(80, 24, 0);
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+    enable_mouse(&name, &mut a);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "w0".into()]));
+    expect_cli_done(&cli, 0);
+    a.recv_output_until(&mut grid_a, |g| row_text(g, g.rows() - 1).contains("0:w0*"));
+
+    a.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    a.recv_output_until(&mut grid_a, |g| row_text(g, g.rows() - 1).contains("1:"));
+
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["rename-window".into(), "w1".into()]));
+    expect_cli_done(&cli2, 0);
+    a.recv_output_until(&mut grid_a, |g| {
+        let row = row_text(g, g.rows() - 1);
+        row.contains("1:w1*") && row.contains("0:w0-")
+    });
+
+    // Second client, SAME session, so a `:` command it types acts on the
+    // same shared registry state A's menu is anchored into.
+    let mut b = Client::connect(&name);
+    attach(&mut b, AttachMode::Existing, "stalemenu", 80, 24);
+    let mut grid_b = Grid::new(80, 24, 0);
+    b.recv_output_until(&mut grid_b, |g| screen_text(g).iter().any(|l| l.contains("PS ")));
+
+    // A right-clicks window 0's tab, opening the default WINDOW menu
+    // (anchored to `(session, window0's id)`).
+    let status_row = grid_a.rows() - 1;
+    let line = row_text(&grid_a, status_row);
+    let tab0_col = line.find("0:w0-").expect("window 0 tab must be on the status line") as u16;
+    a.send(&ClientMsg::Stdin(sgr_mouse(CB_RIGHT, tab0_col, status_row, false)));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // B kills window 0 out from under A's still-open menu, via the `:`
+    // command prompt -- a Stdin-driven dispatch, which is where the
+    // staleness sweep runs (it re-checks EVERY attached client, not just
+    // the one that issued the kill).
+    b.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    b.send(&ClientMsg::Stdin(b"kill-window -t :0\r".to_vec()));
+    b.recv_output_until(&mut grid_b, |g| !row_text(g, g.rows() - 1).contains("0:w0"));
+
+    // A's menu must now be gone: the anchor window died out from under it.
+    a.recv_output_until(&mut grid_a, |g| !screen_text(g).iter().any(|l| l.contains("Kill")));
+
+    // A's subsequent input must be treated as NORMAL input (forwarded to
+    // the pane), not stale menu navigation -- prove the session is still
+    // alive and responsive end to end.
+    a.send(&ClientMsg::Stdin(b"echo stillalive\r".to_vec()));
+    a.recv_output_until(&mut grid_a, |g| screen_text(g).iter().any(|l| l.contains("stillalive")));
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli3, 0);
     server.join().expect("server exits after kill-server");
 }
 

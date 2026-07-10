@@ -89,6 +89,24 @@ pub struct Window {
     pub alert_bell: bool,
     pub alert_activity: bool,
     pub alert_silence: bool,
+    /// Edge-latch for the activity/silence REACTION (message/BEL/whatever
+    /// `*-action` resolves to), separate from `alert_activity`/
+    /// `alert_silence` (SP7 final-fix wave, correctness review SHOULD-FIX
+    /// #4). `alert_activity`/`alert_silence` are deliberately only ever set
+    /// `true` for a NON-current window (tmux doesn't draw the `#`/`~` flag
+    /// for the window you're already looking at), which means their own
+    /// `if self.alert_activity { return false }` edge-trigger guard never
+    /// engages for the CURRENT window — so before this fix, `mark_activity`/
+    /// `mark_silence` returned `true` on literally EVERY call for a
+    /// focused, idle, monitor-silence-enabled window, causing
+    /// `check_silence` to force a wasted render pass and (for `*-action
+    /// any`/`current`) repeat the message/BEL reaction every single 50ms
+    /// tick, forever. This latch fires once regardless of `is_current`, and
+    /// is reset by [`Window::clear_alerts`] (window visited) for activity,
+    /// or by [`Window::note_output`] (a fresh silence "episode" can start
+    /// once output resumes) for silence — see those methods' doc comments.
+    activity_fired: bool,
+    silence_fired: bool,
     /// Last time this window had ANY pane output (tmux `window_update_
     /// activity`'s `activity_time`) — the silence-monitor clock
     /// `server.rs`'s Tick handler compares against `monitor-silence`
@@ -103,10 +121,14 @@ impl Window {
     /// tmux clear-on-visit (`winlink_clear_flags`, window.c:2085-2096): all
     /// three alert flags reset when this window becomes its session's
     /// current window. Idempotent (a window with no flags set is a no-op).
+    /// Also resets the activity reaction latch (SP7 final-fix wave) — see
+    /// `activity_fired`'s doc comment; the silence latch is intentionally
+    /// NOT reset here, only by [`Window::note_output`].
     pub fn clear_alerts(&mut self) {
         self.alert_bell = false;
         self.alert_activity = false;
         self.alert_silence = false;
+        self.activity_fired = false;
     }
 
     /// Bell detection (tmux `alerts_check_bell`, alerts.c:182-218): sets
@@ -123,15 +145,22 @@ impl Window {
     }
 
     /// Activity detection (tmux `alerts_check_activity`, alerts.c:220-254):
-    /// EDGE-TRIGGERED — once `alert_activity` is set, every further call
-    /// is a no-op (`false`) until the window is visited and the flag
-    /// clears; the caller only evaluates the activity-action/visual-
-    /// activity reaction on a `true` return (tmux's `if (wl->flags &
-    /// WINLINK_ACTIVITY) continue;`).
+    /// EDGE-TRIGGERED — once fired, every further call is a no-op (`false`)
+    /// until the window is visited (`clear_alerts`); the caller only
+    /// evaluates the activity-action/visual-activity reaction on a `true`
+    /// return (tmux's `if (wl->flags & WINLINK_ACTIVITY) continue;`).
+    /// `alert_activity` (the STATUS-BAR `#` flag) is still only ever set
+    /// for a non-current window, unchanged — but the edge-trigger guard
+    /// itself now runs on `activity_fired`, which fires for the CURRENT
+    /// window too (SP7 final-fix wave, correctness review SHOULD-FIX #4:
+    /// previously the guard was `self.alert_activity`, which never becomes
+    /// true for the current window, so this returned `true` on literally
+    /// every call for a focused window with `monitor-activity` on).
     pub fn mark_activity(&mut self, is_current: bool) -> bool {
-        if self.alert_activity {
+        if self.activity_fired {
             return false;
         }
+        self.activity_fired = true;
         if !is_current {
             self.alert_activity = true;
         }
@@ -139,17 +168,34 @@ impl Window {
     }
 
     /// Silence detection (tmux `alerts_check_silence`, alerts.c:256-290):
-    /// same edge-triggered shape as [`Window::mark_activity`], checked by
-    /// `server::Server`'s Tick handler once `now - last_output` has crossed
-    /// `monitor-silence` seconds.
+    /// same edge-triggered shape as [`Window::mark_activity`] (see that
+    /// method's doc comment for the SP7 final-fix wave's `_fired`-latch
+    /// split), checked by `server::Server`'s Tick handler once `now -
+    /// last_output` has crossed `monitor-silence` seconds. Unlike the
+    /// activity latch, the silence latch resets on [`Window::note_output`]
+    /// (fresh output), not on visit — a silence "episode" naturally ends
+    /// when output resumes, so a LATER quiet period should be able to react
+    /// again even if the window was never revisited in between.
     pub fn mark_silence(&mut self, is_current: bool) -> bool {
-        if self.alert_silence {
+        if self.silence_fired {
             return false;
         }
+        self.silence_fired = true;
         if !is_current {
             self.alert_silence = true;
         }
         true
+    }
+
+    /// Record fresh pane output for this window (tmux `window_update_
+    /// activity`): refreshes `last_output` (the silence-monitor clock) and
+    /// ends any active silence "episode" so a FUTURE quiet period can react
+    /// again — see `mark_silence`'s doc comment. Called unconditionally on
+    /// every pane-output event routed to this window (`server::Server::
+    /// note_activity`), independent of `monitor-activity`/`monitor-silence`.
+    pub fn note_output(&mut self) {
+        self.last_output = Instant::now();
+        self.silence_fired = false;
     }
 }
 
@@ -279,6 +325,8 @@ impl Registry {
             alert_bell: false,
             alert_activity: false,
             alert_silence: false,
+            activity_fired: false,
+            silence_fired: false,
             last_output: Instant::now(),
         };
         let session = Session {
@@ -563,6 +611,8 @@ impl Session {
             alert_bell: false,
             alert_activity: false,
             alert_silence: false,
+            activity_fired: false,
+            silence_fired: false,
             last_output: Instant::now(),
         }
     }
