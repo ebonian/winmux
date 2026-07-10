@@ -101,6 +101,15 @@ pub struct WindowEntry {
     pub current: bool,
     pub last: bool,
     pub zoomed: bool,
+    /// Alerts subsystem (SP7 Task 17, closes follow-up #74): tmux's
+    /// `WINLINK_ACTIVITY`/`WINLINK_BELL`/`WINLINK_SILENCE` display flags
+    /// (`model::Window::alert_activity`/`alert_bell`/`alert_silence`,
+    /// resolved by the caller). Feed [`flags`]'s `#`/`!`/`~` chars; every
+    /// pre-Task-17 caller/test gets `false` here (via the `win()` test
+    /// helper), so no earlier expected flags string changes.
+    pub activity: bool,
+    pub bell: bool,
+    pub silence: bool,
     /// SP7 Task 6 (closes follow-up #26): this window's own EFFECTIVE
     /// `window-status-format`/`-current-format` (resolved by the caller
     /// through this window's `window_options` overlay via `Options::
@@ -132,10 +141,23 @@ pub struct WindowEntry {
     pub pane_title: String,
 }
 
-/// Flags string for one window: `*` if current, else `-` if last, else empty,
-/// then `Z` appended when zoomed (e.g. `*Z`, `-Z`, `Z`, `*`, `-`, or empty).
+/// Flags string for one window, tmux's fixed `window_printable_flags` order
+/// (`docs/tmux-reference/status-line-and-messages.md` §2.3): `#` activity,
+/// `!` bell, `~` silence, then `*` if current else `-` if last, then `Z` if
+/// zoomed (`M` marked-pane is not implemented -- winmux has no
+/// `server_check_marked` equivalent, documented narrowing). E.g. `!*Z`,
+/// `#-`, `~`, `*Z`, or empty.
 fn flags(w: &WindowEntry) -> String {
     let mut f = String::new();
+    if w.activity {
+        f.push('#');
+    }
+    if w.bell {
+        f.push('!');
+    }
+    if w.silence {
+        f.push('~');
+    }
     if w.current {
         f.push('*');
     } else if w.last {
@@ -656,11 +678,24 @@ mod tests {
             current,
             last,
             zoomed,
+            activity: false,
+            bell: false,
+            silence: false,
             format_override: None,
             style_override: None,
             pane_index: 0,
             pane_title: String::new(),
         }
+    }
+
+    /// SP7 Task 17 (closes follow-up #74): same as [`win`] but with the
+    /// three alert flags settable, for `flags()`-ordering coverage.
+    fn win_alert(index: u32, name: &str, current: bool, activity: bool, bell: bool, silence: bool) -> WindowEntry {
+        let mut w = win(index, name, current, false, false);
+        w.activity = activity;
+        w.bell = bell;
+        w.silence = silence;
+        w
     }
 
     /// tmux default `status-style` resolved: `bg=green,fg=black`.
@@ -756,6 +791,28 @@ mod tests {
                 ("1:logsZ".to_string(), base()),
                 (" ".to_string(), base()),
                 ("2:shell*".to_string(), Style { underline: true, ..base() }),
+            ]
+        );
+    }
+
+    /// SP7 Task 17 (closes follow-up #74): `#`/`!`/`~` render in tmux's
+    /// fixed `window_printable_flags` order, ahead of `*`/`-`/`Z`
+    /// (`docs/tmux-reference/status-line-and-messages.md` §2.3).
+    #[test]
+    fn flags_bell_activity_silence_order() {
+        let windows = vec![
+            win_alert(0, "bg", false, true, true, true), // all three + non-current -> "#!~"
+            win_alert(1, "cur", true, false, false, false), // current, no alerts (clear-on-visit) -> "*"
+        ];
+        let (ws, wcs) = default_partials();
+        let spans = spans_default("[a] ", &windows, base(), &ws, &wcs);
+        assert_eq!(
+            spans,
+            vec![
+                ("[a] ".to_string(), base()),
+                ("0:bg#!~".to_string(), base()),
+                (" ".to_string(), base()),
+                ("1:cur*".to_string(), Style { underline: true, ..base() }),
             ]
         );
     }

@@ -1238,6 +1238,7 @@ impl Server {
             if wid != session.current {
                 session.last = Some(session.current);
                 session.current = wid;
+                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
             }
         }
         self.apply_layout_for_session(&session_name);
@@ -1637,6 +1638,7 @@ impl Server {
             if detached {
                 session.current = wid;
                 session.last = Some(new_wid);
+                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
             }
         }
         // NOTE (fix round 4): the moved pane becoming the new window's
@@ -1767,6 +1769,7 @@ impl Server {
                     if wid != session.current {
                         session.last = Some(session.current);
                         session.current = wid;
+                        session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
                     }
                 }
                 self.apply_layout_for_session(&session_name);
@@ -2860,6 +2863,15 @@ impl Server {
                     current: is_current,
                     last: Some(w.id) == session.last,
                     zoomed: w.layout.is_zoomed(),
+                    // Alerts subsystem (SP7 Task 17, closes follow-up #74):
+                    // MUST mirror `render_one`'s entries exactly (see the
+                    // doc comment above) -- the flag chars affect tab text
+                    // width, so leaving these `false` would desync a click
+                    // hit-test's column math from what's actually drawn on
+                    // any window with an active alert.
+                    activity: w.alert_activity,
+                    bell: w.alert_bell,
+                    silence: w.alert_silence,
                     format_override: Some(fmt.to_string()),
                     style_override: None,
                     pane_index: w_pane_index,
@@ -2891,6 +2903,7 @@ impl Server {
             if wid != session.current {
                 session.last = Some(session.current);
                 session.current = wid;
+                session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
             }
         }
         self.apply_layout_for_session(session_name);
@@ -3443,13 +3456,24 @@ impl Server {
         let session = self.registry.sessions().iter().find(|s| s.name == name).ok_or_else(|| format!("can't find session: {name}"))?;
         let mut out = String::new();
         for w in &session.windows {
-            let flag = if w.id == session.current {
-                "*"
+            // Alerts subsystem (SP7 Task 17, closes follow-up #74): same
+            // `#`/`!`/`~` chars and ordering as `status::flags` (tmux's
+            // `window_printable_flags`), ahead of `*`/`-`.
+            let mut flag = String::new();
+            if w.alert_activity {
+                flag.push('#');
+            }
+            if w.alert_bell {
+                flag.push('!');
+            }
+            if w.alert_silence {
+                flag.push('~');
+            }
+            if w.id == session.current {
+                flag.push('*');
             } else if Some(w.id) == session.last {
-                "-"
-            } else {
-                ""
-            };
+                flag.push('-');
+            }
             let active = if w.id == session.current { " (active)" } else { "" };
             let panes = w.layout.panes().len();
             let (cols, rows) = session.size;
@@ -4424,6 +4448,7 @@ impl Server {
                     if wid != session.current {
                         session.last = Some(session.current);
                         session.current = wid;
+                        session.clear_alerts_for(wid); // SP7 Task 17 (#74): clear-on-visit
                     }
                 }
                 self.apply_layout_for_session(&sname);

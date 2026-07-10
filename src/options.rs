@@ -176,6 +176,27 @@ const SPECS: &[Spec] = &[
     Spec { name: "status-right-style", kind: Kind::Style, choices: &[] },
     Spec { name: "window-status-format", kind: Kind::Str, choices: &[] },
     Spec { name: "window-status-current-format", kind: Kind::Str, choices: &[] },
+    // Alerts subsystem (SP7 Task 17, closes follow-up #74). `bell-action`/
+    // `visual-bell`/`monitor-activity`/`clock-mode-colour`/
+    // `window-status-bell-style` were already SPECS entries (SP6 Task 2,
+    // accepted-and-stored but inert); this task wires them up AND adds the
+    // remaining options real tmux pairs with them (verified against
+    // `docs/tmux-reference/status-line-and-messages.md` §4.4/§9 and, where
+    // that doc is thin on defaults, tmux's own `options-table.c`):
+    // `activity-action`/`silence-action` (session-scoped, same choice set as
+    // `bell-action`, defaults `other`/`other` vs. `bell-action`'s `any` --
+    // options-table.c:733-739/1011-1017), `monitor-bell` (window-scoped
+    // flag, default ON -- options-table.c:1480-1485, note this is the
+    // OPPOSITE default of `monitor-activity`), `monitor-silence`
+    // (window-scoped number, seconds, default 0 = off --
+    // options-table.c:1487-1493), and `window-status-activity-style`
+    // (window-scoped style, default `reverse`, same as `-bell-style` --
+    // options-table.c:1799-1806).
+    Spec { name: "activity-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "silence-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "monitor-bell", kind: Kind::Flag, choices: &[] },
+    Spec { name: "monitor-silence", kind: Kind::Number, choices: &[] },
+    Spec { name: "window-status-activity-style", kind: Kind::Style, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -241,6 +262,9 @@ pub fn scope(name: &str) -> Option<Scope> {
         | "automatic-rename"
         | "allow-rename"
         | "monitor-activity"
+        | "monitor-bell"
+        | "monitor-silence"
+        | "window-status-activity-style"
         | "clock-mode-colour"
         | "clock-mode-style" => Scope::Window,
         _ => Scope::Session,
@@ -406,6 +430,16 @@ fn default_value(name: &str) -> Value {
         // doc comment above; closes docs/follow-ups.md #70).
         "window-status-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         "window-status-current-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
+        // Alerts subsystem (SP7 Task 17, closes follow-up #74). See the
+        // SPECS entries' doc comment above for the tmux-verified defaults.
+        "activity-action" => Value::Choice("other"),
+        "silence-action" => Value::Choice("other"),
+        "monitor-bell" => Value::Flag(true),
+        "monitor-silence" => Value::Number(0),
+        "window-status-activity-style" => {
+            let s = "reverse";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -818,11 +852,14 @@ impl Options {
         self.flag("allow-rename")
     }
 
-    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2): how an
-    /// activity/bell/silence alert is shown (`off`/`on`/`both` -- `both`
-    /// means visual AND audible). Accepted-and-stored but INERT: no
-    /// alerts/bell subsystem exists yet (`docs/follow-ups.md`-tracked; see
-    /// `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2; wired
+    /// up SP7 Task 17, closes follow-up #74): how an activity/bell/silence
+    /// alert is shown (`off`/`on`/`both`). Per
+    /// `docs/tmux-reference/status-line-and-messages.md` §4.4
+    /// (`alerts_set_message`): `off` -> terminal BEL passthrough to every
+    /// client attached to the alerting window's session, no message; `on`
+    /// -> a status-line message only, no BEL; `both` -> BEL AND message.
+    /// Consumed by `server::Server::react_alert`.
     pub fn visual_activity(&self) -> &'static str {
         self.choice("visual-activity")
     }
@@ -835,18 +872,103 @@ impl Options {
         self.choice("visual-silence")
     }
 
-    /// `bell-action` (SP6 Task 2): which window(s) a bell alert routes to
-    /// (`any`/`none`/`current`/`other`). Accepted-and-stored but INERT, same
-    /// bucket as the `visual-*` getters above.
+    pub fn visual_activity_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-activity", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-activity is always Choice"),
+        }
+    }
+
+    pub fn visual_bell_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-bell", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-bell is always Choice"),
+        }
+    }
+
+    pub fn visual_silence_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("visual-silence", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("visual-silence is always Choice"),
+        }
+    }
+
+    /// `bell-action`/`activity-action`/`silence-action` (SP6 Task 2 for
+    /// `bell-action`; the other two added SP7 Task 17, closes follow-up
+    /// #74): which window(s) an alert's notify/visual REACTION applies to
+    /// (`any`/`none`/`current`/`other` -- `alerts_action_applies`,
+    /// alerts.c:70-89). This is a SEPARATE gate from the window-flag
+    /// (`#`/`!`/`~`) detection itself, which only checks `monitor-*` (see
+    /// `model::Window::mark_bell`/`mark_activity`/`mark_silence`'s doc
+    /// comments) -- a window can show `!` with NO reaction (`bell-action
+    /// none`), or vice versa is impossible (a reaction always implies
+    /// `monitor-*` was on, but the FLAG might still not be set if the
+    /// window happens to be current). tmux defaults: `bell-action any`,
+    /// `activity-action other`, `silence-action other`
+    /// (options-table.c:733-739/761-767/1011-1017).
     pub fn bell_action(&self) -> &'static str {
         self.choice("bell-action")
     }
 
-    /// `monitor-activity` (SP6 Task 2): per-window activity monitoring
-    /// on/off. Accepted-and-stored but INERT (no activity tracking exists
-    /// yet).
+    pub fn activity_action(&self) -> &'static str {
+        self.choice("activity-action")
+    }
+
+    pub fn silence_action(&self) -> &'static str {
+        self.choice("silence-action")
+    }
+
+    pub fn bell_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("bell-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("bell-action is always Choice"),
+        }
+    }
+
+    pub fn activity_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("activity-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("activity-action is always Choice"),
+        }
+    }
+
+    pub fn silence_action_for(&self, session: &Overlay) -> &'static str {
+        match self.resolve_session("silence-action", session) {
+            Value::Choice(c) => c,
+            _ => unreachable!("silence-action is always Choice"),
+        }
+    }
+
+    /// `monitor-activity`/`monitor-bell` (SP6 Task 2 for `monitor-
+    /// activity`, wired up SP7 Task 17 alongside the new `monitor-bell`,
+    /// closes follow-up #74): per-window bell/activity monitoring on/off --
+    /// gates the WINDOW FLAG (`!`/`#`) detection itself, independent of
+    /// `bell-action`/`activity-action`'s reaction scoping (see
+    /// `bell_action`'s doc comment). tmux defaults: `monitor-bell` ON,
+    /// `monitor-activity` OFF (options-table.c:1473-1485 -- note the two
+    /// options default OPPOSITE ways).
     pub fn monitor_activity(&self) -> bool {
         self.flag("monitor-activity")
+    }
+
+    pub fn monitor_bell(&self) -> bool {
+        self.flag("monitor-bell")
+    }
+
+    pub fn monitor_bell_for(&self, window: &Overlay) -> bool {
+        as_flag(self.resolve_window("monitor-bell", window))
+    }
+
+    /// `monitor-silence` (SP7 Task 17, closes follow-up #74): per-window
+    /// silence-monitoring interval in seconds, `0` = off (tmux default).
+    /// `server::Server`'s Tick handler compares this against each window's
+    /// `model::Window::last_output` age.
+    pub fn monitor_silence(&self) -> Duration {
+        Duration::from_secs(self.number("monitor-silence") as u64)
+    }
+
+    pub fn monitor_silence_for(&self, window: &Overlay) -> Duration {
+        Duration::from_secs(as_number(self.resolve_window("monitor-silence", window)) as u64)
     }
 
     /// `clock-mode-colour` (SP6 Task 2): the big-clock overlay's colour.
@@ -864,11 +986,33 @@ impl Options {
         matches!(self.values.get("clock-mode-style"), Some(Value::Choice("12")))
     }
 
-    /// `window-status-bell-style` (SP6 Task 2): style for a window tab with
-    /// an unseen bell. Accepted-and-stored but INERT (no bell-state tracking
-    /// exists yet).
+    /// `window-status-bell-style`/`-activity-style` (SP6 Task 2 for
+    /// `-bell-style`; `-activity-style` added + both wired up SP7 Task 17,
+    /// closes follow-up #74): style layered over a flagged window's tab.
+    /// Per `docs/tmux-reference/status-line-and-messages.md` §2.2's style
+    /// resolution order: bell-style applies (if != `default`) whenever
+    /// `alert_bell` is set; activity-style applies (if != `default`) only
+    /// as the ELSE branch -- i.e. only when bell-style did NOT already
+    /// apply -- whenever `alert_activity` OR `alert_silence` is set (both
+    /// flags share this one style option). "!= `default`" is checked via
+    /// `PartialStyle::default()` equality (an unmentioned/`default`-keyword
+    /// style parses to the same all-`None` value). See `server::Server`'s
+    /// `WindowEntry` construction for the actual layering. tmux default for
+    /// both: `reverse`.
     pub fn window_status_bell_style(&self) -> &PartialStyle {
         self.style_ref("window-status-bell-style")
+    }
+
+    pub fn window_status_activity_style(&self) -> &PartialStyle {
+        self.style_ref("window-status-activity-style")
+    }
+
+    pub fn window_status_bell_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-bell-style", window))
+    }
+
+    pub fn window_status_activity_style_for<'a>(&'a self, window: &'a Overlay) -> &'a PartialStyle {
+        as_style(self.resolve_window("window-status-activity-style", window))
     }
 
     /// `window-status-separator` (SP6 Task 2): literal text between window

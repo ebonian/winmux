@@ -7525,3 +7525,262 @@ fn unbind_unknown_key_quiet_with_q() {
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
 }
+
+// ---- SP7 Task 17: alerts subsystem (closes follow-up #74) -----------------
+//
+// `send-keys -t ":<index>."` (a leading `:` + window index + trailing `.`
+// with an empty pane spec) targets a WINDOW's focused pane directly, without
+// switching the client's own focus there first -- unlike the bare-numeric
+// `-t 0`/`-t 1` targets used elsewhere in this file (which name a PANE
+// POSITION within the client's CURRENT window; see `resolve_pane_target`'s
+// doc comment). This lets these tests drive a BACKGROUND window's shell
+// while a different window stays current, exactly the scenario the alerts
+// subsystem exists to flag.
+//
+// A raw BEL byte is produced by having the target pane's real PowerShell
+// process run `Write-Host -NoNewline ([char]7)` -- the same "let the shell
+// emit the exact byte, don't try to inject a synthetic escape sequence"
+// pattern already established by the ESC-k rename tests
+// (`pane_title_updates_window_name`'s neighbors, `[char]27` construction);
+// seen the alt-screen-wheel test's doc comment for why a synthetic
+// `Write-Host`-emitted sequence is the one paths that DIDN'T reliably survive
+// real ConPTY transit (`\x1b[?1049h`), a bare 1-byte BEL is not that.
+
+#[test]
+fn bel_in_unfocused_window_sets_bang_flag_and_bell_style() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Second window (current); window 0 goes to the background.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // BEL into the BACKGROUND window (0); `monitor-bell` defaults ON and
+    // `bell-action` defaults `any`, so no config needed.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+
+    // `window-status-bell-style` defaults to `reverse` -- layered over
+    // window 0's tab now that it's bell-flagged.
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, status_row);
+        match row.find("0:powershell!") {
+            Some(col) => g.cell(col as u16, status_row).style.reverse,
+            None => false,
+        }
+    });
+    // The still-current window's tab is untouched.
+    assert!(
+        !g_cell_reverse_at(&grid, status_row, "1:powershell*"),
+        "the current window's own tab must not pick up the bell style"
+    );
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Small helper for the assertion above: `true` iff `marker` is found in
+/// `row` and its FIRST cell has `style.reverse` set.
+fn g_cell_reverse_at(g: &Grid, row: u16, marker: &str) -> bool {
+    match row_text(g, row).find(marker) {
+        Some(col) => g.cell(col as u16, row).style.reverse,
+        None => false,
+    }
+}
+
+#[test]
+fn activity_flag_hash_when_monitor_activity_on() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    // `monitor-activity` defaults OFF -- must be turned on for the `#` flag
+    // to ever appear.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "monitor-activity".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "echo activity-marker".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell#"));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn flags_clear_on_selecting_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+
+    // Select window 0 (tmux clear-on-visit): its own `!` flag must clear
+    // the moment it becomes current.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'0']));
+    c.recv_output_until(&mut grid, |g| {
+        let row = row_text(g, status_row);
+        row.contains("0:powershell*") && !row.contains("0:powershell!")
+    });
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `bell-action none` suppresses the notify/visual-bell REACTION only --
+/// the `!` window-flag detection is a SEPARATE gate (`monitor-bell` alone),
+/// per `docs/tmux-reference/status-line-and-messages.md` §4.4 /
+/// `alerts_check_bell` (alerts.c:182-218, which never consults `bell-action`
+/// before setting the flag). This test proves both halves at once: the flag
+/// still appears, but with `visual-bell on` armed, no "Bell in window 0"
+/// message ever shows.
+#[test]
+fn bell_action_none_suppresses() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "bell-action".into(), "none".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "visual-bell".into(), "on".into()]));
+    expect_cli_done(&cli2, 0);
+
+    let mut cli3 = cli_client(&name);
+    cli3.send(&ClientMsg::Cli(vec![
+        "send-keys".into(),
+        "-t".into(),
+        ":0.".into(),
+        "Write-Host -NoNewline ([char]7)".into(),
+        "Enter".into(),
+    ]));
+    expect_cli_done(&cli3, 0);
+
+    let status_row = grid.rows() - 1;
+    // The flag still appears (monitor-bell alone gates it)...
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell!"));
+    // ...but no reaction message ever shows, `bell-action none` suppressed
+    // it entirely.
+    assert!(
+        !screen_text(&grid).iter().any(|l| l.contains("Bell in window")),
+        "bell-action none must suppress the visual-bell reaction; screen:\n{}",
+        screen_text(&grid).join("\n")
+    );
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+#[test]
+fn visual_bell_on_shows_message_instead_of_passthrough() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "visual-bell".into(), "on".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Bell on the CURRENT (only) window: `bell-action` defaults `any`, so
+    // the reaction fires here too, with the "current window" wording.
+    c.send(&ClientMsg::Stdin(b"Write-Host -NoNewline ([char]7)\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("Bell in current window")));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `monitor-silence <secs>`, checked on the server's existing 50ms Tick: a
+/// window with no output for the configured interval gets the `~` flag.
+/// Set to 1s (comfortably above the 50ms tick granularity, well below the
+/// harness's 10s `recv_output_until` timeout) and no keys are ever sent to
+/// either window -- the flag must appear on its own, driven purely by the
+/// Tick handler re-rendering once `check_silence` reports dirty.
+#[test]
+fn monitor_silence_flags_after_interval() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| {
+        screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*"))
+    });
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "monitor-silence".into(), "1".into()]));
+    expect_cli_done(&cli, 0);
+
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).contains("0:powershell~"));
+
+    let mut cli_k = cli_client(&name);
+    cli_k.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_k, 0);
+    server.join().expect("server exits after kill-server");
+}

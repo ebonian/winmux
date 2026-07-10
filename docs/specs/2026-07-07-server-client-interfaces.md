@@ -221,6 +221,18 @@ pub struct Window {
     // empty (inherits the global table). See the `## option-scopes` section
     // of 2026-07-07-command-config-interfaces.md for `options::Overlay`.
     pub window_options: crate::options::Overlay,
+    // AMENDED (SP7 Task 17, closes follow-up #74): alerts subsystem flags,
+    // tmux's WINLINK_BELL/_ACTIVITY/_SILENCE collapsed onto the window
+    // (winmux windows belong to exactly one session). `last_output` is
+    // tmux's `activity_time`, the silence-monitor clock. New methods:
+    // `clear_alerts(&mut self)`, `mark_bell(&mut self, is_current: bool)`,
+    // `mark_activity`/`mark_silence(&mut self, is_current: bool) -> bool`
+    // (edge-triggered; see 2026-07-07-command-config-interfaces.md's
+    // "Task 17" section for the full contract).
+    pub alert_bell: bool,
+    pub alert_activity: bool,
+    pub alert_silence: bool,
+    pub last_output: std::time::Instant,
 }
 pub struct Session {
     pub name: String,
@@ -243,6 +255,7 @@ impl Registry {
     pub fn find(&mut self, target: &str) -> Result<&mut Session, String>; // tmux -t rules: "=x" exact only; else exact, then unambiguous prefix; Err("can't find session: <t>")
     pub fn kill_session(&mut self, name: &str) -> bool;
     pub fn sessions(&self) -> &[Session];
+    pub fn sessions_mut(&mut self) -> &mut [Session]; // AMENDED (SP7 Task 17, #74): the silence-check Tick handler's one-pass walk
     pub fn session_mut(&mut self, name: &str) -> Option<&mut Session>;
     pub fn is_empty(&self) -> bool;
     pub fn auto_name(&self) -> String;                      // lowest unused non-negative integer as string
@@ -260,6 +273,13 @@ impl Session {
     // Amendment (sub-project 6, Task 5, `swap-window`) -- see below.
     pub fn window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>;
     pub fn swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool;
+    // AMENDED (SP7 Task 17, closes follow-up #74): `pub(crate)`, not `pub`
+    // — called by every `Session` method above that reassigns `current`,
+    // AND by every `server/dispatch.rs` call site that mutates
+    // `session.current` directly instead of through one of these methods
+    // (`exec_select_window`, `find-window`, the status-row window click,
+    // choose-tree's Enter commit, `break-pane -d`).
+    pub(crate) fn clear_alerts_for(&mut self, id: WindowId);
 }
 ```
 
@@ -469,6 +489,16 @@ pub struct WindowEntry {
     pub current: bool,
     pub last: bool,
     pub zoomed: bool,
+    // AMENDED (SP7 Task 17, closes follow-up #74): tmux's WINLINK_ACTIVITY/
+    // _BELL/_SILENCE display flags (`model::Window::alert_activity`/
+    // `alert_bell`/`alert_silence`, resolved by the caller). Feed
+    // `status::flags`'s (private) `#`/`!`/`~` chars, tmux's fixed
+    // `window_printable_flags` order (ahead of `*`/`-`/`Z`). Every
+    // pre-Task-17 caller/test defaults these to `false` (no earlier
+    // expected flags string changes).
+    pub activity: bool,
+    pub bell: bool,
+    pub silence: bool,
     // AMENDED (SP7 Task 6, closes follow-up #26): per-window EFFECTIVE
     // window-status-format/-current-format and -style/-current-style,
     // resolved by the CALLER through that window's own options overlay
