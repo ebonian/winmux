@@ -19,6 +19,22 @@ pub struct Window {
     /// tmux window index (lowest unused >= 0 at creation).
     pub index: u32,
     /// Default "powershell"; renamed via tmux prefix `,` (future task).
+    ///
+    /// **Invariant (follow-up #62):** every write to this field MUST go
+    /// through [`validate_name`] first (directly, or via a setter that
+    /// already calls it). There is no type-level enforcement — a plain
+    /// `String` accepts anything — the invariant holds today only because
+    /// every call site that sets it (`exec_rename_window`,
+    /// `derive_auto_name`'s caller, `Registry::create_session`/
+    /// `Session::new_window`'s hardcoded initial `"powershell"`, which is
+    /// itself a known-valid literal) happens to be gated by it. Choose-tree
+    /// row rendering and the status bar interpolate this value into rendered
+    /// VT output with no further escaping, trusting that transitively. A
+    /// future direct-assignment call site that skips validation would
+    /// silently reintroduce the terminal-corruption/control-character risk
+    /// `validate_name` exists to close (see that function's own doc
+    /// comment) — this note exists so the risk is documented at the FIELD,
+    /// not only at today's call sites.
     pub name: String,
     pub layout: Layout,
     /// `next-layout`'s cycle position (Task 6, sub-project 4): the
@@ -51,6 +67,13 @@ pub struct Window {
 }
 
 pub struct Session {
+    /// **Invariant (follow-up #62):** same rule as [`Window::name`] — every
+    /// write MUST go through [`validate_name`] (directly, or via a setter
+    /// that already calls it: `Registry::create_session`,
+    /// `exec_rename_session`). No type-level guarantee; see `Window::name`'s
+    /// doc comment for the full rationale (status bar / choose-tree render
+    /// this into VT output untrusted-input-free only because every existing
+    /// call site is gated).
     pub name: String,
     pub created: SystemTime,
     /// Kept sorted by `Window::index`.

@@ -285,8 +285,10 @@ fn e2e_no_server_error() {
 /// server -- otherwise redirected stdio (e.g. under a test harness, or a
 /// misconfigured launcher) would leave an idle detached server process
 /// behind forever (it never gets a session, so exit-empty never fires).
+/// Renamed from `no_console_fails_fast` (follow-up #24: every sibling test in
+/// this file is `e2e_`-prefixed; this one alone wasn't).
 #[test]
-fn no_console_fails_fast() {
+fn e2e_no_console_fails_fast() {
     let socket = unique_socket("no-console");
     // Defensive: if the fail-fast guard regresses, don't leak a server.
     let _guard = ServerGuard { socket: socket.clone() };

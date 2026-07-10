@@ -1125,7 +1125,8 @@ autostarting; `Control` connects WITHOUT autostarting either. Both of these
 non-autostarting paths' `NotFound` prints `no server running on <pipe>` and
 exits 1 — matching the design spec's "pure queries... error... auto-start:
 new-session... starts the server" rule. Covered by
-`tests/e2e_sessions.rs::no_console_fails_fast`.
+`tests/e2e_sessions.rs::e2e_no_console_fails_fast` (renamed from
+`no_console_fails_fast`, follow-up #24).
 
 **Implementation module:** `src/client.rs`. No unit tests (pure I/O glue:
 threads, a live named pipe, a live console) — coverage is
