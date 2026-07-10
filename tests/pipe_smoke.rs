@@ -14,6 +14,23 @@ fn unique_pipe_name(tag: &str) -> String {
     format!(r"\\.\pipe\winmux-test-pipe-{}-{}", std::process::id(), tag)
 }
 
+/// Connect like the real client does (`src/client.rs`): retry on `NotFound`
+/// while the server's accept loop races to create the next pipe instance.
+/// Without this, a client reconnecting immediately after a previous
+/// connection can land in the gap before `accept` re-creates an instance —
+/// rare on a fast machine, routine on loaded CI runners.
+fn connect_retry(name: &str) -> io::Result<PipeConn> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match PipeConn::connect(name) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && std::time::Instant::now() < deadline => {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A client connects, sends a `ClientMsg::Stdin` frame, and the server echoes
 /// it back as a `ServerMsg::Output` frame — exercising Task 1's codec over a
 /// real named pipe end to end.
@@ -159,7 +176,7 @@ fn two_sequential_clients() {
     });
 
     for i in 0..2u8 {
-        let mut client = PipeConn::connect(&name).expect("client connect");
+        let mut client = connect_retry(&name).expect("client connect");
         let sent = vec![i; 3];
         write_client_msg(&mut client, &ClientMsg::Stdin(sent.clone())).expect("client write");
         let reply = read_server_msg(&mut client).expect("client read");
