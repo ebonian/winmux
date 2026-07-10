@@ -30,12 +30,12 @@ use windows::Win32::System::Time::FileTimeToSystemTime;
 
 use crate::bindings::{
     mouse_default_double_click_pane, mouse_default_drag_pane_enter_copy, mouse_default_drag_pane_select,
-    mouse_default_status_select_window, mouse_default_triple_click_pane, Binding,
+    mouse_default_status_select_window, mouse_default_triple_click_pane, mouse_default_wheel_up_pane_root, Binding,
 };
 use crate::cmd::{self, CopyAction, ParsedCmd, RawCmd};
 use crate::geom::{Direction, Rect};
 use crate::input::WhichTable;
-use crate::keys::{Key, KeyCode, MouseEvent, MouseKeyKind, MouseKeyLoc, MouseKind};
+use crate::keys::{self, Key, KeyCode, MouseEvent, MouseKeyKind, MouseKeyLoc, MouseKind};
 use crate::layout::{Layout, PaneId, SplitDir};
 use crate::model::{Registry, Session, Window, WindowId};
 use crate::options::{self, FormatCtx};
@@ -49,7 +49,7 @@ use super::{
     PaneRuntime, PreviewMode, PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
     MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
-use crate::grid::{Cell, Grid, Style};
+use crate::grid::{Cell, Grid, MouseProto, Style};
 use std::time::Duration;
 
 /// Abbreviated C-locale English weekday names, indexed by
@@ -891,6 +891,29 @@ enum MouseHit {
     /// `Layout::resize_from` reference leaf for an Up/Down resize.
     HBorder { top: PaneId },
     None,
+}
+
+/// Whether a pane whose own app has requested `proto` mouse reporting is
+/// eligible to receive a forwarded event of `kind` (SP7 Task 9, closes
+/// follow-ups #35/#72; `docs/tmux-reference/mouse.md` §3.1's
+/// `MOTION_MOUSE_MODES`/`ALL_MOUSE_MODES` split, `input-keys.c:713-793`):
+/// `Down`/`Up`/wheel events forward whenever the pane asked for ANY mouse
+/// mode at all (X10/Normal/Button/Any -- real tmux's `ALL_MOUSE_MODES` is
+/// STANDARD|BUTTON|ALL and has no X10 bit at all since mode 9 is legacy/
+/// pane-side-unimplemented in modern tmux, but winmux tracks X10 as its own
+/// `MouseProto` variant per `Grid::mouse_proto`'s doc comment specifically
+/// so THIS task can treat "the app asked for legacy X10 clicks" as owning
+/// the mouse too -- an app that only ever sent `CSI ?9h` still wants its
+/// clicks, just wire-encoded the legacy way, which `Grid::mouse_encoding`
+/// already resolves to `MouseEncoding::Default` when neither 1005 nor 1006
+/// was also requested). Pure motion (`Drag`) additionally requires
+/// `Button`/`Any` (1002/1003 -- `MOTION_MOUSE_MODES`), since an X10/Normal-
+/// only app never asked the terminal to report motion at all.
+fn mouse_forward_eligible(proto: MouseProto, kind: MouseKind) -> bool {
+    match kind {
+        MouseKind::Drag(_) => matches!(proto, MouseProto::Button | MouseProto::Any),
+        _ => !matches!(proto, MouseProto::Off),
+    }
 }
 
 /// Hit-test `(x, y)` against `rects` (a window's current pane rects, as
@@ -2536,9 +2559,12 @@ impl Server {
     /// ctrl/meta/shift` at all, so always looking up the UNMODIFIED key form
     /// here reproduces that exactly -- modifier-specific tmux defaults like
     /// `C-MouseDown1Pane`/`M-MouseDrag1Pane` are a documented gap, not
-    /// modeled). `None` = unbound (silent no-op, matching real tmux's
-    /// "unbound mouse key -> forwarded to the pane app or dropped" -- winmux
-    /// has no app-mouse passthrough yet, follow-up #72).
+    /// modeled). `None` = unbound; this function itself is silent either
+    /// way (real tmux's "unbound mouse key -> forwarded to the pane app or
+    /// dropped" decision, `forward_mouse_to_pane`, is made by each CALL
+    /// SITE -- `mouse_drag`'s `PendingSelect { enter_copy: true }` arm and
+    /// `mouse_wheel` -- on a `None`/is-still-the-default result, SP7 Task 9,
+    /// closes follow-ups #35/#72).
     fn mouse_lookup(&self, table: WhichTable, kind: MouseKeyKind, btn: u8, loc: MouseKeyLoc) -> Option<Vec<RawCmd>> {
         let key = Key { code: KeyCode::MouseKey(kind, btn, loc), ctrl: false, meta: false, shift: false };
         self.bindings.lookup(table, &key).map(|b| b.cmds.clone())
@@ -2585,24 +2611,32 @@ impl Server {
     /// Route one decoded [`MouseEvent`] for `client` (already resolved to
     /// `session_name`). Dropped entirely (a silent `Ok`) when the `mouse`
     /// option is off (design spec: "mouse events with mouse off are
-    /// dropped"), or while `client` has an active confirm/prompt/choose-
-    /// tree/display-panes overlay (Task 5 decision, undecided by the brief:
-    /// real tmux's mouse-during-prompt behavior is a can of worms out of
-    /// scope here -- winmux swallows mouse events in those modes so a stray
-    /// click can never race a confirm's y/n capture or act on pane geometry
-    /// the overlay is currently hiding; documented deviation, see
-    /// `docs/follow-ups.md` #38). `ChooseTree`/`DisplayPanes` (Task 8,
-    /// added later) joined this guard in the final SP4 review fix round --
-    /// both draw full-screen, so the exact same "hidden pane geometry" risk
-    /// applies: a click/drag/wheel would otherwise focus/resize/copy-mode a
-    /// pane the user cannot currently see. Dismissal policy mirrors the
-    /// keyboard policy documented in `## overlays` of
-    /// `docs/specs/2026-07-07-parity-polish-interfaces.md`: mouse events
-    /// never dismiss either overlay (unlike display-panes' "any non-digit
-    /// KEY dismisses" rule) and never navigate/select a choose-tree row --
-    /// they are swallowed outright, same as `ConfirmCmd`/`Prompt`. Real
-    /// tmux-style mouse routing into choose-tree (click selects a row,
-    /// wheel scrolls the list) is ticketed, `docs/follow-ups.md` #61.
+    /// dropped"), or while `client` has an active confirm/prompt/display-
+    /// panes overlay, OR a choose-tree kill-confirm prompt is pending (Task
+    /// 5 decision, undecided by the brief: real tmux's mouse-during-prompt
+    /// behavior is a can of worms out of scope here -- winmux swallows
+    /// mouse events in those modes so a stray click can never race a
+    /// confirm's y/n capture or act on pane geometry the overlay is
+    /// currently hiding; documented deviation, see `docs/follow-ups.md`
+    /// #38). `DisplayPanes` (Task 8, added later) joined this guard in the
+    /// final SP4 review fix round -- it draws full-screen, so the same
+    /// "hidden pane geometry" risk applies: a click/drag/wheel would
+    /// otherwise focus/resize/copy-mode a pane the user cannot currently
+    /// see; no `docs/tmux-reference/*.md` source pins any display-panes
+    /// mouse behavior at all (`cmd_display_panes_key` is a KEY-only
+    /// handler), so this stays swallowed rather than guessed at. `ChooseTree`
+    /// (SP7 Task 10, closes follow-up #61) now routes `Down(1)` into the
+    /// tree list itself -- see [`dispatch_choose_tree_mouse`] -- UNLESS a
+    /// kill-confirm prompt is currently pending on it, which absorbs mouse
+    /// exactly like `ConfirmCmd`/`Prompt` for the same race-safety reason.
+    /// Every other choose-tree mouse event kind (wheel, drag, non-left
+    /// buttons) is still swallowed: `docs/tmux-reference/choose-tree.md`
+    /// §7.4 documents real tmux's mouse branch as click/double-click/
+    /// right-click ONLY (wheel is UNREACHABLE via mouse with `mouse on` --
+    /// "matching tmux exactly means click/double-click/right-click only");
+    /// right-click (context menu) and drag are out of scope (winmux has no
+    /// context-menu system, and `mouse.md` §2.5's drag-selection semantics
+    /// don't apply to a list overlay).
     pub(super) fn dispatch_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         // `mouse` is session-scoped (#26).
         let mouse_on = match self.acting_session_overlay(Some(session_name)) {
@@ -2628,10 +2662,25 @@ impl Server {
             client.mode = ClientMode::Normal;
             return ExecOutcome::Ok(String::new());
         }
-        if matches!(
-            client.mode,
-            ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
-        ) {
+        // SP7 Task 10 (closes follow-up #61): choose-tree gets its OWN
+        // guard, routing `Down(1)` into the tree list rather than swallowing
+        // it outright -- see `dispatch_choose_tree_mouse`. Still swallows
+        // everything (including `Down(1)`) while a kill-confirm prompt is
+        // pending on it, matching `ConfirmCmd`/`Prompt` below.
+        if let ClientMode::ChooseTree(state) = &client.mode {
+            let no_pending_kill = state.pending_kill.is_none();
+            // #64: a drag armed before the overlay opened must not survive
+            // across it (see the sibling guard below for the full
+            // rationale); `end_drag` also stops the edge-autoscroll timer.
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            if no_pending_kill && matches!(ev.kind, MouseKind::Down(1)) {
+                return self.dispatch_choose_tree_mouse(ev, client, session_name);
+            }
+            return ExecOutcome::Ok(String::new());
+        }
+        if matches!(client.mode, ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::DisplayPanes(_)) {
             // #64: a drag armed before the overlay opened (keyboard-
             // triggered mid-drag) must not survive across the overlay's
             // lifetime -- clear it just like the sibling "outside pane
@@ -2721,6 +2770,41 @@ impl Server {
         }
     }
 
+    /// Re-encode `ev` (screen coordinates) relative to `pane`'s own `rect`
+    /// and write it to that pane's pty, IF `pane`'s own application has
+    /// requested mouse reporting eligible for `ev.kind`
+    /// ([`mouse_forward_eligible`]) -- the forwarding primitive SP7 Task 9
+    /// (closes follow-ups #35/#72) plugs into every root-table mouse
+    /// decision point (`mouse_down`'s pane-click branch, `mouse_drag`'s
+    /// `PendingSelect { enter_copy: true }`/`Forwarding` arms,
+    /// `mouse_wheel`'s not-already-in-copy-mode branch). Returns `true` iff
+    /// something was actually written -- the caller's signal to skip its own
+    /// winmux gesture for this event ("forward INSTEAD of", matching every
+    /// GATED root binding in `docs/tmux-reference/mouse.md` §7.1/§7.4 except
+    /// `MouseDown1Pane`, which forwards unconditionally IN ADDITION to
+    /// focusing -- `mouse_down`'s call site ignores the return value for
+    /// that reason). `false` (nothing written, caller proceeds with its own
+    /// action) when the pane isn't eligible, its rect isn't in `rects`
+    /// (already gone/hidden), or its `Pty`/runtime no longer exists.
+    fn forward_mouse_to_pane(&mut self, pane: PaneId, ev: MouseEvent, rect: Rect) -> bool {
+        let Some(p) = self.panes.get(&pane) else { return false };
+        let proto = p.grid.mouse_proto();
+        if !mouse_forward_eligible(proto, ev.kind) {
+            return false;
+        }
+        let encoding = p.grid.mouse_encoding();
+        let px = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
+        let py = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+        let rel = MouseEvent { x: px, y: py, ..ev };
+        let bytes = keys::encode_mouse(&rel, encoding);
+        if let Some(pane) = self.panes.get_mut(&pane) {
+            if let Some(pty) = pane.pty.as_mut() {
+                let _ = pty.write_input(&bytes);
+            }
+        }
+        true
+    }
+
     /// `Down1`/`Down2`/`Down3` inside the pane area: a border press arms a
     /// live resize drag; a pane press always focuses that pane (tmux
     /// `select-pane`), and a LEFT click additionally arms `PendingSelect`
@@ -2733,9 +2817,18 @@ impl Server {
     /// selection immediately here, matching tmux's separate
     /// `DoubleClick1Pane`/`TripleClick1Pane` bindings (not `MouseDown1Pane`)
     /// which fire `select-word`/`select-line` right away. Non-left buttons
-    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet;
-    /// forwarding the click to the pane's own mouse-reporting application is
-    /// out of scope for v1, documented deferral).
+    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet.
+    /// SP7 Task 9 (closes follow-ups #35/#72): a click is ALSO forwarded
+    /// (`forward_mouse_to_pane`) to the pane's own application if it has
+    /// requested mouse reporting -- unconditionally, not gated on whether
+    /// this is `!in_copy_here`'s later branches take, matching real tmux's
+    /// UNGATED root `MouseDown1Pane -> select-pane -t=; send -M` (`mouse.md`
+    /// §7.1: focus and forward both always happen; only `MouseDrag1Pane`/
+    /// `WheelUpPane`/`DoubleClick1Pane`/`TripleClick1Pane` are gated
+    /// "forward INSTEAD of"). Skipped while `in_copy_here` (copy-mode's OWN
+    /// `MouseDown1Pane` table entry is `select-pane`, ungated, no `send -M`
+    /// variant at all -- §5.2/§7.3), matching the pre-existing double/
+    /// triple-click gate immediately below.
     fn mouse_down(
         &mut self,
         ev: MouseEvent,
@@ -2773,11 +2866,21 @@ impl Server {
             MouseHit::Pane(pane_id) => {
                 self.mouse_focus_pane(session_name, pane_id);
                 let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
+                let rect = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r);
+                // SP7 Task 9 (closes follow-ups #35/#72): forward, in
+                // ADDITION to focus, for any button -- see this fn's own doc
+                // comment for why this is unconditional (unlike the
+                // Drag/Wheel/DoubleClick/TripleClick gates below).
+                if !in_copy_here {
+                    if let Some(rect) = rect {
+                        self.forward_mouse_to_pane(pane_id, ev, rect);
+                    }
+                }
                 if btn != 1 {
                     client.mouse.drag = MouseDrag::None;
                     return ExecOutcome::Ok(String::new());
                 }
-                let Some(rect) = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r) else {
+                let Some(rect) = rect else {
                     return ExecOutcome::Ok(String::new());
                 };
                 let cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
@@ -2873,18 +2976,30 @@ impl Server {
             MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy } => {
                 if enter_copy {
                     // Root `MouseDrag1Pane` (Task 8, SP7 wave 3: table-driven
-                    // -- was unconditional through SP6). Unbound: abandon,
-                    // no copy-mode entry (matches real tmux: an unbound
-                    // mouse key is forwarded to the app / dropped, never
-                    // "enter copy mode anyway"). Bound to a user override:
-                    // run it generically and abandon winmux's own
-                    // anchor-install tail (the override fully replaces the
-                    // default's "enter copy mode + begin selecting" pair).
-                    // Bound to the default: fall through to the EXACT same
-                    // logic this task found here, now gated.
+                    // -- was unconditional through SP6). Unbound: SP7 Task 9
+                    // (closes #35/#72) -- real tmux's "unbound mouse key ->
+                    // forward_key" step (`mouse.md` §3 point 5) applies here
+                    // regardless of any specific binding's own guard, so try
+                    // forwarding before abandoning with no copy-mode entry.
+                    // Bound to a user override: run it generically and
+                    // abandon winmux's own anchor-install tail (the override
+                    // fully replaces the default's "enter copy mode + begin
+                    // selecting" pair, INCLUDING its `if -F mouse_any_flag`
+                    // guard -- a user's own command has no such wrapper, so
+                    // no forwarding check applies to an override at all).
+                    // Bound to the default: THIS is where the default's own
+                    // `if -F {mouse_any_flag} {send -M} {copy-mode -M}` guard
+                    // lives, so the forwarding check runs here too, ahead of
+                    // the "enter copy mode" fallthrough.
                     let default = mouse_default_drag_pane_enter_copy();
                     match self.mouse_lookup(WhichTable::Root, MouseKeyKind::Drag, 1, MouseKeyLoc::Pane) {
                         None => {
+                            if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                                if self.forward_mouse_to_pane(pane, ev, rect) {
+                                    client.mouse.drag = MouseDrag::Forwarding { pane };
+                                    return ExecOutcome::Ok(String::new());
+                                }
+                            }
                             client.mouse.drag = MouseDrag::None;
                             return ExecOutcome::Ok(String::new());
                         }
@@ -2893,15 +3008,23 @@ impl Server {
                             client.mouse.drag = MouseDrag::Selecting { moved: true };
                             return outcome;
                         }
-                        _ => {}
+                        _ => {
+                            if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                                if self.forward_mouse_to_pane(pane, ev, rect) {
+                                    client.mouse.drag = MouseDrag::Forwarding { pane };
+                                    return ExecOutcome::Ok(String::new());
+                                }
+                            }
+                        }
                     }
                     // (c) SP6 Task 6: enter copy mode on `pane` NOW, at the
                     // first motion event (tmux's drag-START classification,
                     // `mouse.md` §2.5) -- mirrors the root binding `if
                     // pane_in_mode/mouse_any_flag { send -M } else {
-                    // copy-mode -M }`; winmux has no app-owns-mouse relay for
-                    // drag yet, so this always enters copy mode. `mouse:
-                    // false` matches real `-M` (it does NOT set
+                    // copy-mode -M }`; the forwarding branch just above
+                    // already took the `send -M` side when eligible, so
+                    // reaching here means the pane does NOT own the mouse.
+                    // `mouse: false` matches real `-M` (it does NOT set
                     // `scroll_exit` -- only `-e` does).
                     if !self.panes.contains_key(&pane) {
                         client.mouse.drag = MouseDrag::None;
@@ -3000,6 +3123,21 @@ impl Server {
                 ExecOutcome::Ok(String::new())
             }
             MouseDrag::None => ExecOutcome::Ok(String::new()),
+            // SP7 Task 9 (closes follow-ups #35/#72): every subsequent
+            // motion event while forwarding is re-checked live and re-sent
+            // (`mouse.md` §2.5: "no callback installed -> every motion
+            // re-synthesizes and re-dispatches" -- unlike a real winmux
+            // drag callback, forwarding installs no persistent state beyond
+            // "which pane", so eligibility is re-verified every event; a
+            // pane that turns its own mouse mode off mid-drag simply stops
+            // receiving further bytes rather than winmux inventing a
+            // fallback gesture for the rest of the drag).
+            MouseDrag::Forwarding { pane } => {
+                if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                    self.forward_mouse_to_pane(pane, ev, rect);
+                }
+                ExecOutcome::Ok(String::new())
+            }
         }
     }
 
@@ -3109,6 +3247,23 @@ impl Server {
                     ExecOutcome::Ok(String::new())
                 }
             }
+            // SP7 Task 9 (closes follow-ups #35/#72): the release itself is
+            // forwarded too (real tmux's root table has no
+            // `MouseDragEnd1Pane` binding at all, so an unbound release is
+            // `forward_key`'d just like every other unbound mouse key,
+            // `mouse.md` §3 point 5) -- resolved against whichever pane is
+            // CURRENTLY under the pointer at release (may differ from the
+            // drag-origin pane if it moved/closed), matching the same
+            // release-position-not-origin-position rule `Selecting` uses
+            // just above.
+            MouseDrag::Forwarding { pane } => {
+                if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == pane) {
+                    if let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) {
+                        self.forward_mouse_to_pane(pane, ev, rect);
+                    }
+                }
+                ExecOutcome::Ok(String::new())
+            }
             _ => ExecOutcome::Ok(String::new()),
         }
     }
@@ -3164,33 +3319,19 @@ impl Server {
         client: &mut ClientState,
         session_name: &str,
     ) -> ExecOutcome {
-        let Some(pane_id) = rects
+        let Some((pane_id, rect)) = rects
             .iter()
             .find(|(_, r)| ev.x >= r.x && ev.x < r.x + r.w && ev.y >= r.y && ev.y < r.y + r.h)
-            .map(|(id, _)| *id)
+            .map(|(id, r)| (*id, *r))
         else {
             return ExecOutcome::Ok(String::new());
         };
-        let Some(p) = self.panes.get(&pane_id) else {
+        // Captured as a plain `bool` (not a live `&PaneRuntime`) since it's
+        // read again AFTER a `&mut self` forwarding attempt below -- holding
+        // a borrow of `self.panes` across that call would conflict with it.
+        let Some(alt_screen) = self.panes.get(&pane_id).map(|p| p.grid.alt_screen()) else {
             return ExecOutcome::Ok(String::new());
         };
-        if p.grid.alt_screen() {
-            // tmux's alternate-screen wheel translation: an alt-screen app
-            // (`less`, vim, ...) has its own scrollback/paging concept, not
-            // winmux's, so each wheel event becomes 3 arrow-key presses sent
-            // straight to the pane instead of entering copy mode.
-            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-            let mut data = Vec::with_capacity(arrow.len() * 3);
-            for _ in 0..3 {
-                data.extend_from_slice(arrow);
-            }
-            if let Some(pane) = self.panes.get_mut(&pane_id) {
-                if let Some(pty) = pane.pty.as_mut() {
-                    let _ = pty.write_input(&data);
-                }
-            }
-            return ExecOutcome::Ok(String::new());
-        }
 
         // Table-driven since Task 8, SP7 wave 3 (required regression:
         // `bind_wheelup_pane_custom_command_overrides_default`). The four
@@ -3230,13 +3371,51 @@ impl Server {
 
         // WheelDownPane is deliberately unbound at ROOT by default (real
         // tmux has no default there either, `docs/tmux-reference/mouse.md`
-        // §6) -- `dispatch_mouse_bound` naturally reproduces that no-op
-        // while still honoring a user's own `bind -n WheelDownPane ...`.
-        // WheelUpPane's default enters copy mode scrolled 5 lines (tmux's
-        // `WheelUpPane` default, `mouse: true`/`-e` sets `scroll_exit` so
-        // scrolling back down to the live bottom by wheel auto-exits).
+        // §6). WheelUpPane's default enters copy mode scrolled 5 lines
+        // (tmux's `WheelUpPane` default, `mouse: true`/`-e` sets
+        // `scroll_exit` so scrolling back down to the live bottom by wheel
+        // auto-exits) -- UNLESS gated away by SP7 Task 9 (closes follow-ups
+        // #35/#72), replacing the old unconditional alt-screen 3x-arrow-key
+        // translation (`mouse.md` §9: "No wheel→arrow translation... tmux
+        // never converts wheel to arrow keys"):
+        //
+        // - Unbound (`None`, i.e. WheelDownPane, or WheelUpPane after
+        //   `unbind -n WheelUpPane`): real tmux's unconditional "unbound
+        //   mouse key -> forward_key" step (`mouse.md` §3 point 5) --
+        //   forward if the pane owns the mouse, else a true no-op either
+        //   way (there is no bound command to fall back to regardless).
+        // - Bound to a user override: run it generically, no forwarding
+        //   check at all (the override fully replaces the default's own
+        //   `if -F {alternate_on || pane_in_mode || mouse_any_flag} {send
+        //   -M} {copy-mode -e}` guard, which has no equivalent in a plain
+        //   user command).
+        // - Bound to the default (WheelUpPane only -- WheelDownPane has no
+        //   root default to match): THIS is where that guard lives --
+        //   forward if the pane owns the mouse; else, on the alternate
+        //   screen, SWALLOW (`alternate_on` guard: `send -M` would reach
+        //   `input_key_get_mouse`, which returns 0 for an app that hasn't
+        //   enabled its own mouse reporting -- no copy-mode entry from
+        //   wheel on alt screen either way); else (live screen, not
+        //   forwarded) fall through to the default's `copy-mode -e`.
         let kind = if up { MouseKeyKind::WheelUp } else { MouseKeyKind::WheelDown };
-        self.dispatch_mouse_bound(WhichTable::Root, kind, 0, MouseKeyLoc::Pane, client, session_name)
+        match self.mouse_lookup(WhichTable::Root, kind, 0, MouseKeyLoc::Pane) {
+            None => {
+                self.forward_mouse_to_pane(pane_id, ev, rect);
+                ExecOutcome::Ok(String::new())
+            }
+            Some(cmds) => {
+                let is_default = up && cmds == mouse_default_wheel_up_pane_root();
+                if is_default {
+                    if self.forward_mouse_to_pane(pane_id, ev, rect) {
+                        return ExecOutcome::Ok(String::new());
+                    }
+                    if alt_screen {
+                        return ExecOutcome::Ok(String::new());
+                    }
+                }
+                self.dispatch_mouse_cmds(&cmds, client, session_name)
+            }
+        }
     }
 
     /// A click or wheel event on the status row (tmux default status-table
@@ -3275,12 +3454,27 @@ impl Server {
     /// `server::render_one` does (format/style overrides, each window's own
     /// active pane -- see #26/#71) and maps `x` through `status::
     /// status_tab_columns`, the SAME layout core `status_spans` draws from,
-    /// so the hit-test always agrees with what's actually on screen. Still
-    /// deliberately does NOT replicate `render::compose_back`'s final
-    /// spatial truncation when left+right don't fit the terminal width (a
-    /// click past that truncation point on an extremely narrow terminal may
-    /// resolve to a tab that isn't actually drawn there -- documented v1
-    /// gap, `docs/follow-ups.md`).
+    /// so the hit-test always agrees with what's actually on screen.
+    ///
+    /// VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39): this used to
+    /// carry a caveat that it doesn't replicate `render::compose_back`'s
+    /// final spatial right-truncation (when left+right don't fit the
+    /// terminal width). Re-investigated: it doesn't need to. `left`/
+    /// `right_len`/`width` (`session.size.0`) are constructed IDENTICALLY
+    /// here and in `render_one`'s status-row build (same `expand_format`/
+    /// `truncate_visible`/`truncate_chars` calls, same option reads), so
+    /// both feed `plan_tab_layout` the exact same inputs; `plan_tab_layout`
+    /// itself guarantees `left_width + list_avail == width - right_len`
+    /// whenever the list fits, and produces ZERO tab hitboxes at all
+    /// whenever it doesn't (the overflow branch's `content_w` saturates to
+    /// 0 before any clip window is computed) -- so `compose_back`'s own
+    /// final truncation step is a provable no-op under matching inputs, not
+    /// a residual gap. `status_click_past_truncation_is_noop`
+    /// (`tests/server_proto.rs`) proves the one place a hit-test bug (as
+    /// opposed to a `compose_back`-truncation-specifically bug) COULD hide
+    /// -- a click on the `<`/`>` overflow marker character itself -- is
+    /// also a no-op, matching real hitboxes (markers are drawn outside
+    /// every `TabColumn` range).
     fn mouse_status_click(&mut self, x: u16, session_name: &str) -> ExecOutcome {
         let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
             return ExecOutcome::Ok(String::new());
@@ -4770,6 +4964,103 @@ impl Server {
         h.clamp(0, sy_i.max(0)) as u16
     }
 
+    /// Map a choose-tree overlay click's screen row `y` to an index into
+    /// `rows` (already rebuilt fresh by the caller from LIVE registry
+    /// state, `build_tree_rows`), mirroring `server::render_one`'s
+    /// `RenderOverlay::Tree` -> `render::ListOverlay` layout EXACTLY (SP7
+    /// Task 10, closes follow-up #61) so a click always resolves to the row
+    /// actually drawn there: choose-tree's `ListOverlay::title` is ALWAYS
+    /// empty (`render_one` never sets it), so there is no header-row
+    /// offset to account for; `list_height`/`preview`/`msg_reserved`/`top`
+    /// are all recomputed the SAME way `render_one`'s own `RenderOverlay::
+    /// Tree` arm does. `None` on a click outside the row list (an empty
+    /// list, the preview box below it, a reserved kill-confirm-prompt row,
+    /// or past the last row).
+    fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        let ClientMode::ChooseTree(state) = &client.mode else { return None };
+        let sel = resolve_tree_sel(rows, &state.selected, state.sel);
+        let list_height = Server::choose_tree_list_height(client.rows, client.cols, rows.len(), state.preview);
+        let preview_shown = list_height < client.rows;
+        // Mirrors `render_one`'s own `message` resolution for `ClientMode::
+        // ChooseTree`: the pending kill-confirm prompt takes priority over
+        // an ordinary transient `client.message`, but either one reserves
+        // the panel's last row exactly when no preview is showing.
+        let has_message = state.pending_kill.is_some() || client.message.is_some();
+        let msg_reserved: usize = if has_message && !preview_shown { 1 } else { 0 };
+        let visible = (list_height as usize).saturating_sub(msg_reserved);
+        if visible == 0 {
+            return None;
+        }
+        let top = sel.saturating_sub(visible.saturating_sub(1));
+        let start = top.min(rows.len());
+        let end = (start + visible).min(rows.len());
+        let idx = start + y as usize;
+        if idx < end {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Route a `Down(1)` mouse event into the acting client's open
+    /// choose-tree overlay (SP7 Task 10, closes follow-up #61;
+    /// `docs/tmux-reference/choose-tree.md` §7.4): a click on a list row
+    /// selects it (`mode_tree_key`'s mouse branch: "Click (MouseDown1) on a
+    /// list row: select that row (no choose)"); a second click on the SAME
+    /// row/button within the click-run window (`advance_click_run`, the
+    /// SAME double/triple-click tracker `mouse_down` uses for pane clicks --
+    /// choose-tree isn't touching `client.mouse` for anything else while
+    /// open, since the overlay guard in `dispatch_mouse` clears any stale
+    /// drag before ever reaching here) COMMITS it (doc: "Double-click on a
+    /// list row: select + rewrite the key to `\r` -> Enter (choose)").
+    /// `dispatch_mouse`'s caller already filtered to `Down(1)` and to "no
+    /// kill-confirm pending" before calling this, so neither is re-checked
+    /// here. A click that misses every row (blank area, the preview box, a
+    /// reserved message row) is a no-op -- no selection change, matching
+    /// real tmux's `mode_tree_key` returning early when the click doesn't
+    /// land in the list rect at all.
+    fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let (view, expanded, filter) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone(), state.filter.clone()),
+            _ => return ExecOutcome::Ok(String::new()),
+        };
+        // Same filtered row set the renderer draws (SP7 Task 12's
+        // find-window filter) — hit-testing an unfiltered list here would
+        // click the wrong row inside a filtered tree.
+        let rows = self.build_tree_rows(session_name, view, &expanded, filter.as_ref());
+        let Some(row_idx) = self.choose_tree_row_at(client, &rows, ev.y) else {
+            return ExecOutcome::Ok(String::new());
+        };
+        let Some(target) = rows.get(row_idx).map(|r| r.target.clone()) else {
+            return ExecOutcome::Ok(String::new());
+        };
+
+        let run = advance_click_run(&mut client.mouse, Instant::now(), ev.x, ev.y, 1);
+        if let ClientMode::ChooseTree(state) = &mut client.mode {
+            state.sel = row_idx;
+            state.selected = Some(target.clone());
+        }
+        if run < 2 {
+            return ExecOutcome::Ok(String::new());
+        }
+        // Commit (double-click): mirrors `dispatch_choose_tree_key`'s
+        // `ChooseTreeAction::Commit` arm exactly (mode -> Normal, then
+        // `exec_tree_commit`). `exec_tree_commit` needs `&mut String` only
+        // to hand a `SwitchedSession`-producing target its OLD session name
+        // to mutate-and-restore locally -- this function only has `&str`
+        // (mirrors `dispatch_mouse_cmds`'s identical `let mut sn = ...`
+        // pattern just above in this same file), and the caller applies the
+        // real session switch from the returned `ExecOutcome::
+        // SwitchedSession` regardless, same as every other mouse dispatch
+        // path here.
+        client.mode = ClientMode::Normal;
+        let mut sn = session_name.to_string();
+        self.exec_tree_commit(target, client, &mut sn)
+    }
+
     /// The selected tree row's live preview content (SP6 wave 2, Task 8;
     /// `docs/tmux-reference/choose-tree.md` `## 6`): a session item's
     /// preview is a horizontal filmstrip of its windows' ACTIVE panes; a
@@ -5345,6 +5636,79 @@ mod mouse_dispatch_tests {
         MouseEvent { kind: MouseKind::WheelUp, ctrl: false, meta: false, shift: false, x, y }
     }
 
+    /// SP7 Task 9 (closes follow-ups #35/#72): like `test_server_with_pane`,
+    /// but feeds `mouse_decset` (a raw DECSET/DECRST byte string, e.g.
+    /// `b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"`) into the pane's `Grid` before
+    /// returning, so `Grid::mouse_proto()`/`mouse_encoding()` report
+    /// whatever mode/encoding that sequence requests -- the SAME "feed
+    /// DECSET straight into the pane's `Grid`, no ConPTY involved" pattern
+    /// `test_server_with_pane`'s `alt_screen` flag already established for
+    /// `\x1b[?1049h`, applied to the mouse-mode DECSET bytes this task
+    /// tracks instead.
+    fn test_server_with_pane_mouse(mouse_decset: &[u8]) -> (Server, String, PaneId) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        server.options.set("mouse", Some("on"), false, false).unwrap();
+        let pane_id = server.mint_pane_id();
+        let mut grid = Grid::new(20, 10, 100);
+        grid.feed(mouse_decset);
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
+        let session_name = server
+            .registry
+            .create_session(Some("0"), pane_id, (20, 10), 0)
+            .expect("create_session")
+            .name
+            .clone();
+        (server, session_name, pane_id)
+    }
+
+    /// SP7 Task 9 (closes follow-ups #35/#72): a real 2-pane LEFT/RIGHT
+    /// split (`left` occupying columns 0..10, `right` 10..20 of a 20-wide,
+    /// 10-tall session), so a border-drag regression test
+    /// (`border_drag_still_resizes_when_pane_owns_mouse`) can prove actual
+    /// layout resize still happens -- `mouse_drag_border` reads the
+    /// session's LIVE layout directly, not any `rects` a caller passes in,
+    /// so a single-pane session (as `test_server_with_pane`/`_mouse` build)
+    /// can never exercise it. `left_decset` (if any) is fed into the LEFT
+    /// pane's `Grid` before the split, same as `test_server_with_pane_mouse`.
+    fn test_server_with_two_panes(left_decset: Option<&[u8]>) -> (Server, String, PaneId, PaneId) {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        server.options.set("mouse", Some("on"), false, false).unwrap();
+
+        let left_id = server.mint_pane_id();
+        let mut left_grid = Grid::new(20, 10, 100);
+        if let Some(bytes) = left_decset {
+            left_grid.feed(bytes);
+        }
+        let (left_tx, _left_rx) = channel();
+        server.panes.insert(left_id, super::super::PaneRuntime { pty: None, grid: left_grid, dead: false, title: String::new(), input_tx: left_tx });
+
+        let session_name = server
+            .registry
+            .create_session(Some("0"), left_id, (20, 10), 0)
+            .expect("create_session")
+            .name
+            .clone();
+
+        let right_id = server.mint_pane_id();
+        let right_grid = Grid::new(10, 10, 100);
+        let (right_tx, _right_rx) = channel();
+        server.panes.insert(right_id, super::super::PaneRuntime { pty: None, grid: right_grid, dead: false, title: String::new(), input_tx: right_tx });
+
+        let area = Rect { x: 0, y: 0, w: 20, h: 10 };
+        if let Some(session) = server.registry.session_mut(&session_name) {
+            session
+                .current_window_mut()
+                .layout
+                .split(SplitDir::Horizontal, right_id, area)
+                .expect("test setup: 20-wide area must fit a left/right split");
+        }
+        server.apply_layout_for_session(&session_name);
+        (server, session_name, left_id, right_id)
+    }
+
     #[test]
     fn alt_screen_wheel_does_not_enter_copy_mode() {
         let (mut server, session_name, _pane_id) = test_server_with_pane(true);
@@ -5455,6 +5819,194 @@ mod mouse_dispatch_tests {
         assert!(
             client.mouse.drag == super::super::MouseDrag::None,
             "overlay guard must clear stale drag state on a swallowed Up"
+        );
+    }
+
+    // ---- application mouse passthrough (SP7 Task 9, closes follow-ups #35/#72) ----
+
+    #[test]
+    fn mouse_forward_eligible_gates_by_proto_and_kind() {
+        // Down/Up/Wheel: any non-Off proto is eligible, INCLUDING legacy
+        // X10 -- Task 3's grid.rs doc comment explicitly tracks X10 "since
+        // Task 9's interface promise requires the X10 variant to exist":
+        // this is that promise, an app that only ever sent `CSI ?9h` still
+        // owns its own clicks (just legacy-wire-encoded, per
+        // `Grid::mouse_encoding`'s own `Default` fallback).
+        for proto in [MouseProto::X10, MouseProto::Normal, MouseProto::Button, MouseProto::Any] {
+            assert!(mouse_forward_eligible(proto, MouseKind::Down(1)), "{proto:?} must forward Down");
+            assert!(mouse_forward_eligible(proto, MouseKind::Up(1)), "{proto:?} must forward Up");
+            assert!(mouse_forward_eligible(proto, MouseKind::WheelUp), "{proto:?} must forward WheelUp");
+            assert!(mouse_forward_eligible(proto, MouseKind::WheelDown), "{proto:?} must forward WheelDown");
+        }
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::Down(1)), "Off must never forward");
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::WheelUp), "Off must never forward");
+
+        // Drag (pure motion): only Button/Any (`MOTION_MOUSE_MODES`) --
+        // X10/Normal never asked the terminal to report motion at all.
+        assert!(mouse_forward_eligible(MouseProto::Button, MouseKind::Drag(1)));
+        assert!(mouse_forward_eligible(MouseProto::Any, MouseKind::Drag(1)));
+        assert!(!mouse_forward_eligible(MouseProto::X10, MouseKind::Drag(1)), "X10 never reports motion");
+        assert!(!mouse_forward_eligible(MouseProto::Normal, MouseKind::Drag(1)), "Normal (1000) never reports motion");
+        assert!(!mouse_forward_eligible(MouseProto::Off, MouseKind::Drag(1)));
+    }
+
+    #[test]
+    fn forward_mouse_to_pane_writes_when_pane_owns_mouse_click() {
+        let (mut server, _session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+        assert!(
+            server.forward_mouse_to_pane(pane_id, ev, rect),
+            "a pane requesting DECSET 1000+1006 must be eligible to receive a forwarded click"
+        );
+    }
+
+    #[test]
+    fn forward_mouse_to_pane_false_when_pane_does_not_own_mouse() {
+        let (mut server, _session_name, pane_id) = test_server_with_pane(false);
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+        assert!(
+            !server.forward_mouse_to_pane(pane_id, ev, rect),
+            "a pane that never sent a mouse-mode DECSET must not receive forwarded events"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §7.1: the root `MouseDown1Pane`
+    /// default is `select-pane -t=; send -M` -- UNGATED, both always
+    /// happen, unlike `MouseDrag1Pane`/`WheelUpPane`/`DoubleClick1Pane`/
+    /// `TripleClick1Pane`, which forward INSTEAD of their own default
+    /// action. A click on a mouse-owning pane that is NOT currently
+    /// focused must still move focus there (`forward_mouse_to_pane`'s own
+    /// unit coverage above already proves the SAME gate that `mouse_down`
+    /// calls would write bytes for this exact configuration).
+    #[test]
+    fn mouse_down_focuses_pane_that_owns_mouse() {
+        let (mut server, session_name, left_id, right_id) = test_server_with_two_panes(Some(b"\x1b[?1000h\x1b[?1006h"));
+        let mut client = test_client(20, 10);
+        let focused = |server: &Server| {
+            server.registry.sessions().iter().find(|s| s.name == session_name).unwrap().current_window().layout.focused()
+        };
+        assert_eq!(focused(&server), right_id, "test setup: split must focus the new (right) pane");
+
+        let (_area, rects) = server.mouse_pane_rects(&session_name).expect("session must exist");
+        let (_, left_rect) = *rects.iter().find(|(id, _)| *id == left_id).expect("left pane must have a rect");
+        let click = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: left_rect.x + 1, y: left_rect.y + 1 };
+
+        let outcome = server.dispatch_mouse(click, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert_eq!(
+            focused(&server),
+            left_id,
+            "a click on a mouse-owning pane must still focus it (tmux's ungated MouseDown1Pane: select-pane AND send -M both always happen)"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §5.1/§7.1: root `MouseDrag1Pane` is
+    /// `if -F {mouse_any_flag} {send -M} {copy-mode -M}` -- when the pane
+    /// owns the mouse, the drag is forwarded INSTEAD of entering copy mode.
+    #[test]
+    fn drag_on_mouse_owning_pane_does_not_enter_copy_mode() {
+        let (mut server, session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: 6, y: 3 };
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        assert!(
+            matches!(client.mode, ClientMode::Normal),
+            "a drag over a pane whose app owns the mouse (1002 button-event tracking) must forward, not enter copy mode"
+        );
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::Forwarding { pane: pane_id },
+            "the drag state must record this drag is being forwarded, not driving a winmux selection"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §6/§7.1: root `WheelUpPane` is `if -F
+    /// {alternate_on || pane_in_mode || mouse_any_flag} {send -M} {copy-mode
+    /// -e}` -- when the pane owns the mouse, wheel forwards INSTEAD of
+    /// entering copy mode (replaces the old unconditional alt-screen
+    /// 3x-arrow-key translation this task removes; mirrors
+    /// `alt_screen_wheel_does_not_enter_copy_mode`'s pattern one section up,
+    /// but for a LIVE screen whose pane owns the mouse instead of an
+    /// alt-screen pane that doesn't).
+    #[test]
+    fn wheel_forwards_to_mouse_owning_pane_instead_of_copy_mode() {
+        let (mut server, session_name, _pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            matches!(client.mode, ClientMode::Normal),
+            "wheel over a pane whose app owns the mouse must forward, not enter copy mode"
+        );
+    }
+
+    /// `docs/tmux-reference/mouse.md` §7.4 point 2: real tmux "ALWAYS
+    /// KEEPS: border drags, status-line clicks, ..." regardless of any
+    /// pane's own mouse ownership -- `MouseDown1Border`/`MouseDrag1Border`
+    /// have no `if -F mouse_any_flag` guard at all in tmux's own default
+    /// table. A real 2-pane split is required (unlike the other tests in
+    /// this section) because `mouse_drag_border` reads the session's LIVE
+    /// layout directly, so only an actual resize proves nothing regressed.
+    #[test]
+    fn border_drag_still_resizes_when_pane_owns_mouse() {
+        let (mut server, session_name, left_id, _right_id) = test_server_with_two_panes(Some(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h"));
+        let mut client = test_client(20, 10);
+
+        let (_area, rects_before) = server.mouse_pane_rects(&session_name).unwrap();
+        let (_, left_rect_before) = *rects_before.iter().find(|(id, _)| *id == left_id).unwrap();
+        let border_x = left_rect_before.x + left_rect_before.w;
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: border_x, y: 3 };
+        let outcome = server.dispatch_mouse(down, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::Border { pane: left_id, vertical: true },
+            "test setup: press on the border must arm a border drag even though the left pane owns the mouse"
+        );
+
+        let drag = MouseEvent { kind: MouseKind::Drag(1), ctrl: false, meta: false, shift: false, x: border_x + 2, y: 3 };
+        let outcome = server.dispatch_mouse(drag, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+
+        let (_area, rects_after) = server.mouse_pane_rects(&session_name).unwrap();
+        let (_, left_rect_after) = *rects_after.iter().find(|(id, _)| *id == left_id).unwrap();
+        assert!(
+            left_rect_after.w > left_rect_before.w,
+            "border drag must still resize the pane even though it owns the mouse (mouse.md §7.4/§4: border drags are ALWAYS winmux's own)"
+        );
+    }
+
+    /// `Grid::mouse_proto`'s doc comment: RESET of any of the 4 mouse-mode
+    /// DECSET numbers clears unconditionally to `Off` -- proves the
+    /// forwarding gate is live/dynamic, not a one-time snapshot taken when
+    /// the pane first requested mouse mode.
+    #[test]
+    fn passthrough_stops_after_decrst() {
+        let (mut server, session_name, pane_id) = test_server_with_pane_mouse(b"\x1b[?1000h\x1b[?1006h");
+        let mut client = test_client(20, 10);
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(matches!(client.mode, ClientMode::Normal), "test setup: pane must own the mouse before DECRST");
+
+        if let Some(pane) = server.panes.get_mut(&pane_id) {
+            pane.grid.feed(b"\x1b[?1000l");
+        }
+
+        let outcome = server.dispatch_mouse(wheel_up_at(5, 3), &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            matches!(client.mode, ClientMode::Copy(_)),
+            "after DECRST the pane no longer owns the mouse, so wheel must resume winmux's own copy-mode entry"
         );
     }
 }

@@ -549,8 +549,25 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     UNBOUND space still forwards to the pane as ordinary typed input,
     exactly as before).
 
-35. **Mouse clicks/drags are never forwarded to the pane application's own
-    mouse-reporting mode** (Task 5, mouse). tmux, when a pane's own
+35. **RESOLVED** (SP7 Task 9, 2026-07-10; same fix as #72, see that entry for
+    the full writeup). `server::dispatch` now re-encodes and forwards mouse
+    events to a pane whose own application has requested mouse reporting
+    (`Grid::mouse_proto()`/`mouse_encoding()`, tracked by SP7 Task 3),
+    INSTEAD of consuming them for winmux's own copy-mode-entry/drag-
+    selection where real tmux's default bindings are gated
+    (`MouseDrag1Pane`/`WheelUpPane`), and IN ADDITION to focusing where
+    tmux's default is ungated (`MouseDown1Pane`). Border drags and status-
+    line clicks are unaffected either way, matching tmux's "ALWAYS KEEPS"
+    rule. See `docs/specs/2026-07-07-parity-polish-interfaces.md`'s "Task 9
+    amendment: application mouse passthrough" for the full design and test
+    inventory, including an honestly-noted residual gap (no live-process
+    byte-receipt e2e proof, for the same class of reason `alt_screen_wheel_
+    sends_arrows` was abandoned; unit-level coverage exercises the same
+    `forward_mouse_to_pane` -> `keys::encode_mouse` -> `Pty::write_input`
+    chain instead).
+    *Original text:* Mouse clicks/drags are never forwarded to the pane
+    application's own
+    mouse-reporting mode (Task 5, mouse). tmux, when a pane's own
     application has ALSO requested mouse reporting (e.g. vim/tmux-inside-
     tmux/htop with mouse support enabled), can forward click/drag events to
     that application instead of consuming them for pane focus/copy-mode/
@@ -625,8 +642,27 @@ as sub-project 4 ("parity polish") candidates rather than merge blockers.
     documented deviation, fixed in the same review round; see
     `docs/follow-ups.md` #61 for the follow-on "real tmux-style mouse
     routing into choose-tree" ticket this fix deferred.
-39. **Status-row click hit-testing doesn't replicate the renderer's final
-    spatial truncation** (Task 5, mouse). `mouse_status_click` rebuilds the
+39. **VERIFIED-RESOLVED** (SP7 Task 10, 2026-07-10, verify-and-mark). Task
+    7's `status::status_tab_columns` fix (see follow-up #69a's entry) made
+    `mouse_status_click` build `left`/`right_len`/`width` via the EXACT same
+    calls `render_one`'s status-row construction uses, then feed them into
+    the SAME `plan_tab_layout` core `status_spans` draws from. Re-
+    investigated this ticket's original claim under that shared code path:
+    it no longer holds. `plan_tab_layout`'s own math guarantees `left_width
+    + list_avail == width - right_len` whenever the window list fits (so
+    `compose_back`'s later `right_len = right.len().min(cols_u - left_len)`
+    truncation step is a provable no-op under matching inputs), and produces
+    ZERO tab hitboxes at all whenever the list doesn't fit (the overflow
+    branch's `content_w` saturates to 0 before any clip window exists) — so
+    there is no reachable scenario where a click resolves to a tab that
+    isn't actually drawn. The one place a genuine (different) hit-test bug
+    could still hide — a click landing exactly on the `<`/`>` overflow
+    marker character, drawn OUTSIDE every window's `TabColumn` range — is
+    covered by the new regression test `tests/server_proto.rs::status_click_
+    past_truncation_is_noop` and is also correctly a no-op.
+    *Original text:* Status-row click hit-testing doesn't replicate the
+    renderer's final
+    spatial truncation (Task 5, mouse). `mouse_status_click` rebuilds the
     same left-prefix + per-window-tab span layout `render_one`/
     `status::status_spans` draws to hit-test which window a click column
     belongs to, but does NOT replicate `render::compose_back`'s LAST step —
@@ -1085,8 +1121,28 @@ None block the sub-project 4 merge.
     `pos == n-1` swapping `Down` (should wrap to pane 0) for `n >= 3` panes.
     Low-risk coverage gap, not a known bug -- add a
     `swap_pane_wraps_at_ends` (or similar) `server_proto` test.
-61. **Choose-tree ignores mouse entirely -- no click-to-select or
-    wheel-to-scroll routing** (Task 8, overlays; amends #38's scope). The
+61. **RESOLVED** (SP7 Task 10, 2026-07-10). `dispatch_mouse` now routes
+    `Down(1)` into a real choose-tree mouse handler
+    (`dispatch::Server::dispatch_choose_tree_mouse`/`choose_tree_row_at`,
+    `src/server/dispatch.rs`): a click on a row selects it, a same-row
+    double-click within the click-run window selects AND commits (matching
+    `docs/tmux-reference/choose-tree.md` §7.4's `MouseDown1`/`DoubleClick1`
+    rules exactly). A kill-confirm prompt pending on the overlay still
+    swallows mouse entirely, same as `ConfirmCmd`/`Prompt`. **Semantics
+    deviation from this ticket's own "wheel scrolls the list" wording,
+    deliberate:** the tmux-reference doc's §7.4 rules it out as real tmux's
+    actual behavior ("matching tmux exactly means click/double-click/
+    right-click only" — wheel is a documented no-op with `mouse on`, calling
+    a wheel-scrolls mapping "a defensible divergence" rather than what tmux
+    does) — winmux follows the doc's ruling over this ticket's original
+    phrasing, per the project's "be exactly like tmux" guiding principle.
+    Right-click (context menu) stays out of scope (no context-menu system
+    anywhere in winmux). Full design + test inventory:
+    `docs/specs/2026-07-07-parity-polish-interfaces.md`'s "SP7 Task 10
+    amendment: choose-tree mouse routing".
+    *Original text:* Choose-tree ignores mouse entirely -- no click-to-select
+    or
+    wheel-to-scroll routing (Task 8, overlays; amends #38's scope). The
     final SP4 review's merge-gate fix made `dispatch_mouse` swallow every
     mouse event while `ChooseTree`/`DisplayPanes` is open (fixing the
     hidden-pane-focus leak, see #38), but real tmux lets the mouse interact
@@ -1445,7 +1501,32 @@ None block the sub-project 4 merge.
     active-pane data in `status::WindowEntry` (or the ctx). Not exercised
     by the fixture config (`#I`/`#W`/`#F` only). SMALL. LOW.
 
-72. **No application mouse passthrough** (adjudicated in SP6 Task 6 review, 2026-07-10).
+72. **RESOLVED** (SP7 Task 9, 2026-07-10). `src/keys.rs` gained
+    `encode_mouse` (SGR/X10/UTF-8 re-encoding, the inverse of the existing
+    SGR decode side, byte-exact roundtrip-tested); `src/server/dispatch.rs`
+    gained `mouse_forward_eligible`/`forward_mouse_to_pane` plus a new
+    `MouseDrag::Forwarding { pane }` client-drag-state variant, wired into
+    `mouse_down` (unconditional forward-in-addition-to-focus, matching
+    tmux's ungated `MouseDown1Pane`), `mouse_drag`'s `PendingSelect {
+    enter_copy: true }` arm (forward INSTEAD of entering copy mode, mirrors
+    `MouseDrag1Pane`'s `if -F mouse_any_flag` guard), and `mouse_wheel`
+    (forward INSTEAD of entering copy mode / the old unconditional
+    alt-screen 3x-arrow-key translation, which this task REMOVED entirely
+    per `mouse.md` §9's "tmux never converts wheel to arrow keys" ruling —
+    an alt-screen pane that does NOT own the mouse now correctly swallows
+    wheel instead). Border drags and status-line clicks are deliberately
+    UNCHANGED, matching tmux's "ALWAYS KEEPS" rule. Full design + precedence
+    table + test inventory in `docs/specs/2026-07-07-parity-polish-
+    interfaces.md`'s "Task 9 amendment: application mouse passthrough"
+    (same section covers duplicate ticket #35). One residual gap honestly
+    noted there: no live-process byte-receipt e2e proof was attempted (same
+    class of risk that sank `alt_screen_wheel_sends_arrows`); the unit-level
+    coverage exercises the identical `forward_mouse_to_pane` ->
+    `keys::encode_mouse` -> `Pty::write_input` call chain instead, and
+    `Pty::write_input` delivery itself is already covered by
+    `tests/pty_smoke.rs` and every keystroke-based e2e test in the suite.
+    *Original text:* No application mouse passthrough (adjudicated in SP6
+    Task 6 review, 2026-07-10).
     winmux never relays raw mouse bytes to pane applications: a pane program that
     enables mouse reporting (vim, htop, less --mouse) receives nothing; wheel input
     is translated to 3x arrow keys only (src/server/dispatch.rs wheel path). Real

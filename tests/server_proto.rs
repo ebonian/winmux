@@ -4639,6 +4639,85 @@ fn status_click_selects_correct_window_when_list_scrolled() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP7 Task 10 (#39, status hit-test truncation): `mouse_status_click`
+/// hit-tests through `status::status_tab_columns` -- the SAME `plan_tab_
+/// layout` core `status_spans`/`render_one`/`compose_back` draw the status
+/// row from (SP7 Task 7's fix, closes follow-up #69a). A `<`/`>` overflow
+/// marker is drawn OUTSIDE every window's `TabColumn` range (only
+/// `layout.raw_spans` entries become clickable hitboxes -- see
+/// `status_tab_columns`'s doc comment), so a click that lands ON the marker
+/// character itself must resolve to no window at all, not the nearest
+/// visible tab. Same setup as `status_click_selects_correct_window_when_
+/// list_scrolled` above (`< 2 3 4*` at 8 columns; see that test's doc
+/// comment for the exact column table) -- column 0 is the `<` marker.
+///
+/// Verify-and-mark note (this task): investigated whether
+/// `mouse_status_click` still has a genuine gap vs. `render::compose_back`'s
+/// final width-based right-truncation step (the literal concern #39's
+/// original text raised, predating SP7 Task 7's `status_tab_columns` fix).
+/// It does not: `compose_back`'s truncation is `right_len = right.len().
+/// min(cols_u - left_len)` where `left_len` is the ACTUAL drawn width of
+/// everything before `right`; `plan_tab_layout`'s own math (shared by both
+/// `status_tab_columns` and `status_spans`) already guarantees `left_width +
+/// list_avail == width - right_len` whenever the list FITS, and produces NO
+/// tab hitboxes at all whenever it doesn't (`content_w` saturates to 0) --
+/// so under the ONE `width`/`right_len`/`left_width` both call sites already
+/// share (confirmed identical by direct comparison of `mouse_status_click`
+/// vs. `render_one`'s status-row construction), `compose_back`'s own
+/// truncation step is a provable no-op, not a residual gap. The overflow-
+/// marker case this test exercises is the one place a NEW server-side
+/// hitbox bug (not `compose_back` truncation specifically) could plausibly
+/// hide, and it doesn't.
+#[test]
+fn status_click_past_truncation_is_noop() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 8, 24);
+    enable_mouse(&name, &mut c);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-left".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-right".into(), "".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-format".into(), "#I".into()]));
+    expect_cli_done(&cli, 0);
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["setw".into(), "-g".into(), "window-status-current-format".into(), "#I*".into()]));
+    expect_cli_done(&cli, 0);
+
+    // 4 more windows on top of the initial one -> indices 0-4, current = 4.
+    for _ in 0..4 {
+        c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    }
+    let status_row = grid.rows() - 1;
+    c.recv_output_until(&mut grid, |g| row_text(g, status_row).trim_end() == "< 2 3 4*");
+
+    // Column 0 is the `<` overflow marker itself -- not any window's tab.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, status_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, status_row, true)));
+
+    // Synchronize on the same connection (`list-buffers`, a clean exit-0
+    // no-op) so the click has been fully processed server-side, then prove
+    // the negative: the status row is byte-for-byte unchanged.
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert_eq!(
+        row_text(&grid, status_row).trim_end(),
+        "< 2 3 4*",
+        "a click on the overflow marker itself must be a no-op, not resolve to the nearest window"
+    );
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn mouse_wheel_status_cycles_windows() {
     let name = unique_pipe_name();
@@ -6141,14 +6220,21 @@ fn choose_tree_escape_cancels() {
     server.join().expect("server exits after last session dies");
 }
 
-/// Final SP4 review, MUST-FIX NEW-1: mouse events must be swallowed while
-/// an overlay (choose-tree or display-panes) is open, exactly like the
-/// pre-existing `ConfirmCmd`/`Prompt` guard -- a click landing on a HIDDEN
-/// pane underneath the overlay must never focus it. Splits the window so
-/// the right pane is focused and a left pane exists to be mis-focused by a
-/// leaking click; opens choose-tree (which draws full-screen, hiding the
-/// split); clicks where the left pane would be; then dismisses the overlay
-/// with `q` and asserts focus is STILL the right pane.
+/// Final SP4 review, MUST-FIX NEW-1: mouse events must never leak through
+/// to a HIDDEN pane underneath a full-screen overlay (choose-tree or
+/// display-panes), exactly like the pre-existing `ConfirmCmd`/`Prompt`
+/// guard. Splits the window so the right pane is focused and a left pane
+/// exists to be mis-focused by a leaking click; opens choose-tree (which
+/// draws full-screen, hiding the split); clicks where the left pane would
+/// be; then dismisses the overlay with `q` and asserts focus is STILL the
+/// right pane. SP7 Task 10 (closes follow-up #61) note: choose-tree itself
+/// now DOES react to a `Down(1)` click (selecting whichever tree row is
+/// under the pointer, see `choose_tree_click_selects_row`) -- this test's
+/// claim is narrower than its original "mouse events must be swallowed"
+/// title suggests: the click here lands on a blank/no-row area of the
+/// choose-tree panel (only one window exists, so most of an 80x24 panel is
+/// empty), so it's STILL a no-op for row selection too, and the pane-leak
+/// assertion below is unaffected either way.
 #[test]
 fn mouse_ignored_under_choose_tree_overlay() {
     let name = unique_pipe_name();
@@ -6215,6 +6301,169 @@ fn mouse_ignored_under_display_panes_overlay() {
     c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
+}
+
+// ---- choose-tree mouse (SP7 Task 10, closes follow-up #61) ----------------
+
+/// `docs/tmux-reference/choose-tree.md` §7.4: "Click (MouseDown1) on a list
+/// row: select that row (no choose)". Same `w`-list setup as
+/// `choose_tree_w_lists_and_switches`: after `prefix c` (new window 1) +
+/// `prefix w`, the panel is `- 0: 2 windows (attached)` (y=0), `  0:
+/// powershell-` (y=1), `  1: powershell*` (y=2, CURRENT -- default
+/// selection per SP6 wave 2's "current item" default). Clicking window 0's
+/// row (y=1) must SELECT it without committing -- proven indirectly: a
+/// plain keyboard Enter right after the click switches to window 0 (if the
+/// click had no effect, Enter would instead re-commit the already-current
+/// window 1, a silent same-window no-op the status line would never
+/// visibly change to).
+#[test]
+fn choose_tree_click_selects_row() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("0: 2 windows (attached)"))
+            && lines.iter().any(|l| l.contains("  0: powershell-"))
+            && lines.iter().any(|l| l.contains("  1: powershell*"))
+    });
+
+    // A single click (Down then Up, no second press) on window 0's row.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, true)));
+
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `docs/tmux-reference/choose-tree.md` §7.4: "Double-click on a list row:
+/// select + rewrite the key to `\r` -> Enter (choose)". Same setup as
+/// `choose_tree_click_selects_row`, but two presses on window 0's row
+/// within the click-run window commit it directly -- no keyboard Enter at
+/// all.
+#[test]
+fn choose_tree_double_click_commits_switch() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, true)));
+
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Semantics decision (this task, deviating from the task brief's literal
+/// "wheel scrolls/moves selection" wording in favor of the authoritative
+/// tmux-reference doc): `docs/tmux-reference/choose-tree.md` §7.4 states
+/// real tmux's `mode_tree_key` mouse branch swallows every mouse key
+/// EXCEPT the three click types before its key switch is even reached, so
+/// wheel is a no-op with `mouse on` there -- "matching tmux exactly means
+/// click/double-click/right-click only" (the doc explicitly calls
+/// wheel-moves-selection "a (defensible) divergence", not tmux's own
+/// behavior). Given this project's stated guiding principle ("be exactly
+/// like tmux"), wheel over the choose-tree list is implemented as a no-op
+/// here too. Same setup as the tests above (default selection = window 1's
+/// row, the current item): wheel events, then a bare keyboard Enter with NO
+/// navigation -- if wheel had (incorrectly) moved the selection, Enter
+/// would commit window 0 instead and the status line would show window 0
+/// current; asserting it's STILL window 1 proves wheel was a true no-op.
+#[test]
+fn choose_tree_wheel_is_noop_matching_tmux() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_UP, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_WHEEL_DOWN, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP7 Task 10 (closes follow-up #61): a click on window 0's row while a
+/// kill-confirm prompt (`x` was already pressed) is pending must be
+/// swallowed entirely -- exactly like `ConfirmCmd`/`Prompt` -- rather than
+/// silently changing the selection out from under the pending y/n answer.
+#[test]
+fn choose_tree_click_swallowed_during_pending_kill_confirm() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")));
+
+    // `x` arms a kill-confirm on the default-selected row (window 1).
+    c.send(&ClientMsg::Stdin(b"x".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window")));
+
+    // A click on window 0's row must NOT change the selection while the
+    // prompt is pending -- confirmed via `n` (cancel) staying on the
+    // overlay with window 1 still current afterward (had the click somehow
+    // re-armed selection to window 0 and the confirm miraculously still
+    // applied to the right target, this would be indistinguishable; the
+    // real proof is architectural -- `dispatch_mouse`'s guard checks
+    // `pending_kill.is_none()` before ever calling `dispatch_choose_tree_
+    // mouse` -- but this end-to-end check at least proves the confirm
+    // prompt itself survives a click without visibly corrupting).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, 1, true)));
+    c.send(&ClientMsg::Stdin(b"n".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 2 windows (attached)")) && !screen_text(g).iter().any(|l| l.contains("kill-window")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
 }
 
 /// SP7 Task 7 (closes follow-up #29): `status-interval` must drive a

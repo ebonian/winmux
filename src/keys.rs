@@ -8,6 +8,11 @@
 //! - [`encode_key`]: `Key` -> VT bytes to SEND to a pane (`send-keys`).
 //! - [`KeyDecoder`]: VT input bytes -> `Key` values (the future table-driven
 //!   replacement for `src/input.rs`'s hand-rolled escape parsing).
+//! - [`encode_mouse`]: `MouseEvent` -> VT bytes to FORWARD to a pane whose
+//!   own application requested mouse reporting (SP7 Task 9) — the encoding
+//!   half of [`KeyDecoder`]'s SGR mouse decoding.
+
+use crate::grid::MouseEncoding;
 
 /// A single logical key: a base [`KeyCode`] plus modifier flags.
 ///
@@ -809,6 +814,106 @@ fn mods_from_param(p: i64) -> (bool, bool, bool) {
     (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) // (shift, meta, ctrl)
 }
 
+/// Reconstruct the xterm/SGR `Cb` button-word from a decoded [`MouseEvent`]
+/// — the exact inverse of [`mouse_kind_from_cb`] plus the modifier-bit
+/// packing `classify_sgr_mouse` reads: low 2 bits + bit 0x20 pick the
+/// button/drag encoding (button number stored as `button - 1`, matching
+/// `mouse_kind_from_cb`'s `low + 1`), bit 0x40 marks a wheel event (low bit
+/// then picks up/down), and 0x04/0x08/0x10 carry shift/meta/ctrl — SAME
+/// layout `classify_sgr_mouse` decodes, so `cb_for(classify_sgr_mouse(..))
+/// == cb` round-trips for any legally-decoded event (verified by
+/// `encode_roundtrip_via_decoder`-style tests below).
+fn cb_for(ev: &MouseEvent) -> i64 {
+    let mut cb: i64 = match ev.kind {
+        MouseKind::Down(b) | MouseKind::Up(b) => (b.saturating_sub(1)) as i64,
+        MouseKind::Drag(b) => (b.saturating_sub(1)) as i64 | 0x20,
+        MouseKind::WheelUp => 0x40,
+        MouseKind::WheelDown => 0x40 | 0x01,
+    };
+    if ev.shift {
+        cb |= 0x04;
+    }
+    if ev.meta {
+        cb |= 0x08;
+    }
+    if ev.ctrl {
+        cb |= 0x10;
+    }
+    cb
+}
+
+/// Re-encode a decoded [`MouseEvent`] (coordinates already pane-relative and
+/// 0-based — the caller's job, see `server::dispatch::forward_mouse_to_pane`)
+/// into the wire bytes a pane application requesting `encoding` expects —
+/// the forwarding half of Task 9 (SP7, closes follow-ups #35/#72): tmux's
+/// `input_key_get_mouse` (`input-keys.c:713-793`) re-encodes per the pane's
+/// own requested protocol rather than replaying the outer terminal's raw
+/// bytes verbatim, since the pane's coordinate origin and requested wire
+/// format can both differ from the client's.
+pub fn encode_mouse(ev: &MouseEvent, encoding: MouseEncoding) -> Vec<u8> {
+    match encoding {
+        MouseEncoding::Sgr => encode_mouse_sgr(ev),
+        MouseEncoding::Utf8 => encode_mouse_utf8(ev),
+        MouseEncoding::Default => encode_mouse_x10(ev),
+    }
+}
+
+/// `CSI < Cb ; Cx ; Cy (M|m)` — SGR (1006) encoding, unbounded coordinate
+/// range (1-based, no clamp). `M` for every event except a release
+/// (`MouseKind::Up`), which uses `m` — the exact inverse of
+/// `classify_sgr_mouse`'s `released = b == b'm'` check.
+fn encode_mouse_sgr(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev);
+    let final_byte = if matches!(ev.kind, MouseKind::Up(_)) { 'm' } else { 'M' };
+    format!("\x1b[<{cb};{};{}{final_byte}", ev.x as u32 + 1, ev.y as u32 + 1).into_bytes()
+}
+
+/// `CSI M <Cb+32> <Cx+32> <Cy+32>` — legacy X10/xterm-normal encoding
+/// (DECSET 1000, the `MouseEncoding::Default` fallback when neither 1005
+/// nor 1006 was requested): three raw bytes, 1-based coordinates offset by
+/// 32 and clamped at 223 (byte value 255) since a single byte can't carry a
+/// coordinate past `255 - 32`, per the task brief ("X10 encoding caps at
+/// 223") and real xterm's own `MOUSE_PARAM_POS_OFF`/byte-width limit
+/// (`docs/tmux-reference/mouse.md` §1's decode-side mirror: `x = byte -
+/// 33`, i.e. encode is `byte = x + 33` — 32 for the offset, 1 more for the
+/// 0-based-to-1-based conversion `classify_sgr_mouse`'s own `(cx - 1)`
+/// undoes on decode). No release-button ambiguity here (unlike real X10,
+/// which can't distinguish which button released) since [`MouseEvent`]
+/// always carries the concrete kind/button already.
+fn encode_mouse_x10(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev).clamp(0, 255 - 32) as u8;
+    let cx = ((ev.x as u32 + 1).min(223)) as u8;
+    let cy = ((ev.y as u32 + 1).min(223)) as u8;
+    vec![0x1b, b'[', b'M', cb.wrapping_add(32), cx.wrapping_add(32), cy.wrapping_add(32)]
+}
+
+/// `CSI M <Cb+32> <Cx+32 as UTF-8> <Cy+32 as UTF-8>` — UTF-8 extended
+/// coordinates (DECSET 1005): same button byte as legacy X10 (button/
+/// modifier words never approach the 223 cap in practice), but `Cx+32`/
+/// `Cy+32` are emitted as UTF-8-encoded codepoints instead of raw bytes,
+/// extending the usable coordinate range well past 223 (capped here at
+/// 2015 = 2047 - 32, xterm's own ctlseqs-documented 1005 limit) — matches
+/// real xterm/tmux's 1005 extension, though no `docs/tmux-reference/*.md`
+/// source line pins the exact byte-for-byte algorithm (1005 is a rare,
+/// largely-superseded-by-1006 protocol; this is a best-effort, clearly
+/// peripheral encoding, not exercised by winmux's own default `?1006h`-
+/// only enable sequence).
+fn encode_mouse_utf8(ev: &MouseEvent) -> Vec<u8> {
+    let cb = cb_for(ev).clamp(0, 255 - 32) as u8;
+    let cx = (ev.x as u32 + 1).min(2015) + 32;
+    let cy = (ev.y as u32 + 1).min(2015) + 32;
+    let mut out = vec![0x1b, b'[', b'M', cb.wrapping_add(32)];
+    if let Some(c) = char::from_u32(cx) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    if let Some(c) = char::from_u32(cy) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    out
+}
+
 fn parse_csi(params_str: &str, final_byte: u8) -> Option<Key> {
     let parts: Vec<i64> = if params_str.is_empty() {
         Vec::new()
@@ -1476,5 +1581,89 @@ mod tests {
             dec.feed(&input),
             vec![dm(MouseKind::Down(1), 5, 10, b"\x1b[<0;6;11M"), dk(plain(KeyCode::Char('a')), b"a")]
         );
+    }
+
+    // ---- encode_mouse (SP7 Task 9 -- closes follow-ups #35/#72) ----
+
+    fn me(kind: MouseKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent { kind, ctrl: false, meta: false, shift: false, x, y }
+    }
+
+    #[test]
+    fn encode_mouse_sgr_press_matches_wire_format() {
+        // 0-based (5, 10) pane-relative -> 1-based (6, 11) on the wire.
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 5, 10), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<0;6;11M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_release_uses_lowercase_m() {
+        let bytes = encode_mouse(&me(MouseKind::Up(1), 5, 10), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<0;6;11m");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_drag_sets_motion_bit() {
+        let bytes = encode_mouse(&me(MouseKind::Drag(1), 9, 4), MouseEncoding::Sgr);
+        assert_eq!(bytes, b"\x1b[<32;10;5M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_wheel() {
+        assert_eq!(encode_mouse(&me(MouseKind::WheelUp, 2, 2), MouseEncoding::Sgr), b"\x1b[<64;3;3M");
+        assert_eq!(encode_mouse(&me(MouseKind::WheelDown, 2, 2), MouseEncoding::Sgr), b"\x1b[<65;3;3M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_carries_modifiers() {
+        let ev = MouseEvent { kind: MouseKind::Down(1), ctrl: true, meta: true, shift: true, x: 0, y: 0 };
+        // cb = 0 (button 1) | 0x04 (shift) | 0x08 (meta) | 0x10 (ctrl) = 28.
+        assert_eq!(encode_mouse(&ev, MouseEncoding::Sgr), b"\x1b[<28;1;1M");
+    }
+
+    #[test]
+    fn encode_mouse_sgr_roundtrips_through_decoder() {
+        // encode_mouse's SGR output, fed back into KeyDecoder, must decode to
+        // the exact same MouseEvent it was built from -- the inverse-function
+        // property `cb_for`'s doc comment claims.
+        for ev in [
+            me(MouseKind::Down(1), 5, 10),
+            me(MouseKind::Down(3), 0, 0),
+            me(MouseKind::Up(1), 5, 10),
+            me(MouseKind::Drag(1), 9, 4),
+            me(MouseKind::WheelUp, 2, 2),
+            me(MouseKind::WheelDown, 2, 2),
+        ] {
+            let bytes = encode_mouse(&ev, MouseEncoding::Sgr);
+            let mut dec = KeyDecoder::new();
+            let items = dec.feed(&bytes);
+            assert_eq!(items, vec![dm(ev.kind, ev.x, ev.y, &bytes)], "roundtrip failed for {ev:?}");
+        }
+    }
+
+    #[test]
+    fn encode_mouse_x10_offsets_by_32_and_caps_at_223() {
+        // 0-based (5, 10) -> 1-based (6, 11) -> +32 offset -> bytes (38, 43).
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 5, 10), MouseEncoding::Default);
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 6 + 32, 11 + 32]);
+
+        // A coordinate past the 223 cap clamps rather than overflowing the
+        // single wire byte (task brief: "X10 encoding caps at 223").
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 500, 500), MouseEncoding::Default);
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32, 223 + 32, 223 + 32]);
+    }
+
+    #[test]
+    fn encode_mouse_utf8_extends_range_past_x10_cap() {
+        // A coordinate that would clamp under X10 (500 > 223) survives
+        // uncapped under the UTF-8 (1005) encoding -- decode the emitted
+        // UTF-8 codepoints back into 0-based coordinates and check they
+        // match, rather than pinning exact byte sequences.
+        let bytes = encode_mouse(&me(MouseKind::Down(1), 500, 500), MouseEncoding::Utf8);
+        let s = std::str::from_utf8(&bytes[4..]).unwrap();
+        let mut chars = s.chars();
+        let cx = chars.next().unwrap() as u32 - 32 - 1;
+        let cy = chars.next().unwrap() as u32 - 32 - 1;
+        assert_eq!((cx, cy), (500, 500));
     }
 }

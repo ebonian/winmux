@@ -1324,24 +1324,27 @@ simpler, and satisfies the same observable contract (the client's next
 `server::handle_stdin`'s `KeyInputEvent::Mouse` arm):**
 1. `!options.mouse()` → dropped (`Ok`, no-op) — see the `keys` amendment's
    "consume-always" note for why this drop happens here, not at decode time.
-2. `client.mode` is `ConfirmCmd`/`Prompt`/`ChooseTree`/`DisplayPanes` →
-   dropped (documented deviation: real tmux's mouse-during-prompt behavior
-   was left undecided by the task brief; winmux swallows mouse events during
-   these overlays so a stray click/drag can never race a confirm's y/n
-   capture or act on pane geometry the overlay is hiding). **Final SP4
-   review, MUST-FIX (NEW-1):** `ChooseTree`/`DisplayPanes` (Task 8, added
-   after this guard was written) joined the match arm in the merge-gate fix
-   round — both overlays draw full-screen exactly like `ConfirmCmd`/
-   `Prompt`, so the identical "hidden pane geometry" risk applies (a click
-   would silently focus, a border-drag would silently resize, a wheel would
-   silently enter copy mode on a pane the user cannot currently see). See
-   the `## overlays` section's "server::dispatch amendment: key routing"
-   subsection for the analogous KEYBOARD dismissal policy this mirrors —
-   mouse dismisses NEITHER overlay and never navigates/selects a
-   choose-tree row (a pure swallow, matching `ConfirmCmd`/`Prompt` exactly,
-   not display-panes' "any non-digit KEY dismisses" rule). Real tmux-style
-   mouse routing into choose-tree is out of scope here, ticketed
-   `docs/follow-ups.md` #61 (amends #38's scope to all four modal states).
+2. `client.mode` is `ConfirmCmd`/`Prompt`/`DisplayPanes` → dropped
+   (documented deviation: real tmux's mouse-during-prompt behavior was left
+   undecided by the task brief; winmux swallows mouse events during these
+   overlays so a stray click/drag can never race a confirm's y/n capture or
+   act on pane geometry the overlay is hiding). **Final SP4 review, MUST-FIX
+   (NEW-1):** `DisplayPanes` (Task 8, added after this guard was written)
+   joined the match arm in the merge-gate fix round — it draws full-screen
+   exactly like `ConfirmCmd`/`Prompt`, so the identical "hidden pane
+   geometry" risk applies (a click would silently focus, a border-drag
+   would silently resize, a wheel would silently enter copy mode on a pane
+   the user cannot currently see); no `docs/tmux-reference/*.md` source
+   pins any display-panes mouse behavior at all (`cmd_display_panes_key` is
+   KEY-only), so this stays a pure swallow rather than a guess.
+   `ChooseTree` gets its OWN branch: mouse dismisses it neither by key nor
+   mouse (unchanged), but **SP7 Task 10 (closes follow-up #61, amending
+   this section)** now routes `Down(1)` into `dispatch_choose_tree_mouse`
+   — click selects a row, double-click commits — UNLESS a kill-confirm
+   prompt is pending on it (`state.pending_kill.is_some()`), which still
+   swallows mouse entirely for the same y/n-race-safety reason as
+   `ConfirmCmd`/`Prompt`. See the `## overlays` section's "SP7 Task 10
+   amendment" subsection below for the full design.
 3. `y` equals the status row for THIS client (`mouse_status_row`: row 0 if
    `status-position top` else `client.rows - 1`, `None` if `status` off) →
    `dispatch_mouse_status`.
@@ -1543,27 +1546,183 @@ reconstructed the tab layout itself (unscrolled, a hardcoded
 predated SP7 Task 7's overflow scrolling and disagreed with it the moment a
 real window list actually scrolled, so a click on the visually-current tab
 could resolve to the wrong window (`tests/server_proto.rs::status_click_
-selects_correct_window_when_list_scrolled` is the regression test). Still
-does NOT replicate `render::compose_back`'s final spatial right-truncation
-(when left+right don't fit the terminal width) — documented v1 gap,
-`docs/follow-ups.md`. `WheelUp`/`WheelDown` on the status row →
+selects_correct_window_when_list_scrolled` is the regression test).
+**VERIFIED-RESOLVED (SP7 Task 10, closes follow-up #39):** re-investigated
+whether this still doesn't replicate `render::compose_back`'s final
+spatial right-truncation (when left+right don't fit the terminal width) —
+it doesn't need to. `mouse_status_click` and `render_one`'s status-row
+build construct `left`/`right_len`/`width` IDENTICALLY (same
+`expand_format`/`truncate_visible`/`truncate_chars` calls reading the same
+options, same `session.size.0`), so both feed the SAME inputs into
+`plan_tab_layout`, whose own math guarantees `left_width + list_avail ==
+width - right_len` whenever the list fits and produces ZERO tab hitboxes
+at all whenever it doesn't — `compose_back`'s own final truncation is a
+provable no-op under matching inputs. `status_click_past_truncation_is_noop`
+(`tests/server_proto.rs`) proves the one place a genuine hit-test bug
+could still hide — a click landing exactly on a `<`/`>` overflow marker
+character, which is drawn outside every `TabColumn` range — is also
+correctly a no-op. `WheelUp`/`WheelDown` on the status row →
 `exec_step_window(false, ..)` / `exec_step_window(true, ..)` (previous-window
 / next-window — tmux's default `WheelUpStatus`/`WheelDownStatus` bindings).
 
-**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):**
-forwarding a click/drag to the pane's own mouse-reporting application (the
-design spec's "v1: NOT forwarded" note; ticketed `docs/follow-ups.md` #72).
-Two PRIOR deferrals in this section are now RESOLVED and removed from this
-list: "drag-to-select on a live (non-copy-mode) pane" (Task 6's
-`PendingSelect { enter_copy: true }`) and "`word-separators` as a real
-option" (Task 7's `Options::word_separators`, replacing the old hardcoded
-`" -_@"` guess with the doc-verified tmux default). One new interaction is
-left untested rather than deferred outright: toggling `rectangle-toggle`
+**Explicit deferrals (v1 scope, documented in `docs/follow-ups.md`):** THREE
+PRIOR deferrals in this section are now RESOLVED and removed from this list:
+"drag-to-select on a live (non-copy-mode) pane" (Task 6's `PendingSelect {
+enter_copy: true }`), "`word-separators` as a real option" (Task 7's
+`Options::word_separators`, replacing the old hardcoded `" -_@"` guess with
+the doc-verified tmux default), and "forwarding a click/drag to the pane's
+own mouse-reporting application" (follow-ups #35/#72 — SP7 Task 9, see the
+`### Task 9 amendment` immediately below this section). One new interaction
+is left untested rather than deferred outright: toggling `rectangle-toggle`
 (`R`/`v`) mid-drag on a `Word`/`Line`-kind selection — `sel.rect` and
 `sel.kind` are independent fields, so this is representable, but real tmux
 itself treats `SEL_WORD`/`SEL_LINE` and rectangle selection as mutually
 exclusive selection MODES rather than orthogonal flags; low risk (mouse-only
 entry point, no keybinding reaches this combination).
+
+### Task 9 amendment: application mouse passthrough (SP7, closes follow-ups #35/#72)
+
+Real tmux forwards mouse events to a pane whose own application has
+requested mouse reporting, INSTEAD of consuming them for winmux's own
+copy-mode-entry/drag-selection gestures, per `docs/tmux-reference/mouse.md`
+§3.1/§7.1/§7.4. This amendment wires that up using Task 3's pane-side
+tracking (`Grid::mouse_proto`/`mouse_encoding`) and Task 8's table-driven
+mouse routing.
+
+```rust
+// keys (new)
+pub fn encode_mouse(ev: &MouseEvent, encoding: MouseEncoding) -> Vec<u8>;
+```
+
+`encode_mouse` is the re-encoding half of `KeyDecoder`'s SGR mouse
+decoding — the inverse of `classify_sgr_mouse`/`mouse_kind_from_cb`, plus
+two more wire formats decode never needed to produce: legacy X10 (`CSI M
+<Cb+32><Cx+32><Cy+32>`, three raw bytes, coordinates capped at 223 since a
+single byte can't carry more) and UTF-8 (1005, same button byte, but
+`Cx+32`/`Cy+32` emitted as UTF-8-encoded codepoints, extending the
+coordinate range to 2015 — a best-effort encoding with no
+`docs/tmux-reference/*.md` source line pinning its exact algorithm, since
+1005 is a rare, largely-superseded-by-1006 protocol winmux itself never
+requests). `ev.x`/`ev.y` must already be PANE-relative and 0-based (the
+caller's job); `MouseEncoding::Sgr` is unbounded (1-based, no clamp).
+`MouseKind::Up` encodes with the SGR release final byte (`m`) / X10-and-UTF8
+still emit the button byte concretely since `MouseEvent` always carries the
+resolved kind, unlike real X10's release-button ambiguity.
+
+```rust
+// server (MouseDrag amendment)
+enum MouseDrag {
+    // ...existing variants unchanged...
+    Forwarding { pane: PaneId }, // NEW
+}
+```
+
+`MouseDrag::Forwarding { pane }`: armed when a drag START (the first
+`Drag1Pane` motion event after a `PendingSelect { enter_copy: true }`
+press) finds the pressed pane eligible to receive it instead of entering
+copy mode. Every subsequent `Drag`/`Up` event on this client re-attempts
+forwarding (`Server::forward_mouse_to_pane`, re-checked live per event,
+matching tmux's "no drag-update callback installed -> every motion
+re-synthesizes and re-dispatches" rule, `mouse.md` §2.5) rather than
+driving any winmux copy-mode/selection state; `Up` forwards the release
+too, resolved against whichever pane is under the pointer AT RELEASE
+(mirrors the pre-existing `Selecting`/`MouseDragEnd1Pane` release-position
+rule).
+
+```rust
+// server::dispatch (new)
+fn mouse_forward_eligible(proto: MouseProto, kind: MouseKind) -> bool;
+fn forward_mouse_to_pane(&mut self, pane: PaneId, ev: MouseEvent, rect: Rect) -> bool; // private method
+```
+
+`mouse_forward_eligible`: `Down`/`Up`/`WheelUp`/`WheelDown` are eligible
+whenever `proto != MouseProto::Off` — INCLUDING `MouseProto::X10`, the one
+variant modern tmux itself has no `MODE_MOUSE_*` bit for at all (per
+`Grid::mouse_proto`'s doc comment, tracked in winmux specifically because
+"a later task's interface promise requires the X10 variant to exist" — this
+is that promise: an app that only ever sent `CSI ?9h` still owns its own
+clicks, wire-encoded via `MouseEncoding::Default`/X10 since it never also
+requested 1005/1006). `Drag` (pure motion) additionally requires
+`MouseProto::Button`/`Any` (`MOTION_MOUSE_MODES` — X10/Normal never asked
+the terminal to report motion at all).
+
+`forward_mouse_to_pane`: re-encodes `ev` relative to `rect` (the pane's
+current rect — `px = ev.x - rect.x`, clamped, same for `py`) via
+`keys::encode_mouse(&rel, pane.grid.mouse_encoding())` and writes the
+result to the pane's `Pty::write_input`, IF `mouse_forward_eligible`. Returns
+whether it actually wrote anything — callers use this to decide "forward
+INSTEAD of my own action" (`mouse_drag`'s `PendingSelect { enter_copy: true
+}` arm, `mouse_wheel`) vs. "forward IN ADDITION to my own action, which
+always happens regardless" (`mouse_down`'s pane-click branch — mirrors
+tmux's UNGATED root `MouseDown1Pane -> select-pane -t=; send -M`, the only
+default root pane binding with no `if -F mouse_any_flag` guard at all).
+
+**Call-site precedence (mirrors each gated default binding's own `if -F`
+guard, which a plain `RawCmd` list can't express directly):**
+
+- `mouse_down` (pane click, any button): unconditional focus (unchanged),
+  PLUS an unconditional forward attempt when `!in_copy_here` — no
+  `mouse_lookup` gate at all, since real tmux's `MouseDown1Pane` default has
+  none either.
+- `mouse_drag`'s `PendingSelect { enter_copy: true }` arm (root
+  `MouseDrag1Pane`): the forward attempt runs in the `mouse_lookup ==
+  None` arm (real tmux's unconditional "unbound -> forward_key" step) AND
+  in the "resolved to the exact default" arm (standing in for the
+  default's own `if -F {mouse_any_flag} {send -M} {copy-mode -M}` body) —
+  NOT when a user's own override is bound, since an override fully replaces
+  the default's guard along with its action.
+- `mouse_wheel` (root `WheelUpPane`/`WheelDownPane`, only reached when the
+  pane is NOT already in this client's copy mode): same `None`-arm /
+  is-the-default-arm split as `mouse_drag` above. Replaces the OLD
+  unconditional alt-screen "wheel -> 3x synthesized arrow-key presses"
+  translation entirely (`docs/tmux-reference/mouse.md` §9: "No wheel→arrow
+  translation... tmux never converts wheel to arrow keys") — an alt-screen
+  pane that does NOT own the mouse now SWALLOWS wheel (matches tmux's
+  `alternate_on` guard: `send -M` reaches `input_key_get_mouse`, which
+  returns 0 for an app that hasn't enabled its own mouse reporting) instead
+  of receiving synthesized arrows.
+- Border drags and status-line clicks are UNCHANGED — no forwarding check
+  was added to either path, matching real tmux's "ALWAYS KEEPS: border
+  drags, status-line clicks" rule (`mouse.md` §7.4 point 2); a border-owning
+  pane's own mouse mode has no effect on border-drag resize.
+
+TDD evidence (`src/server/dispatch.rs::mouse_dispatch_tests`, all built the
+same "real `Server` + `Grid::feed`'d DECSET, no ConPTY" way
+`alt_screen_wheel_does_not_enter_copy_mode` established):
+`mouse_forward_eligible_gates_by_proto_and_kind` (exhaustive over every
+`MouseProto` × representative `MouseKind`), `forward_mouse_to_pane_writes_
+when_pane_owns_mouse_click` / `_false_when_pane_does_not_own_mouse`,
+`mouse_down_focuses_pane_that_owns_mouse` (focus AND forward both happen,
+proving the UNGATED-click claim), `drag_on_mouse_owning_pane_does_not_
+enter_copy_mode` (asserts `client.mode` stays `Normal` AND `client.mouse.
+drag` becomes `Forwarding`), `wheel_forwards_to_mouse_owning_pane_instead_
+of_copy_mode`, `border_drag_still_resizes_when_pane_owns_mouse` (a REAL
+2-pane split via `Layout::split`, proving actual resize still happens),
+`passthrough_stops_after_decrst` (proves the gate re-reads live state, not
+a one-time snapshot). Unit tests (`src/keys.rs::tests`):
+`encode_mouse_sgr_{press,release,drag,wheel}_*`, `encode_mouse_sgr_
+carries_modifiers`, `encode_mouse_sgr_roundtrips_through_decoder` (every
+SGR encode output, fed back into `KeyDecoder`, decodes to the exact
+`MouseEvent` it was built from), `encode_mouse_x10_offsets_by_32_and_caps_
+at_223`, `encode_mouse_utf8_extends_range_past_x10_cap`.
+
+**Residual gap, honestly noted:** an end-to-end proof of "the pane's own
+REAL PROCESS actually receives these bytes on its stdin" (as opposed to the
+above, which proves the SERVER decides to write them and byte-verifies
+their exact wire encoding) was evaluated and NOT attempted, for the same
+class of reason `alt_screen_wheel_sends_arrows` (Task 5/SP6) was
+abandoned: a real interactive shell's own line editor / conhost's VT-INPUT
+parser would almost certainly reinterpret (not passively echo) an
+unrecognized `CSI < ... M` sequence typed into its stdin in an
+unpredictable, un-pinnable way, unlike straightforward ASCII keystrokes
+(which the project's OTHER `send-keys`-style e2e tests already rely on
+echoing reliably). The unit-level coverage above exercises the exact same
+`forward_mouse_to_pane` → `keys::encode_mouse` → `Pty::write_input` call
+chain a live pane would receive; only the LAST hop (does `write_input`
+correctly deliver already-known-correct bytes to a real process) is
+unverified by THIS task specifically — general `Pty::write_input` delivery
+is already covered by `tests/pty_smoke.rs` and every other keystroke-based
+e2e test in the suite.
 
 Integration tests (`tests/server_proto.rs`): `mouse_option_emits_enable_
 sequences`, `mouse_click_focuses_pane`, `mouse_wheel_enters_copy_mode`,
@@ -2160,20 +2319,91 @@ one difference from copy mode's own precedent, below.
   "not reprocessed" simplification).
 
 **Mouse dismissal policy while either overlay is open (final SP4 review,
-MUST-FIX NEW-1):** `server::dispatch::dispatch_mouse`'s modal guard (see the
-`## mouse` section's routing-step-2 amendment above) swallows EVERY mouse
-event — click, drag, wheel — outright while `client.mode` is `ChooseTree`
-or `DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
-handling. This is deliberately NOT the same policy as the keyboard rules
-just above: a click never dismisses either overlay (unlike display-panes'
-"any non-digit KEY dismisses" rule) and never navigates or selects a
-choose-tree row (unlike an unbound key, which is silently ignored but at
-least leaves the possibility of a future bound mouse action open — today
-there is none). The simplest, safest policy given the brief left real
-tmux's mouse-during-overlay behavior undecided: a stray click/drag/wheel
-can never act on the pane geometry either overlay is currently hiding.
-Real tmux-style routing (click selects a choose-tree row, wheel scrolls the
-list) is out of scope here — ticketed `docs/follow-ups.md` #61.
+MUST-FIX NEW-1; AMENDED by SP7 Task 10 for `ChooseTree`, see below):**
+`server::dispatch::dispatch_mouse`'s modal guard (see the `## mouse`
+section's routing-step-2 amendment above) still swallows EVERY mouse
+event — click, drag, wheel — outright while `client.mode` is
+`DisplayPanes`, exactly like its pre-existing `ConfirmCmd`/`Prompt`
+handling: a click never dismisses it (unlike display-panes' own "any
+non-digit KEY dismisses" keyboard rule), consistent with no
+`docs/tmux-reference/*.md` source pinning any display-panes mouse
+behavior at all. `ChooseTree` no longer follows this same blanket swallow
+— see the `## overlays` section's "SP7 Task 10 amendment" subsection
+immediately below for its real routing (closes follow-up #61).
+
+### SP7 Task 10 amendment: choose-tree mouse routing (closes follow-up #61)
+
+`docs/tmux-reference/choose-tree.md` §7.4 (`mode_tree_key`'s mouse branch):
+click selects a row (no choose), double-click selects AND commits
+(rewrites the key to Enter), right-click is a context menu (out of scope —
+winmux has no context-menu system anywhere), and **wheel is a documented
+NO-OP with `mouse on`** — tmux's mouse branch swallows every mouse key
+except the three click types before its key switch is even reached, so
+`WheelUp`/`DownPane`'s `mode_tree_up`/`_down` cases are UNREACHABLE via a
+real mouse event; the doc's own words: "matching tmux exactly means
+click/double-click/right-click only" (a wheel-scrolls-the-list mapping is
+explicitly called out as "a (defensible) divergence", not what real tmux
+does). Given this project's stated guiding principle ("be exactly like
+tmux"), winmux implements wheel as a no-op here too — a deliberate
+deviation from the task brief's own more casual "wheel scrolls the list"
+phrasing, in favor of the doc's more rigorously researched ruling.
+
+```rust
+// server::dispatch (new, private methods)
+fn choose_tree_row_at(&self, client: &ClientState, rows: &[TreeRow], y: u16) -> Option<usize>;
+fn dispatch_choose_tree_mouse(&mut self, ev: MouseEvent, client: &mut ClientState, session_name: &str) -> ExecOutcome;
+```
+
+`choose_tree_row_at` maps a click's screen row `y` to an index into a
+freshly-rebuilt `rows` (`build_tree_rows`), mirroring `server::render_one`'s
+`RenderOverlay::Tree` → `render::ListOverlay` layout exactly: choose-tree's
+`ListOverlay::title` is ALWAYS empty (no header-row offset to account for),
+and `list_height`/`preview`-shown/`msg_reserved`/`top`/the visible `[start,
+end)` window are recomputed the SAME way `render_one`'s own `RenderOverlay::
+Tree` arm does (same `choose_tree_list_height` call, same
+`pending_kill.is_some() || client.message.is_some()` message-reservation
+rule). `None` (no row) on a click outside the list — an empty list, the
+preview box, a reserved kill-confirm row, or past the last row.
+
+`dispatch_choose_tree_mouse` is called from `dispatch_mouse`'s
+`ChooseTree` guard branch ONLY for `Down(1)` with no kill-confirm pending
+(both already checked by the caller). It resolves the row under `ev.y`,
+updates `state.sel`/`state.selected` to it unconditionally (a plain click
+always at least selects), then uses the SAME `advance_click_run` click-run
+tracker `mouse_down` uses for pane double/triple-clicks (choose-tree isn't
+using `client.mouse` for anything else while open) to detect a same-cell
+second press within the click window — on a `run >= 2`, it sets
+`client.mode = ClientMode::Normal` and calls `exec_tree_commit`, exactly
+mirroring `dispatch_choose_tree_key`'s `ChooseTreeAction::Commit` arm. A
+plain single click (`run == 1`) returns `Ok` with no further action —
+selection only, no choose, per the doc.
+
+`dispatch_mouse`'s `ChooseTree` guard (amended): checks
+`state.pending_kill.is_none()` BEFORE calling `dispatch_choose_tree_mouse`
+— a kill-confirm prompt (`x` was pressed, awaiting y/n) still swallows
+`Down(1)` too, exactly like `ConfirmCmd`/`Prompt`, so a stray click can
+never silently re-arm the selection out from under a pending confirm
+answer. Every other mouse event kind (wheel, `Drag`, `Up`, non-left
+buttons) reaching a `ChooseTree` client is still a pure swallow, matching
+the doc's click/double-click-only ruling above; `Drag`/`Up` additionally
+still run `end_drag` first (#64: a drag armed before the overlay opened
+must not survive across it — unchanged from the pre-existing guard).
+
+TDD evidence (`tests/server_proto.rs`): `choose_tree_click_selects_row`
+(a plain click on a non-current row, then a bare keyboard Enter, switches
+to THAT row — proving the click alone changed the selection, since a
+no-op click would leave Enter re-committing the already-current window, a
+silent non-event), `choose_tree_double_click_commits_switch` (two presses
+on the same row within the click window switches with NO keyboard
+involved at all), `choose_tree_wheel_is_noop_matching_tmux` (wheel events
+followed by a bare Enter still commit the ORIGINAL default selection, not
+whatever wheel might have moved it to), `choose_tree_click_swallowed_
+during_pending_kill_confirm` (a click during a pending `x` kill-confirm
+doesn't disrupt the confirm flow). `mouse_ignored_under_choose_tree_
+overlay` (pre-existing, Task 8 era) still passes unmodified — its click
+lands on a blank/no-row area of an (only one window) tree panel, so it's
+still a no-op for row selection too, and its actual claim (no leak-through
+to the hidden pane underneath) is unaffected by this task either way.
 
 **Task 8 review fix (Important #2) — interception applies to EVERY `Key`
 event, not just `table: Root`:** the original `Key{table, ..}` arm gated

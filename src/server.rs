@@ -790,6 +790,18 @@ enum MouseDrag {
     /// motion, and without this flag a plain click would always look like a
     /// (zero-width) completed drag.
     Selecting { moved: bool },
+    /// (SP7 Task 9, closes follow-ups #35/#72) The press landed on a pane
+    /// whose own application owns the mouse (`Grid::mouse_proto() != Off`,
+    /// eligible per `dispatch::mouse_forward_eligible` for the motion that
+    /// started this drag) -- tmux's root `MouseDrag1Pane -> if mouse_any_flag
+    /// { send -M } else { copy-mode -M }` guard took the `send -M` branch, so
+    /// winmux never enters copy-mode/selection at all for this drag. Every
+    /// subsequent `Drag`/`Up` on `pane` is re-encoded and forwarded to the
+    /// pane's own pty instead (`dispatch::Server::forward_mouse_to_pane`,
+    /// re-checked live on each event, mirroring tmux's "no callback
+    /// installed -> every motion re-synthesizes and re-dispatches" rule,
+    /// `mouse.md` §2.5) rather than driving any winmux copy-mode state.
+    Forwarding { pane: PaneId },
 }
 
 /// Advance `m`'s click-run-length tracker for a `Down` at `(x, y)` with
