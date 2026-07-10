@@ -44,6 +44,16 @@
 //! layered over `base` directly — NOT over `window-status-style` (tmux
 //! layers `window-status-current-style` over `status-style` directly, so an
 //! fg set only in `window-status-style` never leaks into the current tab).
+//!
+//! **SP7 Task 1 (general format engine):** `expand_format` now delegates to
+//! [`crate::format::expand`], a real recursive-descent engine (braced
+//! variables, `#{?cond,true,false}` conditionals, comparisons, length
+//! limits — see that module's docs). This removed the SP6 Task 4 "fix round
+//! 1" flagless-padding shim that used to live in the per-window loop below:
+//! `options::DEFAULT_WINDOW_STATUS_FORMAT` is now tmux's literal
+//! `#I:#W#{?window_flags,#{window_flags}, }`, whose conditional the engine
+//! evaluates directly, so the width-stable one-space-when-flagless behavior
+//! falls out of the format string itself (closes follow-ups #27/#70).
 
 use crate::grid::Style;
 use crate::options::{expand_format, FormatCtx};
@@ -201,21 +211,18 @@ pub fn status_spans(
     let mut tab_spans: Vec<Vec<(String, Style)>> = Vec::with_capacity(windows.len());
     let mut tab_widths: Vec<usize> = Vec::with_capacity(windows.len());
     for w in windows {
-        let mut flags_str = flags(w);
+        let flags_str = flags(w);
         let fmt = if w.current { window_current_format } else { window_format };
-        // Fix round 1 (width-stable default format): tmux's real default
-        // `#I:#W#{?window_flags,#{window_flags}, }` renders ONE padding
-        // space when a window has no flags, so a tab keeps its width when
-        // the window gains/loses `*`/`-` on focus change. winmux's stored
-        // default is `#I:#W#F` (no `#{?...}` support in the expand_format
-        // subset — options::DEFAULT_WINDOW_STATUS_FORMAT's doc comment);
-        // reproduce the conditional's else-branch here, on the
-        // DEFAULT-format path ONLY. A custom format (even one ending in
-        // `#F`) gets the plain empty flags string, exactly what real tmux's
-        // `#{window_flags}` would substitute.
-        if fmt == crate::options::DEFAULT_WINDOW_STATUS_FORMAT && flags_str.is_empty() {
-            flags_str.push(' ');
-        }
+        // SP7 Task 1: no shim needed anymore. tmux's real default
+        // (`#I:#W#{?window_flags,#{window_flags}, }`,
+        // `options::DEFAULT_WINDOW_STATUS_FORMAT`) is now stored VERBATIM
+        // and the general format engine (`crate::format`) evaluates its
+        // `#{?cond,a,b}` conditional correctly on its own: an empty
+        // `window_flags` is falsy, so the conditional's else-branch (a
+        // single literal space) renders directly, keeping a tab's width
+        // stable across focus changes with no special-casing here (closes
+        // follow-ups #27/#70; superseded the SP6 Task 4 padding shim that
+        // used to live in this loop).
         let per_window_ctx = FormatCtx {
             session: ctx.session,
             window_index: w.index,
@@ -293,15 +300,11 @@ mod tests {
         }
     }
 
-    /// tmux's real default (`#I:#W#{?window_flags,#{window_flags}, }`)
-    /// isn't expressible by the `expand_format` subset without evaluating
-    /// its `#{?...}` conditional; winmux's stored default is the
-    /// expand_format-compatible `#I:#W#F`, plus a default-format-only
-    /// flagless one-space padding shim in `status_spans` (fix round 1) that
-    /// reproduces the conditional's else-branch — together byte-identical
-    /// to tmux's default rendering for flagged AND flagless windows. Tests
-    /// below alias the real constant so they exercise the REAL default path
-    /// (including the shim's `fmt == DEFAULT` comparison).
+    /// tmux's real default (`#I:#W#{?window_flags,#{window_flags}, }`) is
+    /// stored verbatim as of SP7 Task 1 — the general format engine
+    /// (`crate::format`) evaluates its `#{?...}` conditional directly, no
+    /// shim needed (closes follow-ups #27/#70). Tests below alias the real
+    /// constant so they exercise the REAL default path end to end.
     const DEFAULT_FMT: &str = crate::options::DEFAULT_WINDOW_STATUS_FORMAT;
 
     #[allow(clippy::too_many_arguments)]
@@ -385,9 +388,9 @@ mod tests {
                 ("1:powershell*".to_string(), Style { underline: true, ..base() }),
                 (" ".to_string(), base()),
                 // Flagless window on the DEFAULT-format path: one padding
-                // space (fix round 1 — matches tmux's real default
-                // `#{?window_flags,#{window_flags}, }` else-branch; the old
-                // pin `"2:logs"` predated the width-stability shim).
+                // space (tmux's real default's `#{?window_flags,
+                // #{window_flags}, }` else-branch, evaluated directly by the
+                // format engine — SP7 Task 1).
                 ("2:logs ".to_string(), base()),
             ]
         );
@@ -668,8 +671,8 @@ mod tests {
             vec![
                 (String::new(), base_style),
                 // Windows 0/1 are flagless on the DEFAULT-format path ->
-                // one padding space each (fix round 1; the old pins
-                // `"0:a"`/`"1:b"` predated the width-stability shim).
+                // one padding space each (the conditional's else-branch,
+                // evaluated directly by the format engine).
                 ("0:a ".to_string(), base_style),
                 ("|".to_string(), base_style),
                 ("1:b ".to_string(), base_style),
@@ -679,14 +682,13 @@ mod tests {
         );
     }
 
-    // ---- Fix round 1: width-stable default format (flagless padding) ----
+    // ---- width-stable default format (flagless padding, via the real conditional) ----
 
     /// tmux's real default `#I:#W#{?window_flags,#{window_flags}, }` emits
     /// ONE padding space when a window has NO flags, so a tab's width is
     /// stable across the most common transition (a window gaining/losing
-    /// `*`/`-` on focus change). The `#I:#W#F` default must reproduce that:
-    /// on the DEFAULT-format path only, an empty flags string is padded to
-    /// a single space before expansion.
+    /// `*`/`-` on focus change) -- the format engine evaluates this
+    /// conditional directly (SP7 Task 1), no special-casing in this module.
     /// windows: 0 "aa" current  -> flags "*" -> "0:aa*" (5 chars)
     ///          1 "bb" flagless -> flags " " -> "1:bb " (5 chars, SAME width)
     #[test]
@@ -715,13 +717,12 @@ mod tests {
         assert_eq!(spans2[3].0, "1:bb*");
     }
 
-    /// The one-space padding is a DEFAULT-format-path fidelity shim ONLY: a
-    /// CUSTOM format (even one that also ends in `#F`) gets the plain empty
-    /// flags string, exactly what `expand_format` substitutes -- no
-    /// invisible extra characters the user didn't write. (Real tmux with a
-    /// custom `#I:#W#F`-style format would also render `#F` empty here --
-    /// the padding lives in the DEFAULT format string's conditional, not in
-    /// `#{window_flags}` itself.)
+    /// The one-space padding lives entirely in the DEFAULT format string's
+    /// own `#{?window_flags,#{window_flags}, }` conditional -- a CUSTOM
+    /// format using the plain `#F` short code (not the conditional) gets the
+    /// plain empty flags string, exactly what real tmux's `#{window_flags}`/
+    /// `#F` substitutes, no invisible extra characters the user didn't
+    /// write.
     #[test]
     fn custom_format_flagless_window_not_padded() {
         let (ws, wcs) = default_partials();
