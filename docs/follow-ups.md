@@ -2117,3 +2117,35 @@ or correctness niceties, not known-active bugs.
     flake outside that specific trio doesn't misread it as a new
     regression. `CLAUDE.md`'s testing-conventions section has been updated
     accordingly in the same commit as this ticket.
+
+## Follow-ups from the open-source release pipeline (2026-07-11)
+
+90. **13 `server_proto` tests encode host-build-specific ConPTY/PowerShell
+    behavior and fail deterministically on GitHub-hosted Windows Server
+    runners; they self-skip there via `WINMUX_TESTS_SKIP_HOST_SENSITIVE`.**
+    Discovered standing up the GitHub Actions CI/release pipeline: the same
+    13 tests failed identically at `--test-threads=4` AND fully serial, so
+    this is environment variance, not the follow-up #89 contention class.
+    Two confirmed mechanisms, from the runner's own panic screen dumps:
+    (a) the hosted image's ConPTY strips a hosted process's `ESC k`
+    title escape and passes the payload through as literal text (the
+    dump shows `escknamedone-esck-check` printed in the pane and the
+    window still named `powershell`) — the same platform-variance class
+    as follow-up #84's DECSET finding, affecting the five
+    `allow_rename`/`esc_k` tests and any assertion that a real hosted
+    process can rename a window via `ESC k`; and (b) the image's
+    `powershell.exe` paints no logo banner, so a fresh pane's prompt
+    lands on pane row 0, and cursor-row predicates written against the
+    local banner offset (e.g. `focus_down_into_split_row`'s
+    `g.cursor().1 >= 13`, `copy_mode_vi_vs_emacs_tables`' `entry_row - 1`
+    — a usize underflow when `entry_row == 0`) can never hold — the
+    remaining eight tests (`focus_*`, `rotate_window_ctrl_o`,
+    `swap_pane_*`, `resize_rewraps_real_pane_content`). The gated tests
+    still run on developer machines (the env var is only set in
+    `.github/workflows/ci.yml`/`release.yml`), and
+    `tests/server_proto.rs::skip_host_sensitive`'s doc comment points
+    here. Proper fixes if someone wants the coverage back on hosted CI:
+    banner-independent predicates (measure the prompt row after attach
+    and assert relative to it) for group (b), and an ESC-k-relay
+    capability probe (mirroring `tests/pty_smoke.rs`'s DECSET pin
+    pattern) gating group (a).
