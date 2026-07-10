@@ -23,10 +23,17 @@ impl Grid {
     pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self;
     /// Feed raw VT bytes from the pane's ConPTY output.
     pub fn feed(&mut self, bytes: &[u8]);
-    /// Content is clipped (shrink) or padded with default cells (grow);
-    /// cursor is clamped into range. While in alt-screen mode the saved
-    /// primary buffer is ALSO clipped/padded in lockstep, so a subsequent
-    /// leave-alt restores a primary screen consistent with the new size.
+    /// **AMENDED (SP7, Task 2 — closes follow-up #47):** on the primary
+    /// (non-alt) screen, a column-WIDTH change now REFLOWS scrollback + the
+    /// live screen to the new width, tmux (`grid_reflow`)-style, instead of
+    /// clipping/padding — see "Reflow on resize" below. A row-COUNT-only
+    /// change still clips (shrink)/pads (grow), preserving the overlapping
+    /// top-left region, and leaves history untouched. The alternate screen
+    /// still NEVER reflows (tmux clears/redraws it) — any resize while
+    /// showing it keeps the original clip/pad behavior for BOTH axes, and
+    /// the saved primary buffer is ALSO clipped/padded in lockstep, so a
+    /// subsequent leave-alt restores a primary screen consistent with the
+    /// new size. Cursor is clamped into range in all cases.
     pub fn resize(&mut self, cols: u16, rows: u16);
     pub fn cols(&self) -> u16;
     pub fn rows(&self) -> u16;
@@ -90,9 +97,13 @@ impl Grid {
 - Each captured line is a `Vec<Cell>` exactly `cols` cells wide AT CAPTURE
   TIME. `view_cell`/`view_row_text` clip (extra columns read as blank) or
   pad (missing columns read as blank) a captured line lazily on read if the
-  grid's width has since changed — **no reflow** (documented divergence from
-  tmux ≥1.9, which does reflow; ticketed in `docs/follow-ups.md` at SP4
-  closeout).
+  grid's width has since changed. **SUPERSEDED (SP7, Task 2 — closes
+  follow-up #47):** this "no reflow" divergence from tmux ≥1.9 is fixed —
+  see "Reflow on resize" below. The clip/pad-on-read behavior described here
+  now only fires in the residual case where a captured line's width somehow
+  still differs from the current `cols` outside of a `resize` call (it
+  shouldn't in practice, since `reflow_to_width` rewrites every history line
+  to the current width immediately).
 - Eviction: once a push brings the scrollback length to `>= history_limit`,
   the oldest `max(1, history_limit / 10)` lines are dropped in one chunk
   (mirrors tmux's `grid_collect_history` batch-eviction, not evict-one-at-
@@ -133,7 +144,44 @@ row `index - history_len`.
 - `resize` while in alt mode also clips/pads the saved primary buffer (and
   clamps its saved cursor) in lockstep with the active alt buffer, so a
   later leave restores a primary screen consistent with the grid's current
-  dimensions.
+  dimensions. This is unconditional clip/pad on BOTH axes (never reflow) —
+  the alternate screen itself never reflows even on a width change (SP7
+  Task 2), since tmux clears/redraws the alt screen on resize rather than
+  reflowing it.
+
+**Reflow on resize (SP7, Task 2 — closes follow-up #47):** on the primary
+(non-alt) screen, `resize` reflows scrollback + the live screen whenever the
+column WIDTH changes (row-count-only changes are unaffected and still
+clip/pad, matching tmux: reflow is a width-axis operation only).
+- **Wrapped-row tracking:** a new private per-row `wrapped: bool` (tmux's
+  `GRID_LINE_WRAPPED`), one for each live-screen row and one carried on
+  every captured `HistLine`. Set ONLY at the instant the cursor auto-wraps
+  off the right margin while printing (consuming `wrap_pending`); cleared
+  on an explicit linefeed (`0x0A`) even if it was (stale-)true. Row
+  shifts (`scroll_up`/`scroll_down`/`insert_lines`/`delete_lines`, and
+  capture into `HistLine` on `scroll_up`) carry the flag along with the
+  row's cells; newly-blanked rows get `wrapped = false`.
+- **Algorithm (`grid_reflow`-equivalent):** the combined history+screen rows
+  are grouped into "logical lines" by following `wrapped` chains — a run of
+  `wrapped = true` rows (always fully used at the OLD width, since a row is
+  only ever marked wrapped once completely filled) followed by exactly one
+  `wrapped = false` terminal row, whose trailing never-written cells are
+  trimmed. Each logical line's content is re-split at the new width into
+  `ceil(len / new_cols)` rows (1 row for an empty line), every row but the
+  last marked wrapped. If the reflowed total needs more rows than the
+  screen has, the extra rows accumulate into `history` (oldest first,
+  subject to the normal `history_limit`/eviction rules — discarded outright
+  when `history_limit == 0`); if fewer, blank rows pad the tail (tmux:
+  `grid_reflow_add`).
+- **Cursor mapping** follows tmux's `grid_wrap_position`/
+  `grid_unwrap_position`: the cursor's offset within its OWN logical line is
+  preserved; a cursor sitting past that row's real content (trailing blank
+  padding) collapses to "end of the logical line" (tmux's `UINT_MAX`
+  sentinel); if the mapped position ends up scrolled into history (only
+  possible when eviction drops the cursor's own line), the cursor resets to
+  `(0, 0)` (tmux `screen_resize_cursor`).
+- Implemented entirely in `src/grid.rs` (`TermState::reflow_to_width`,
+  private); `Grid::resize`'s public signature is unchanged.
 
 **OSC title capture (`osc_dispatch`):**
 - OSC `0` (icon + title) and OSC `2` (title) both set the title: OSC

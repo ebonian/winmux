@@ -302,6 +302,30 @@ for the full current contract. This section is kept for historical reference
 only; everything below it describing scrollback-free/OSC-ignored MVP behavior
 is superseded.
 
+**FURTHER SUPERSEDED (SP7, Task 2 — closes follow-up #47):** `grid-v2`'s
+"no reflow" divergence note (below, and mirrored in
+`2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section) is itself
+now superseded. `Grid::resize`'s signature is UNCHANGED, but on the primary
+(non-alt) screen a column-WIDTH change now reflows scrollback + the live
+screen to the new width like tmux ≥1.9 (`grid_reflow`): wrapped-chain rows
+(tracked by a new private per-row `wrapped` flag — tmux's
+`GRID_LINE_WRAPPED` — set only when the cursor auto-wraps off the right
+margin, cleared on an explicit linefeed) are concatenated into logical
+lines, then re-split at the new width (`ceil(len / new_cols)` rows per
+logical line, all but the last marked wrapped); a row-COUNT-only change (or
+any resize while showing the alternate screen — the alt screen still NEVER
+reflows, tmux clears/redraws it instead) keeps the original clip/pad
+behavior. Cursor mapping follows tmux's `grid_wrap_position`/
+`grid_unwrap_position`: preserved by offset within its own logical line,
+collapsing to "end of the line" if it sat past real content, and resetting
+to `(0, 0)` if its line was itself evicted by the resize. See
+`docs/specs/2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` section
+for the amended prose (amended in the same commit as this note, even though
+that file sits outside this task's normal edit scope, because it — not this
+superseded section — is the contract's actual current authority on `resize`
+and `view_cell`'s history semantics, and leaving its "no reflow" claim
+uncorrected there would misdocument the real behavior).
+
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color { Default, Idx(u8), Rgb(u8, u8, u8) }

@@ -55,6 +55,17 @@ struct SavedCursor {
     autowrap: bool,
 }
 
+/// One captured scrollback line: cells at the width in effect when last
+/// (re)captured, plus whether it soft-wraps onto the line below it (tmux's
+/// `GRID_LINE_WRAPPED`). See `TermState::row_wrapped` for how the flag is
+/// set/cleared, and `TermState::reflow_to_width` for how chains of these are
+/// rejoined/re-split on a column-width resize.
+#[derive(Clone)]
+struct HistLine {
+    cells: Vec<Cell>,
+    wrapped: bool,
+}
+
 /// Emulator state; the vte performer. Separate from the Parser so `feed`
 /// can borrow the parser and this state disjointly.
 struct TermState {
@@ -75,14 +86,27 @@ struct TermState {
     /// The primary screen's cells + cursor state (position, SGR pen,
     /// autowrap -- DECSC/DECRC scope, per xterm's documentation of 1049),
     /// saved on entering the alt screen and restored on leaving it.
-    /// `None` when not in alt-screen mode.
-    saved_primary: Option<(Vec<Cell>, SavedCursor)>,
+    /// `None` when not in alt-screen mode. The saved primary's own
+    /// per-row wrapped flags travel alongside it (second tuple element) so
+    /// a later leave-alt restores a primary screen with correct wrap chains.
+    saved_primary: Option<(Vec<Cell>, Vec<bool>, SavedCursor)>,
     /// Scrollback: oldest line at the front. Each line is exactly `cols`
-    /// wide AT CAPTURE TIME -- width changes since capture are clipped/
-    /// padded lazily on read (`view_cell`), not reflowed.
-    history: VecDeque<Vec<Cell>>,
+    /// wide AT THE CURRENT WIDTH -- a column-width resize reflows every
+    /// history line (and the live screen) to the new width via
+    /// `TermState::reflow_to_width`, so lines are never stale-width between
+    /// reflows; row-count-only resizes leave history untouched (see
+    /// `resize`).
+    history: VecDeque<HistLine>,
     /// 0 = scrollback disabled (nothing is ever captured).
     history_limit: u32,
+    /// Per-live-screen-row soft-wrap flag, parallel to `cells` (indexed by
+    /// row): `true` iff this row's content continues onto the row below it
+    /// with no real newline in between (tmux's `GRID_LINE_WRAPPED`). Set
+    /// only at the instant the cursor auto-wraps off the right margin
+    /// (`Perform::print`, consuming `wrap_pending`); cleared on an explicit
+    /// linefeed (`Perform::execute` on `0x0A`). Reflow (`reflow_to_width`)
+    /// walks these chains to rejoin/re-split logical lines at a new width.
+    row_wrapped: Vec<bool>,
     /// Monotonic count of lines EVER pushed into scrollback (never
     /// decremented by eviction) — the stable "lines-ever-captured"
     /// coordinate system copy-mode selection anchors are pinned to (Task 3
@@ -118,6 +142,7 @@ impl TermState {
             saved_primary: None,
             history: VecDeque::new(),
             history_limit,
+            row_wrapped: vec![false; rows as usize],
             history_total: 0,
             title: None,
             title_changed: false,
@@ -134,12 +159,12 @@ impl TermState {
     /// disabled (`history_limit == 0`). Degenerate `history_limit == 1`:
     /// every push immediately hits the limit and evicts the line just
     /// pushed, so `history_len()` stays 0 -- effectively disabled.
-    fn push_history(&mut self, line: Vec<Cell>) {
+    fn push_history(&mut self, line: Vec<Cell>, wrapped: bool) {
         if self.history_limit == 0 {
             return;
         }
         self.history_total += 1;
-        self.history.push_back(line);
+        self.history.push_back(HistLine { cells: line, wrapped });
         if self.history.len() as u32 >= self.history_limit {
             let chunk = (self.history_limit / 10).max(1) as usize;
             for _ in 0..chunk.min(self.history.len()) {
@@ -164,7 +189,11 @@ impl TermState {
         // screen; `combined_index` is where view row `row` lands in it.
         let combined_index = history_len - scroll_back + row as u32;
         if combined_index < history_len {
-            self.history[combined_index as usize].get(col as usize).copied().unwrap_or_default()
+            self.history[combined_index as usize]
+                .cells
+                .get(col as usize)
+                .copied()
+                .unwrap_or_default()
         } else {
             let live_row = (combined_index - history_len) as u16;
             self.cells[self.idx(col, live_row)]
@@ -189,7 +218,8 @@ impl TermState {
             for row in 0..capture_n {
                 let start = row * cols;
                 let line = self.cells[start..start + cols].to_vec();
-                self.push_history(line);
+                let wrapped = self.row_wrapped[row];
+                self.push_history(line, wrapped);
             }
         }
         for row in top..=bottom {
@@ -198,10 +228,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -219,10 +251,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -288,10 +322,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -310,10 +346,12 @@ impl TermState {
                 for col in 0..cols {
                     self.cells[row * cols + col] = self.cells[src * cols + col];
                 }
+                self.row_wrapped[row] = self.row_wrapped[src];
             } else {
                 for col in 0..cols {
                     self.cells[row * cols + col] = Cell::default();
                 }
+                self.row_wrapped[row] = false;
             }
         }
     }
@@ -484,26 +522,211 @@ impl TermState {
         }
     }
 
-    /// Resize the active buffer, clipping/padding cell content. While in
-    /// alt-screen mode the saved primary buffer is ALSO resized (clipped/
-    /// padded) in lockstep, per spec, so a subsequent leave-alt restores a
+    /// Resize the active buffer. On the (non-alt-screen) PRIMARY screen, a
+    /// column-WIDTH change reflows scrollback + the live screen to the new
+    /// width like tmux >= 1.9 (`reflow_to_width`: long lines wrap into more
+    /// rows, soft-wrapped pairs rejoin when there's room); a row-COUNT-only
+    /// change keeps the original clip (shrink)/pad (grow) behavior,
+    /// preserving the overlapping top-left region and leaving history
+    /// untouched. The alternate screen NEVER reflows (tmux clears/redraws
+    /// it) -- any resize while `alt_screen` is active keeps the original
+    /// clip/pad behavior for both axes, and the saved primary buffer is
+    /// ALSO clipped/padded in lockstep, so a subsequent leave-alt restores a
     /// primary screen consistent with the new dimensions.
     fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
-        if let Some((primary, saved)) = &mut self.saved_primary {
-            *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
-            saved.col = saved.col.min(cols.saturating_sub(1));
-            saved.row = saved.row.min(rows.saturating_sub(1));
+        if self.alt_screen {
+            self.cells = resize_cells(&self.cells, self.cols, self.rows, cols, rows);
+            self.row_wrapped = resize_row_flags(&self.row_wrapped, self.rows, rows);
+            if let Some((primary, primary_wrapped, saved)) = &mut self.saved_primary {
+                *primary = resize_cells(primary, self.cols, self.rows, cols, rows);
+                *primary_wrapped = resize_row_flags(primary_wrapped, self.rows, rows);
+                saved.col = saved.col.min(cols.saturating_sub(1));
+                saved.row = saved.row.min(rows.saturating_sub(1));
+            }
+            self.cols = cols;
+            self.rows = rows;
+        } else {
+            if cols != self.cols {
+                self.reflow_to_width(cols);
+            }
+            if rows != self.rows {
+                self.cells = resize_cells(&self.cells, self.cols, self.rows, self.cols, rows);
+                self.row_wrapped = resize_row_flags(&self.row_wrapped, self.rows, rows);
+                self.rows = rows;
+            }
         }
-        self.cols = cols;
-        self.rows = rows;
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
         self.wrap_pending = false;
+    }
+
+    /// Reflow scrollback + the live screen to a new column width, tmux
+    /// (`grid_reflow`) style. Rows are grouped into "logical lines" by
+    /// following `row_wrapped`/`HistLine::wrapped` chains: a run of
+    /// wrapped=true rows (always fully used at the OLD width -- a row is
+    /// only ever marked wrapped at the instant it was filled edge-to-edge
+    /// and the cursor auto-wrapped off it) followed by exactly one
+    /// wrapped=false terminal row, whose trailing never-written cells are
+    /// trimmed. Each logical line's content is then re-split at the new
+    /// width into `ceil(len / new_cols)` rows (1 row for an empty line),
+    /// every row but the last marked wrapped. Row COUNT (`self.rows`) is
+    /// untouched here -- see the `resize` caller for the separate row-count
+    /// axis.
+    ///
+    /// Cursor mapping follows tmux's `grid_wrap_position`/
+    /// `grid_unwrap_position`: the cursor's offset within its OWN logical
+    /// line is preserved; a cursor sitting past that row's real content (in
+    /// trailing blank padding -- e.g. after `CUP` into blank space)
+    /// collapses to "end of the logical line", matching tmux's own
+    /// `UINT_MAX` sentinel. If the mapped position ends up scrolled into
+    /// history (only possible when eviction drops the cursor's own line),
+    /// the cursor resets to (0, 0) -- again matching tmux
+    /// (`screen_resize_cursor`).
+    fn reflow_to_width(&mut self, new_cols: u16) {
+        let old_cols = self.cols as usize;
+        let old_rows = self.rows as usize;
+        let new_cols_usz = (new_cols as usize).max(1);
+
+        // 1. Combined physical-row source: history (oldest first), then the
+        //    live screen, each paired with its wrapped flag.
+        let mut phys: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(self.history.len() + old_rows);
+        for h in &self.history {
+            phys.push((h.cells.clone(), h.wrapped));
+        }
+        for r in 0..old_rows {
+            let start = r * old_cols;
+            phys.push((self.cells[start..start + old_cols].to_vec(), self.row_wrapped[r]));
+        }
+
+        // 2. Group into logical lines: concatenate a wrapped=true chain,
+        //    trimming only the final (wrapped=false) row of each chain.
+        struct Logical {
+            content: Vec<Cell>,
+            phys_start: usize,
+            phys_end: usize, // exclusive
+        }
+        let mut logicals: Vec<Logical> = Vec::new();
+        let mut i = 0;
+        while i < phys.len() {
+            let start = i;
+            let mut content: Vec<Cell> = Vec::new();
+            loop {
+                let (row, wrapped) = &phys[i];
+                if *wrapped {
+                    content.extend_from_slice(row);
+                } else {
+                    let used = trimmed_len(row);
+                    content.extend_from_slice(&row[..used]);
+                }
+                let was_wrapped = *wrapped;
+                i += 1;
+                if !was_wrapped || i >= phys.len() {
+                    break;
+                }
+            }
+            logicals.push(Logical { content, phys_start: start, phys_end: i });
+        }
+
+        // 3. Locate the cursor's logical line + its offset within it.
+        let cursor_abs_row = self.history.len() + self.cursor_row as usize;
+        let cursor_li = logicals
+            .iter()
+            .position(|l| cursor_abs_row >= l.phys_start && cursor_abs_row < l.phys_end)
+            .unwrap_or(logicals.len() - 1);
+        let cursor_line_len = logicals[cursor_li].content.len();
+        let cursor_ax = {
+            let l = &logicals[cursor_li];
+            let offset_rows = cursor_abs_row - l.phys_start;
+            let is_terminal_row = cursor_abs_row + 1 == l.phys_end;
+            let accumulated = offset_rows * old_cols;
+            let row_len =
+                if is_terminal_row { trimmed_len(&phys[cursor_abs_row].0) } else { old_cols };
+            let cursor_col = self.cursor_col as usize;
+            if cursor_col >= row_len {
+                cursor_line_len
+            } else {
+                accumulated + cursor_col
+            }
+        };
+
+        // 4. Re-split every logical line's content at the new width,
+        //    recording the cursor's new absolute (row, col) along the way.
+        let mut new_phys: Vec<(Vec<Cell>, bool)> = Vec::new();
+        let mut new_cursor_row_abs = 0usize;
+        let mut new_cursor_col = 0u16;
+        for (li, l) in logicals.iter().enumerate() {
+            let len = l.content.len();
+            let num_rows = if len == 0 { 1 } else { 1 + (len - 1) / new_cols_usz };
+            let base = new_phys.len();
+            for r in 0..num_rows {
+                let s = r * new_cols_usz;
+                let e = (s + new_cols_usz).min(len);
+                let mut row = vec![Cell::default(); new_cols_usz];
+                row[..e - s].copy_from_slice(&l.content[s..e]);
+                new_phys.push((row, r + 1 < num_rows));
+            }
+            if li == cursor_li {
+                let idx = cursor_ax.min(len);
+                let mut row_local = idx / new_cols_usz;
+                let mut col_local = idx % new_cols_usz;
+                // Exact multiple of the new width: land on the LAST column
+                // of the last existing row rather than the first column of
+                // a row that doesn't exist.
+                if col_local == 0 && idx == len && len > 0 && row_local > 0 {
+                    row_local -= 1;
+                    col_local = new_cols_usz - 1;
+                }
+                row_local = row_local.min(num_rows - 1);
+                new_cursor_row_abs = base + row_local;
+                new_cursor_col = col_local as u16;
+            }
+        }
+
+        // 5. Pad with blank rows at the tail if reflow produced fewer total
+        //    rows than the screen needs (tmux: `grid_reflow_add` at the end).
+        while new_phys.len() < old_rows {
+            new_phys.push((vec![Cell::default(); new_cols_usz], false));
+        }
+        let hsize = new_phys.len() - old_rows;
+        let (new_history, new_screen) = new_phys.split_at(hsize);
+
+        // 6. Store history (capped at history_limit, keeping the NEWEST
+        //    entries; discarded entirely when scrollback is disabled, same
+        //    as `push_history`).
+        self.history.clear();
+        if self.history_limit > 0 {
+            let cap = self.history_limit as usize;
+            let start = new_history.len().saturating_sub(cap);
+            for (cells, wrapped) in &new_history[start..] {
+                self.history.push_back(HistLine { cells: cells.clone(), wrapped: *wrapped });
+            }
+        }
+
+        // 7. Store the live screen + its wrapped flags.
+        self.cells = vec![Cell::default(); new_cols_usz * old_rows];
+        self.row_wrapped = vec![false; old_rows];
+        for (r, (cells, wrapped)) in new_screen.iter().enumerate() {
+            let start = r * new_cols_usz;
+            self.cells[start..start + new_cols_usz].copy_from_slice(cells);
+            self.row_wrapped[r] = *wrapped;
+        }
+
+        // 8. Map the cursor: if it landed within the visible screen, carry
+        //    its position across; if reflow pushed its own line out into
+        //    history/eviction, reset to (0, 0) (tmux `screen_resize_cursor`).
+        if new_cursor_row_abs >= hsize {
+            self.cursor_row = (new_cursor_row_abs - hsize) as u16;
+            self.cursor_col = new_cursor_col;
+        } else {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
+
+        self.cols = new_cols;
     }
 }
 
@@ -523,6 +746,31 @@ fn resize_cells(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_r
     new_cells
 }
 
+/// Crop/pad a per-row boolean flag vector -- the `resize_cells` analog for
+/// `row_wrapped`/a saved primary's wrapped flags (one bool per row, not
+/// `cols` cells per row). Used only on the row-COUNT axis and for
+/// alt-screen resizes (the wrapped flags of newly-added rows are `false`);
+/// width-driven changes go through `reflow_to_width` instead.
+fn resize_row_flags(old: &[bool], old_rows: u16, new_rows: u16) -> Vec<bool> {
+    let mut v = vec![false; new_rows as usize];
+    let copy_rows = new_rows.min(old_rows) as usize;
+    v[..copy_rows].copy_from_slice(&old[..copy_rows]);
+    v
+}
+
+/// Length of `row` with trailing default (never-written) cells trimmed off
+/// -- lets reflow tell real printed content on a logical line's terminal
+/// row apart from unwritten padding. Non-terminal (wrapped) rows are never
+/// trimmed: by construction they were filled edge-to-edge before the cursor
+/// auto-wrapped off them.
+fn trimmed_len(row: &[Cell]) -> usize {
+    let mut n = row.len();
+    while n > 0 && row[n - 1] == Cell::default() {
+        n -= 1;
+    }
+    n
+}
+
 /// Read subparameter 0 of CSI param `idx`, or `default` if absent/empty.
 /// Does NOT map an explicit 0 to the default — callers apply `.max(1)`
 /// for movement commands.
@@ -536,6 +784,10 @@ fn param_or(params: &Params, idx: usize, default: u16) -> u16 {
 impl Perform for TermState {
     fn print(&mut self, c: char) {
         if self.wrap_pending && self.autowrap {
+            // The row we're leaving soft-wraps onto the row we're about to
+            // land on (tmux `GRID_LINE_WRAPPED`) -- mark it BEFORE
+            // `line_feed` moves `cursor_row` off it.
+            self.row_wrapped[self.cursor_row as usize] = true;
             self.cursor_col = 0;
             self.line_feed();
         }
@@ -567,8 +819,11 @@ impl Perform for TermState {
                 self.cursor_col = next.min(self.cols.saturating_sub(1));
             }
             0x0A => {
-                // LF
+                // LF: an explicit (hard) newline is never a soft wrap --
+                // clear the outgoing row's wrapped flag even if it was
+                // (stale-)true, so reflow never joins it to the next row.
                 self.wrap_pending = false;
+                self.row_wrapped[self.cursor_row as usize] = false;
                 self.line_feed();
             }
             0x0D => {
@@ -635,6 +890,7 @@ impl Perform for TermState {
                                 if !self.alt_screen {
                                     self.saved_primary = Some((
                                         self.cells.clone(),
+                                        self.row_wrapped.clone(),
                                         SavedCursor {
                                             col: self.cursor_col,
                                             row: self.cursor_row,
@@ -645,6 +901,7 @@ impl Perform for TermState {
                                     self.alt_screen = true;
                                 }
                                 self.erase_display(2);
+                                self.row_wrapped = vec![false; self.rows as usize];
                                 self.cursor_col = 0;
                                 self.cursor_row = 0;
                                 self.wrap_pending = false;
@@ -653,8 +910,11 @@ impl Perform for TermState {
                                 // (cells + cursor position/pen/autowrap),
                                 // no clearing. A spurious ?1049l while not
                                 // in alt mode is a no-op.
-                                if let Some((primary, saved)) = self.saved_primary.take() {
+                                if let Some((primary, primary_wrapped, saved)) =
+                                    self.saved_primary.take()
+                                {
                                     self.cells = primary;
+                                    self.row_wrapped = primary_wrapped;
                                     self.cursor_col = saved.col.min(self.cols.saturating_sub(1));
                                     self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
                                     self.style = saved.style;
@@ -1504,23 +1764,183 @@ mod tests {
 
     #[test]
     fn resize_clips_and_clamps() {
+        // A column-width change now REFLOWS (follow-up #47) instead of
+        // clipping -- this test was originally written for the pre-reflow
+        // clip/pad behavior and is updated here to the tmux-faithful
+        // result, hand-derived:
+        //
+        // Grid::new(5, 3, 0): row0 = "abc  " (terminal, unwrapped,
+        // trimmed_len=3), row1/row2 blank. history_limit=0 so no
+        // scrollback capture ever happens.
+        //
+        // resize(2, 2): width 5->2 triggers reflow (using the OLD row
+        // count, 3, before the row-count axis is touched):
+        //   logical line0 = "abc" (len 3) -> at width 2: ceil(3/2)=2 rows:
+        //     "ab" (wrapped=true), "c " (wrapped=false)
+        //   logical line1 = ""  (len 0) -> 1 row ""
+        //   logical line2 = ""  (len 0) -> 1 row ""
+        //   total = 4 physical rows, old_rows(3) needed -> hsize = 4-3 = 1:
+        //   the OLDEST row ("ab") overflows into history -- but
+        //   history_limit==0 discards it (matches "scrollback disabled"
+        //   semantics elsewhere: overflow that would scroll off is lost).
+        //   Remaining screen (3 rows) = ["c ", "", ""].
+        // Cursor was at (col=3, row=0); row0's cellused (terminal, trimmed)
+        // is 3, so col(3) >= cellused -> "end of logical line" (tmux's
+        // UINT_MAX sentinel) -> maps to local row 1 ("c " row), col 1 of
+        // line0's own 2 new rows -> global row 1 -> screen-local row 0
+        // (since hsize=1) -> post-reflow cursor = (col=1, row=0).
+        //
+        // Then the row-count axis (3->2) applies its OWN simple
+        // (non-history-aware) top-left clip: keep rows 0,1 ("c ", "  "),
+        // drop row2; cursor row 0 stays valid.
         let mut g = Grid::new(5, 3, 0);
         g.feed(b"abc"); // cursor at (3,0)
         g.resize(2, 2);
         assert_eq!(g.cols(), 2);
         assert_eq!(g.rows(), 2);
-        assert_eq!(g.cell(0, 0).ch, 'a');
-        assert_eq!(g.cell(1, 0).ch, 'b'); // 'c' clipped
-        assert_eq!(g.cursor(), (1, 0));   // clamped from (3,0)
+        assert_eq!(g.cell(0, 0).ch, 'c'); // "ab" scrolled off (history disabled: lost)
+        assert_eq!(g.cell(1, 0).ch, ' ');
+        assert_eq!(g.cursor(), (1, 0));
     }
 
     #[test]
     fn resize_grows_and_pads() {
+        // Widening also goes through reflow now (width changed 2->4), but
+        // "ab" never wrapped (row0 is a single terminal row, unwrapped) and
+        // the reflowed content (1 row, "ab" + padding) still fits inside
+        // the unchanged 2-row screen, so the visible result is identical to
+        // plain clip/pad padding.
         let mut g = Grid::new(2, 2, 0);
         g.feed(b"ab");
         g.resize(4, 3);
         assert_eq!(g.cell(0, 0).ch, 'a');
         assert_eq!(g.cell(1, 0).ch, 'b');
         assert_eq!(g.cell(3, 2).ch, ' '); // padded
+    }
+
+    /// Set only when the cursor auto-wraps at the right margin; cleared on
+    /// an explicit linefeed (RED test per the SP7 Task 2 brief).
+    #[test]
+    fn autowrap_sets_wrapped_flag_hard_newline_clears_it() {
+        let mut g = Grid::new(3, 3, 0);
+        // Fill row0 exactly (3 cols) -- wrap_pending is set but NOT yet
+        // consumed, so the flag isn't set until the NEXT print.
+        g.feed(b"abc");
+        assert!(!g.state.row_wrapped[0]);
+        // One more printable char consumes the pending wrap: row0 becomes a
+        // soft-wrap row, cursor lands on row1 col0.
+        g.feed(b"d");
+        assert!(g.state.row_wrapped[0]);
+        assert_eq!(g.cursor(), (1, 1));
+        assert_eq!(g.cell(0, 1).ch, 'd');
+
+        // Now force row1 to also look wrapped (as if from earlier content),
+        // then send a HARD newline from it: the flag must be cleared, not
+        // left stale.
+        g.state.row_wrapped[1] = true;
+        g.feed(b"\r\n");
+        assert!(!g.state.row_wrapped[1]);
+        // row0's wrap (a different row, from a real auto-wrap) is untouched.
+        assert!(g.state.row_wrapped[0]);
+    }
+
+    #[test]
+    fn narrow_resize_rewraps_long_line() {
+        // 80-col grid, one 100-char line: autowraps into exactly one
+        // wrapped pair -- row0 (80 chars, wrapped=true), row1 (20 chars,
+        // wrapped=false). 3 more blank rows below it (rows=5 total).
+        let mut g = Grid::new(80, 5, 100);
+        let line: String = (0..100).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        g.feed(line.as_bytes());
+        assert_eq!(g.history_len(), 0);
+        assert!(g.state.row_wrapped[0]);
+        assert!(!g.state.row_wrapped[1]);
+        assert_eq!(g.cursor(), (20, 1));
+
+        // Resize to 40 cols: logical line len=100 -> ceil(100/40)=3 rows:
+        // 40, 40, 20 chars (first 2 wrapped=true, last wrapped=false). But
+        // the 5 original physical rows (2 real + 3 blank) can't hold the
+        // now-3-row real content plus the 3 still-blank logical lines (6
+        // rows needed > 5 available), so the OLDEST row -- the line's
+        // first 40-char chunk -- overflows into scrollback history
+        // (captured since history_limit=100 is large enough).
+        g.resize(40, 5);
+        assert_eq!(g.cols(), 40);
+        assert_eq!(g.history_len(), 1);
+        assert!(g.state.history[0].wrapped); // chunk0 -> chunk1
+        assert!(g.state.row_wrapped[0]); // chunk1 (screen row0) -> chunk2
+        assert!(!g.state.row_wrapped[1]); // chunk2 (screen row1), terminal
+
+        let concatenated = g.view_row_text(1, 0).trim_end().to_string()
+            + g.view_row_text(0, 0).trim_end()
+            + g.view_row_text(0, 1).trim_end();
+        assert_eq!(concatenated, line);
+        // Cursor was at the end of the 100-char content -> still the end:
+        // chunk2 (screen row1, since chunk0 is now in history), col 20
+        // (100 - 2*40).
+        assert_eq!(g.cursor(), (20, 1));
+    }
+
+    #[test]
+    fn widen_resize_rejoins_soft_wrapped_rows() {
+        // A soft-wrapped pair rejoins into one row when widened enough.
+        let mut g = Grid::new(5, 4, 100);
+        g.feed(b"abcdefg"); // "abcde" (wrapped) + "fg" (terminal)
+        assert!(g.state.row_wrapped[0]);
+        g.resize(10, 4);
+        assert_eq!(row_str(&g, 0).trim_end(), "abcdefg");
+        assert!(!g.state.row_wrapped[0]); // single row now, not wrapped
+
+        // A HARD-newline pair must NOT rejoin, even though it also fits.
+        let mut h = Grid::new(5, 4, 100);
+        h.feed(b"abc\r\nde");
+        assert!(!h.state.row_wrapped[0]);
+        h.resize(10, 4);
+        assert_eq!(row_str(&h, 0).trim_end(), "abc");
+        assert_eq!(row_str(&h, 1).trim_end(), "de");
+    }
+
+    #[test]
+    fn reflow_preserves_scrollback_content_across_shrink_and_grow() {
+        // Round-trip 80 -> 40 -> 80 restores the original visible text
+        // exactly. Hand-derived: at 40 cols the 100-char line needs 3 rows
+        // instead of 2, overflowing its first 40-char chunk into
+        // scrollback (history_limit=1000, so it's captured, not
+        // discarded); widening back to 80 re-joins it into 2 rows again,
+        // exactly filling the original 5-row screen with zero left over in
+        // history -- narrowing then widening are exact inverses here.
+        let mut g = Grid::new(80, 5, 1000);
+        let line: String = (0..100).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        g.feed(line.as_bytes());
+        g.feed(b"\r\nsecond line\r\nthird");
+
+        g.resize(40, 5);
+        assert_eq!(g.history_len(), 1); // the 100-char line's first chunk
+
+        g.resize(80, 5);
+
+        assert_eq!(g.cols(), 80);
+        assert_eq!(g.history_len(), 0);
+        assert_eq!(row_str(&g, 0), line[0..80]);
+        assert_eq!(row_str(&g, 1).trim_end(), &line[80..100]);
+        assert_eq!(row_str(&g, 2).trim_end(), "second line");
+        assert_eq!(row_str(&g, 3).trim_end(), "third");
+        assert_eq!(g.cursor(), (5, 3));
+    }
+
+    #[test]
+    fn alt_screen_resize_does_not_reflow() {
+        // While showing the alternate screen, a column-width resize keeps
+        // the original clip/pad behavior (no reflow) -- content that would
+        // otherwise wrap into another row is simply clipped.
+        let mut g = Grid::new(5, 3, 100);
+        g.feed(b"\x1b[?1049h"); // enter alt screen
+        g.feed(b"abc");
+        g.resize(2, 3);
+        assert_eq!(g.cols(), 2);
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(1, 0).ch, 'b'); // 'c' clipped, NOT reflowed to row1
+        assert_eq!(g.cell(0, 1).ch, ' ');
+        assert_eq!(g.cell(1, 1).ch, ' ');
     }
 }
