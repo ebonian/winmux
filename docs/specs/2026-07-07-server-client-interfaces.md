@@ -248,6 +248,9 @@ impl Session {
     pub fn last_window(&mut self) -> bool;
     pub fn current_window(&self) -> &Window; pub fn current_window_mut(&mut self) -> &mut Window;
     pub fn window_by_pane(&mut self, pane: crate::layout::PaneId) -> Option<&mut Window>;
+    // Amendment (sub-project 6, Task 5, `swap-window`) -- see below.
+    pub fn window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>;
+    pub fn swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool;
 }
 ```
 
@@ -362,6 +365,68 @@ impl Session {
   `next_window`/`prev_window` are no-ops with a single window.
 - `last_window` swaps `current`/`last` (like `Layout::focus_last`); `false`
   if there is no `last` or it no longer exists.
+- **Amendment (sub-project 6, Task 5, `swap-window`):** two new `Session`
+  methods, both pure bookkeeping (no I/O), backing
+  `server::dispatch::exec_swap_window` (`## server-dispatch` section of the
+  sibling `command-config` contract). Full behavioral spec:
+  `docs/tmux-reference/windows-and-sessions.md` §swap-window.
+  - `window_relative(&self, from: WindowId, offset: i64) -> Option<WindowId>`:
+    the window `offset` slots after (positive) / before (negative) `from` in
+    INDEX order, WRAPPING at either end (`self.windows` is already
+    index-sorted by every mutator, so this is a plain modular walk over the
+    vector — the pure-data equivalent of tmux's `winlink_next_by_number`/
+    `winlink_previous_by_number` winlink-tree walk). `None` if `from` isn't
+    a live window in this session. A single-window session returns `from`
+    itself for any offset (0-step wrap). This is `swap-window`'s `-1`/`+1`
+    relative-target grammar (the user's real `bind -r "<" swap-window -d -t
+    -1` binding).
+  - `swap_windows(&mut self, src: WindowId, dst: WindowId, detach: bool) -> bool`:
+    exchanges `src`'s and `dst`'s `index` values in place (`self.windows`
+    stays sorted afterward) — each window OBJECT (id, name, layout,
+    `last_layout`, `auto_rename` state) keeps its own identity; only which
+    index it sits at trades places, mirroring tmux's actual mechanism
+    exactly ("the two winlinks stay at their indexes; their `->window`
+    pointers are exchanged") since winmux has no separate winlink type (the
+    `index` field on the id-keyed `Window` doubles as that identity here).
+    `false` (no-op, nothing changed) if `src == dst`, or either id isn't a
+    live window in this session — mirrors tmux's own "no-op success if both
+    winlinks already point at the same window" rule.
+    Also resolves `current`/`last`, since winmux tracks both by `WindowId`
+    (content) where tmux tracks them by winlink (slot/index) — the two only
+    coincide when a window's index never changes, which the swap explicitly
+    violates for `src`/`dst`. Let `flip(id)` map `src`↔`dst` and pass any
+    other id through unchanged:
+    - `detach == false` (no `-d`): tmux leaves `curw` (the SLOT pointer)
+      untouched, so whatever the slot now displays is a different window —
+      `current`/`last`, if they named `src` or `dst`, FLIP to the other id
+      (same slot, new content); anything else is untouched.
+    - `detach == true` (`-d` given): tmux calls `session_select(dst_session,
+      wl_dst->idx)` — select BY THE FIXED INDEX that was `dst`'s, which
+      post-swap is now occupied by `src`. When that reselect actually
+      changes the current slot (i.e. pre-swap `current != dst`) this makes
+      `src` the new `current`, and — mirroring `session_set_current`'s
+      "push the OLD curw onto the lastw stack" step — sets `last` to
+      `flip(current)` as it stood BEFORE this call (the same-slot post-swap
+      content of whichever window was current going in). **EXCEPT** (review
+      fix, Task 5 round 1): when pre-swap `current == dst`, the reselect
+      target (dst's original slot, now showing `src`) IS the current slot,
+      and `session_set_current` early-returns (`if (wl == s->curw) return
+      1;`, session.c:475-498) without touching curw or lastw — the whole
+      `-d` select is a no-op, so the bookkeeping degenerates to exactly the
+      no-`-d` rule above (`current` flips dst → src via the same
+      slot-content logic; `last` flips only if it named `src`/`dst`, and is
+      otherwise left untouched — never overwritten).
+    Tests: `model.rs`'s `swap_windows_exchanges_indices_keeps_ids` (pure
+    index exchange; unrelated `current` untouched, related `last` flips),
+    `swap_windows_without_detach_flips_current_to_other_window`,
+    `swap_windows_with_detach_keeps_focus_on_source_window`,
+    `swap_windows_detach_when_current_is_dst_preserves_last` /
+    `swap_windows_detach_when_current_is_dst_flips_src_named_last` (the
+    early-return case, round-1 review fix),
+    `swap_windows_same_id_or_unknown_id_is_noop`, and `window_relative_wraps`;
+    end to end, `tests/server_proto.rs`'s
+    `swap_window_relative_target_moves_current_window` /
+    `swap_window_without_d_keeps_focus_on_index`.
 
 **Implementation module:** `src/model.rs`, pure logic (no I/O, no Windows
 APIs, no threads) — unit-tested the same way as `src/layout.rs`. Depends
@@ -385,7 +450,7 @@ None of these new `Action` variants are dispatched by `src/app.rs` yet
 task wires them into `Registry`/`Session` (defined above) and the
 server/client loop.
 
-## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8)
+## `status` — status-line span builder (pure, Task 5; SIGNATURE AMENDED SP3 Task 8, SP6 Task 4)
 
 ```rust
 // status.rs
@@ -397,42 +462,87 @@ pub struct WindowEntry {
     pub zoomed: bool,
 }
 
-// SP3 Task 8 signature (styled spans; `StatusSpan`/its underline bool are
-// deleted — see the amended `render` section of 2026-07-06-mvp-interfaces.md
-// and the SP3 contract's `## render-styles` section):
+// SP6 Task 4 signature (status-justify, per-side styles, per-window
+// window-status-format/-current-format expansion, window-status-separator —
+// see the amendment below):
 pub fn status_spans(
-    left: &str,                                     // pre-expanded, pre-length-capped status-left text
+    left: &str,                                      // pre-expanded, pre-length-capped status-left text
+    left_style: &crate::style::PartialStyle,          // status-left-style
     windows: &[WindowEntry],
-    base: crate::grid::Style,                       // status-style applied to Style::default()
-    win_style: &crate::style::PartialStyle,         // window-status-style
-    win_current_style: &crate::style::PartialStyle, // window-status-current-style
+    ctx: &crate::options::FormatCtx,                  // session/pane/hostname/time; window_index/name/flags overridden per window
+    window_format: &str,                              // window-status-format (raw, NOT pre-expanded)
+    window_current_format: &str,                      // window-status-current-format (raw, NOT pre-expanded)
+    base: crate::grid::Style,                         // status-style applied to Style::default()
+    win_style: &crate::style::PartialStyle,           // window-status-style
+    win_current_style: &crate::style::PartialStyle,   // window-status-current-style
+    separator: &str,                                  // window-status-separator
+    justify: &str,                                    // status-justify: "left"/"centre"/"right"/"absolute-centre"
+    width: u16,                                        // terminal column count
+    right_len: usize,                                  // char count of the (already capped, already stripped) status-right text
 ) -> Vec<(String, crate::grid::Style)>;
+
+/// Strip `#[...]` inline style markers from `expand_format`-expanded text,
+/// keeping only the literal text — used for `status-right`, whose
+/// `render::StatusRow::right` field has only ONE style slot (no room for
+/// multiple inline-styled sub-runs the way `status_spans`'s returned `Vec`
+/// has for `left`/the window list).
+pub fn strip_style_markers(text: &str) -> String;
 ```
 
-**AMENDMENT (SP3 Task 8):** the original Task 5 signature was
+**AMENDMENT (SP3 Task 8, historical):** the original Task 5 signature was
 `status_spans(session_name: &str, windows: &[WindowEntry]) ->
 Vec<StatusSpan>`, hardcoding the `[<session>] ` prefix and an underline-only
-current-window marker. It now takes the ALREADY-EXPANDED `status-left` text
-(the server expands `[#S] ` — the default, which reproduces the old prefix
-exactly — via `options::expand_format` and caps it to `status-left-length`)
-plus the three style inputs, and returns fully resolved styles per span.
-`status.rs` remains pure bookkeeping with no dependency on `model.rs` (it
-now additionally depends on `grid::Style` + `style::PartialStyle`).
+current-window marker. SP3 Task 8 replaced it with the ALREADY-EXPANDED
+`status-left` text plus `base`/`win_style`/`win_current_style`, returning
+fully resolved styles per span.
 
-**Span composition** (index order as given in `windows`):
-1. One span with `left`'s text, styled `base`.
-2. Per window, one span `"<index>:<name><flags>"`, styled
-   `win_current_style.apply_to(base)` iff `current`, else
-   `win_style.apply_to(base)`. Note the current style layers over BASE —
-   NOT over `win_style` (tmux layers `window-status-current-style` over
-   `status-style` directly, so an fg set only in `window-status-style` never
-   leaks into the current tab). With default options (`win_style` empty,
-   `win_current_style` = `underscore`) this reproduces the old behavior
-   exactly: every span equals `base` except the current tab = `base` +
-   underline.
-3. Between window spans (not after the last one), a separate single-space
-   span `" "`, styled `base` — the separator never takes a window style,
-   even when the window before or after it is current.
+**AMENDMENT (SP6 Task 4 — status-justify, side styles, window formats,
+separator):** `status_spans` gained `left_style`, `ctx`, `window_format`,
+`window_current_format`, `separator`, `justify`, `width`, `right_len`.
+`status.rs` now depends on `crate::options` (`expand_format`/`FormatCtx`) —
+still pure (no I/O), `expand_format` is pure too.
+
+- **Per-window format expansion:** for each window, `window_current_format`
+  (if `current`) else `window_format` is expanded via `options::
+  expand_format` against a `FormatCtx` built from `ctx`'s
+  session/pane_index/hostname/now/pane_title fields, with `window_index`/
+  `window_name`/`window_flags` overridden to that window's own values
+  (`window_flags` uses the SAME flags-string rule as before — see below,
+  now fed through `#F` rather than hardcoded string concatenation).
+- **Inline `#[...]` style markers:** `expand_format` (SP6 Task 4 addition,
+  see the command-config contract amendment) passes `#[...]` blocks through
+  VERBATIM rather than interpreting them. `status.rs`'s private
+  `styled_runs` then splits each window's (and `left`'s) expanded text on
+  those markers into multiple `(text, Style)` sub-spans, additively layering
+  each marker's `style::parse_style`-parsed style onto that section's base
+  style (the tab's `win_style`/`win_current_style`-over-`base`, or `left`'s
+  `left_style`-over-`base`). Text with no markers — the common case —
+  yields exactly one span, byte-identical to the pre-Task-4 output. A
+  malformed marker (no closing `]`, or content `parse_style` rejects) is a
+  no-op/literal-text fallback, never a panic.
+- **`status-justify` positioning:** the window-list group's start column is
+  computed by a private `list_offset` helper per
+  `docs/tmux-reference/status-line-and-messages.md` §1.4's closed-form
+  offsets (winmux has no user-configurable centre/after content, so the
+  general 8-screen trim-order engine collapses to `left`/`centre`/`right`/
+  `absolute-centre` formulas keyed off `left`'s width, `right_len`, and the
+  list's own total width). The gap between `left` and the list start is
+  realized as a literal run of `base`-styled padding spaces inserted into
+  the returned `Vec` — `render::compose_back` is UNCHANGED, it still just
+  draws spans sequentially from column 0 (see `## render-styles`); this is
+  why no `render.rs`/`Scene`/`StatusRow` signature changed for this task. An
+  offset that would require NEGATIVE padding (overflow: `left` + list +
+  `right` wider than the terminal) clamps to zero pad rather than
+  overlapping — a documented simplification vs. tmux's `<`/`>` scroll
+  markers (out of scope).
+- **`window-status-separator`** replaces the old hardcoded `" "` between
+  tabs (still omitted after the last one).
+- **`status-right`'s style** is resolved by the SERVER directly
+  (`options::status_right_style().apply_to(base)`, assigned to
+  `render::StatusRow::right_style`) since `right` has only one style slot;
+  any `#[...]` markers `expand_format` leaves in the expanded `status-right`
+  text are removed via `strip_style_markers` before length-capping and
+  assignment, rather than leaking literal `#[...]` bytes onto the screen.
 
 **Flags string** for a window (exact rule — resolves the apparent ambiguity
 between "else a literal space" and "else empty" phrasings that circulated
@@ -441,20 +551,37 @@ during design; empty is correct and is what's implemented/tested):
 - Then `Z` appended if `zoomed`.
 - So: current+zoomed → `*Z`; last+zoomed → `-Z`; zoomed only (neither current
   nor last) → `Z` (e.g. window 2 named `logs` renders `2:logsZ`); no flags at
-  all → bare `<index>:<name>` (e.g. `2:logs`).
+  all → the flags string is empty.
+- **Default-format padding shim (SP6 Task 4 fix round 1):** when the
+  effective format for a tab IS `options::DEFAULT_WINDOW_STATUS_FORMAT`
+  (`#I:#W#F`, a public const), an EMPTY flags string is padded to a single
+  space before expansion — reproducing the `, }` else-branch of tmux's real
+  default `#I:#W#{?window_flags,#{window_flags}, }`, so a flagless window
+  renders `2:logs ` (trailing space) and every tab's width is stable across
+  focus changes, byte-identical to real tmux's default rendering. CUSTOM
+  formats are never padded — `#F` expands to the plain (possibly empty)
+  flags string, exactly what tmux's `#{window_flags}` would substitute.
+  Tests: `default_format_flagless_window_pads_one_space`,
+  `custom_format_flagless_window_not_padded`.
 
-**Render integration (as amended SP3 Task 8):** the server packs the
-returned spans into `render::StatusRow` (base fill, right text/style, top
-flag from `status-position`) — see the SP3 contract's `## render-styles`
-section; `render::compose_back` draws them left-to-right from column 0 with
-each span's own resolved style, then the right text right-aligned; the
-"total left length" used for right-truncation is the summed char count of
-all spans' text.
+**Render integration:** the server packs the returned spans into
+`render::StatusRow` (base fill, right text/style, top flag from
+`status-position`) — see the `## render-styles` section; `render::
+compose_back` draws them left-to-right from column 0 with each span's own
+resolved style, then the right text right-aligned; the "total left length"
+used for right-truncation is the summed char count of all spans' text
+(unchanged by this task — justify padding is just more span text).
 
-**Implementation module:** `src/status.rs`, pure (no I/O), unit-tested with
-exact expected `Vec<(String, Style)>` span vectors (mirrors `render.rs`'s
-exact-VT-bytes test style), including a `custom_styles_layering` test pinning
-the layered-over-base (not over-win_style) rule.
+**Implementation module:** `src/status.rs`, pure (no I/O, but now depends on
+`crate::options`), unit-tested with exact expected `Vec<(String, Style)>`
+span vectors (mirrors `render.rs`'s exact-VT-bytes test style), including
+`custom_styles_layering` (layered-over-base, not over-win_style),
+`status_justify_centre_positions_window_list`/`status_justify_right`/
+`status_justify_absolute_centre` (exact offset math), `window_status_format_
+expands_per_tab`/`window_status_current_format_used_for_current` (per-window
+expansion + format selection), `side_styles_layer_over_status_style`,
+`window_status_separator_respected`, and `inline_style_marker_in_window_
+format` (SP6 Task 4).
 
 ## `server` — headless multiplexer server (Task 6; `run` amended Task 7)
 

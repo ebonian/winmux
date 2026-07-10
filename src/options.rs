@@ -67,6 +67,18 @@ struct Spec {
     choices: &'static [&'static str],
 }
 
+/// The stored default for `window-status-format`/`window-status-current-format`
+/// (SP6 Task 4 — a documented deviation from tmux's literal
+/// `#I:#W#{?window_flags,#{window_flags}, }`, whose `#{?cond,a,b}`
+/// conditional the `expand_format` subset does not evaluate; see the
+/// deviation note on `default_value`'s arm). Public and named so
+/// `status::status_spans` can recognize "the effective format IS the
+/// default" and apply the one-space flagless padding shim that reproduces
+/// the conditional's `, }` else-branch — keeping the default rendering
+/// byte-identical to real tmux for BOTH flagged and flagless windows
+/// (width-stable across focus changes). Custom formats are never padded.
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
+
 const SPECS: &[Spec] = &[
     Spec { name: "prefix", kind: Kind::Key, choices: &[] },
     Spec { name: "base-index", kind: Kind::Number, choices: &[] },
@@ -84,6 +96,10 @@ const SPECS: &[Spec] = &[
     Spec { name: "message-style", kind: Kind::Style, choices: &[] },
     Spec { name: "pane-border-style", kind: Kind::Style, choices: &[] },
     Spec { name: "pane-active-border-style", kind: Kind::Style, choices: &[] },
+    // Active-pane border indication (Task 11, sub-project 6 wave 2):
+    // `off`/`colour`/`arrows`/`both`, default `colour` -- see the
+    // `pane_border_indicators` getter below.
+    Spec { name: "pane-border-indicators", kind: Kind::Choice, choices: &["off", "colour", "arrows", "both"] },
     Spec { name: "display-time", kind: Kind::Number, choices: &[] },
     Spec { name: "repeat-time", kind: Kind::Number, choices: &[] },
     Spec { name: "default-command", kind: Kind::Str, choices: &[] },
@@ -105,6 +121,11 @@ const SPECS: &[Spec] = &[
     Spec { name: "mode-style", kind: Kind::Style, choices: &[] },
     // Selection + paste buffers (Task 3, sub-project 4).
     Spec { name: "buffer-limit", kind: Kind::Number, choices: &[] },
+    // Drag word/line selection extension (Task 7, SP6 wave 2): promoted from
+    // a hardcoded constant (`" -_@"`, an inaccurate guess never verified
+    // against real tmux) to a real, settable `Str` option -- see the
+    // `word_separators()` getter's doc comment for the verified default.
+    Spec { name: "word-separators", kind: Kind::Str, choices: &[] },
     // Layout presets (Task 6, sub-project 4): `main-horizontal`/
     // `main-vertical`'s main-pane size.
     Spec { name: "main-pane-width", kind: Kind::Number, choices: &[] },
@@ -117,6 +138,38 @@ const SPECS: &[Spec] = &[
     Spec { name: "display-panes-time", kind: Kind::Number, choices: &[] },
     Spec { name: "display-panes-colour", kind: Kind::Str, choices: &[] },
     Spec { name: "display-panes-active-colour", kind: Kind::Str, choices: &[] },
+    // SP6 Task 2 (config compatibility): every remaining option the user's
+    // real `.tmux.conf` sets that winmux's table was missing entirely.
+    // `visual-activity`/`visual-bell`/`visual-silence`/`bell-action`/
+    // `monitor-activity`/`clock-mode-colour`/`window-status-bell-style` are
+    // accepted-and-stored but INERT (no alerts/bell/clock-mode subsystem
+    // exists yet -- same bucket as `mouse`/`history-limit` before Task 5/7
+    // wired them up; see `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    // `status-justify`/`status-left-style`/`status-right-style`/
+    // `window-status-format`/`window-status-current-format`/
+    // `window-status-separator` are typed+stored here; the status-bar
+    // RENDERING wiring for them (SP6 Task 4) lands in `src/status.rs`.
+    Spec { name: "visual-activity", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "visual-bell", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "visual-silence", kind: Kind::Choice, choices: &["off", "on", "both"] },
+    Spec { name: "bell-action", kind: Kind::Choice, choices: &["any", "none", "current", "other"] },
+    Spec { name: "monitor-activity", kind: Kind::Flag, choices: &[] },
+    // Bare colour token (like `display-panes-colour` above), not a full
+    // style string -- stored as `Str`, parsed on read via `style::parse_color`.
+    Spec { name: "clock-mode-colour", kind: Kind::Str, choices: &[] },
+    // clock-mode (Task 10, sub-project 6 wave 2): 12-/24-hour format
+    // selector. Real tmux's choice set is `12 | 24 | 12-with-seconds |
+    // 24-with-seconds` (`docs/tmux-reference/status-line-and-messages.md`
+    // `## 6. Clock mode`); winmux implements only the plain two, a
+    // documented task-scope simplification (no seconds-resolution display).
+    Spec { name: "clock-mode-style", kind: Kind::Choice, choices: &["12", "24"] },
+    Spec { name: "window-status-bell-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "window-status-separator", kind: Kind::Str, choices: &[] },
+    Spec { name: "status-justify", kind: Kind::Choice, choices: &["left", "centre", "right", "absolute-centre"] },
+    Spec { name: "status-left-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "status-right-style", kind: Kind::Style, choices: &[] },
+    Spec { name: "window-status-format", kind: Kind::Str, choices: &[] },
+    Spec { name: "window-status-current-format", kind: Kind::Str, choices: &[] },
 ];
 
 fn find_spec(name: &str) -> Option<&'static Spec> {
@@ -178,6 +231,7 @@ fn default_value(name: &str) -> Value {
             let s = "fg=green";
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
+        "pane-border-indicators" => Value::Choice("colour"),
         "display-time" => Value::Number(750),
         "repeat-time" => Value::Number(500),
         "default-command" => Value::Str("powershell.exe -NoLogo".to_string()),
@@ -196,11 +250,60 @@ fn default_value(name: &str) -> Value {
             Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
         }
         "buffer-limit" => Value::Number(50),
+        // Verified against `docs/tmux-reference/copy-mode-and-buffers.md`
+        // §6.4 / its options table (options-table.c:1262-1270): every
+        // printable non-alphanumeric ASCII character EXCEPT underscore.
+        // Plain space/tab are NOT in this string -- they're tmux's separate
+        // `WHITESPACE` class (`"\t "`, tmux.h:662), handled by
+        // `dispatch::char_class` as its own `CharClass::Whitespace` variant
+        // rather than folded into `Separator` here.
+        "word-separators" => Value::Str("!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~".to_string()),
         "main-pane-width" => Value::Number(80),
         "main-pane-height" => Value::Number(24),
         "display-panes-time" => Value::Number(1000),
         "display-panes-colour" => Value::Str("blue".to_string()),
         "display-panes-active-colour" => Value::Str("red".to_string()),
+        "visual-activity" => Value::Choice("off"),
+        "visual-bell" => Value::Choice("off"),
+        "visual-silence" => Value::Choice("off"),
+        "bell-action" => Value::Choice("any"),
+        "monitor-activity" => Value::Flag(false),
+        "clock-mode-colour" => Value::Str("blue".to_string()),
+        // Verified against the reference doc's options appendix
+        // (`## 9`/options-table.c:1342-1348): default is `24`, same as
+        // classic tmux's narrower 12/24-only choice set.
+        "clock-mode-style" => Value::Choice("24"),
+        "window-status-bell-style" => {
+            let s = "reverse";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "window-status-separator" => Value::Str(" ".to_string()),
+        "status-justify" => Value::Choice("left"),
+        "status-left-style" => {
+            let s = "default";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        "status-right-style" => {
+            let s = "default";
+            Value::Style(s.to_string(), style::parse_style(s).expect("valid default style"))
+        }
+        // SP6 Task 4 deviation from tmux's literal real default
+        // (`#I:#W#{?window_flags,#{window_flags}, }`): the `#{?cond,a,b}`
+        // conditional isn't in the `expand_format` subset (same "SP3
+        // simplification" bucket as status-right's `#{=21:pane_title}` gap —
+        // see that option's own deviation note above). `#I:#W#F` reproduces
+        // the identical rendered text for every FLAGGED window via the
+        // already-supported `#F` short code; the conditional's `, }`
+        // else-branch (one padding space when a window has NO flags, which
+        // keeps tab width stable across focus changes) is reproduced by a
+        // default-format-only shim in `status::status_spans` (fix round 1)
+        // that pads an empty flags string to a single space — see
+        // DEFAULT_WINDOW_STATUS_FORMAT's doc comment above. Net: the
+        // DEFAULT rendering is byte-identical to real tmux in all cases;
+        // only CUSTOM formats using `#{?...}` remain unsupported
+        // (docs/follow-ups.md #70).
+        "window-status-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
+        "window-status-current-format" => Value::Str(DEFAULT_WINDOW_STATUS_FORMAT.to_string()),
         _ => unreachable!("default_value called with unknown option: {name}"),
     }
 }
@@ -209,6 +312,12 @@ fn default_value(name: &str) -> Value {
 /// window overlays (see module docs).
 pub struct Options {
     values: BTreeMap<&'static str, Value>,
+    /// SP6 Task 2: free-form user (`@name`) options -- tmux accepts ANY
+    /// `@`-prefixed name at any scope, string-typed, no SPECS validation
+    /// (`commands-config-options-formats.md` §3.4). Keyed WITHOUT the `@`
+    /// (the prefix is stripped once at the `set`/`show` boundary). Starts
+    /// empty: there is no "default" for a user option, only "never set".
+    user_options: BTreeMap<String, String>,
 }
 
 impl Options {
@@ -219,7 +328,7 @@ impl Options {
         for spec in SPECS {
             values.insert(spec.name, default_value(spec.name));
         }
-        Options { values }
+        Options { values, user_options: BTreeMap::new() }
     }
 
     /// Set (or unset/append/toggle) one option.
@@ -233,6 +342,9 @@ impl Options {
     ///   missing value is `Err("bad value: <name> requires a value")`.
     /// - Unknown `name` -> `Err("unknown option: <name>")`.
     pub fn set(&mut self, name: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            return self.set_user_option(uname, value, append, unset);
+        }
         let spec = find_spec(name).ok_or_else(|| format!("unknown option: {name}"))?;
 
         if unset {
@@ -315,12 +427,75 @@ impl Options {
         Ok(())
     }
 
+    /// `set`'s `@name` branch (SP6 Task 2): any `@`-prefixed name is a
+    /// free-form user option -- string-typed, no SPECS validation, valid at
+    /// any scope (`commands-config-options-formats.md` §3.4). `uname` is
+    /// the name WITHOUT its `@` prefix (already stripped by the caller).
+    /// Otherwise mirrors the `Str`-kind rules on the built-in path: `-u`
+    /// removes it entirely (there is no default to fall back to -- an unset
+    /// user option is "never set", not a stored empty string); `-a` appends
+    /// onto the current value (or empty string if never set); control
+    /// characters are rejected in the same way and for the same reason as
+    /// every other `Str`-kind value (see the control-char rejection note on
+    /// this module's docs).
+    fn set_user_option(&mut self, uname: &str, value: Option<&str>, append: bool, unset: bool) -> Result<(), String> {
+        if unset {
+            self.user_options.remove(uname);
+            return Ok(());
+        }
+        if append {
+            let mut current = self.user_options.get(uname).cloned().unwrap_or_default();
+            current.push_str(value.unwrap_or(""));
+            if has_control_chars(&current) {
+                return Err(format!("bad value: {}", sanitize_control_chars(&current)));
+            }
+            self.user_options.insert(uname.to_string(), current);
+            return Ok(());
+        }
+        let value = value.ok_or_else(|| format!("bad value: @{uname} requires a value"))?;
+        if has_control_chars(value) {
+            return Err(format!("bad value: {}", sanitize_control_chars(value)));
+        }
+        self.user_options.insert(uname.to_string(), value.to_string());
+        Ok(())
+    }
+
     /// Format one option's current value back as tmux would print it
     /// (`show-options`/`show-options <name>`), or `None` for an unknown
-    /// name.
+    /// name. For an `@name` user option, `None` means "never set" -- the
+    /// SAME signal an unknown BUILT-IN name gives here (this is the
+    /// non-quiet-by-default tmux behavior: `show`'s caller, `server::
+    /// dispatch::exec_show_options`, already turns a `None` into `Err("unknown
+    /// option: {n}")` for ANY name with no further change needed). See
+    /// [`Options::show_user_option`] for the `-q`-aware variant that
+    /// distinguishes "never set" from "not a real option" with an
+    /// explicit quiet flag (commands-config-options-formats.md:255).
     pub fn show(&self, name: &str) -> Option<String> {
+        if let Some(uname) = name.strip_prefix('@') {
+            return self.user_options.get(uname).cloned();
+        }
         let value = self.values.get(name)?;
         Some(format_value(value))
+    }
+
+    /// `-q`-aware read of a user (`@name`) option, mirroring tmux's `show
+    /// -gqv "@foo"` idiom -- the canonical "read a user option, empty if
+    /// unset" pattern (commands-config-options-formats.md:255: "`show -gqv
+    /// "@foo"` when unset: prints nothing, returns success -- the `o == NULL
+    /// && *name == '@'` branch errors `invalid option: %s` only without
+    /// `-q`."). `name` may be given with or without its leading `@`.
+    /// `quiet`: `true` (tmux `-q`) -> an unset option is silently `Ok(None)`;
+    /// `false` -> `Err("invalid option: @name")`, matching tmux's default
+    /// (no `-q`) behavior. Not yet wired into `server::dispatch` (SP6 Task
+    /// 2 scope is the `Options`-level semantics; CLI `-v`/`-q` flag parsing
+    /// for `show-options` is future work).
+    pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String> {
+        let uname = name.strip_prefix('@').unwrap_or(name);
+        match self.user_options.get(uname) {
+            Some(v) => Ok(Some(v.clone())),
+            None if quiet => Ok(None),
+            None => Err(format!("invalid option: @{uname}")),
+        }
     }
 
     /// All known options, one `name value` line per option, sorted by name
@@ -333,6 +508,11 @@ impl Options {
             .iter()
             .map(|(name, value)| format!("{name} {}", format_value(value)))
             .collect();
+        // Only ACTUALLY-SET user options appear (there is no "default" row
+        // for an `@name` the way built-in options always have one).
+        for (uname, value) in &self.user_options {
+            lines.push(format!("@{uname} {}", quote_if_needed(value)));
+        }
         lines.sort();
         lines.join("\n")
     }
@@ -404,6 +584,22 @@ impl Options {
         self.style_ref("pane-active-border-style")
     }
 
+    /// `pane-border-indicators` (Task 11, sub-project 6 wave 2): how a
+    /// border cell shows which pane is active -- `off` (no indication),
+    /// `colour` (default; half-border cosmetic split on a 2-pane divider,
+    /// general per-cell adjacency colouring otherwise), `arrows` (four
+    /// glyphs on the active pane's own border, no colouring), `both` (both).
+    /// See `render::BorderIndicators`, which this maps onto 1:1.
+    pub fn pane_border_indicators(&self) -> crate::render::BorderIndicators {
+        use crate::render::BorderIndicators;
+        match self.values.get("pane-border-indicators") {
+            Some(Value::Choice("off")) => BorderIndicators::Off,
+            Some(Value::Choice("arrows")) => BorderIndicators::Arrows,
+            Some(Value::Choice("both")) => BorderIndicators::Both,
+            _ => BorderIndicators::Colour,
+        }
+    }
+
     pub fn display_time(&self) -> Duration {
         Duration::from_millis(self.number("display-time") as u64)
     }
@@ -446,6 +642,21 @@ impl Options {
     /// position indicator uses this yet; selection highlighting is Task 3).
     pub fn mode_style(&self) -> &PartialStyle {
         self.style_ref("mode-style")
+    }
+
+    /// `word-separators` (Task 7, SP6 wave 2): the character class boundary
+    /// double-click word selection (`select_word_at`) and continued-drag
+    /// word-extension (`dispatch::move_drag_cursor`) expand to. tmux default
+    /// (verified against `docs/tmux-reference/copy-mode-and-buffers.md`
+    /// §6.4's options table, NOT the task brief's unverified `" -_@"`
+    /// guess): every printable non-alphanumeric ASCII character except `_`
+    /// -- so alphanumerics+`_` form one class ("word chars"), a run of this
+    /// string's characters forms another (a run of separator punctuation is
+    /// itself a selectable "word"), and plain space/tab are a third,
+    /// separate whitespace class (tmux's `WHITESPACE`, never part of this
+    /// option's value) -- see `dispatch::CharClass`/`char_class`.
+    pub fn word_separators(&self) -> &str {
+        self.str_ref("word-separators")
     }
 
     /// Max AUTOMATIC paste buffers (Task 3, sub-project 4) before
@@ -509,6 +720,105 @@ impl Options {
     /// and the design spec's `## 9. automatic-rename` section.
     pub fn automatic_rename(&self) -> bool {
         self.flag("automatic-rename")
+    }
+
+    /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2): how an
+    /// activity/bell/silence alert is shown (`off`/`on`/`both` -- `both`
+    /// means visual AND audible). Accepted-and-stored but INERT: no
+    /// alerts/bell subsystem exists yet (`docs/follow-ups.md`-tracked; see
+    /// `.superpowers/sdd/sp6-gap-analysis.md` §A).
+    pub fn visual_activity(&self) -> &'static str {
+        self.choice("visual-activity")
+    }
+
+    pub fn visual_bell(&self) -> &'static str {
+        self.choice("visual-bell")
+    }
+
+    pub fn visual_silence(&self) -> &'static str {
+        self.choice("visual-silence")
+    }
+
+    /// `bell-action` (SP6 Task 2): which window(s) a bell alert routes to
+    /// (`any`/`none`/`current`/`other`). Accepted-and-stored but INERT, same
+    /// bucket as the `visual-*` getters above.
+    pub fn bell_action(&self) -> &'static str {
+        self.choice("bell-action")
+    }
+
+    /// `monitor-activity` (SP6 Task 2): per-window activity monitoring
+    /// on/off. Accepted-and-stored but INERT (no activity tracking exists
+    /// yet).
+    pub fn monitor_activity(&self) -> bool {
+        self.flag("monitor-activity")
+    }
+
+    /// `clock-mode-colour` (SP6 Task 2): the big-clock overlay's colour.
+    /// Accepted-and-stored but INERT (clock-mode itself does not exist).
+    /// Same fallback-on-unparseable-stored-value pattern as
+    /// [`Options::display_panes_colour`].
+    pub fn clock_mode_colour(&self) -> Color {
+        style::parse_color(&self.str_ref("clock-mode-colour").to_ascii_lowercase()).unwrap_or(Color::Idx(4))
+    }
+
+    /// `clock-mode-style` (Task 10, sub-project 6 wave 2): `true` = `12`
+    /// (`%l:%M ` + `AM`/`PM`), `false` = the `24` default (`%H:%M`) -- see
+    /// `server::format_clock`, which this selects between.
+    pub fn clock_mode_style_12(&self) -> bool {
+        matches!(self.values.get("clock-mode-style"), Some(Value::Choice("12")))
+    }
+
+    /// `window-status-bell-style` (SP6 Task 2): style for a window tab with
+    /// an unseen bell. Accepted-and-stored but INERT (no bell-state tracking
+    /// exists yet).
+    pub fn window_status_bell_style(&self) -> &PartialStyle {
+        self.style_ref("window-status-bell-style")
+    }
+
+    /// `window-status-separator` (SP6 Task 2): literal text between window
+    /// tabs in the status bar. Typed+stored here; `status.rs`'s tab-join
+    /// wiring is Task 4.
+    pub fn window_status_separator(&self) -> &str {
+        self.str_ref("window-status-separator")
+    }
+
+    /// `status-justify` (SP6 Task 2): window-list placement within the
+    /// status bar (`left`/`centre`/`right`/`absolute-centre`). Typed+stored
+    /// here; `status.rs`'s tab-placement wiring is Task 4.
+    pub fn status_justify(&self) -> &'static str {
+        self.choice("status-justify")
+    }
+
+    /// `status-left-style`/`status-right-style` (SP6 Task 2): per-side style
+    /// layered over `status-style`. Typed+stored here; `status.rs`'s
+    /// per-side layering wiring is Task 4.
+    pub fn status_left_style(&self) -> &PartialStyle {
+        self.style_ref("status-left-style")
+    }
+
+    pub fn status_right_style(&self) -> &PartialStyle {
+        self.style_ref("status-right-style")
+    }
+
+    /// `window-status-format`/`window-status-current-format` (SP6 Task 2,
+    /// rendering wired in Task 4): per-window tab format-string templates,
+    /// expanded per window by `status::status_spans` via `expand_format`.
+    /// Default `#I:#W#F` -- see the deviation note on this option's
+    /// `default_value` arm for why it isn't tmux's literal
+    /// `#{?window_flags,...}` string.
+    pub fn window_status_format(&self) -> &str {
+        self.str_ref("window-status-format")
+    }
+
+    pub fn window_status_current_format(&self) -> &str {
+        self.str_ref("window-status-current-format")
+    }
+
+    fn choice(&self, name: &str) -> &'static str {
+        match self.values.get(name) {
+            Some(Value::Choice(c)) => c,
+            _ => unreachable!("{name} is always Choice"),
+        }
     }
 
     fn number(&self, name: &str) -> u32 {
@@ -690,6 +1000,25 @@ pub fn expand_format(fmt: &str, ctx: &FormatCtx) -> String {
                 Some('T') => {
                     chars.next();
                     out.push_str(ctx.pane_title);
+                }
+                Some('[') => {
+                    // Inline style marker (`#[fg=white]`, ...): expand_format
+                    // does text substitution only -- `#[...]` blocks are
+                    // interpreted by the RENDERER's span builder
+                    // (`status::styled_runs`, SP6 Task 4), not here, so they
+                    // must survive expansion byte-for-byte. Copied verbatim,
+                    // including the brackets; an unterminated marker (no
+                    // closing `]`) is copied to end-of-string rather than
+                    // silently dropped -- no well-formed template hits this.
+                    chars.next(); // consume '['
+                    out.push('#');
+                    out.push('[');
+                    for c2 in chars.by_ref() {
+                        out.push(c2);
+                        if c2 == ']' {
+                            break;
+                        }
+                    }
                 }
                 Some('{') => {
                     chars.next();
@@ -1002,6 +1331,21 @@ mod tests {
         }
     }
 
+    /// Task 10 (clock-mode): `clock-mode-style`'s default and `set`
+    /// round-trip. `Choice`-kind validation rejects an out-of-set value
+    /// (`12-with-seconds` is a real tmux choice this task deliberately
+    /// doesn't implement -- see the `SPECS` entry's doc comment).
+    #[test]
+    fn clock_mode_style_getter_and_roundtrip() {
+        let mut o = Options::new();
+        assert!(!o.clock_mode_style_12());
+        o.set("clock-mode-style", Some("12"), false, false).unwrap();
+        assert!(o.clock_mode_style_12());
+        o.set("clock-mode-style", Some("24"), false, false).unwrap();
+        assert!(!o.clock_mode_style_12());
+        assert!(o.set("clock-mode-style", Some("12-with-seconds"), false, false).is_err());
+    }
+
     #[test]
     fn copy_mode_getters() {
         let mut o = Options::new();
@@ -1047,6 +1391,93 @@ mod tests {
         assert_eq!(o.buffer_limit(), 50);
         o.set("buffer-limit", Some("10"), false, false).unwrap();
         assert_eq!(o.buffer_limit(), 10);
+    }
+
+    /// SP6 Task 2: `set -g @yank_action 'copy-pipe'` stores; `show`
+    /// retrieves it; `-u` clears it back to "never set" (no default to fall
+    /// back to). `show_user_option`'s `-q` semantics (doc citation:
+    /// commands-config-options-formats.md:255): a never-set user option is
+    /// silent (`Ok(None)`) when quiet, `Err("invalid option: ...")` when not.
+    #[test]
+    fn user_option_set_show_roundtrip() {
+        let mut o = Options::new();
+        // Unknown @-name before it's ever set: same "unknown" signal a
+        // built-in unknown name gives (`show` returns `None`).
+        assert_eq!(o.show("@yank_action"), None);
+
+        o.set("@yank_action", Some("copy-pipe"), false, false).unwrap();
+        assert_eq!(o.show("@yank_action"), Some("copy-pipe".to_string()));
+        assert_eq!(o.show_user_option("@yank_action", false), Ok(Some("copy-pipe".to_string())));
+        assert_eq!(o.show_user_option("yank_action", false), Ok(Some("copy-pipe".to_string())), "leading @ is optional");
+
+        // Append.
+        o.set("@yank_action", Some("-and-cancel"), true, false).unwrap();
+        assert_eq!(o.show("@yank_action"), Some("copy-pipe-and-cancel".to_string()));
+
+        // A DIFFERENT, never-set user option: quiet read is silent;
+        // non-quiet read errors like tmux.
+        assert_eq!(o.show_user_option("@unset_thing", true), Ok(None));
+        assert_eq!(o.show_user_option("@unset_thing", false), Err("invalid option: @unset_thing".to_string()));
+
+        // Control chars rejected, same rule as every other Str-kind value.
+        assert_eq!(
+            o.set("@evil", Some("a\x1bb"), false, false),
+            Err("bad value: a?b".to_string())
+        );
+
+        // `-u` clears it back to "never set" -- NOT an empty string.
+        o.set("@yank_action", None, false, true).unwrap();
+        assert_eq!(o.show("@yank_action"), None);
+        assert_eq!(o.show_user_option("@yank_action", true), Ok(None));
+    }
+
+    /// SP6 Task 2: every option added to close the user's real `.tmux.conf`
+    /// gap list -- defaults verified against
+    /// `docs/tmux-reference/commands-config-options-formats.md`'s options
+    /// appendix, plus a basic set/get round trip for each.
+    #[test]
+    fn sp6_config_compat_options_defaults_and_roundtrip() {
+        let mut o = Options::new();
+        assert_eq!(o.visual_activity(), "off");
+        assert_eq!(o.visual_bell(), "off");
+        assert_eq!(o.visual_silence(), "off");
+        assert_eq!(o.bell_action(), "any");
+        assert!(!o.monitor_activity());
+        assert_eq!(o.clock_mode_colour(), Color::Idx(4)); // blue
+        let bell_style = o.window_status_bell_style().apply_to(crate::grid::Style::default());
+        assert!(bell_style.reverse);
+        assert_eq!(o.window_status_separator(), " ");
+        assert_eq!(o.status_justify(), "left");
+        // `status-left-style`/`status-right-style` default to the literal
+        // tmux "default" style term -- a no-op that leaves the base cell
+        // untouched (style.rs's `default_term_resets_everything`).
+        let base = crate::grid::Style { fg: Color::Idx(3), ..crate::grid::Style::default() };
+        assert_eq!(o.status_left_style().apply_to(base), base);
+        assert_eq!(o.status_right_style().apply_to(base), base);
+        // SP6 Task 4: default changed from tmux's literal
+        // `#{?window_flags,#{window_flags}, }` (not expressible by the
+        // `expand_format` subset) to the equivalent-for-flagged-windows
+        // `#I:#W#F` -- see the `default_value` deviation note.
+        assert_eq!(o.window_status_format(), "#I:#W#F");
+        assert_eq!(o.window_status_current_format(), "#I:#W#F");
+
+        o.set("visual-activity", Some("both"), false, false).unwrap();
+        assert_eq!(o.visual_activity(), "both");
+        o.set("bell-action", Some("current"), false, false).unwrap();
+        assert_eq!(o.bell_action(), "current");
+        o.set("monitor-activity", Some("on"), false, false).unwrap();
+        assert!(o.monitor_activity());
+        o.set("clock-mode-colour", Some("green"), false, false).unwrap();
+        assert_eq!(o.clock_mode_colour(), Color::Idx(2));
+        assert!(!o.clock_mode_style_12()); // default 24
+        o.set("window-status-separator", Some("|"), false, false).unwrap();
+        assert_eq!(o.window_status_separator(), "|");
+        o.set("status-justify", Some("centre"), false, false).unwrap();
+        assert_eq!(o.status_justify(), "centre");
+        o.set("status-right-style", Some("fg=white bg=black"), false, false).unwrap();
+        let applied = o.status_right_style().apply_to(crate::grid::Style::default());
+        assert_eq!(applied.fg, Color::Idx(7));
+        assert_eq!(applied.bg, Color::Idx(0));
     }
 
     #[test]
@@ -1126,6 +1557,18 @@ mod tests {
         // same as an unset `#{...}` form, not a literal placeholder.
         let empty = ctx("s", sample_time());
         assert_eq!(expand_format("#T", &empty), "");
+    }
+
+    /// SP6 Task 4: `#[...]` inline style markers are text-substitution's
+    /// business only in that they must NOT be interpreted/eaten here --
+    /// they pass through byte-for-byte so `status::styled_runs` can parse
+    /// them afterward into styled spans. An unterminated marker (no closing
+    /// `]`) is copied verbatim to end-of-string rather than dropped.
+    #[test]
+    fn expand_inline_style_marker_passthrough() {
+        let c = ctx("s", sample_time());
+        assert_eq!(expand_format("#I #[fg=white]#W", &c), "1 #[fg=white]bash");
+        assert_eq!(expand_format("#[fg=white", &c), "#[fg=white");
     }
 
     #[test]

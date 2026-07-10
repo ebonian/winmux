@@ -19,6 +19,7 @@
 //! object, so the resolution logic (`resolve_session_name`/
 //! `resolve_window_target`/`resolve_pane_target`) is shared verbatim.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -36,12 +37,13 @@ use crate::options::FormatCtx;
 use crate::protocol::ServerMsg;
 
 use super::{
-    advance_click_run, anchor_key_now, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key, send_msg,
-    spawn_pane, system_time_parts, ChooseTreeState, ChooseTreeView, ClientId, ClientMode, ClientState,
-    ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PromptKind, SearchPrompt, SearchState, SelState,
-    Server, TreeTarget, MONTHS, MOUSE_WHEEL_STEP,
+    advance_click_run, anchor_key_now, format_clock, key_to_view, pane_digit_entries, resolve_tree_sel, sel_key,
+    send_msg, spawn_pane, system_time_parts, AutoscrollState, ChooseTreeState, ChooseTreeView, ClientId, ClientMode,
+    ClientState, ClockState, ConfigCandidate, CopyState, DisplayPanesState, MouseDrag, PaneRuntime, PreviewMode,
+    PromptKind, SearchPrompt, SearchState, SelKind, SelState, Server, TreeTarget, MONTHS,
+    MOUSE_DRAG_AUTOSCROLL_INTERVAL, MOUSE_WHEEL_STEP,
 };
-use crate::grid::Grid;
+use crate::grid::{Cell, Grid, Style};
 use std::time::Duration;
 
 /// Abbreviated C-locale English weekday names, indexed by
@@ -198,6 +200,45 @@ fn resolve_pane(window: &Window, spec: Option<&str>) -> Result<PaneId, String> {
     panes.get(idx).copied().ok_or_else(|| format!("pane not found: {s}"))
 }
 
+/// `swap-window`'s `-s`/`-t` target grammar (SP6 Task 5,
+/// `windows-and-sessions.md` §swap-window/§"Target resolution"): `None` ->
+/// `session.current`; a bare `+N`/`-N` (N optional, default 1) -> a relative
+/// winlink offset via [`Session::window_relative`], WRAPPING; a leading `:`
+/// (`:N`, tmux's "index N in the current session" form) is stripped before
+/// falling back to [`resolve_window`]'s existing absolute-index/name
+/// grammar. No cross-session support (same-session-only, mirroring
+/// `move-window`'s documented simplification) -- a bare `session:window`
+/// target isn't split here at all; the whole string is resolved as a window
+/// spec within the CALLER's already-chosen session.
+fn resolve_swap_window_target(session: &Session, spec: Option<&str>) -> Result<WindowId, String> {
+    let Some(raw) = spec else { return Ok(session.current) };
+    let stripped = raw.strip_prefix(':').unwrap_or(raw);
+    if let Some(offset) = parse_relative_offset(stripped) {
+        return session
+            .window_relative(session.current, offset)
+            .ok_or_else(|| format!("window not found: {raw}"));
+    }
+    resolve_window(session, Some(stripped))
+}
+
+/// Parse a bare `+N`/`-N` winlink-offset token (`N` optional, defaulting to
+/// magnitude 1, per cmd-find.c:396-407's "`+`/`-` alone mean 1"). `None` for
+/// anything not shaped like a signed offset (falls through to
+/// [`resolve_window`]'s absolute-index/name grammar instead).
+fn parse_relative_offset(s: &str) -> Option<i64> {
+    let (sign, digits) = if let Some(d) = s.strip_prefix('+') {
+        (1i64, d)
+    } else if let Some(d) = s.strip_prefix('-') {
+        (-1i64, d)
+    } else {
+        return None;
+    };
+    if digits.is_empty() {
+        return Some(sign);
+    }
+    digits.parse::<i64>().ok().map(|n| sign * n)
+}
+
 /// Convert a `SystemTime` to a local-time `SYSTEMTIME` (carrying
 /// `wDayOfWeek`) for the CLI `ls` command's tmux-style creation-time
 /// formatting. Moved verbatim from the deleted `cli_exec.rs`.
@@ -233,6 +274,28 @@ fn format_ctime(t: SystemTime) -> String {
 
 fn is_bare(raw: &RawCmd, names: &[&str]) -> bool {
     raw.args.is_empty() && names.contains(&raw.name.as_str())
+}
+
+/// SP6 Task 2: expand a leading `~` (bare, or `~/...`/`~\...`) to
+/// `%USERPROFILE%`, mirroring tmux's parse-time tilde expansion
+/// (`commands-config-options-formats.md` §2.6) for the one path winmux
+/// resolves it for -- a runtime `source-file` argument (`execute_source_file_
+/// headless`'s only caller). `~user` (a DIFFERENT user's home directory) is
+/// deliberately NOT supported (no passwd database on Windows) and is left
+/// untouched, same as any other non-`~`-prefixed path. If `USERPROFILE`
+/// isn't set, the path is left untouched too (the subsequent file-open
+/// simply fails with its own "not found"-shaped error, same as tmux's own
+/// unresolvable-`~` token error).
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("USERPROFILE").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            return format!("{home}\\{rest}");
+        }
+    }
+    path.to_string()
 }
 
 /// `find-window` (Task 7, sub-project 4) content-search predicate:
@@ -542,19 +605,65 @@ fn edit_line_buf(buf: &mut String, b: u8) -> LineEdit {
     }
 }
 
-// ---- mouse (Task 5, sub-project 4) ----
+// ---- mouse (Task 5, sub-project 4; word-separators + drag extension Task 7, SP6 wave 2) ----
 
-/// tmux's default `word-separators` option value (` -_@`), hardcoded per the
-/// task brief -- no `word-separators` option exists in the registry yet (a
-/// documented v1 simplification, alongside the existing `copy-next-word`/
-/// `copy-previous-word` motions' own whitespace-only word notion above,
-/// which double-click word selection intentionally does NOT reuse: tmux's
-/// real double-click uses `word-separators`, not the plain-whitespace rule
-/// those cursor motions use).
-const WORD_SEPARATORS: &str = " -_@";
+/// Which of tmux's three word-motion classes a character falls into
+/// (`docs/tmux-reference/copy-mode-and-buffers.md` §6.4's "vim-like 3-class
+/// model: whitespace / separators / other"): `Whitespace` (tmux's
+/// `WHITESPACE` = `"\t "`, always its own class regardless of the
+/// `word-separators` option), `Separator` (any character in the
+/// `word-separators` option's value -- a RUN of separator punctuation is
+/// itself a selectable "word", same as a run of word characters), and `Word`
+/// (everything else: alphanumerics + `_`, since `word-separators`'s tmux
+/// default excludes `_`). Double-click word selection
+/// (`select_word_at`/[`word_bounds_at`]) and the Task 7 drag-extension snap
+/// (`move_drag_cursor`) both expand to the maximal run of the SAME class as
+/// the reference character -- NOT the plain-whitespace-only rule
+/// `copy-next-word`/`copy-previous-word` (above) use, which is a documented,
+/// intentional divergence between winmux's two independent "word" notions
+/// (see those actions' own call sites).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Whitespace,
+    Separator,
+    Word,
+}
 
-fn is_word_sep(c: char) -> bool {
-    WORD_SEPARATORS.contains(c)
+fn char_class(c: char, seps: &str) -> CharClass {
+    if c == ' ' || c == '\t' {
+        CharClass::Whitespace
+    } else if seps.contains(c) {
+        CharClass::Separator
+    } else {
+        CharClass::Word
+    }
+}
+
+/// The maximal run of same-[`CharClass`] characters in `text` (a single view
+/// row's text) around column `x`, per `seps` (the live `word-separators`
+/// option value, `Options::word_separators`) -- shared by `select_word_at`
+/// (DoubleClick's initial anchor) and `move_drag_cursor` (Task 7's
+/// continued-drag word snap, which re-derives a word's bounds from
+/// WHICHEVER end of the word the current anchor/cursor column happens to sit
+/// on, since both ends are within the same run). Returns `(0, 0)` for a
+/// blank row rather than panicking on an out-of-range index.
+fn word_bounds_at(text: &str, x: u16, seps: &str) -> (u16, u16) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let ci = (x as usize).min(n - 1);
+    let class = char_class(chars[ci], seps);
+    let mut start = ci;
+    let mut end = ci;
+    while start > 0 && char_class(chars[start - 1], seps) == class {
+        start -= 1;
+    }
+    while end + 1 < n && char_class(chars[end + 1], seps) == class {
+        end += 1;
+    }
+    (start as u16, end as u16)
 }
 
 /// Hit-test result for a mouse event's `(x, y)` against a window's current
@@ -602,39 +711,204 @@ fn hit_test(rects: &[(PaneId, Rect)], x: u16, y: u16) -> MouseHit {
 }
 
 /// Double-click word selection (`DoubleClick1Pane` -> `select-word`): expand
-/// from the clicked cell to the maximal run of same-class characters (word
-/// chars, or [`WORD_SEPARATORS`] chars) on that view row, using
-/// [`WORD_SEPARATORS`] as the separator class -- NOT the plain-whitespace
-/// rule `copy-next-word`/`copy-previous-word` use (see [`WORD_SEPARATORS`]'s
-/// doc comment). A blank row (`n == 0`) clears any selection instead of
-/// panicking on an out-of-range index.
-fn select_word_at(cs: &mut CopyState, grid: &Grid, history_total: u64) {
+/// from the clicked cell to the maximal run of same-[`CharClass`] characters
+/// on that view row (see [`word_bounds_at`]), per the live `word-separators`
+/// option (`seps`). `kind: SelKind::Word` (Task 7, SP6 wave 2) marks this
+/// selection so a subsequent `Drag` (`move_drag_cursor`) snaps by whole
+/// words instead of extending cell-by-cell. A blank row clears any selection
+/// instead of panicking on an out-of-range index.
+fn select_word_at(cs: &mut CopyState, grid: &Grid, history_total: u64, seps: &str) {
     let text = grid.view_row_text(cs.scroll, cs.cy);
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    if n == 0 {
+    if text.chars().next().is_none() {
         cs.sel = None;
         return;
     }
-    let ci = (cs.cx as usize).min(n - 1);
-    let sep = is_word_sep(chars[ci]);
-    let mut start = ci;
-    let mut end = ci;
-    while start > 0 && is_word_sep(chars[start - 1]) == sep {
-        start -= 1;
-    }
-    while end + 1 < n && is_word_sep(chars[end + 1]) == sep {
-        end += 1;
-    }
-    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: start as u16, anchor_y: cs.cy, anchor_total: history_total, rect: false });
-    cs.cx = end as u16;
+    let (start, end) = word_bounds_at(&text, cs.cx, seps);
+    cs.sel = Some(SelState {
+        anchor_scroll: cs.scroll,
+        anchor_x: start,
+        anchor_y: cs.cy,
+        anchor_total: history_total,
+        rect: false,
+        kind: SelKind::Word,
+    });
+    cs.cx = end;
 }
 
 /// Triple-click line selection (`TripleClick1Pane` -> `select-line`): the
-/// whole clicked view row, column 0 through the last column.
+/// whole clicked view row, column 0 through the last column. `kind:
+/// SelKind::Line` (Task 7, SP6 wave 2) marks this selection so a subsequent
+/// `Drag` (`move_drag_cursor`) snaps by whole lines instead of extending
+/// cell-by-cell.
 fn select_line_at(cs: &mut CopyState, cols: u16, history_total: u64) {
-    cs.sel = Some(SelState { anchor_scroll: cs.scroll, anchor_x: 0, anchor_y: cs.cy, anchor_total: history_total, rect: false });
+    cs.sel = Some(SelState {
+        anchor_scroll: cs.scroll,
+        anchor_x: 0,
+        anchor_y: cs.cy,
+        anchor_total: history_total,
+        rect: false,
+        kind: SelKind::Line,
+    });
     cs.cx = cols.saturating_sub(1);
+}
+
+/// Update a copy-mode drag's cursor to pane-relative `(x_raw, y_raw)`
+/// (clamped here into the pane's CURRENT `cols`/`rows`, so callers may pass a
+/// raw event/edge coordinate unclamped). Task 7, SP6 wave 2: if the active
+/// selection's `kind` is [`SelKind::Word`] or [`SelKind::Line`] (installed by
+/// `select_word_at`/`select_line_at`), the MOVING end snaps to the whole
+/// word/line under the cursor instead of the raw cell, and the FIXED anchor
+/// end flips between the anchor word/line's start and end -- tmux's
+/// `SEL_WORD`/`SEL_LINE` `window_copy_synchronize_cursor_end`
+/// (`docs/tmux-reference/mouse.md` :636-642,
+/// `docs/tmux-reference/copy-mode-and-buffers.md` :440-447):
+///
+/// - Dragging BEFORE (up/left of) the anchor word/line -- i.e. the raw
+///   cursor position sorts earlier than `(anchor row, anchor column)` in
+///   reading order -- snaps the moving end to the START of the word/line
+///   under the cursor, and the anchor to the anchor word/line's END.
+/// - Dragging AFTER (down/right of, or still inside, the anchor word/line)
+///   snaps the moving end to its END, and the anchor to the anchor
+///   word/line's START.
+///
+/// so the selection is always a whole number of words/lines that always
+/// includes the anchor word/line, regardless of drag direction. [`SelKind::Char`]
+/// (a plain click-drag or `begin-selection`) is untouched: the moving end is
+/// exactly `(x_raw, y_raw)`. A no-op if the client isn't in `ClientMode::Copy`
+/// on `pane`, has no active selection, or `pane`'s runtime is gone.
+fn move_drag_cursor(
+    panes: &HashMap<PaneId, PaneRuntime>,
+    seps: &str,
+    client: &mut ClientState,
+    pane: PaneId,
+    x_raw: u16,
+    y_raw: u16,
+) {
+    let Some(p) = panes.get(&pane) else { return };
+    let cols = p.grid.cols();
+    let rows = p.grid.rows();
+    let history_len = p.grid.history_len();
+    let history_total = p.grid.history_total();
+    let x_raw = x_raw.min(cols.saturating_sub(1));
+    let y_raw = y_raw.min(rows.saturating_sub(1));
+
+    let ClientMode::Copy(cs) = &mut client.mode else { return };
+    if cs.pane != pane {
+        return;
+    }
+    let Some(sel) = cs.sel else { return };
+
+    match sel.kind {
+        SelKind::Char => {
+            cs.cx = x_raw;
+            cs.cy = y_raw;
+        }
+        SelKind::Word | SelKind::Line => {
+            let anchor_key = anchor_key_now(&sel, history_len, history_total);
+            let cursor_key = sel_key(cs.scroll, y_raw);
+            let backward = (cursor_key, x_raw) < (anchor_key, sel.anchor_x);
+            let (new_cx, new_anchor_x) = if sel.kind == SelKind::Line {
+                if backward {
+                    (0, cols.saturating_sub(1))
+                } else {
+                    (cols.saturating_sub(1), 0)
+                }
+            } else {
+                let (anchor_scroll_now, anchor_row_now) = key_to_view(anchor_key, rows);
+                let cursor_text = p.grid.view_row_text(cs.scroll, y_raw);
+                let anchor_text = p.grid.view_row_text(anchor_scroll_now, anchor_row_now);
+                let (cur_lo, cur_hi) = word_bounds_at(&cursor_text, x_raw, seps);
+                let (anc_lo, anc_hi) = word_bounds_at(&anchor_text, sel.anchor_x, seps);
+                if backward {
+                    (cur_lo, anc_hi)
+                } else {
+                    (cur_hi, anc_lo)
+                }
+            };
+            cs.cx = new_cx;
+            cs.cy = y_raw;
+            cs.sel = Some(SelState { anchor_x: new_anchor_x, ..sel });
+        }
+    }
+}
+
+/// One drag-autoscroll line: scrolls `cs.scroll` by one (toward history if
+/// `top`, toward the live bottom otherwise, both clamped) and re-runs
+/// [`move_drag_cursor`] at the edge row (`0` if `top`, `rows - 1` otherwise)
+/// with `cursor_x` so a Word/Line-kind selection's snap is re-evaluated
+/// against the NEW scroll (extending it one more word/line into the newly
+/// revealed content). Shared by the interactive edge-arm path
+/// (`service_drag_edge`) and the `Tick`-driven repeat
+/// (`Server::service_autoscroll_tick`). A no-op if the client isn't in copy
+/// mode on `pane` or `pane`'s runtime is gone.
+fn scroll_and_resnap(panes: &HashMap<PaneId, PaneRuntime>, seps: &str, client: &mut ClientState, pane: PaneId, top: bool, cursor_x: u16) {
+    let Some(p) = panes.get(&pane) else { return };
+    let history_len = p.grid.history_len();
+    let rows = p.grid.rows();
+    {
+        let ClientMode::Copy(cs) = &mut client.mode else { return };
+        if cs.pane != pane {
+            return;
+        }
+        if top {
+            cs.scroll = (cs.scroll + 1).min(history_len);
+        } else {
+            cs.scroll = cs.scroll.saturating_sub(1);
+        }
+    }
+    let cy_edge = if top { 0 } else { rows.saturating_sub(1) };
+    move_drag_cursor(panes, seps, client, pane, cursor_x, cy_edge);
+}
+
+/// End any in-progress mouse drag AND its edge-autoscroll timer together
+/// (Task 7 fix round 1). `dispatch_mouse`'s three early-exit guards
+/// (overlay-open, status-row diversion, outside-pane-area) each reset
+/// `client.mouse.drag` so a stale Border/Selecting drag can't survive
+/// across them (follow-up #64 / Task 1's state-leak class) -- but the Task 7
+/// review found the SAME leak class recurring with the new `autoscroll`
+/// field: a drag armed at a pane edge whose pointer then crossed onto the
+/// status row (adjacent to the pane's first/last row) kept its timer
+/// running forever, since `service_autoscroll_tick` only self-disarms when
+/// the client leaves copy mode or the pane dies. This helper is the one
+/// place "the drag session is over" is defined, so any FUTURE per-drag
+/// state added to `MouseClientState` gets cleaned up at every guard by
+/// construction instead of repeating the leak a third time.
+fn end_drag(client: &mut ClientState) {
+    client.mouse.drag = MouseDrag::None;
+    client.mouse.autoscroll = None;
+}
+
+/// After an interactive `Drag` event has updated the copy cursor
+/// (`move_drag_cursor`), arm/refresh/disarm this client's drag-autoscroll
+/// timer (Task 7, SP6 wave 2, `docs/tmux-reference/mouse.md` §5.4): if the
+/// resulting cursor row is the pane's first or last row, perform ONE
+/// immediate extra scroll line (matching tmux: the edge Drag event itself
+/// already scrolls once, in addition to the timer's later repeats) and arm
+/// `client.mouse.autoscroll` for [`MOUSE_DRAG_AUTOSCROLL_INTERVAL`] from
+/// `now`; otherwise clear it -- "motion outside the pane is a no-op that
+/// stops the timer... leaving the edge row stops it too". A no-op (autoscroll
+/// cleared) if the client isn't in copy mode on `pane` or `pane`'s runtime is
+/// gone.
+fn service_drag_edge(panes: &HashMap<PaneId, PaneRuntime>, seps: &str, client: &mut ClientState, pane: PaneId, cursor_x: u16, now: Instant) {
+    let Some(p) = panes.get(&pane) else {
+        client.mouse.autoscroll = None;
+        return;
+    };
+    let rows = p.grid.rows();
+    let cy = match &client.mode {
+        ClientMode::Copy(cs) if cs.pane == pane => cs.cy,
+        _ => {
+            client.mouse.autoscroll = None;
+            return;
+        }
+    };
+    if cy == 0 || cy == rows.saturating_sub(1) {
+        let top = cy == 0;
+        scroll_and_resnap(panes, seps, client, pane, top, cursor_x);
+        client.mouse.autoscroll = Some(AutoscrollState { pane, top, cursor_x, deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL });
+    } else {
+        client.mouse.autoscroll = None;
+    }
 }
 
 impl Server {
@@ -776,6 +1050,12 @@ impl Server {
     fn kill_pane_by_id(&mut self, session_name: &str, pane_id: PaneId) -> Result<bool, String> {
         let owner_wid = self.registry.session_mut(session_name).and_then(|s| s.window_by_pane(pane_id).map(|w| w.id));
         let Some(wid) = owner_wid else { return Err("pane not found".to_string()) };
+        // NOTE (fix round 3): `Layout::remove` may reassign `focused` to a
+        // surviving sibling here -- deliberately NOT stamped. tmux's
+        // `window_lost_pane` (window.c) reassigns `w->active` directly
+        // (last_panes stack -> prev -> next) with no `active_point` bump:
+        // a death handoff preserves the survivor's historical recency.
+        // See `Server::stamp_active`'s doc for the full stamp/no-stamp map.
         let removed = self
             .registry
             .session_mut(session_name)
@@ -785,6 +1065,7 @@ impl Server {
         if removed {
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
+            self.pane_activity.remove(&pane_id); // Finding 2: prune, mirrors last_rects
             self.apply_layout_for_session(session_name);
             return Ok(false);
         }
@@ -802,6 +1083,7 @@ impl Server {
         }
         self.panes.remove(&pane_id);
         self.last_rects.remove(&pane_id);
+        self.pane_activity.remove(&pane_id); // Finding 2: prune, mirrors last_rects
         self.apply_layout_for_session(session_name);
         Ok(false)
     }
@@ -838,6 +1120,7 @@ impl Server {
             for pid in pane_ids {
                 self.panes.remove(&pid);
                 self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
             }
             self.apply_layout_for_session(session_name);
         }
@@ -878,6 +1161,9 @@ impl Server {
             Ok(pr) => {
                 self.panes.insert(new_id, pr);
                 self.apply_layout_for_session(&session_name);
+                // Newly created panes take focus (tmux default) -- the most
+                // recently active pane by construction.
+                self.stamp_active(new_id);
             }
             Err(_) => {
                 if let Some(s) = self.registry.session_mut(&session_name) {
@@ -893,22 +1179,41 @@ impl Server {
         if let Some(d) = dir {
             let session_name = self.resolve_session_name(None, cs)?;
             let area_y = self.pane_area_y();
-            if let Some(session) = self.registry.session_mut(&session_name) {
-                let size = session.size;
-                let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
-                session.current_window_mut().layout.focus_dir(d, area);
+            let mut newly_focused = None;
+            {
+                let activity = &self.pane_activity;
+                let activity_fn = |id: PaneId| activity.get(&id).copied().unwrap_or(0);
+                if let Some(session) = self.registry.session_mut(&session_name) {
+                    let size = session.size;
+                    let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
+                    let layout = &mut session.current_window_mut().layout;
+                    if layout.focus_dir(d, area, &activity_fn) {
+                        newly_focused = Some(layout.focused());
+                    }
+                }
+            }
+            if let Some(id) = newly_focused {
+                self.stamp_active(id);
             }
             return Ok(String::new());
         }
         let (session_name, wid, pane_id) = self.resolve_pane_target(cs, target.as_deref())?;
+        let mut changed = false;
         if let Some(session) = self.registry.session_mut(&session_name) {
             if let Some(w) = session.windows.iter_mut().find(|w| w.id == wid) {
-                w.layout.focus_pane(pane_id);
+                changed = w.layout.focus_pane(pane_id);
             }
+        }
+        if changed {
+            self.stamp_active(pane_id);
         }
         Ok(String::new())
     }
 
+    // Deliberately does NOT `stamp_active` (nor do `exec_step_window`/
+    // `exec_last_window`): switching windows changes the session's current
+    // winlink, not any window's active pane -- tmux only bumps
+    // `active_point` in `window_set_active_pane`. See `stamp_active`'s doc.
     fn exec_select_window(&mut self, target: String, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, Some(&target))?;
         if let Some(session) = self.registry.session_mut(&session_name) {
@@ -945,8 +1250,18 @@ impl Server {
 
     fn exec_last_pane(&mut self, cs: Option<&str>) -> Result<String, String> {
         let session_name = self.resolve_session_name(None, cs)?;
+        let mut newly_focused = None;
         if let Some(session) = self.registry.session_mut(&session_name) {
-            session.current_window_mut().layout.focus_last();
+            let layout = &mut session.current_window_mut().layout;
+            let before = layout.focused();
+            layout.focus_last();
+            let after = layout.focused();
+            if after != before {
+                newly_focused = Some(after);
+            }
+        }
+        if let Some(id) = newly_focused {
+            self.stamp_active(id);
         }
         Ok(String::new())
     }
@@ -971,6 +1286,8 @@ impl Server {
                     }
                 }
                 self.apply_layout_for_session(&session_name);
+                // A new window's sole pane starts focused (tmux default).
+                self.stamp_active(pane_id);
                 Ok(String::new())
             }
             Err(e) => Err(format!("open terminal failed: {e}")),
@@ -1183,10 +1500,20 @@ impl Server {
 
     fn exec_rotate_window(&mut self, down: bool, target: Option<String>, cs: Option<&str>) -> Result<String, String> {
         let (session_name, wid) = self.resolve_window_target(cs, target.as_deref())?;
+        // Finding 1(c): `Layout::rotate` keeps the same LEAF POSITION
+        // focused, but a DIFFERENT PaneId now occupies it -- `self.focused`
+        // is reassigned to a new pane on every successful rotate, which
+        // must be stamped for the same reason as any other focus handoff.
+        let mut newly_focused = None;
         if let Some(session) = self.registry.session_mut(&session_name) {
             if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
-                window.layout.rotate(down);
+                if window.layout.rotate(down) {
+                    newly_focused = Some(window.layout.focused());
+                }
             }
+        }
+        if let Some(id) = newly_focused {
+            self.stamp_active(id);
         }
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
@@ -1223,6 +1550,11 @@ impl Server {
         if let Some(n) = &name {
             crate::model::validate_name(n, "window")?;
         }
+        // NOTE (fix round 3): the source window's `Layout::remove` may hand
+        // focus to a surviving sibling -- deliberately NOT stamped, same
+        // `window_lost_pane` no-bump rule as `kill_pane_by_id` (the moved
+        // pane's stamp below is different: that one is a CREATION-path
+        // focus, tmux spawn.c shape).
         let removed = self
             .registry
             .session_mut(&session_name)
@@ -1253,6 +1585,16 @@ impl Server {
                 session.last = Some(new_wid);
             }
         }
+        // NOTE (fix round 4): the moved pane becoming the new window's
+        // active pane is deliberately NOT stamped either. tmux's classic
+        // break-pane path (cmd-break-pane.c:153-158) assigns
+        // `w->active = wp` DIRECTLY, no `active_point` bump -- unlike a
+        // freshly SPAWNED window/split pane (spawn.c), which does get
+        // stamped. break-pane RECYCLES an existing pane, so it keeps its
+        // historical recency, same as the source window's
+        // `window_lost_pane`-shaped handoff above. (The
+        // `window_set_active_pane` at cmd-break-pane.c:80 belongs to the
+        // `-W` floating-window feature, which winmux doesn't implement.)
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
     }
@@ -1295,7 +1637,44 @@ impl Server {
         for pid in occupant_panes {
             self.panes.remove(&pid);
             self.last_rects.remove(&pid);
+            self.pane_activity.remove(&pid); // Finding 2: prune, mirrors last_rects
         }
+        self.apply_layout_for_session(&session_name);
+        Ok(String::new())
+    }
+
+    /// `swap-window|swapw [-d] [-s src] -t dst` (SP6 Task 5,
+    /// `windows-and-sessions.md` §swap-window): exchange the target session's
+    /// `src` and `dst` windows' INDEXES (`src` defaults to the session's
+    /// current window; `dst` is required by `cmd::resolve`, so `dst` is
+    /// always `Some` here in practice). Both targets are resolved via
+    /// [`resolve_swap_window_target`]'s grammar (relative `+N`/`-N`,
+    /// wrapping; `:N`/bare-digit absolute index; name/prefix match).
+    ///
+    /// Same-window swap (`src == dst`, e.g. `-t` resolves back to the
+    /// current window with no other window present) is a no-op success,
+    /// mirroring real tmux. See [`crate::model::Session::swap_windows`]'s
+    /// doc comment for the exact `current`/`last`/`-d` bookkeeping this
+    /// delegates to -- this handler's only job is target resolution plus
+    /// re-flowing the layout for whichever window ends up current.
+    fn exec_swap_window(&mut self, src: Option<String>, dst: Option<String>, detach: bool, cs: Option<&str>) -> Result<String, String> {
+        let session_name = self.resolve_session_name(None, cs)?;
+        let Some(session) = self.registry.session_mut(&session_name) else {
+            return Err(format!("can't find session: {session_name}"));
+        };
+        let src_wid = resolve_swap_window_target(session, src.as_deref())?;
+        let Some(dst_spec) = dst else {
+            return Err(cmd::usage("swap-window").expect("swap-window has a usage string").to_string());
+        };
+        let dst_wid = resolve_swap_window_target(session, Some(&dst_spec))?;
+        session.swap_windows(src_wid, dst_wid, detach);
+        // NOTE: deliberately does NOT consult `renumber-windows` here --
+        // swap-window exchanges winlink indexes only, it never closes an
+        // index gap the way killing a window does. Per
+        // `windows-and-sessions.md` §"renumber-windows", the auto-trigger is
+        // `server_kill_window`'s `renumber=1` path plus the manual
+        // `move-window -r`; swap-window's own exec never calls
+        // `session_renumber_windows` at all.
         self.apply_layout_for_session(&session_name);
         Ok(String::new())
     }
@@ -1498,6 +1877,7 @@ impl Server {
                     anchor_y: cs.cy,
                     anchor_total: p.grid.history_total(),
                     rect: false,
+                    kind: SelKind::Char,
                 });
             }
             CopyAction::RectangleToggle => {
@@ -1526,6 +1906,7 @@ impl Server {
                         anchor_y: cs.cy,
                         anchor_total: p.grid.history_total(),
                         rect: sel.rect,
+                        kind: sel.kind,
                     });
                     let row_under_current = key + cs.scroll as i64;
                     let (new_scroll, new_cy) = if (0..rows as i64).contains(&row_under_current) {
@@ -1610,15 +1991,58 @@ impl Server {
         if !self.options.mouse() {
             return ExecOutcome::Ok(String::new());
         }
+        // clock-mode (Task 10, fix round 1): tmux's `window_clock_key`
+        // (`window-clock.c:214-218`) calls `window_pane_reset_mode`
+        // UNCONDITIONALLY -- its `key` and `mouse_event` parameters are
+        // both `__unused` -- so ANY mouse event EXITS clock mode, exactly
+        // like any key. And, same as the key path (`dispatch_clock_key`),
+        // the exiting event is CONSUMED by the exit, never reprocessed as
+        // a click-to-focus/drag/wheel underneath. The Drag/Up `end_drag`
+        // hygiene mirrors the sibling swallow-guard below (#64: a drag
+        // armed before the mode opened must not survive across it).
+        if matches!(client.mode, ClientMode::Clock(_)) {
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
+            client.mode = ClientMode::Normal;
+            return ExecOutcome::Ok(String::new());
+        }
         if matches!(
             client.mode,
             ClientMode::ConfirmCmd { .. } | ClientMode::Prompt { .. } | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_)
         ) {
+            // #64: a drag armed before the overlay opened (keyboard-
+            // triggered mid-drag) must not survive across the overlay's
+            // lifetime -- clear it just like the sibling "outside pane
+            // area"/status-row guards do, so a later out-of-sequence
+            // Drag/Up can't revive stale Border/Selecting state. Task 7 fix
+            // round 1: `end_drag` also stops the edge-autoscroll timer,
+            // which this guard's bare `drag = None` used to leave running.
+            if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                end_drag(client);
+            }
             return ExecOutcome::Ok(String::new());
         }
 
         if let Some(sy) = self.mouse_status_row(client) {
             if ev.y == sy {
+                // A border/selection drag that overshoots onto the status
+                // row at release is diverted to `dispatch_mouse_status`,
+                // which only handles Down(1)/Wheel -- Drag/Up would
+                // otherwise fall through with no reset, leaving
+                // `client.mouse.drag` stuck and making the NEXT drag a
+                // silent no-op (see `mouse_drag_border`'s `delta == 0`
+                // early return). Mirrors the "outside pane area" guard
+                // below. Task 7 fix round 1: `end_drag` also stops the
+                // edge-autoscroll timer -- the pane's first/last row is
+                // ADJACENT to the status row, so an edge-armed drag
+                // overshooting here was the review's exact runaway-scroll
+                // scenario (`mouse.md` §5.4: "motion outside the pane...
+                // stops the timer"); regression test
+                // `autoscroll_stops_when_drag_leaves_onto_status_row`.
+                if matches!(ev.kind, MouseKind::Drag(_) | MouseKind::Up(_)) {
+                    end_drag(client);
+                }
                 return self.dispatch_mouse_status(ev, client, session_name);
             }
         }
@@ -1629,16 +2053,17 @@ impl Server {
         if ev.x >= area.w || ev.y < area.y || ev.y >= area.y + area.h {
             // Outside the pane area entirely (e.g. a blank gap row on a
             // client taller than the session's shared size): no-op, and end
-            // any in-progress drag so it can't keep resizing/selecting based
-            // on an off-screen position.
-            client.mouse.drag = MouseDrag::None;
+            // any in-progress drag (Task 7 fix round 1: including its
+            // edge-autoscroll timer, via `end_drag`) so it can't keep
+            // resizing/selecting/scrolling based on an off-screen position.
+            end_drag(client);
             return ExecOutcome::Ok(String::new());
         }
 
         match ev.kind {
             MouseKind::Down(btn) => self.mouse_down(ev, btn, &rects, client, session_name),
             MouseKind::Drag(_) => self.mouse_drag(ev, &rects, client, session_name),
-            MouseKind::Up(_) => self.mouse_up(client),
+            MouseKind::Up(_) => self.mouse_up(ev, &rects, client),
             MouseKind::WheelUp => self.mouse_wheel(ev, true, &rects, client, session_name),
             MouseKind::WheelDown => self.mouse_wheel(ev, false, &rects, client, session_name),
         }
@@ -1666,19 +2091,30 @@ impl Server {
     }
 
     fn mouse_focus_pane(&mut self, session_name: &str, pane_id: PaneId) {
+        let mut changed = false;
         if let Some(session) = self.registry.session_mut(session_name) {
-            session.current_window_mut().layout.focus_pane(pane_id);
+            changed = session.current_window_mut().layout.focus_pane(pane_id);
+        }
+        if changed {
+            self.stamp_active(pane_id);
         }
     }
 
     /// `Down1`/`Down2`/`Down3` inside the pane area: a border press arms a
     /// live resize drag; a pane press always focuses that pane (tmux
-    /// `select-pane`), and additionally arms a selection drag when it's a
-    /// LEFT click landing inside the pane bound to `client`'s OWN copy mode
-    /// (clicking on some other pane, or any click while not in copy mode at
-    /// all, only focuses -- see the design spec's "Down1 on pane -> focus"
-    /// bullet; forwarding the click to the pane's own mouse-reporting
-    /// application is out of scope for v1, documented deferral).
+    /// `select-pane`), and a LEFT click additionally arms `PendingSelect`
+    /// (SP6 Task 6: click purity, `mouse.md` §2.5/§5.3) -- neither the copy
+    /// cursor, the selection anchor, NOR copy-mode entry itself are touched
+    /// here; all of that is deferred to `mouse_drag`'s handling of the first
+    /// actual `Drag` event, so a plain click (`Down` then `Up`, no `Drag`)
+    /// is `select-pane` only, matching tmux exactly. Double/triple clicks
+    /// (`run == 2`/`3`) are the one exception: they still arm the word/line
+    /// selection immediately here, matching tmux's separate
+    /// `DoubleClick1Pane`/`TripleClick1Pane` bindings (not `MouseDown1Pane`)
+    /// which fire `select-word`/`select-line` right away. Non-left buttons
+    /// only focus -- see the design spec's "Down1 on pane -> focus" bullet;
+    /// forwarding the click to the pane's own mouse-reporting application is
+    /// out of scope for v1, documented deferral).
     fn mouse_down(
         &mut self,
         ev: MouseEvent,
@@ -1687,6 +2123,11 @@ impl Server {
         client: &mut ClientState,
         session_name: &str,
     ) -> ExecOutcome {
+        // Task 7, SP6 wave 2: any fresh press invalidates whatever drag
+        // autoscroll timer a PRIOR drag may have left armed (a stray
+        // leftover would otherwise keep scrolling a selection nothing is
+        // dragging anymore).
+        client.mouse.autoscroll = None;
         match hit_test(rects, ev.x, ev.y) {
             MouseHit::VBorder { left } => {
                 client.mouse.drag = MouseDrag::Border { pane: left, vertical: true };
@@ -1699,43 +2140,63 @@ impl Server {
             MouseHit::Pane(pane_id) => {
                 self.mouse_focus_pane(session_name, pane_id);
                 let in_copy_here = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane_id);
-                if btn != 1 || !in_copy_here {
+                if btn != 1 {
                     client.mouse.drag = MouseDrag::None;
                     return ExecOutcome::Ok(String::new());
                 }
                 let Some(rect) = rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r) else {
                     return ExecOutcome::Ok(String::new());
                 };
-                let now = Instant::now();
-                let run = advance_click_run(&mut client.mouse, now, ev.x, ev.y, btn);
                 let cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
                 let cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+
+                if !in_copy_here {
+                    // (c) SP6 Task 6: root `MouseDrag1Pane -> copy-mode -M`.
+                    // The press itself is `select-pane` only (already done
+                    // above) -- copy-mode entry and the selection anchor are
+                    // deferred to the first actual `Drag` event, exactly like
+                    // the in-copy-mode plain-click case below.
+                    client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: true };
+                    return ExecOutcome::Ok(String::new());
+                }
+
+                let now = Instant::now();
+                let run = advance_click_run(&mut client.mouse, now, ev.x, ev.y, btn);
+                if run == 1 {
+                    // (a) SP6 Task 6: a plain click (`MouseDown1Pane` with no
+                    // subsequent `Drag`) is `select-pane` only in tmux's
+                    // copy-mode table too -- the copy cursor must NOT move
+                    // and no selection anchor becomes visible
+                    // (`mouse.md:537-539`). Defer both to the first `Drag`
+                    // event, anchored at THIS press position.
+                    client.mouse.drag = MouseDrag::PendingSelect { pane: pane_id, press_x: cx, press_y: cy, enter_copy: false };
+                    return ExecOutcome::Ok(String::new());
+                }
                 let Some(p) = self.panes.get(&pane_id) else {
                     return ExecOutcome::Ok(String::new());
                 };
                 let history_total = p.grid.history_total();
                 let cols = p.grid.cols();
+                let seps = self.options.word_separators();
                 if let ClientMode::Copy(cs) = &mut client.mode {
                     cs.cx = cx;
                     cs.cy = cy;
                     match run {
-                        1 => {
-                            cs.sel = Some(SelState {
-                                anchor_scroll: cs.scroll,
-                                anchor_x: cx,
-                                anchor_y: cy,
-                                anchor_total: history_total,
-                                rect: false,
-                            });
-                        }
-                        2 => select_word_at(cs, &p.grid, history_total),
+                        2 => select_word_at(cs, &p.grid, history_total, seps),
                         _ => select_line_at(cs, cols, history_total),
                     }
                 }
                 client.mouse.drag = MouseDrag::Selecting { moved: false };
                 ExecOutcome::Ok(String::new())
             }
-            MouseHit::None => ExecOutcome::Ok(String::new()),
+            MouseHit::None => {
+                // A press that misses every pane/border cell (off-by-one
+                // vs. a just-moved border, a zero-size rect, ...) must not
+                // leave a previously-armed drag stale -- every other arm
+                // above overwrites `client.mouse.drag` unconditionally.
+                client.mouse.drag = MouseDrag::None;
+                ExecOutcome::Ok(String::new())
+            }
         }
     }
 
@@ -1750,14 +2211,88 @@ impl Server {
                 self.mouse_drag_border(ev, pane, vertical, session_name);
                 ExecOutcome::Ok(String::new())
             }
+            MouseDrag::PendingSelect { pane, press_x, press_y, enter_copy } => {
+                if enter_copy {
+                    // (c) SP6 Task 6: enter copy mode on `pane` NOW, at the
+                    // first motion event (tmux's drag-START classification,
+                    // `mouse.md` §2.5) -- mirrors the root binding `if
+                    // pane_in_mode/mouse_any_flag { send -M } else {
+                    // copy-mode -M }`; winmux has no app-owns-mouse relay for
+                    // drag yet, so this always enters copy mode. `mouse:
+                    // false` matches real `-M` (it does NOT set
+                    // `scroll_exit` -- only `-e` does).
+                    if !self.panes.contains_key(&pane) {
+                        client.mouse.drag = MouseDrag::None;
+                        return ExecOutcome::Ok(String::new());
+                    }
+                    let outcome = self.exec_copy_mode(false, false, client, session_name);
+                    if matches!(outcome, ExecOutcome::Err(_)) {
+                        client.mouse.drag = MouseDrag::None;
+                        return outcome;
+                    }
+                    if !matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == pane) {
+                        // Focus moved off `pane` between the press and this
+                        // motion event (race) -- abandon rather than
+                        // mis-attribute the drag to whatever pane copy-mode
+                        // actually opened on.
+                        client.mode = ClientMode::Normal;
+                        client.mouse.drag = MouseDrag::None;
+                        return ExecOutcome::Ok(String::new());
+                    }
+                }
+                // Install the anchor at the PRESS position (tmux's
+                // `window_copy_start_drag`: `cmd_mouse_at(..., 1)` reads
+                // `lx/ly`, the press position, not the current motion
+                // position), then apply THIS event's motion to the cursor --
+                // real tmux calls `window_copy_drag_update` immediately
+                // after starting the drag, so the very first `Drag` frame
+                // both anchors AND extends the selection in one step. Always
+                // `SelKind::Char` (Task 7): a plain click-drag never installs
+                // a word/line anchor -- only DoubleClick/TripleClick
+                // (`mouse_down`) do that.
+                let history_total = self.panes.get(&pane).map(|p| p.grid.history_total()).unwrap_or(0);
+                if let ClientMode::Copy(cs) = &mut client.mode {
+                    if cs.pane == pane {
+                        cs.sel = Some(SelState {
+                            anchor_scroll: cs.scroll,
+                            anchor_x: press_x,
+                            anchor_y: press_y,
+                            anchor_total: history_total,
+                            rect: false,
+                            kind: SelKind::Char,
+                        });
+                    }
+                }
+                if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane) {
+                    let x_raw = ev.x.saturating_sub(rect.x);
+                    let y_raw = ev.y.saturating_sub(rect.y);
+                    move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
+                    service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                }
+                client.mouse.drag = MouseDrag::Selecting { moved: true };
+                ExecOutcome::Ok(String::new())
+            }
             MouseDrag::Selecting { .. } => {
                 // An actual `Drag` event happened: mark `moved` so `mouse_up`
                 // knows this is a real drag-select, not a plain click.
                 client.mouse.drag = MouseDrag::Selecting { moved: true };
-                if let ClientMode::Copy(cs) = &mut client.mode {
-                    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == cs.pane) {
-                        cs.cx = ev.x.saturating_sub(rect.x).min(rect.w.saturating_sub(1));
-                        cs.cy = ev.y.saturating_sub(rect.y).min(rect.h.saturating_sub(1));
+                let pane = match &client.mode {
+                    ClientMode::Copy(cs) => Some(cs.pane),
+                    _ => None,
+                };
+                if let Some(pane) = pane {
+                    match rects.iter().find(|(id, _)| *id == pane) {
+                        Some((_, rect)) => {
+                            let x_raw = ev.x.saturating_sub(rect.x);
+                            let y_raw = ev.y.saturating_sub(rect.y);
+                            move_drag_cursor(&self.panes, self.options.word_separators(), client, pane, x_raw, y_raw);
+                            service_drag_edge(&self.panes, self.options.word_separators(), client, pane, x_raw, Instant::now());
+                        }
+                        // Task 7, SP6 wave 2 / `mouse.md` §5.4: motion
+                        // OUTSIDE the pane rectangle is a no-op that also
+                        // stops any armed autoscroll timer (the selection
+                        // itself is left exactly where it was).
+                        None => client.mouse.autoscroll = None,
                     }
                 }
                 ExecOutcome::Ok(String::new())
@@ -1772,6 +2307,17 @@ impl Server {
     /// clamping at layout minimums -- the border always ends up exactly at
     /// `ev.x`/`ev.y` if that position is reachable at all, rather than
     /// drifting from a stale accumulated offset.
+    ///
+    /// `pane` (bound once at `Down` by `VBorder{ left }`/`HBorder{ top }`) is
+    /// always the FIRST-child-side pane of whichever split owns this border.
+    /// `Layout::resize_from` only accepts a first-child reference for
+    /// `Direction::Right`/`Down` (see its `want_first` doc comment and
+    /// `layout::tests::resize_from_reference_pane_ignores_focus`) --
+    /// `Direction::Left`/`Up` need the SECOND-child-side pane instead. Using
+    /// `pane` unconditionally made every Left/Up drag (toward the
+    /// first-child pane's own edge) a silent no-op (follow-up #66); resolve
+    /// the correct reference pane fresh each call, per direction, by finding
+    /// `pane`'s current neighbor across this exact border.
     fn mouse_drag_border(&mut self, ev: MouseEvent, pane: PaneId, vertical: bool, session_name: &str) {
         let Some((area, rects)) = self.mouse_pane_rects(session_name) else { return };
         let Some(rect) = rects.iter().find(|(id, _)| *id == pane).map(|(_, r)| *r) else { return };
@@ -1786,33 +2332,102 @@ impl Server {
         }
         let dir = if delta > 0 { positive_dir } else { negative_dir };
         let cells = delta.unsigned_abs() as u16;
+        let reference = if matches!(dir, Direction::Left | Direction::Up) {
+            // The second-child neighbor starts one cell PAST the border
+            // itself (panes are separated by the single border cell, e.g.
+            // pane1 `x=0,w=40` / border at col 40 / pane2 `x=41` -- not
+            // `x=40`), so its origin is `current + 1`, not `current`.
+            rects
+                .iter()
+                .find(|(id, r)| {
+                    *id != pane
+                        && if vertical {
+                            r.x == current + 1 && r.y < rect.y + rect.h && r.y + r.h > rect.y
+                        } else {
+                            r.y == current + 1 && r.x < rect.x + rect.w && r.x + r.w > rect.x
+                        }
+                })
+                .map(|(id, _)| *id)
+                .unwrap_or(pane)
+        } else {
+            pane
+        };
         if let Some(session) = self.registry.session_mut(session_name) {
-            session.current_window_mut().layout.resize_from(pane, dir, area, cells);
+            session.current_window_mut().layout.resize_from(reference, dir, area, cells);
         }
         self.apply_layout_for_session(session_name);
     }
 
     /// `Up1`/`Up2`/`Up3`: ends whatever drag was in progress. A border-resize
     /// drag needs no further action (already applied live). A copy-mode
-    /// selection drag that saw at least one `Drag` event copies the
-    /// selection and exits copy mode -- tmux's `MouseDragEnd1Pane` default
-    /// (`copy-selection-and-cancel`). A PLAIN click (no `Drag` event at all
-    /// between this `Up` and the preceding `Down`, i.e. `moved == false`) is
-    /// left alone entirely: no copy, no cancel, no selection/buffer touch --
-    /// real tmux's copy-mode table has no default binding for a bare
-    /// `MouseUp1Pane`, only `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of
-    /// which require actual motion). The click's `select-pane`
-    /// (`mouse_down`'s unconditional focus) and, inside copy mode, its
-    /// zero-width point-selection anchor / cursor reposition still stand --
-    /// only the "release" side is a no-op.
-    fn mouse_up(&mut self, client: &mut ClientState) -> ExecOutcome {
+    /// selection drag that saw at least one `Drag` event (`moved == true`)
+    /// copies the selection and exits copy mode -- tmux's
+    /// `MouseDragEnd1Pane` default (`copy-selection-and-cancel`) -- but ONLY
+    /// if `ev` (the RELEASE event's own position) still hit-tests to the
+    /// pane the selection is bound to (SP6 Task 6, part (b): tmux resolves
+    /// `MouseDragEnd1Pane` against the pane under the pointer at release,
+    /// not the drag-origin pane; see the match arm below). A PLAIN click (no
+    /// `Drag` event at all between this `Up` and the preceding `Down`, i.e.
+    /// `MouseDrag::PendingSelect`/`Selecting{moved:false}` at this point,
+    /// both falling through to the wildcard arm) is left alone entirely: no
+    /// copy, no cancel, no selection/buffer touch -- real tmux's copy-mode
+    /// table has no default binding for a bare `MouseUp1Pane`, only
+    /// `MouseDrag1Pane`/`MouseDragEnd1Pane` (both of which require actual
+    /// motion). The click's `select-pane` (`mouse_down`'s unconditional
+    /// focus) still stands -- only the "release" side is a no-op.
+    fn mouse_up(&mut self, ev: MouseEvent, rects: &[(PaneId, Rect)], client: &mut ClientState) -> ExecOutcome {
         let drag = std::mem::replace(&mut client.mouse.drag, MouseDrag::None);
+        // Task 7, SP6 wave 2: releasing always ends any armed drag
+        // autoscroll timer, whether or not this `Up` ends up copying.
+        client.mouse.autoscroll = None;
         match drag {
-            MouseDrag::Selecting { moved: true } if matches!(client.mode, ClientMode::Copy(_)) => {
-                self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+            MouseDrag::Selecting { moved: true } => {
+                let ClientMode::Copy(cs) = &client.mode else {
+                    return ExecOutcome::Ok(String::new());
+                };
+                // (b) SP6 Task 6: `MouseDragEnd1Pane` resolves against the
+                // pane under the pointer AT RELEASE, not the drag-origin
+                // pane (`mouse.md:308-311, 654-658`) -- releasing over a
+                // DIFFERENT pane (or a border/dead zone, which also fails
+                // this match) means that pane's key table has no
+                // `MouseDragEnd1Pane` binding for a non-copy-mode pane, so
+                // no copy happens; the origin pane keeps its selection and
+                // stays in copy mode.
+                if matches!(hit_test(rects, ev.x, ev.y), MouseHit::Pane(id) if id == cs.pane) {
+                    self.exec_copy_action(CopyAction::SelectionAndCancel, client)
+                } else {
+                    ExecOutcome::Ok(String::new())
+                }
             }
             _ => ExecOutcome::Ok(String::new()),
         }
+    }
+
+    /// `Tick`-driven drag-autoscroll repeat (Task 7, SP6 wave 2): called by
+    /// `Server::handle_event`'s `Tick` arm for every client whose
+    /// `client.mouse.autoscroll` deadline has passed, AFTER that arm's own
+    /// `self.clients.iter_mut()` pass has ended (mirrors the pre-existing
+    /// escape-time flush's two-pass shape -- see its own comment for why).
+    /// Disarms (and returns `false`, no redraw needed) if the client is no
+    /// longer in `ClientMode::Copy` on the armed pane, or that pane's
+    /// runtime is gone; otherwise scrolls one line and re-snaps the
+    /// selection (`scroll_and_resnap`), re-arms for another
+    /// `MOUSE_DRAG_AUTOSCROLL_INTERVAL` from `now`, and returns `true`.
+    pub(super) fn service_autoscroll_tick(&mut self, cid: ClientId, now: Instant) -> bool {
+        let Some(client) = self.clients.get_mut(&cid) else { return false };
+        let Some(a) = client.mouse.autoscroll else { return false };
+        let in_copy = matches!(&client.mode, ClientMode::Copy(cs) if cs.pane == a.pane);
+        if !in_copy {
+            client.mouse.autoscroll = None;
+            return false;
+        }
+        if !self.panes.contains_key(&a.pane) {
+            client.mouse.autoscroll = None;
+            return false;
+        }
+        scroll_and_resnap(&self.panes, self.options.word_separators(), client, a.pane, a.top, a.cursor_x);
+        client.mouse.autoscroll = Some(AutoscrollState { deadline: now + MOUSE_DRAG_AUTOSCROLL_INTERVAL, ..a });
+        true
     }
 
     /// `WheelUp`/`WheelDown` inside the pane area.
@@ -2146,6 +2761,14 @@ impl Server {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
+            // SP6 Task 2: `cmd.rs`'s own `-T` validation has accepted these
+            // two table names since sub-project 4 (`copy-mode`/
+            // `copy-mode-vi` are real bindable tables, see `src/bindings.rs`
+            // `WhichTable`), but this dispatch-time match never grew the
+            // matching arms -- a parser/executor mismatch, not a missing
+            // feature (`.superpowers/sdd/sp6-gap-analysis.md` §A).
+            "copy-mode" => WhichTable::CopyMode,
+            "copy-mode-vi" => WhichTable::CopyModeVi,
             _ => return Err(format!("unknown key table: {table}")),
         };
         let k = crate::keys::parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
@@ -2157,6 +2780,8 @@ impl Server {
         let which = match table.as_str() {
             "root" => WhichTable::Root,
             "prefix" => WhichTable::Prefix,
+            "copy-mode" => WhichTable::CopyMode,
+            "copy-mode-vi" => WhichTable::CopyModeVi,
             _ => return Err(format!("unknown key table: {table}")),
         };
         if all {
@@ -2164,8 +2789,21 @@ impl Server {
             return Ok(String::new());
         }
         let key = key.expect("cmd::resolve guarantees a key unless -a is given");
-        let k = crate::keys::parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
-        self.bindings.unbind(which, &k);
+        // A key token that isn't valid winmux key notation (e.g. tmux's
+        // mouse pseudo-keys like `MouseDragEnd1Pane` -- real tmux keys, but
+        // winmux's mouse handling is hardcoded dispatch logic, not
+        // table-driven via named pseudo-keys, so no such binding could ever
+        // exist here to remove) is a silent no-op on UNBIND, not an error:
+        // removing something that structurally can never be bound is at
+        // least as harmless as removing something merely unbound (doc:
+        // "Removing a key that isn't bound is a silent no-op"; an
+        // unrecognized key is also one of the things real tmux's `-q`
+        // suppresses). `bind-key` (above) still errors on a bad key --
+        // CREATING a binding to a garbage key is a real mistake worth
+        // reporting; removing a no-op binding is not.
+        if let Some(k) = crate::keys::parse_key(&key) {
+            self.bindings.unbind(which, &k);
+        }
         Ok(String::new())
     }
 
@@ -2217,7 +2855,8 @@ impl Server {
     }
 
     fn execute_source_file_headless(&mut self, path: &str) -> Result<String, String> {
-        let candidate = ConfigCandidate { path: std::path::PathBuf::from(path), required: true };
+        let expanded = expand_tilde(path);
+        let candidate = ConfigCandidate { path: std::path::PathBuf::from(expanded), required: true };
         let errors = self.load_config_files(std::slice::from_ref(&candidate));
         if errors.is_empty() {
             Ok(String::new())
@@ -2240,6 +2879,8 @@ impl Server {
                 match self.registry.create_session(name.as_deref(), pane_id, size, base_index) {
                     Ok(_) => {
                         self.had_session = true;
+                        // A new session's sole pane starts focused.
+                        self.stamp_active(pane_id);
                         Ok(String::new())
                     }
                     Err(e) => {
@@ -2484,9 +3125,11 @@ impl Server {
             RotateWindow { down, target } => self.exec_rotate_window(down, target, None),
             BreakPane { detached, name } => self.exec_break_pane(detached, name, None),
             MoveWindow { kill, target } => self.exec_move_window(kill, target, None),
+            SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst, detach, None),
             FindWindow { pattern } => self.exec_find_window(pattern, None),
             ChooseTree { .. } => Err("no current client".to_string()),
             DisplayPanes { .. } => Err("no current client".to_string()),
+            ClockMode => Err("no current client".to_string()),
         }
     }
 
@@ -2667,9 +3310,11 @@ impl Server {
             RotateWindow { down, target } => wrap(self.exec_rotate_window(down, target, Some(session_name.as_str()))),
             BreakPane { detached, name } => wrap(self.exec_break_pane(detached, name, Some(session_name.as_str()))),
             MoveWindow { kill, target } => wrap(self.exec_move_window(kill, target, Some(session_name.as_str()))),
+            SwapWindow { src, dst, detach } => wrap(self.exec_swap_window(src, dst, detach, Some(session_name.as_str()))),
             FindWindow { pattern } => wrap(self.exec_find_window(pattern, Some(session_name.as_str()))),
             ChooseTree { sessions } => self.exec_choose_tree_client(sessions, client, session_name.as_str()),
             DisplayPanes { ms } => self.exec_display_panes_client(ms, client),
+            ClockMode => self.exec_clock_mode_client(client, session_name.as_str()),
         }
     }
 
@@ -2711,12 +3356,14 @@ impl Server {
             ClientMode::ConfirmCmd { .. } => self.feed_confirm_byte(client, session_name, b),
             ClientMode::Prompt { .. } => self.feed_prompt_byte(client, session_name, b),
             // Copy mode (Task 2) without an open search prompt, and
-            // choose-tree/display-panes (Task 8), never arm raw capture
-            // (`set_capture`) — their keys flow through the normal
-            // `KeyInputEvent::Key`/`Forward` path with a table override (see
-            // `handle_stdin`), not `Captured` bytes. This arm exists only
-            // for match-exhaustiveness.
-            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (true, None),
+            // choose-tree/display-panes/clock-mode (Tasks 8, 10), never arm
+            // raw capture (`set_capture`) — their keys flow through the
+            // normal `KeyInputEvent::Key`/`Forward` path with a table
+            // override (see `handle_stdin`), not `Captured` bytes. This arm
+            // exists only for match-exhaustiveness.
+            ClientMode::Normal | ClientMode::Copy(_) | ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => {
+                (true, None)
+            }
         }
     }
 
@@ -2914,13 +3561,18 @@ impl Server {
 
 // ---- overlays: choose-tree + display-panes (Task 8, sub-project 4) --------
 
-/// One choose-tree row: its already-formatted display text and the
-/// underlying session/window identity it acts on. Built fresh every time by
-/// [`Server::build_tree_rows`] — never cached across a render or a keypress
-/// (see `ClientMode::ChooseTree`'s doc comment for why).
+/// One choose-tree row: its already-formatted display text, the underlying
+/// session/window identity it acts on, and (SP6 wave 2, Task 8) its tree
+/// position — `depth` (`0` session/root, `1` window/child) and `marker`
+/// (`Some('+')`/`Some('-')` for an expandable root, `None` for a leaf).
+/// Built fresh every time by [`Server::build_tree_rows`] — never cached
+/// across a render or a keypress (see `ClientMode::ChooseTree`'s doc comment
+/// for why).
 pub(super) struct TreeRow {
     pub(super) text: String,
     pub(super) target: TreeTarget,
+    pub(super) depth: u8,
+    pub(super) marker: Option<char>,
 }
 
 /// Hardcoded choose-tree key resolution (Task 8) — deliberately NOT routed
@@ -2933,12 +3585,19 @@ pub(super) struct TreeRow {
 /// mode follows instead (`handle_stdin` intercepts already-DECODED `Key`
 /// events). `None` = unbound: swallowed (choose-tree, like copy mode, never
 /// leaks a keystroke to the pane underneath), overlay stays open.
+///
+/// SP6 wave 2, Task 8 additions: `Expand`/`Collapse` (`Right`/`l`/`+` and
+/// `Left`/`h`/`-` respectively, `docs/tmux-reference/choose-tree.md`
+/// `## 5.1`/`## 7.1`) and `TogglePreview` (`v`, `## 3.1`).
 enum ChooseTreeAction {
     Up,
     Down,
     Commit,
     Cancel,
     Kill,
+    Expand,
+    Collapse,
+    TogglePreview,
 }
 
 fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
@@ -2957,6 +3616,13 @@ fn resolve_choose_tree_key(key: &Key) -> Option<ChooseTreeAction> {
         KeyCode::Char('q') => Some(ChooseTreeAction::Cancel),
         KeyCode::Escape => Some(ChooseTreeAction::Cancel),
         KeyCode::Char('x') => Some(ChooseTreeAction::Kill),
+        KeyCode::Right => Some(ChooseTreeAction::Expand),
+        KeyCode::Char('l') => Some(ChooseTreeAction::Expand),
+        KeyCode::Char('+') => Some(ChooseTreeAction::Expand),
+        KeyCode::Left => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('h') => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('-') => Some(ChooseTreeAction::Collapse),
+        KeyCode::Char('v') => Some(ChooseTreeAction::TogglePreview),
         _ => None,
     }
 }
@@ -2968,42 +3634,204 @@ impl Server {
     /// what makes stale-row bugs structurally unreachable (see
     /// `ClientMode::ChooseTree`'s doc comment).
     ///
-    /// `Sessions`: one row per session, `<name>: N windows[ (attached)]`.
-    /// `Windows`: the CURRENT session only — a header row in the same format
-    /// as a `Sessions` row, followed by one indented row per window,
-    /// `  <index>: <name><flags>` (`*` current, `-` last, else nothing) —
-    /// see the design spec's `## 7. Overlays` section for the exact format
-    /// and the documented "current session's windows only" scope
-    /// simplification (real tmux's `-w` shows the whole tree).
-    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView) -> Vec<TreeRow> {
+    /// `Sessions` (SP6 wave 2, Task 8 — a real tree): one root row per
+    /// session, `<name>: N windows[ (attached)]`, `depth: 0`, marker
+    /// `Some('-')` if `expanded` contains that session's name (its windows
+    /// follow as `depth: 1` children, `<index>: <name><flags>`) or
+    /// `Some('+')` otherwise (collapsed — `docs/tmux-reference/choose-
+    /// tree.md` `## 1.1`: "sessions start collapsed"). `Windows`: the
+    /// CURRENT session only, unconditionally expanded (ignores `expanded`
+    /// entirely) — a header row in the same format as a `Sessions` row
+    /// (marker `Some('-')`, cosmetic only: this view has no collapse
+    /// affordance of its own), followed by one `depth: 1`, `marker: None`
+    /// leaf row per window, `<index>: <name><flags>` (`*` current, `-` last,
+    /// else nothing) — see the design spec's `## 7. Overlays` section for
+    /// the "current session's windows only" scope simplification this task
+    /// deliberately leaves unchanged (real tmux's `-w` shows the whole
+    /// multi-session tree; see `ChooseTreeView`'s doc comment).
+    pub(super) fn build_tree_rows(&self, session_name: &str, view: ChooseTreeView, expanded: &HashSet<String>) -> Vec<TreeRow> {
         let is_attached = |name: &str| self.clients.values().any(|c| c.session.as_deref() == Some(name));
-        let session_row = |s: &Session| TreeRow {
-            text: format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" }),
-            target: TreeTarget::Session(s.name.clone()),
+        let session_text = |s: &Session| format!("{}: {} windows{}", s.name, s.windows.len(), if is_attached(&s.name) { " (attached)" } else { "" });
+        let window_row = |session: &Session, w: &Window| {
+            let flag = if w.id == session.current {
+                "*"
+            } else if Some(w.id) == session.last {
+                "-"
+            } else {
+                ""
+            };
+            TreeRow {
+                text: format!("{}: {}{}", w.index, w.name, flag),
+                target: TreeTarget::Window(session.name.clone(), w.id),
+                depth: 1,
+                marker: None,
+            }
         };
         match view {
-            ChooseTreeView::Sessions => self.registry.sessions().iter().map(session_row).collect(),
+            ChooseTreeView::Sessions => {
+                let mut rows = Vec::new();
+                for s in self.registry.sessions() {
+                    let is_expanded = expanded.contains(&s.name);
+                    rows.push(TreeRow {
+                        text: session_text(s),
+                        target: TreeTarget::Session(s.name.clone()),
+                        depth: 0,
+                        marker: Some(if is_expanded { '-' } else { '+' }),
+                    });
+                    if is_expanded {
+                        rows.extend(s.windows.iter().map(|w| window_row(s, w)));
+                    }
+                }
+                rows
+            }
             ChooseTreeView::Windows => {
                 let Some(session) = self.registry.sessions().iter().find(|s| s.name == session_name) else {
                     return Vec::new();
                 };
-                let mut rows = vec![session_row(session)];
-                for w in &session.windows {
-                    let flag = if w.id == session.current {
-                        "*"
-                    } else if Some(w.id) == session.last {
-                        "-"
-                    } else {
-                        ""
-                    };
-                    rows.push(TreeRow {
-                        text: format!("  {}: {}{}", w.index, w.name, flag),
-                        target: TreeTarget::Window(session.name.clone(), w.id),
-                    });
-                }
+                let mut rows = vec![TreeRow {
+                    text: session_text(session),
+                    target: TreeTarget::Session(session.name.clone()),
+                    depth: 0,
+                    marker: Some('-'),
+                }];
+                rows.extend(session.windows.iter().map(|w| window_row(session, w)));
                 rows
             }
         }
+    }
+
+    /// choose-tree preview sizing (SP6 wave 2, Task 8;
+    /// `docs/tmux-reference/choose-tree.md` `## 3.1`, `mode_tree_set_height`
+    /// plus `mode_tree_draw`'s own box-size guard): the ROW LIST's height in
+    /// panel rows -- the preview (if any) occupies every row below it, i.e.
+    /// `sy - h`. Returns `sy` itself (no preview at all) whenever the mode
+    /// is `Off`, the computed split would leave the list under 10 rows
+    /// (NORMAL) / the preview under 2 rows total (BIG, or the final `sy - h
+    /// < 2` guard), or the panel is too small in either axis for a sensible
+    /// box (`sy <= 4 || h < 2 || sy - h <= 4 || w <= 4`).
+    pub(super) fn choose_tree_list_height(sy: u16, w: u16, line_size: usize, mode: PreviewMode) -> u16 {
+        let sy_i = sy as i32;
+        let ls = line_size as i32;
+        let mut h = match mode {
+            PreviewMode::Normal => {
+                let mut h = (sy_i / 3) * 2; // list gets 2/3
+                if h > ls {
+                    h = sy_i / 2; // short list: 1/2
+                }
+                if h < 10 {
+                    h = sy_i; // too small: no preview
+                }
+                h
+            }
+            PreviewMode::Big => {
+                let mut h = sy_i / 4; // list gets 1/4
+                if h > ls {
+                    h = ls;
+                }
+                if h < 2 {
+                    h = 2;
+                }
+                h
+            }
+            PreviewMode::Off => sy_i,
+        };
+        if sy_i - h < 2 {
+            h = sy_i; // preview must be >= 2 rows
+        }
+        if sy_i <= 4 || h < 2 || sy_i - h <= 4 || w <= 4 {
+            h = sy_i; // mode_tree_draw's own box-size guard
+        }
+        h.clamp(0, sy_i.max(0)) as u16
+    }
+
+    /// The selected tree row's live preview content (SP6 wave 2, Task 8;
+    /// `docs/tmux-reference/choose-tree.md` `## 6`): a session item's
+    /// preview is a horizontal filmstrip of its windows' ACTIVE panes; a
+    /// window item's is a filmstrip of its own panes. Each slot is
+    /// `interior_w / N` columns wide (the last slot absorbing the
+    /// remainder), separated by a `│` divider (except the first), with the
+    /// pane's `index:name` label on the slot's first row and a raw
+    /// (truncate, never scale), cell-for-cell copy of the pane's live
+    /// `Grid` from `(0,0)` filling the rows below it. This is a
+    /// deliberately simplified filmstrip -- no cursor-centered source
+    /// viewport, no `<`/`>` scroll gutters for an overflowing filmstrip, no
+    /// centered mini-box label (real tmux's `screen_write_preview`/
+    /// `window_tree_draw_label`, `## 6.1`/`## 6.5`) -- documented scope
+    /// decisions, not oversights; see the task report. Returns `(title,
+    /// content_w, content_h, content)` sized EXACTLY to `(interior_w,
+    /// interior_h)` (never oversized -- the renderer's truncate-not-scale
+    /// guarantee is defensive here, exercised synthetically by
+    /// `render::tests::overlay_preview_truncates_oversized_grid`, not
+    /// needed in production).
+    pub(super) fn build_tree_preview(&self, target: &TreeTarget, interior_w: u16, interior_h: u16) -> (String, u16, u16, Vec<Cell>) {
+        let mut content = vec![Cell::default(); interior_w as usize * interior_h as usize];
+        if interior_w == 0 || interior_h == 0 {
+            return (String::new(), interior_w, interior_h, content);
+        }
+        let (title, slots): (String, Vec<(PaneId, String)>) = match target {
+            TreeTarget::Session(name) => {
+                let Some(session) = self.registry.sessions().iter().find(|s| s.name == *name) else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {} (sort: index)", session.name);
+                let slots = session.windows.iter().map(|w| (w.layout.focused(), format!("{}:{}", w.index, w.name))).collect();
+                (title, slots)
+            }
+            TreeTarget::Window(sname, wid) => {
+                let Some(window) =
+                    self.registry.sessions().iter().find(|s| s.name == *sname).and_then(|s| s.windows.iter().find(|w| w.id == *wid))
+                else {
+                    return (String::new(), interior_w, interior_h, content);
+                };
+                let title = format!(" {}:{} (sort: index)", window.index, window.name);
+                let panes = window.layout.panes();
+                let slots = panes.iter().enumerate().map(|(idx, pid)| (*pid, format!("{idx}"))).collect();
+                (title, slots)
+            }
+        };
+        let n = slots.len();
+        if n == 0 {
+            return (title, interior_w, interior_h, content);
+        }
+        let slot_w = interior_w / n as u16;
+        let mut x0 = 0u16;
+        for (i, (pane_id, label)) in slots.iter().enumerate() {
+            let this_w = if i + 1 == n { interior_w - x0 } else { slot_w };
+            if this_w == 0 {
+                continue;
+            }
+            let divider = i > 0;
+            let gutter: u16 = if divider { 1 } else { 0 };
+            if divider {
+                for y in 0..interior_h {
+                    content[y as usize * interior_w as usize + x0 as usize] = Cell { ch: '│', style: Style::default() };
+                }
+            }
+            let label_x0 = x0 + gutter;
+            let pane_w = this_w.saturating_sub(gutter);
+            for (li, ch) in label.chars().enumerate() {
+                if (li as u16) >= pane_w {
+                    break;
+                }
+                content[(label_x0 + li as u16) as usize] = Cell { ch, style: Style::default() };
+            }
+            if let Some(pane) = self.panes.get(pane_id) {
+                for cy in 1..interior_h {
+                    if cy > pane.grid.rows() {
+                        break;
+                    }
+                    for cx in 0..pane_w {
+                        if cx >= pane.grid.cols() {
+                            break;
+                        }
+                        let cell = pane.grid.cell(cx, cy - 1);
+                        content[cy as usize * interior_w as usize + (label_x0 + cx) as usize] = cell;
+                    }
+                }
+            }
+            x0 += this_w;
+        }
+        (title, interior_w, interior_h, content)
     }
 
     /// `kill-session <name>? (y/n)` / `kill-window <name>? (y/n)` for `x`
@@ -3120,11 +3948,11 @@ impl Server {
         }
 
         let action = resolve_choose_tree_key(key)?;
-        let view = match &client.mode {
-            ClientMode::ChooseTree(state) => state.view,
+        let (view, expanded) = match &client.mode {
+            ClientMode::ChooseTree(state) => (state.view, state.expanded.clone()),
             _ => return None,
         };
-        let rows = self.build_tree_rows(session_name, view);
+        let rows = self.build_tree_rows(session_name, view, &expanded);
 
         // Task 8 review fix, Critical #1: re-resolve the STORED SELECTION
         // IDENTITY against this freshly rebuilt `rows`, rather than trusting
@@ -3175,6 +4003,61 @@ impl Server {
                 client.mode = ClientMode::Normal;
                 Some(self.exec_tree_commit(target, client, session_name))
             }
+            // SP6 wave 2, Task 8 (`docs/tmux-reference/choose-tree.md`
+            // `## 5.1`/`## 7.1`): only session (depth-0) rows carry an
+            // expand/collapse affordance in this project's tree model (no
+            // pane-level children -- see `build_tree_rows`'s doc comment).
+            // On a session row, `Collapse` removes it from `expanded`
+            // (selection stays put) and `Expand` adds it (ditto); on a
+            // window (leaf) row, `Collapse` jumps to its parent session row
+            // ("flat, move to parent" per the doc) and `Expand` just moves
+            // down one line ("flat, move down").
+            ChooseTreeAction::Collapse => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                match &row.target {
+                    TreeTarget::Session(name) => {
+                        let name = name.clone();
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.expanded.remove(&name);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    TreeTarget::Window(sname, _) => {
+                        let parent = TreeTarget::Session(sname.clone());
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.sel = rows.iter().position(|r| r.target == parent).unwrap_or(state.sel);
+                            state.selected = Some(parent);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                }
+            }
+            ChooseTreeAction::Expand => {
+                let Some(row) = rows.get(sel) else { return Some(ExecOutcome::Ok(String::new())) };
+                match &row.target {
+                    TreeTarget::Session(name) => {
+                        let name = name.clone();
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.expanded.insert(name);
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                    TreeTarget::Window(..) => {
+                        let new_sel = (sel + 1).min(rows.len().saturating_sub(1));
+                        if let ClientMode::ChooseTree(state) = &mut client.mode {
+                            state.sel = new_sel;
+                            state.selected = rows.get(new_sel).map(|r| r.target.clone());
+                        }
+                        Some(ExecOutcome::Ok(String::new()))
+                    }
+                }
+            }
+            ChooseTreeAction::TogglePreview => {
+                if let ClientMode::ChooseTree(state) = &mut client.mode {
+                    state.preview = state.preview.cycle();
+                }
+                Some(ExecOutcome::Ok(String::new()))
+            }
         }
     }
 
@@ -3204,6 +4087,21 @@ impl Server {
         ExecOutcome::Ok(String::new())
     }
 
+    /// Route one decoded key to the acting client's clock-mode overlay
+    /// (Task 10): unconditionally dismisses -- `docs/tmux-reference/
+    /// status-line-and-messages.md` `## 6. Clock mode`'s "any key exits"
+    /// (`window_clock_key` calls `window_pane_reset_mode` for literally
+    /// every key, `window-clock.c:213-219` -- no key-table lookup at all)
+    /// -- so unlike display-panes' digit/non-digit split above, there is no
+    /// case where the key does anything OTHER than close the overlay.
+    pub(super) fn dispatch_clock_key(&mut self, client: &mut ClientState) -> ExecOutcome {
+        if !matches!(client.mode, ClientMode::Clock(_)) {
+            return ExecOutcome::Ok(String::new());
+        }
+        client.mode = ClientMode::Normal;
+        ExecOutcome::Ok(String::new())
+    }
+
     /// `choose-tree [-s|-w]` (Task 8): opens the overlay, replacing whatever
     /// mode the client was previously in (matches copy mode's own entry
     /// behavior — no special-casing for "already in copy mode"/"prompt open"
@@ -3211,12 +4109,35 @@ impl Server {
     /// never actually dispatch this command in the first place).
     fn exec_choose_tree_client(&mut self, sessions: bool, client: &mut ClientState, session_name: &str) -> ExecOutcome {
         let view = if sessions { ChooseTreeView::Sessions } else { ChooseTreeView::Windows };
-        // Task 8 review fix, Critical #1: seed `selected` with row 0's
-        // identity (not just index 0) so the very first Up/Down/Commit/Kill
-        // has an identity to re-resolve, same as every subsequent keypress.
-        let rows = self.build_tree_rows(session_name, view);
-        let selected = rows.first().map(|r| r.target.clone());
-        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel: 0, selected, pending_kill: None });
+        let expanded = HashSet::new();
+        // Task 8 review fix, Critical #1: seed `selected` with an IDENTITY
+        // (not just an index) so the very first Up/Down/Commit/Kill has one
+        // to re-resolve, same as every subsequent keypress.
+        //
+        // SP6 wave 2, Task 8 (mode-tree's "current-item" default start,
+        // `docs/tmux-reference/choose-tree.md` `## 1.1`): `Sessions`
+        // defaults to the ACTING CLIENT's own current session's row (always
+        // present -- sessions view lists every session unconditionally, and
+        // a session's own row always exists even collapsed); `Windows`
+        // defaults to that session's CURRENT window's row (also always
+        // present -- the windows view always shows every window of the
+        // current session). Row 0 (the old behavior) is only a fallback for
+        // the structurally-unreachable case that lookup fails.
+        let rows = self.build_tree_rows(session_name, view, &expanded);
+        let default_target = match view {
+            ChooseTreeView::Sessions => Some(TreeTarget::Session(session_name.to_string())),
+            ChooseTreeView::Windows => self
+                .registry
+                .sessions()
+                .iter()
+                .find(|s| s.name == session_name)
+                .map(|s| TreeTarget::Window(session_name.to_string(), s.current)),
+        };
+        let selected = default_target
+            .filter(|t| rows.iter().any(|r| &r.target == t))
+            .or_else(|| rows.first().map(|r| r.target.clone()));
+        let sel = selected.as_ref().and_then(|t| rows.iter().position(|r| &r.target == t)).unwrap_or(0);
+        client.mode = ClientMode::ChooseTree(ChooseTreeState { view, sel, selected, pending_kill: None, expanded, preview: PreviewMode::Normal });
         ExecOutcome::Ok(String::new())
     }
 
@@ -3225,6 +4146,24 @@ impl Server {
     fn exec_display_panes_client(&mut self, ms: Option<u32>, client: &mut ClientState) -> ExecOutcome {
         let dur = ms.map(|m| Duration::from_millis(m as u64)).unwrap_or_else(|| self.options.display_panes_time());
         client.mode = ClientMode::DisplayPanes(DisplayPanesState { deadline: Instant::now() + dur });
+        ExecOutcome::Ok(String::new())
+    }
+
+    /// `clock-mode` (Task 10): opens the overlay on the acting client's
+    /// CURRENTLY FOCUSED pane (binds to that pane id for the mode's
+    /// lifetime, mirroring `exec_copy_mode`'s own "binds to the pane
+    /// focused at entry" rule), with the display string built immediately
+    /// from the current time (`clock-mode-style`-governed, see
+    /// `format_clock`) so the very first render has something to draw
+    /// rather than waiting for the next `Tick`.
+    fn exec_clock_mode_client(&mut self, client: &mut ClientState, session_name: &str) -> ExecOutcome {
+        let pane = match self.registry.session_mut(session_name) {
+            Some(s) => s.current_window().layout.focused(),
+            None => return ExecOutcome::Err(format!("can't find session: {session_name}")),
+        };
+        let now = system_time_parts();
+        let text = format_clock(now.hour, now.min, self.options.clock_mode_style_12());
+        client.mode = ClientMode::Clock(ClockState { pane, text });
         ExecOutcome::Ok(String::new())
     }
 }
@@ -3373,6 +4312,7 @@ mod mouse_dispatch_tests {
                 ClientMode::ConfirmCmd { .. } => "ConfirmCmd",
                 ClientMode::ChooseTree(_) => "ChooseTree",
                 ClientMode::DisplayPanes(_) => "DisplayPanes",
+                ClientMode::Clock(_) => "Clock",
             }
         );
     }
@@ -3409,6 +4349,63 @@ mod mouse_dispatch_tests {
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
         let ClientMode::Copy(cs) = &client_plain.mode else { panic!("expected Copy mode after plain copy-mode") };
         assert!(!cs.scroll_exit, "plain copy-mode entry (no -e) must not set scroll_exit");
+    }
+
+    /// Gap analysis §D point 2: `mouse_down`'s `MouseHit::None` arm didn't
+    /// reset `client.mouse.drag`, unlike every other arm (`VBorder`/
+    /// `HBorder`/`Pane`), which all overwrite it unconditionally. Real
+    /// hit-testing can't actually produce `MouseHit::None` for coordinates
+    /// inside a non-degenerate pane area on any practically-sized terminal
+    /// (`hit_test`'s pane/border rects always fully tile the area), so this
+    /// is exercised directly against `mouse_down` with an EMPTY `rects`
+    /// slice -- the same "zero-size rects" degenerate case the root-cause
+    /// doc comment on `hit_test` calls out, forced by hand rather than by
+    /// shrinking a real terminal to a degenerate size.
+    #[test]
+    fn mouse_down_miss_clears_stale_drag() {
+        let (mut server, session_name, pane_id) = test_server_with_pane(false);
+        let mut client = test_client(20, 10);
+        client.mouse.drag = super::super::MouseDrag::Border { pane: pane_id, vertical: true };
+
+        let down = MouseEvent { kind: MouseKind::Down(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.mouse_down(down, 1, &[], &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::None,
+            "a Down that misses every pane/border cell must clear stale drag state"
+        );
+    }
+
+    /// `docs/follow-ups.md` #64: the choose-tree/display-panes mouse guard
+    /// at the top of `dispatch_mouse` swallows Drag/Up events while an
+    /// overlay is open, but (before this fix) never cleared
+    /// `client.mouse.drag` -- so a drag armed before the overlay opened
+    /// (e.g. a keyboard-triggered `display-panes` mid-drag) survived the
+    /// overlay's lifetime, revivable by a later out-of-sequence `Drag`/`Up`
+    /// with no intervening `Down`. Not reachable through a conformant SGR
+    /// mouse stream (hence the unit-level construction here, mirroring
+    /// `alt_screen_wheel_does_not_enter_copy_mode`'s direct `Server`+
+    /// `ClientState` build instead of a pipe-driven e2e harness): a real
+    /// terminal always sends `Down` before `Drag`/`Up`, and `Down`'s own
+    /// arms already overwrite `client.mouse.drag` unconditionally, so this
+    /// exact sequence can only be forced by hand.
+    #[test]
+    fn mouse_drag_cleared_when_overlay_swallows_release() {
+        let (mut server, session_name, pane_id) = test_server_with_pane(false);
+        let mut client = test_client(20, 10);
+        client.mouse.drag = super::super::MouseDrag::Border { pane: pane_id, vertical: true };
+
+        let outcome = server.exec_display_panes_client(None, &mut client);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(matches!(client.mode, ClientMode::DisplayPanes(_)), "test setup: overlay must be open");
+
+        let up = MouseEvent { kind: MouseKind::Up(1), ctrl: false, meta: false, shift: false, x: 5, y: 3 };
+        let outcome = server.dispatch_mouse(up, &mut client, &session_name);
+        assert!(matches!(outcome, ExecOutcome::Ok(_)));
+        assert!(
+            client.mouse.drag == super::super::MouseDrag::None,
+            "overlay guard must clear stale drag state on a swallowed Up"
+        );
     }
 }
 
@@ -3480,13 +4477,20 @@ mod choose_tree_dispatch_tests {
     /// The review's Critical #1, reproduced: `ChooseTreeState.sel` used to be
     /// a raw array index into a row list rebuilt fresh every keypress -- not
     /// a stable target identity. Rows = `[header, A, B, C]`. Select row 2
-    /// (window B) via real `Down` dispatches, then simulate a SAME-BATCH
+    /// (window B) via a real `Down` dispatch, then simulate a SAME-BATCH
     /// concurrent kill of window A (an EARLIER row) -- directly, bypassing
     /// this client's key machine and with NO intervening render, exactly
     /// the scenario the server's event-loop coalescing makes reachable
     /// (`server.rs`'s `run()` drains the whole channel before rendering).
     /// Rows are now `[header, B, C]`; the OLD raw index 2 would silently
     /// point at C instead of B. Enter must still commit to B.
+    ///
+    /// SP6 wave 2, Task 8 (`(b)` default selection = current item): opening
+    /// choose-tree now starts on window A's row (the session's CURRENT
+    /// window, per `test_server_with_three_windows`'s explicit `current =
+    /// a_id` reset), not the header row -- so ONE `Down` (A -> B) reaches
+    /// the same starting point the old two-`Down` header-relative sequence
+    /// did.
     #[test]
     fn choose_tree_commit_targets_selected_row_after_concurrent_kill() {
         let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
@@ -3496,8 +4500,7 @@ mod choose_tree_dispatch_tests {
         let outcome = server.exec_choose_tree_client(false, &mut client, &sname);
         assert!(matches!(outcome, ExecOutcome::Ok(_)));
 
-        // Down, Down: header -> A's row -> B's row.
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
+        // Down: A's row (the default selection) -> B's row.
         server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
         match &client.mode {
             ClientMode::ChooseTree(state) => {
@@ -3519,7 +4522,9 @@ mod choose_tree_dispatch_tests {
     }
 
     /// Same root cause, `x` (Kill) variant: arming the kill-confirm must
-    /// target the re-resolved identity too, not the stale index.
+    /// target the re-resolved identity too, not the stale index. See the
+    /// `Commit` variant's doc comment above for why a single `Down` (not
+    /// two) now reaches window B's row.
     #[test]
     fn choose_tree_kill_targets_selected_row_after_concurrent_kill() {
         let (mut server, session_name, [a_id, b_id, _c_id]) = test_server_with_three_windows();
@@ -3527,7 +4532,6 @@ mod choose_tree_dispatch_tests {
         let mut sname = session_name.clone();
 
         server.exec_choose_tree_client(false, &mut client, &sname);
-        server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
         server.dispatch_choose_tree_key(&key(KeyCode::Down), &mut client, &mut sname).expect("Down dispatches");
 
         server.kill_window_by_id(&session_name, a_id).expect("kill window A");
@@ -3544,5 +4548,365 @@ mod choose_tree_dispatch_tests {
             }
             _ => panic!("expected ChooseTree mode"),
         }
+    }
+}
+
+/// SP6 Task 2 (config compatibility): the two dispatch-level gaps the user's
+/// real `.tmux.conf` hit that neither `cmd.rs` parsing nor `options.rs`
+/// alone can cover -- copy-mode/copy-mode-vi key-table routing, and
+/// `source-file`'s `~` expansion.
+#[cfg(test)]
+mod sp6_config_compat_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// `bind`/`unbind -T copy-mode-vi`: the `WhichTable::CopyMode`/
+    /// `CopyModeVi` variants already existed (`src/bindings.rs:39-44`) and
+    /// `cmd.rs`'s OWN `-T` validation already accepted these table names --
+    /// only this dispatch-time match was missing the arms.
+    #[test]
+    fn bind_unbind_copy_mode_tables() {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+
+        let tail = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
+        server
+            .exec_bind_key("copy-mode-vi".to_string(), false, "y".to_string(), tail)
+            .expect("bind into copy-mode-vi");
+        let y = crate::keys::parse_key("y").unwrap();
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_some());
+
+        server
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("y".to_string()))
+            .expect("unbind from copy-mode-vi");
+        assert!(server.bindings.lookup(WhichTable::CopyModeVi, &y).is_none());
+
+        // The user's actual fixture line: `unbind -T copy-mode-vi
+        // MouseDragEnd1Pane`. `MouseDragEnd1Pane` is a real tmux mouse
+        // pseudo-key, but winmux's mouse handling is hardcoded dispatch
+        // logic, not table-driven via named pseudo-keys, so `parse_key`
+        // rejects it -- unbinding it must still succeed as a silent no-op
+        // (nothing could ever have been bound there).
+        server
+            .exec_unbind_key(false, "copy-mode-vi".to_string(), Some("MouseDragEnd1Pane".to_string()))
+            .expect("unbind of an unparseable pseudo-key is a silent no-op, not an error");
+
+        // A copy-mode-vi bind still errors on a genuinely bad key.
+        let tail2 = vec![RawCmd { name: "cancel".to_string(), args: vec![] }];
+        assert!(server.exec_bind_key("copy-mode-vi".to_string(), false, "MouseDragEnd1Pane".to_string(), tail2).is_err());
+    }
+
+    /// `source-file ~/xyz.conf` expands the leading `~/` via `USERPROFILE`
+    /// before opening the file (`commands-config-options-formats.md` §2.6).
+    #[test]
+    fn source_file_expands_tilde() {
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set in the test environment");
+        let filename = format!("winmux-test-tilde-{}.conf", std::process::id());
+        let full_path = std::path::Path::new(&home).join(&filename);
+        std::fs::write(&full_path, "set -g base-index 9\n").expect("write temp conf");
+
+        let result = server.execute_source_file_headless(&format!("~/{filename}"));
+        let _ = std::fs::remove_file(&full_path);
+        result.expect("source-file with a leading ~/ expands via USERPROFILE");
+        assert_eq!(server.options.base_index(), 9);
+    }
+
+    /// A bare `~` (no trailing path) also expands.
+    #[test]
+    fn expand_tilde_bare() {
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE must be set in the test environment");
+        assert_eq!(super::expand_tilde("~"), home);
+        assert_eq!(super::expand_tilde("no-tilde-here.conf"), "no-tilde-here.conf");
+    }
+}
+
+/// Task 3 fix rounds 1-3 (report addendum, 2026-07-10). Round 1: Finding 2
+/// -- `pane_activity` never pruned on pane removal (unbounded leak); still
+/// correct, prune tests kept. Rounds 1-2 also stamped death-handoff focus
+/// reassignments (`kill_pane_by_id`/`exec_break_pane` source window/
+/// `handle_exited`); round 3 REVERTED those after the controller verified
+/// tmux's `window_lost_pane` (window.c) never bumps `active_point` on a
+/// death handoff -- the survivor keeps its historical recency. Round 4
+/// then removed `exec_break_pane`'s moved-pane stamp as well
+/// (cmd-break-pane.c:153-158 assigns `w->active` directly; only freshly
+/// SPAWNED panes are stamped, spawn.c -- break-pane recycles one). Stamps
+/// remain only on `window_set_active_pane`-equivalent paths (rotate,
+/// `cmd-rotate-window.c:109`; spawn-time creation, `spawn.c`; explicit
+/// selection/navigation/mouse). Everything is inspected directly via
+/// `Server::pane_activity`/`Server::stamp_active`, which `dispatch.rs` (a
+/// child module of `server`) can already reach the same way production
+/// code does (see `exec_select_pane`'s `activity` closure above).
+#[cfg(test)]
+mod focus_activity_fix_tests {
+    use super::*;
+    use crate::grid::Grid;
+    use std::sync::mpsc::channel;
+
+    fn insert_blank_pane(server: &mut Server) -> PaneId {
+        let pane_id = server.mint_pane_id();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new() });
+        pane_id
+    }
+
+    /// One session/window with `n` panes, split HORIZONTALLY one after
+    /// another directly via `Layout::split` (bypassing `spawn_pane`/real
+    /// ConPTY, same pattern as `mouse_dispatch_tests::test_server_with_pane`
+    /// and `choose_tree_dispatch_tests::test_server_with_three_windows`).
+    /// Returns `(server, session_name, window_id, pane_ids_in_leaf_order)`.
+    /// `pane_activity` is left EMPTY -- none of this setup goes through the
+    /// production `exec_*` stamping call sites, so every pane reads as
+    /// never-focused (activity 0) until a test stamps one explicitly.
+    fn test_server_with_split_panes(n: usize) -> (Server, String, WindowId, Vec<PaneId>) {
+        assert!(n >= 1);
+        let (tx, _rx) = channel();
+        let mut server = Server::new(tx);
+        let first = insert_blank_pane(&mut server);
+        let session = server.registry.create_session(Some("0"), first, (80, 24), 0).expect("create_session");
+        let session_name = session.name.clone();
+        let wid = session.current;
+        let area = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let mut ids = vec![first];
+        for _ in 1..n {
+            let new_id = insert_blank_pane(&mut server);
+            let ok = server
+                .registry
+                .session_mut(&session_name)
+                .unwrap()
+                .windows
+                .iter_mut()
+                .find(|w| w.id == wid)
+                .unwrap()
+                .layout
+                .split(SplitDir::Horizontal, new_id, area)
+                .is_ok();
+            assert!(ok, "test setup: split must succeed");
+            ids.push(new_id);
+        }
+        (server, session_name, wid, ids)
+    }
+
+    fn focused_pane(server: &mut Server, session_name: &str, wid: WindowId) -> PaneId {
+        server.registry.session_mut(session_name).unwrap().windows.iter().find(|w| w.id == wid).unwrap().layout.focused()
+    }
+
+    fn set_focus(server: &mut Server, session_name: &str, wid: WindowId, pane: PaneId) {
+        server.registry.session_mut(session_name).unwrap().windows.iter_mut().find(|w| w.id == wid).unwrap().layout.focus_pane(pane);
+    }
+
+    fn max_activity(server: &Server) -> u64 {
+        server.pane_activity.values().copied().max().unwrap_or(0)
+    }
+
+    /// Fix round 3 (controller-verified against the tmux C source,
+    /// INVERTING the round-1 Finding 1(a) ruling): `window.c
+    /// window_lost_pane` reassigns `w->active` DIRECTLY (last_panes stack
+    /// -> prev -> next) with NO `active_point` bump -- tmux does NOT stamp
+    /// on a kill-pane death handoff; the surviving pane keeps its
+    /// historical recency. `kill_pane_by_id` must leave the handed-off
+    /// pane's activity value untouched.
+    #[test]
+    fn kill_pane_by_id_does_not_stamp_focus_handoff() {
+        // H(A, H(B, C)): kill focused A -> Layout::remove hands focus to
+        // the sibling subtree's first leaf, B -- which must KEEP its prior
+        // activity value (2), not receive a fresh stamp.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        server.stamp_active(c); // c = 1
+        server.stamp_active(b); // b = 2
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, a);
+
+        server.kill_pane_by_id(&session_name, a).expect("kill A");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps active_point)"
+        );
+        assert_eq!(max_activity(&server), before_max, "no pane anywhere may receive a fresh stamp from a death handoff");
+        assert!(!server.pane_activity.contains_key(&a), "the killed pane's activity entry must still be pruned (round-1 Finding 2)");
+    }
+
+    /// Fix round 3, natural-exit variant of the above: `handle_exited`
+    /// routes through the same `window_lost_pane`-shaped handoff, so it
+    /// must not stamp either (inverts round 2's test, whose premise --
+    /// "tmux routes pane death through window_set_active_pane" -- the
+    /// controller's source check disproved). The round-1/2 prune
+    /// assertions stay as-is.
+    #[test]
+    fn handle_exited_does_not_stamp_focus_handoff() {
+        // H(A, H(B, C)): A's shell exits while A is focused ->
+        // Layout::remove hands focus to the sibling subtree's first
+        // leaf, B, which must keep its prior activity value.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        server.stamp_active(c); // c = 1
+        server.stamp_active(b); // b = 2
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, a);
+
+        assert!(server.handle_exited(a), "handle_exited must report the server should keep running");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(new_focus, b, "test setup sanity: Layout::remove hands focus to the sibling subtree's first leaf");
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps active_point)"
+        );
+        assert_eq!(max_activity(&server), before_max, "no pane anywhere may receive a fresh stamp from a death handoff");
+        assert!(!server.pane_activity.contains_key(&a), "the exited pane's activity entry must still be pruned (round-1 Finding 2 site)");
+    }
+
+    /// Guard, mirroring `kill_pane_by_id_does_not_stamp_when_focus_unchanged`:
+    /// a NON-focused pane exiting naturally must not spuriously stamp the
+    /// window's (unchanged) focus.
+    #[test]
+    fn handle_exited_does_not_stamp_when_focus_unchanged() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        set_focus(&mut server, &session_name, wid, c);
+        server.stamp_active(c);
+
+        assert!(server.handle_exited(a));
+
+        assert_eq!(focused_pane(&mut server, &session_name, wid), c, "a non-focused pane exiting must not move focus");
+        assert!(!server.pane_activity.contains_key(&b), "B was never focused and must not be spuriously stamped");
+    }
+
+    /// Guard: killing a NON-focused pane must NOT spuriously stamp the
+    /// window's (unchanged) focus -- `Layout::remove` never touches
+    /// `focused` in that case, so neither should `kill_pane_by_id`.
+    #[test]
+    fn kill_pane_by_id_does_not_stamp_when_focus_unchanged() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(3);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        set_focus(&mut server, &session_name, wid, c);
+        server.stamp_active(c); // c is focused and already stamped
+
+        server.kill_pane_by_id(&session_name, a).expect("kill non-focused A");
+
+        assert_eq!(focused_pane(&mut server, &session_name, wid), c, "killing a non-focused pane must not move focus");
+        assert!(!server.pane_activity.contains_key(&b), "B was never focused and must not be spuriously stamped");
+    }
+
+    /// Finding 1(c): `Layout::rotate` keeps the same LEAF POSITION focused,
+    /// but a DIFFERENT PaneId now occupies it -- `focused` is reassigned to
+    /// a new pane on every successful rotate.
+    #[test]
+    fn exec_rotate_window_stamps_new_focus() {
+        let (mut server, session_name, wid, _ids) = test_server_with_split_panes(3);
+        let before_max = max_activity(&server);
+
+        server.exec_rotate_window(false, None, Some(&session_name)).expect("rotate-window");
+
+        let new_focus = focused_pane(&mut server, &session_name, wid);
+        assert!(
+            server.pane_activity.get(&new_focus).copied().unwrap_or(0) > before_max,
+            "rotate-window's focus reassignment (Layout::rotate) must get a fresh stamp"
+        );
+    }
+
+    /// Fix round 4 (controller read cmd-break-pane.c directly, overturning
+    /// round 3's "creation-path" caveat for the moved pane): the classic
+    /// break-pane path (cmd-break-pane.c:153-158) creates the new window
+    /// and sets `w->active = wp` by DIRECT assignment -- no `active_point`
+    /// bump (the `window_set_active_pane` at :80 belongs to
+    /// `cmd_break_pane_float`, the new `-W` floating feature, irrelevant
+    /// here). tmux distinguishes: a freshly SPAWNED window/split pane gets
+    /// stamped (spawn.c); break-pane's RECYCLED pane does not. So NEITHER
+    /// side of `exec_break_pane` stamps -- the moved pane keeps its prior
+    /// recency too.
+    #[test]
+    fn exec_break_pane_does_not_stamp_either_side() {
+        // H(A, B): break B (focused) out. A (the source window's handed-off
+        // survivor) AND B (the moved, recycled pane) must both keep their
+        // prior activity values exactly; no fresh stamp anywhere.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        server.stamp_active(a); // a = 1
+        server.stamp_active(b); // b = 2
+        let a_before = server.pane_activity.get(&a).copied().expect("a stamped");
+        let b_before = server.pane_activity.get(&b).copied().expect("b stamped");
+        let before_max = max_activity(&server);
+        set_focus(&mut server, &session_name, wid, b);
+
+        server.exec_break_pane(false, None, Some(&session_name)).expect("break-pane");
+
+        let source_focus = focused_pane(&mut server, &session_name, wid);
+        assert_eq!(source_focus, a, "test setup sanity: only A remains in the source window");
+        assert_eq!(
+            server.pane_activity.get(&a).copied(),
+            Some(a_before),
+            "the source window's handed-off survivor must KEEP its historical activity value (window_lost_pane never bumps)"
+        );
+        assert_eq!(
+            server.pane_activity.get(&b).copied(),
+            Some(b_before),
+            "the moved pane must KEEP its historical activity value too (cmd-break-pane.c:158 assigns w->active directly, no bump)"
+        );
+        assert_eq!(max_activity(&server), before_max, "break-pane must not freshly stamp any pane");
+    }
+
+    /// Finding 2: `pane_activity` must be pruned wherever a pane is removed
+    /// from `self.panes`/`self.last_rects`, or it leaks unboundedly across
+    /// the server's lifetime.
+    #[test]
+    fn kill_pane_by_id_prunes_pane_activity() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        set_focus(&mut server, &session_name, wid, a);
+        server.stamp_active(a);
+        server.stamp_active(b);
+
+        server.kill_pane_by_id(&session_name, a).expect("kill A");
+
+        assert!(!server.pane_activity.contains_key(&a), "a killed pane's activity entry must be pruned");
+        assert!(server.pane_activity.contains_key(&b), "the surviving pane's entry must be untouched");
+    }
+
+    #[test]
+    fn kill_window_by_id_prunes_pane_activity_for_all_its_panes() {
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(2);
+        let (a, b) = (ids[0], ids[1]);
+        // A second window so the first can be killed outright (kill_window
+        // refuses the session's only window).
+        let other_pane = insert_blank_pane(&mut server);
+        let other_wid = server.registry.mint_window_id();
+        server.registry.session_mut(&session_name).unwrap().new_window(other_wid, other_pane);
+        server.stamp_active(a);
+        server.stamp_active(b);
+
+        server.kill_window_by_id(&session_name, wid).expect("kill window");
+
+        assert!(!server.pane_activity.contains_key(&a), "killed window's pane A must be pruned from pane_activity");
+        assert!(!server.pane_activity.contains_key(&b), "killed window's pane B must be pruned from pane_activity");
+    }
+
+    #[test]
+    fn exec_move_window_prunes_occupant_pane_activity() {
+        // Two windows (idx0 = wid/A, idx1 = other_wid/B); move-window -k
+        // onto idx1 kills B, its occupant, whose activity entry must be
+        // pruned alongside its pane/rect cleanup.
+        let (mut server, session_name, wid, ids) = test_server_with_split_panes(1);
+        let a = ids[0];
+        let other_pane = insert_blank_pane(&mut server);
+        let other_wid = server.registry.mint_window_id();
+        server.registry.session_mut(&session_name).unwrap().new_window(other_wid, other_pane);
+        server.stamp_active(a);
+        server.stamp_active(other_pane);
+        server.registry.session_mut(&session_name).unwrap().current = wid;
+
+        server.exec_move_window(true, "1".to_string(), Some(&session_name)).expect("move-window -k onto occupied index 1");
+
+        assert!(!server.pane_activity.contains_key(&other_pane), "the killed occupant's activity entry must be pruned");
+        assert!(server.pane_activity.contains_key(&a), "the mover's own pane activity must be untouched");
     }
 }

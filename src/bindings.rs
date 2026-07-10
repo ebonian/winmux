@@ -187,6 +187,10 @@ impl Default for Bindings {
         b(char_key('s'), vec![cmd1("choose-tree", &["-s"])], false);
         b(char_key('q'), vec![cmd1("display-panes", &[])], false);
 
+        // Clock mode (Task 10, sub-project 6 wave 2): `t`, matching real
+        // tmux's default `prefix t` (`key-bindings.c:433`).
+        b(char_key('t'), vec![cmd1("clock-mode", &[])], false);
+
         Bindings { root: HashMap::new(), prefix, copy_mode: copy_mode_emacs_defaults(), copy_mode_vi: copy_mode_vi_defaults() }
     }
 }
@@ -483,6 +487,7 @@ mod tests {
             ("w", "choose-tree", &["-w"], false),
             ("s", "choose-tree", &["-s"], false),
             ("q", "display-panes", &[], false),
+            ("t", "clock-mode", &[], false),
         ];
 
         for (k, name, args, repeat) in expected {

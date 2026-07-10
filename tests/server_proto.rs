@@ -1644,6 +1644,48 @@ fn source_file_runtime() {
     server.join().expect("server exits after kill-server");
 }
 
+/// SP6 Task 2 (config compatibility): the user's REAL `.tmux.conf`, copied
+/// verbatim into `tests/fixtures/user.tmux.conf`, must load with zero
+/// errors. Runtime `source-file` exercises the exact same
+/// `load_config_files`/dispatch path startup config loading uses
+/// (`execute_source_file_headless` wraps one `required: true` candidate
+/// through `load_config_files`, joining every collected error into the
+/// CLI's `err` field) -- a CLI exit code of 0 with an empty `err` is the
+/// strictest "zero config errors" signal available over the protocol today
+/// (there is no direct wire-level "error count" query; the transient
+/// status-bar `config: N error(s)` notice is a STARTUP-only, 750ms-lifetime
+/// side effect, and asserting its ABSENCE for a whole test would be racy --
+/// see `config_errors_collected_and_continue` above for the POSITIVE use of
+/// that same signal). Also spot-checks a few of the fixture's real effects:
+/// the custom prefix, the `|` rebind, and `mouse on`.
+#[test]
+fn user_config_loads_clean() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut cli = cli_client(&name);
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user.tmux.conf");
+    cli.send(&ClientMsg::Cli(vec!["source-file".into(), fixture.to_string_lossy().into_owned()]));
+    let (_out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "", "the user's .tmux.conf must load with zero errors");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "prefix".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "prefix C-a\n");
+
+    cli.send(&ClientMsg::Cli(vec!["show".into(), "mouse".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert_eq!(out, "mouse on\n");
+
+    cli.send(&ClientMsg::Cli(vec!["list-keys".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("bind-key -T prefix | split-window -h"), "out: {out:?}");
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 // ---- Task 7: startup config loading (`## config` contract section) ----
 
 /// A `.tmux.conf`-style fixture loaded at STARTUP (via `--config`, the
@@ -1948,12 +1990,19 @@ fn pane_active_border_style_runtime() {
     ]));
     expect_cli_done(&cli, 0);
 
-    // The split border column (adjacent to the focused right pane) turns
-    // red (fg Idx(1)) instead of the default green.
+    // The split border column turns red (fg Idx(1)) on the half owned by
+    // the focused right pane instead of the default green (Task 11:
+    // exactly two tiled panes -> the divider is cosmetically split in half,
+    // `docs/tmux-reference/panes-and-layout.md` §7.1 -- the RIGHT pane owns
+    // the bottom half of a side-by-side divider, so row 0 specifically is
+    // no longer guaranteed red; check across every row instead). Pre-Task
+    // 11 the whole column read active/red at row 0 -- sanctioned inversion,
+    // see the Task 11 report.
     c.recv_output_until(&mut grid, |g| {
         let pane_rows = g.rows().saturating_sub(1);
         (1..g.cols().saturating_sub(1)).any(|col| {
-            (0..pane_rows).all(|r| g.cell(col, r).ch == '│') && g.cell(col, 0).style.fg == Color::Idx(1)
+            (0..pane_rows).all(|r| g.cell(col, r).ch == '│')
+                && (0..pane_rows).any(|r| g.cell(col, r).style.fg == Color::Idx(1))
         })
     });
 
@@ -2159,6 +2208,44 @@ fn focus_down_into_split_row() {
     down.extend_from_slice(b"\x1b[B");
     c.send(&ClientMsg::Stdin(down));
     c.recv_output_until(&mut grid, |g| g.cursor().0 < 40 && g.cursor().1 >= 13);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// SP6 parity wave 2, Task 3: `Layout::focus_dir`'s edge-flip wrap rule
+/// (`docs/tmux-reference/panes-and-layout.md` §1.1) -- directional
+/// navigation off the near edge of the window wraps to the far edge,
+/// mirroring `window_pane_find_left/right`. Pre-fix this was a silent
+/// no-op (`focus_dir_two_pane_horizontal`'s inverted `false` assertions,
+/// `src/layout.rs`).
+#[test]
+fn focus_wraps_at_window_edge() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // (1 | 2): focus starts on pane2 (right, cursor x > 40).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    // prefix-Left: pane2 -> pane1 (leftmost, single candidate, unaffected
+    // by the wrap fix).
+    c.send(&ClientMsg::Stdin(left.clone()));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < 40);
+
+    // prefix-Left AGAIN from the now-leftmost pane: pane1 is flush against
+    // the window's left edge, so the search edge flips to one past the
+    // right edge -- pane2 (flush right) is the sole candidate. Pre-fix this
+    // was a no-op (cursor would stay in pane1); post-fix it wraps back to
+    // pane2.
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 > 40);
 
     let mut cli = cli_client(&name);
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
@@ -3196,6 +3283,26 @@ const CB_LEFT_DRAG: u8 = 0x20; // button 1 + motion bit
 const CB_WHEEL_UP: u8 = 0x40;
 const CB_WHEEL_DOWN: u8 = 0x41;
 
+/// Drain any `Output` messages that arrive on `c` within `dur`, feeding them
+/// into `grid`, WITHOUT panicking if none arrive -- unlike
+/// `Client::recv_output_until`, which requires a predicate to eventually
+/// become true. Used to prove a negative (nothing changed) after a bounded
+/// wait, once the caller has otherwise synchronized (e.g. a CLI round trip)
+/// that the action under test has already been fully processed server-side.
+fn drain_briefly(c: &Client, grid: &mut Grid, dur: Duration) {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match c.rx.recv_timeout(remaining) {
+            Ok(ServerMsg::Output(bytes)) => grid.feed(&bytes),
+            Ok(_) | Err(_) => return,
+        }
+    }
+}
+
 fn enable_mouse(name: &str, c: &mut Client) {
     let mut cli = cli_client(name);
     cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mouse".into(), "on".into()]));
@@ -3218,6 +3325,27 @@ fn find_vertical_border(g: &Grid) -> u16 {
 
 fn row_text(g: &Grid, row: u16) -> String {
     (0..g.cols()).map(|x| g.cell(x, row).ch).collect()
+}
+
+/// Piggy-back a `Cli` frame on `c` itself (rather than a separate
+/// `cli_client`) to synchronize with whatever `Stdin` frames were already
+/// sent on THIS SAME connection: a single connection's reader thread feeds
+/// the server's event queue strictly in send order, so by the time the
+/// returned `CliDone` arrives, every earlier frame on `c` is guaranteed to
+/// have been fully processed server-side — no arbitrary sleep needed. Any
+/// intervening `Output` frames (e.g. the periodic clock tick, or a mouse
+/// event's own — possibly no-op — render) are drained into `grid` rather
+/// than tripping up the wait. (SP6 Task 6: hoisted from
+/// `mouse_plain_click_in_copy_mode_keeps_mode_and_buffers`, which pioneered
+/// this pattern, for reuse by the click-purity/release-targeting tests.)
+fn next_cli_done(c: &Client, grid: &mut Grid) -> (u8, String, String) {
+    loop {
+        match c.recv() {
+            ServerMsg::Output(bytes) => grid.feed(&bytes),
+            ServerMsg::CliDone { code, out, err } => return (code, out, err),
+            other => panic!("unexpected message waiting for CliDone: {other:?}"),
+        }
+    }
 }
 
 impl Client {
@@ -3407,22 +3535,7 @@ fn mouse_plain_click_in_copy_mode_keeps_mode_and_buffers() {
     c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, true)));
 
     // Piggy-back the assertions as `Cli` frames on the SAME connection as
-    // the click frames above: a single connection's reader thread feeds the
-    // server's event queue strictly in send order, so by the time these
-    // `CliDone` responses arrive, the Down/Up frames are guaranteed to have
-    // already been fully processed -- no arbitrary sleep needed. Any
-    // intervening `Output` frames (e.g. the periodic clock tick) are drained
-    // into `grid` rather than tripping up the wait.
-    fn next_cli_done(c: &Client, grid: &mut Grid) -> (u8, String, String) {
-        loop {
-            match c.recv() {
-                ServerMsg::Output(bytes) => grid.feed(&bytes),
-                ServerMsg::CliDone { code, out, err } => return (code, out, err),
-                other => panic!("unexpected message waiting for CliDone: {other:?}"),
-            }
-        }
-    }
-
+    // the click frames above -- see `next_cli_done`'s doc comment.
     c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
     let (code, out, _) = next_cli_done(&c, &mut grid);
     assert_eq!(code, 0);
@@ -3440,6 +3553,467 @@ fn mouse_plain_click_in_copy_mode_keeps_mode_and_buffers() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+// ---- SP6 Task 6: copy-mode mouse feel, part 1 (click purity, release
+// targeting, drag-enters-copy-mode) ----
+
+/// (a) `docs/tmux-reference/mouse.md:537-539`: a plain click (`Down` then
+/// `Up`, no `Drag` frame between them) inside copy mode is `select-pane`
+/// only -- the copy CURSOR must not move, and the click's target cell must
+/// not become a new (zero-width) selection anchor. The click's position is
+/// deliberately DIFFERENT from the cursor's post-entry position (moved there
+/// first via keyboard) so a regression that reinstates "click writes
+/// cs.cx/cs.cy unconditionally" is unambiguously caught.
+#[test]
+fn click_in_copy_mode_does_not_move_cursor() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Move the copy cursor to a known position via keyboard (emacs table:
+    // plain arrows move the cursor in copy mode) so it's provably distinct
+    // from the click target below.
+    let before_move = grid.cursor();
+    c.send(&ClientMsg::Stdin(b"\x1b[B\x1b[B\x1b[C\x1b[C\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() != before_move);
+    let moved_cursor = grid.cursor();
+    assert_ne!(moved_cursor, (0, 0), "test setup: moved cursor must differ from the click target (0,0) below");
+
+    // Plain click (press + release, NO drag frame) at a DIFFERENT cell.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, true)));
+
+    // Synchronize on the SAME connection: the server processes a whole
+    // batch of already-queued events (Down, Up, this Cli) before rendering,
+    // and `CliDone` is sent synchronously DURING that batch while the
+    // batch's own Output frame is only sent AFTER -- so `CliDone` can race
+    // ahead of the click's own render. That's fine for checking SERVER
+    // STATE read directly off the Cli response (buffer creation, below),
+    // but NOT for `grid.cursor()`, which only reflects frames actually
+    // received. Drain interim Output frames anyway (harmless).
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "a plain click in copy mode must not create a paste buffer: {out:?}");
+
+    // Force a genuine, predicate-observable render by making ONE further,
+    // real cursor-moving keystroke (Right). If the click had (incorrectly)
+    // moved the copy cursor to the clicked cell (0,0) and installed an
+    // anchor there, this final position would be (1,0); if the click was
+    // correctly a no-op, it's `moved_cursor` shifted right by one.
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| g.cursor() != moved_cursor);
+    let expected = (moved_cursor.0 + 1, moved_cursor.1);
+    assert_eq!(
+        grid.cursor(),
+        expected,
+        "a plain click in copy mode must not move the copy cursor (click's own no-op render may race a piggy-backed Cli's CliDone, so this checks a real subsequent keystroke's landing position instead)"
+    );
+    assert!(has_indicator(&grid, "[0/"), "a plain click in copy mode must not exit copy mode");
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, "[0/"));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// (a) The selection anchor a `Drag` installs is the PRESS position, not
+/// wherever the first `Drag` event itself happens to report (a fast/coarse
+/// physical drag can jump several cells before the terminal emits its first
+/// motion frame). Press at col 0, but make the FIRST `Drag` frame already
+/// report col 4 -- if the anchor were (incorrectly) taken from that first
+/// `Drag` position instead of the remembered press position, the copied
+/// text would start at col 4 ("o123") instead of col 0 ("hello123").
+#[test]
+fn drag_after_click_anchors_at_press_point() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false))); // press at col 0
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 4, target_row, false))); // first Drag jumps to col 4
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false))); // further motion to col 7
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true))); // release at col 7
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("buffer0: 8 bytes: \"hello123\""),
+        "selection must span the PRESS position (col 0), not the first Drag frame's position (col 4): {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// (b) `docs/tmux-reference/mouse.md:308-311,654-658`: `MouseDragEnd1Pane`
+/// resolves against the pane under the pointer AT RELEASE, not the
+/// drag-origin pane. Select in the (focused) right pane, but release over
+/// the left pane -- no binding exists there for a non-copy-mode pane, so no
+/// copy happens; the origin pane must keep its selection and stay in copy
+/// mode.
+#[test]
+fn release_over_other_pane_does_not_copy() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Two panes; split-window focuses the NEW (right) pane.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("hello123")));
+    let (target_row, click_x) = {
+        let text = screen_text(&grid);
+        let row = text.iter().position(|l| l.contains("hello123")).unwrap() as u16;
+        let col = text[row as usize].find("hello123").unwrap() as u16;
+        (row, col)
+    };
+    assert!(click_x > border_x, "test setup: click target must be in the RIGHT pane");
+
+    // Enter copy mode bound to the RIGHT pane (still focused).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Drag-select within the right pane, but RELEASE inside the left pane.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, click_x, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, click_x + 7, target_row, false)));
+    let release_x = border_x.saturating_sub(2);
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, release_x, target_row, true)));
+
+    // Synchronize on the SAME connection and drain any interim Output
+    // frames into `grid`.
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, out, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+    assert!(!out.contains("buffer0"), "releasing over a DIFFERENT pane must not copy the selection: {out:?}");
+
+    assert!(has_indicator(&grid, "[0/"), "copy mode must remain active when the release lands on a different pane");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// (c) `docs/tmux-reference/mouse.md:488,501`: the root table's
+/// `MouseDrag1Pane -> copy-mode -M` -- a press+motion (button 1) on a LIVE
+/// pane (not already in copy mode) enters copy mode immediately, anchored
+/// at the press point, with the selection following the drag; the
+/// subsequent release copies-and-cancels exactly like any copy-mode drag.
+#[test]
+fn drag_on_live_pane_enters_copy_mode_selecting() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo hello123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "hello123"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "hello123").unwrap() as u16;
+
+    // NOT in copy mode. Press then drag (button 1) directly on the live
+    // pane: the first Drag frame must enter copy mode, anchored at the
+    // press point (col 0), with the selection already following the drag.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 7, target_row, false)));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).contains("[0/"));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("buffer0: 8 bytes: \"hello123\""),
+        "drag on a live pane must enter copy mode selecting from the press point: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+// ---- drag autoscroll + word/line drag extension (Task 7, SP6 wave 2) ----
+
+/// `docs/tmux-reference/mouse.md` §5.4: while a drag selection is held with
+/// the pointer on the pane's FIRST row, the view scrolls one line and the
+/// selection extends every `MOUSE_DRAG_AUTOSCROLL_INTERVAL` (50ms) of real
+/// time -- serviced by the server's own `Tick`, not by any further mouse
+/// event from the client (matches the escape-time flush test's pattern:
+/// hold still and let the server's real timer do the work). Presses then
+/// drags to (0, 0) -- immediately the pane's top row -- and, having sent NO
+/// further mouse events, waits for the `[scroll/history]` indicator to climb
+/// to `[5/` purely from Tick-driven autoscroll (the Drag event itself only
+/// accounts for ONE line of that). Releasing then must have copied a
+/// selection spanning several distinct rows, not just the original
+/// zero-width point.
+#[test]
+fn drag_at_top_row_autoscrolls_into_history() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // More than one page (23 pane rows on an 80x24 terminal) of scrollback.
+    c.send(&ClientMsg::Stdin(b"1..150 | ForEach-Object { \"histmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("histmark150")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Press then drag to the pane's TOP row (0), col 0 -- the pointer parked
+    // on the edge row. This Drag installs a zero-width Char-kind selection
+    // anchored exactly here and, per `service_drag_edge`, fires ONE
+    // immediate extra scroll line (scroll -> 1) in addition to arming the
+    // autoscroll timer.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 0, false)));
+
+    // No further mouse events at all: hold the pointer there and let the
+    // server's real 50ms Tick drive the autoscroll timer the rest of the
+    // way to scroll == 5 (four MORE lines beyond the Drag's own immediate
+    // one).
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[5/"));
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 0, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(out.contains("buffer0:"), "expected a copied selection: {out:?}");
+    // Each autoscroll tick scrolls one MORE line and re-extends the
+    // selection by one more row; a multi-row selection's embedded newlines
+    // show up sanitized as `?` in the `list-buffers` sample
+    // (`buffers::sample`) -- having reached scroll >= 5 before release, the
+    // selection must span at least 5 distinct rows (>= 4 row breaks).
+    let row_breaks = out.matches('?').count();
+    assert!(
+        row_breaks >= 4,
+        "expected the drag-autoscroll selection to span several rows (>=5), only found {row_breaks} row breaks: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task 7 fix round 1 (review, Moderate): `docs/tmux-reference/mouse.md`
+/// §5.4 -- "motion outside the pane is a no-op that STOPS the timer". The
+/// three early-exit guards in `dispatch_mouse` (overlay-open, status-row
+/// diversion, outside-pane-area) reset `client.mouse.drag` but originally
+/// did NOT clear `client.mouse.autoscroll`; since `service_autoscroll_tick`
+/// only self-disarms when the client leaves copy mode or the pane vanishes,
+/// a drag armed at a pane edge whose pointer then moved onto the status row
+/// (adjacent to the pane's LAST row -- and reachable from the TOP row too
+/// with `status-position top`, exercised here so the armed scroll direction
+/// is the easy-to-assert into-history one) kept scrolling 1 line per 50ms
+/// forever. Arms autoscroll at the pane's top row, proves it is advancing,
+/// drags onto the status row, then samples the indicator's scroll offset
+/// twice ~300ms apart (6+ tick intervals) and asserts it stopped.
+#[test]
+fn autoscroll_stops_when_drag_leaves_onto_status_row() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Status bar on TOP: its row (0) is adjacent to the pane's FIRST row
+    // (1), so an upward edge-drag can overshoot onto it -- and the armed
+    // autoscroll direction is "into history", which the `[N/M]` indicator
+    // makes directly observable. (The bottom-edge variant is the same guard
+    // and the same bug; this construction just asserts more simply.)
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "status-position".into(), "top".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| row_text(g, 0).contains("[0]"));
+
+    // Plenty of history so the runaway scroll (RED) has room to keep
+    // visibly advancing at both sample points.
+    c.send(&ClientMsg::Stdin(b"1..300 | ForEach-Object { \"histmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("histmark300")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    // With status on top the indicator is on the pane's own first row,
+    // which is screen row 1 here -- `has_indicator`/`row0` read screen row
+    // 0, so wait on the pane row directly.
+    c.recv_output_until(&mut grid, |g| row_text(g, 1).contains("[0/"));
+
+    // Press + drag to the pane's TOP row (screen y = 1): arms autoscroll
+    // into history (one immediate line + the 50ms timer).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 0, 1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 1, false)));
+    // Prove the timer is genuinely running before the overshoot.
+    c.recv_output_until(&mut grid, |g| row_text(g, 1).contains("[5/"));
+
+    // Overshoot: drag onto the status row (screen y = 0). This hits
+    // `dispatch_mouse`'s status-row guard, which must stop the timer.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 0, 0, false)));
+    // Synchronize on the same connection so the Drag has been fully
+    // processed server-side before sampling (`next_cli_done` pattern; no
+    // drag-END was sent so no buffer exists yet, and `list-buffers` is a
+    // clean exit-0 no-op either way).
+    c.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (code, _, _) = next_cli_done(&c, &mut grid);
+    assert_eq!(code, 0);
+
+    // Two samples ~300ms apart (6+ autoscroll intervals), parsing the
+    // `[N/M]` indicator's scroll offset from the pane's first row (screen
+    // row 1 under `status-position top`).
+    let sample = |g: &Grid| -> Option<u32> {
+        let row = row_text(g, 1);
+        let trimmed = row.trim_end();
+        let open = trimmed.rfind('[')?;
+        let rest = &trimmed[open + 1..];
+        let slash = rest.find('/')?;
+        rest[..slash].parse().ok()
+    };
+    drain_briefly(&c, &mut grid, Duration::from_millis(150));
+    let first = sample(&grid).expect("copy-mode indicator visible after overshoot");
+    drain_briefly(&c, &mut grid, Duration::from_millis(300));
+    let second = sample(&grid).expect("copy-mode indicator still visible");
+    assert_eq!(
+        first, second,
+        "autoscroll must STOP once the drag pointer leaves the pane onto the status row (mouse.md §5.4); scroll kept advancing {first} -> {second}"
+    );
+
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `docs/tmux-reference/mouse.md` :636-640 / `copy-mode-and-buffers.md`
+/// :440-447: after DoubleClick installs a `SelKind::Word` anchor
+/// (`select_word_at`), continuing to drag snaps the MOVING end to the whole
+/// word under the cursor, not the raw cell. Double-clicks "beta" (columns
+/// 6..=9 of "alpha beta gamma delta") then drags into the MIDDLE of "delta"
+/// (column 19, mid-word) -- if the drag extended cell-by-cell instead of
+/// snapping, the copied text would end mid-word ("...gamma del"); snapping
+/// must capture the WHOLE trailing word instead.
+#[test]
+fn drag_after_double_click_extends_by_words() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo \"alpha beta gamma delta\"\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "alpha beta gamma delta"));
+    let target_row = screen_text(&grid).iter().position(|l| l.trim_end() == "alpha beta gamma delta").unwrap() as u16;
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Double-click "beta" (col 7, the 'e'): Down, Up, Down -- the second
+    // Down reaches run==2, installing the word anchor immediately
+    // (`mouse_down`'s `DoubleClick1Pane` -> `select-word` path).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 7, target_row, false)));
+
+    // Drag into the MIDDLE of "delta" (col 19, its 'l') and release there.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 19, target_row, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 19, target_row, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    assert!(
+        out.contains("\"beta gamma delta\""),
+        "drag after double-click must snap the moving end to the whole word under the cursor: {out:?}"
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `docs/tmux-reference/mouse.md` :636-640 (SEL_LINE branch) /
+/// `copy-mode-and-buffers.md` :440-447: after TripleClick installs a
+/// `SelKind::Line` anchor (`select_line_at`), continuing to drag snaps the
+/// moving end to the WHOLE line under the cursor. Triple-clicks the
+/// "firstrow" line then drags onto (the middle of) the "secondrow" line a
+/// few rows below -- the copied selection must contain both lines in full,
+/// not just up to the drag's column.
+#[test]
+fn drag_after_triple_click_extends_by_lines() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(b"echo firstrow\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "firstrow"));
+    c.send(&ClientMsg::Stdin(b"echo secondrow\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.trim_end() == "secondrow"));
+
+    let (row1, row2) = {
+        let text = screen_text(&grid);
+        let r1 = text.iter().position(|l| l.trim_end() == "firstrow").unwrap() as u16;
+        let r2 = text.iter().position(|l| l.trim_end() == "secondrow").unwrap() as u16;
+        (r1, r2)
+    };
+    assert!(row2 > row1, "test setup: secondrow must be below firstrow");
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // Triple-click "firstrow" (Down, Up, Down, Up, Down -- run reaches 3).
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, true)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 2, row1, false)));
+
+    // Drag down onto the middle of "secondrow"'s row and release there.
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 3, row2, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 3, row2, true)));
+    c.recv_output_until(&mut grid, |g| !row0(g).trim_end().ends_with(']'));
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, _) = expect_cli_done(&cli, 0);
+    // The copied sample's embedded newlines show up sanitized as `?`
+    // (`buffers::sample`): "firstrow?" proves the FULL first line was
+    // captured (not truncated mid-line) before the row break, and
+    // "?secondrow" proves the second line starts fresh on its own row.
+    assert!(out.contains("firstrow?"), "expected the whole first line captured: {out:?}");
+    assert!(out.contains("?secondrow"), "expected the whole second line captured: {out:?}");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
 }
 
 /// Attach, enable mouse, create a second window, and rename both windows to
@@ -3540,6 +4114,236 @@ fn mouse_border_drag_resizes() {
     server.join().expect("server exits after kill-server");
 }
 
+/// Regression test for follow-up #66: dragging a vertical border LEFTWARD --
+/// toward the LEFT pane's OWN edge, shrinking pane 1 (the split's first
+/// child, which `mouse_down`'s `VBorder{ left }` hit-test always binds as
+/// `mouse_drag_border`'s reference for the WHOLE gesture) and growing pane 2
+/// -- must resize the split live, exactly like the rightward drag
+/// `mouse_border_drag_resizes` above already covers (real tmux: a border
+/// drag moves that border in EITHER direction). Pre-fix this is a silent
+/// no-op: `Layout::resize_from` only accepts a first-child reference for
+/// `Direction::Right`/`Down` (see `layout::tests::
+/// resize_from_reference_pane_ignores_focus` and its sibling
+/// `resize_from_first_child_reference_rejects_shrink_direction`), and
+/// `mouse_drag_border` never re-resolves the reference pane per-direction --
+/// confirmed empirically: the border never moves at all on a single
+/// leftward-only drag, fresh state, no staleness involved. See
+/// docs/follow-ups.md #66.
+#[test]
+fn mouse_border_drag_resizes_leftward() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let target_x = border_x - 10;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x, 5, true)));
+
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x));
+    assert!(!has_vertical_border_at(&grid, border_x), "border must have actually moved left");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Same defect, horizontal-border leg (`HBorder{ top }` / `Direction::Up`):
+/// dragging a horizontal border UPWARD -- toward the TOP pane's own edge,
+/// shrinking pane 1 and growing pane 2 -- must resize live, mirroring
+/// `mouse_border_drag_resizes_leftward` above. See docs/follow-ups.md #66.
+#[test]
+fn mouse_border_drag_resizes_upward() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, has_horizontal_border);
+    let border_y = find_horizontal_border(&grid);
+    let target_y = border_y - 5;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, border_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, target_y, true)));
+
+    c.recv_output_until(&mut grid, |g| has_horizontal_border_at(g, target_y));
+    assert!(!has_horizontal_border_at(&grid, border_y), "border must have actually moved up");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Baseline non-regression coverage for the "border drag works once then
+/// dies" bug (SP6 gap analysis §D): two consecutive, fully independent
+/// clean press-drag-release cycles (both releasing inside the pane area, no
+/// status-row/overlay interruption of either) must both actually resize --
+/// the baseline `mouse_border_drag_resizes` above only ever exercises one.
+///
+/// Empirically this already passes on BOTH sides of the Task 1 fix (not a
+/// RED test): `mouse_down`'s `VBorder`/`HBorder` arms unconditionally
+/// overwrite `client.mouse.drag` on every `Down` that lands cleanly on a
+/// real border, so a second, fully legitimate press always re-arms
+/// correctly regardless of what staleness preceded it -- staleness only
+/// bites when a `Drag`/`Up` arrives WITHOUT a fresh preceding `Down` (see
+/// `mouse_border_drag_release_on_status_row_then_drag_again` below, and the
+/// task report, for the actual RED/GREEN reproduction and the full
+/// investigation). This test is still valuable as a regression guard on
+/// the fix itself: an incorrect/overzealous drag-state reset could easily
+/// have broken this exact "second clean drag" case, and this test would
+/// catch that.
+///
+/// Both drags move the border further RIGHT (never left): `VBorder{ left }`
+/// binds the LEFT pane (the split's first child) as `mouse_drag_border`'s
+/// fixed resize-reference for the entire gesture, and `Layout::resize_from`
+/// only accepts a first-child reference for `Direction::Right` (see
+/// `layout::tests::resize_from_reference_pane_ignores_focus`) -- a LEFTWARD
+/// drag would need the second-child (right) pane as reference instead, which
+/// `mouse_drag_border` never resolves (confirmed empirically: even a SINGLE
+/// leftward drag never moves the border). That direction/reference-pane
+/// mismatch is a separate, always-reproducible pre-existing bug, out of
+/// Task 1's drag-STATE-lifecycle scope (see this task's report); rightward
+/// keeps this test isolated to the staleness bug this task addresses.
+#[test]
+fn mouse_border_drag_twice_resizes_twice() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let target_x1 = border_x + 4;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x1, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x1, 5, true)));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x1));
+    assert!(!has_vertical_border_at(&grid, border_x), "first drag must have actually moved the border");
+
+    // Second, independent drag: 4 more columns right. This is the case that
+    // fails today -- the first drag's stale `MouseDrag::Border` survives
+    // (nothing in the fixed-vs-buggy input sequence differs from a real
+    // user's second drag), and `mouse_drag_border` no-ops forever after.
+    let target_x2 = target_x1 + 4;
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x1, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, target_x2, 5, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, target_x2, 5, true)));
+    c.recv_output_until(&mut grid, |g| has_vertical_border_at(g, target_x2));
+    assert!(!has_vertical_border_at(&grid, target_x1), "second drag must have actually moved the border again");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// Regression test for the status-row leg of the same bug (SP6 gap analysis
+/// §D point 1): `dispatch_mouse`'s status-row short-circuit
+/// (`dispatch.rs:1620-1624`) diverts Drag/Up events landing on the status
+/// row to `dispatch_mouse_status`, which ignores them -- so a horizontal
+/// border drag whose RELEASE overshoots onto the status row (very reachable:
+/// the status bar sits immediately below the pane area) leaves
+/// `client.mouse.drag` stuck at `Border`.
+///
+/// Construction note (deviates from the task brief's literal "press again,
+/// motion, release inside the pane area" wording -- see this task's report
+/// for the full empirical investigation): a SECOND, fully independent
+/// press-drag-release cycle turns out NOT to reproduce a failure here, on
+/// EITHER side of the fix, because `mouse_down`'s `VBorder`/`HBorder` arms
+/// unconditionally overwrite `client.mouse.drag` on every `Down` that hits a
+/// real border -- so a legitimate fresh press always re-arms correctly
+/// regardless of what staleness came before. What the leftover
+/// `MouseDrag::Border` actually enables is a Drag frame arriving WITHOUT an
+/// intervening Down (a real-world possibility: buffered/coalesced motion
+/// reports trailing a release, or simply a terminal quirk) being
+/// misinterpreted as a live drag and moving the border using a reference
+/// pane nobody currently pressed -- exactly the "revivable by a later
+/// out-of-sequence Drag/Up frame with no intervening Down" failure mode
+/// `docs/follow-ups.md` #64 describes for the sibling overlay guard. This
+/// test reproduces that directly: after the status-row-swallowed release,
+/// a bare `Drag` frame (no `Down`) must NOT move the border.
+#[test]
+fn mouse_border_drag_release_on_status_row_then_drag_again() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'"']));
+    c.recv_output_until(&mut grid, has_horizontal_border);
+    let border_y = find_horizontal_border(&grid);
+    let mid_y = border_y + 3;
+    let status_row = grid.rows() - 1;
+
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, border_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, mid_y, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, 5, status_row, true)));
+    c.recv_output_until(&mut grid, |g| has_horizontal_border_at(g, mid_y));
+    assert!(!has_horizontal_border_at(&grid, border_y), "first drag must have actually moved the border");
+
+    // Out-of-sequence: a `Drag` frame with NO preceding `Down`. Before the
+    // fix, `client.mouse.drag` is still the stale `Border{ pane: top,
+    // vertical: false }` left by the swallowed release above, so
+    // `mouse_drag_border` runs and moves the border to `target_y` using
+    // that leftover reference -- a spurious resize nobody pressed for.
+    // After the fix, `client.mouse.drag` was reset to `None` by the
+    // status-row guard, so a bare `Drag` is correctly inert.
+    let target_y = mid_y + 3;
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT_DRAG, 5, target_y, false)));
+
+    // Synchronize on a fresh CLI round trip (a separate connection, but the
+    // server's single event loop processes messages in the order its
+    // reader threads forward them, and this request is issued and its
+    // response awaited well after the Drag frame above was sent) so the
+    // Drag frame is guaranteed fully processed before checking state, then
+    // drain whatever `Output` the Drag frame produced (if any) into `grid`.
+    let mut sync_cli = cli_client(&name);
+    sync_cli.send(&ClientMsg::Cli(vec!["list-windows".into()]));
+    expect_cli_done(&sync_cli, 0);
+    drain_briefly(&c, &mut grid, Duration::from_millis(500));
+
+    assert!(
+        has_horizontal_border_at(&grid, mid_y),
+        "an out-of-sequence Drag with no Down must NOT move the border (stale drag state revived)"
+    );
+    assert!(!has_horizontal_border_at(&grid, target_y), "the border must still be at mid_y, unmoved");
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+// The overlay leg of the same bug (`docs/follow-ups.md` #64): the
+// choose-tree/display-panes mouse guard in `dispatch_mouse` swallows
+// Drag/Up events while an overlay is open but (before this fix) did not
+// clear `client.mouse.drag`. Arms a border drag via a raw keyboard/config
+// path that reaches `dispatch_mouse` at the unit level (not exercisable
+// from a conformant SGR mouse stream through the e2e-style pipe harness,
+// since real terminals never send Drag/Up without a preceding Down and the
+// overlay guard sits ahead of the border/pane hit-test), asserting the
+// guard now resets `MouseDrag::None` before returning. See
+// `src/server/dispatch.rs`'s `mouse_dispatch_tests` module for the actual
+// coverage (`mouse_drag_cleared_when_overlay_swallows_release`) -- unlike
+// this file, that module constructs a `Server`/`ClientState` directly, so
+// it can set `client.mouse.drag` to a known `Border` value and open an
+// overlay without needing a real intervening Down event.
+
 // `alt_screen_wheel_sends_arrows`: the task brief's suggested e2e approach
 // (a PowerShell one-liner writes the raw `CSI ?1049h` bytes itself,
 // `Write-Host -NoNewline "$([char]27)[?1049h"`) was tried here first and
@@ -3570,6 +4374,21 @@ fn mouse_border_drag_resizes() {
 fn has_horizontal_border(g: &Grid) -> bool {
     let pane_rows = g.rows().saturating_sub(1);
     (0..pane_rows).any(|r| (0..g.cols()).all(|c| g.cell(c, r).ch == '─'))
+}
+
+/// True if row `row` (must be strictly above the bottom status row) is a
+/// full run of `─` across every column -- mirrors `has_vertical_border_at`'s
+/// pattern but for a horizontal split border.
+fn has_horizontal_border_at(g: &Grid, row: u16) -> bool {
+    let pane_rows = g.rows().saturating_sub(1);
+    row < pane_rows && (0..g.cols()).all(|c| g.cell(c, row).ch == '─')
+}
+
+/// The row of the first full-width horizontal split border, or panics if
+/// there isn't one -- mirrors `find_vertical_border`.
+fn find_horizontal_border(g: &Grid) -> u16 {
+    let pane_rows = g.rows().saturating_sub(1);
+    (0..pane_rows).find(|&row| has_horizontal_border_at(g, row)).expect("expected a horizontal split border")
 }
 
 /// The column of the first occurrence of `marker` in any row, or `None` if
@@ -4062,6 +4881,84 @@ fn move_window_dash_k_kills() {
     server.join().expect("server exits after last session dies");
 }
 
+/// `swap-window -d -t -1` (SP6 Task 5, the user's real `bind -r "<"
+/// swap-window -d -t -1` binding minus the key-binding indirection):
+/// swaps the CURRENT window with the previous one by relative offset
+/// (wrapping), and `-d` means focus FOLLOWS THE WINDOW OBJECT -- the client
+/// keeps looking at its own pane content, which is now at the new (lower)
+/// index. Proven two ways: (1) the status line's `*`/`-` flags land on the
+/// swapped indexes, (2) the marked pane content stays visible (proof focus
+/// followed the WINDOW, not the slot).
+#[test]
+fn swap_window_relative_target_moves_current_window() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // `c` creates window 1 (index 1, current); window 0 becomes "last".
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo w1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w1mark").is_some());
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"swap-window -d -t -1\r".to_vec()));
+    // Window 1 (marked, was current) swaps indexes with window 0: window 1
+    // is now at index 0, window 0 is now at index 1. With -d, the client
+    // stays on window 1 (its own window), which is now current at index 0.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
+    // Content proof: still looking at the SAME (marked) pane -- focus
+    // followed the window object across the index change.
+    assert!(marker_col(&grid, "w1mark").is_some());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `swap-window -t -1` (no `-d`): the client's focus stays on the same
+/// INDEX/slot, which now shows the OTHER window's content -- the opposite
+/// of the `-d` case above. Proven by pane content: after the swap, window
+/// 0's marker is visible again and window 1's marker is not, even though
+/// no `select-window`-style command was ever issued.
+#[test]
+fn swap_window_without_d_keeps_focus_on_index() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // Window 0: mark its pane before switching away from it.
+    c.send(&ClientMsg::Stdin(b"echo w0mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w0mark").is_some());
+
+    // `c` creates window 1 (index 1, current); window 0 becomes "last".
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell- 1:powershell*")));
+    c.send(&ClientMsg::Stdin(b"echo w1mark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w1mark").is_some());
+
+    // Swap current (window 1) with the previous window (window 0), WITHOUT
+    // -d.
+    c.send(&ClientMsg::Stdin(vec![0x02, b':']));
+    c.send(&ClientMsg::Stdin(b"swap-window -t -1\r".to_vec()));
+    // Focus stayed on the same slot (index 1) -- which now shows window 0's
+    // content: "w0mark" is visible again, "w1mark" is not.
+    c.recv_output_until(&mut grid, |g| marker_col(g, "w0mark").is_some() && marker_col(g, "w1mark").is_none());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    // Window 0's shell (now at index 1, current) just exited, killing it;
+    // fallback goes to `last` (window 1, still alive, now at index 0) --
+    // the survivor renders as window 0.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")) && marker_col(g, "w1mark").is_some());
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
 /// `f` (find-window): matches by window NAME, matches by visible pane
 /// CONTENT, and shows a transient `no windows matching: <p>` message (and
 /// switches nothing) when neither matches.
@@ -4291,6 +5188,108 @@ fn display_panes_q_shows_digits_and_selects() {
     server.join().expect("server exits after last session dies");
 }
 
+/// Task 10 (clock-mode, sub-project 6 wave 2): `prefix-t` opens the overlay
+/// (big-digit blocks in `clock-mode-colour`, default blue `Color::Idx(4)`
+/// -- an 80x23 pane comfortably clears the big-digit-mode threshold for the
+/// default `24`-style 5-char `HH:MM` string, `w >= 6*5 == 30`, `h >= 6`);
+/// per `docs/tmux-reference/status-line-and-messages.md` `## 6. Clock
+/// mode`'s "any key exits" rule, a completed PREFIX SEQUENCE typed while
+/// clock mode is open (`C-b c`, normally bound to `new-window`) both closes
+/// the overlay AND must NOT run `new-window` underneath it -- the same
+/// "other key dismisses, and is NOT reprocessed" interception display-panes
+/// uses (`display_panes_prefix_sequence_dismisses_without_executing_bound_command`),
+/// proving the exiting keystroke is swallowed by the overlay rather than
+/// falling through to ordinary prefix-binding dispatch.
+#[test]
+fn clock_mode_opens_and_any_key_exits() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    // prefix-t: the clock overlay opens, painting big-digit blocks in
+    // clock-mode-colour (default blue).
+    c.send(&ClientMsg::Stdin(vec![0x02, b't']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // A full prefix sequence typed WHILE clock mode is open (`C-b c`, bound
+    // to new-window): the overlay must dismiss (blue blocks disappear,
+    // pane content restored) AND `new-window` must NOT execute underneath
+    // it.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'c']));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // Confirm from a fresh CLI connection (avoids racing this client's own
+    // redraw): still exactly one window.
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["list-windows".into(), "-t".into(), "0".into()]));
+    let (out, err) = expect_cli_done(&cli, 0);
+    assert_eq!(err, "");
+    assert_eq!(
+        out.lines().filter(|l| !l.is_empty()).count(),
+        1,
+        "new-window bound under C-b c must NOT have executed while clock mode was open: {out:?}"
+    );
+
+    // Pane content is genuinely restored (not just "no more blue"): a
+    // marker typed now round-trips through the shell normally.
+    c.send(&ClientMsg::Stdin(b"restored\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "restored").is_some());
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Task 10 fix round 1 (review Major): tmux's `window_clock_key`
+/// (`window-clock.c:214-218`) calls `window_pane_reset_mode`
+/// UNCONDITIONALLY -- its `key` and `mouse_event` parameters are both
+/// `__unused` -- so ANY MOUSE EVENT exits clock mode too, exactly like any
+/// key. And, same as the key path, the exiting event is CONSUMED by the
+/// exit, not reprocessed: a click landing on a DIFFERENT (non-focused)
+/// pane closes the overlay but must NOT focus that pane.
+#[test]
+fn clock_mode_exits_on_mouse() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+    enable_mouse(&name, &mut c);
+
+    // Split; the new RIGHT pane is focused. Move focus to the LEFT pane so
+    // the later click on the RIGHT pane would be an observable focus
+    // change if it were (wrongly) reprocessed after the clock exit.
+    c.send(&ClientMsg::Stdin(vec![0x02, b'%']));
+    c.recv_output_until(&mut grid, has_vertical_border);
+    let border_x = find_vertical_border(&grid);
+    let mut left = vec![0x02];
+    left.extend_from_slice(b"\x1b[D");
+    c.send(&ClientMsg::Stdin(left));
+    c.recv_output_until(&mut grid, |g| g.cursor().0 < border_x);
+
+    // prefix-t: clock mode opens on the focused LEFT pane -- blue big-digit
+    // blocks appear left of the border.
+    c.send(&ClientMsg::Stdin(vec![0x02, b't']));
+    c.recv_output_until(&mut grid, |g| has_bg(g, Color::Idx(4), 0, border_x, 0, 23));
+
+    // Click (press + release) well inside the RIGHT pane: the overlay must
+    // close (any mouse event exits, `window-clock.c:214-218`)...
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x + 5, 10, false)));
+    c.send(&ClientMsg::Stdin(sgr_mouse(CB_LEFT, border_x + 5, 10, true)));
+    c.recv_output_until(&mut grid, |g| !has_bg(g, Color::Idx(4), 0, 80, 0, 23));
+
+    // ...and the click must have been CONSUMED by the exit, not reprocessed
+    // as a click-to-focus: a marker typed now still lands in the LEFT pane.
+    c.send(&ClientMsg::Stdin(b"staymark\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| marker_col(g, "staymark").map(|col| col < border_x).unwrap_or(false));
+
+    // Cleanup: kill-server (two live panes).
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli, 0);
+    server.join().expect("server exits after kill-server");
+}
+
 #[test]
 fn choose_tree_w_lists_and_switches() {
     let name = unique_pipe_name();
@@ -4309,8 +5308,11 @@ fn choose_tree_w_lists_and_switches() {
             && lines.iter().any(|l| l.contains("  1: powershell*"))
     });
 
-    // Down (session header -> window 0's row) + Enter switches to window 0.
-    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    // SP6 wave 2, Task 8, `(b)`: the default selection is now the CURRENT
+    // item, i.e. window 1's row (the just-created, now-current window) --
+    // the last row, not the header. Up (window 1's row -> window 0's row) +
+    // Enter switches to window 0.
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec()));
     c.send(&ClientMsg::Stdin(b"\r".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell* 1:powershell-")));
 
@@ -4530,8 +5532,10 @@ fn choose_tree_x_kills_with_confirm() {
     c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("  0: powershell-")));
 
-    // Down selects window 0's row; `x` arms the confirm, `y` commits it.
-    c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
+    // SP6 wave 2, Task 8, `(b)`: default selection is window 1's row (the
+    // just-created, now-current window) -- Up selects window 0's row; `x`
+    // arms the confirm, `y` commits it.
+    c.send(&ClientMsg::Stdin(b"\x1b[A".to_vec()));
     c.send(&ClientMsg::Stdin(b"x".to_vec()));
     c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("kill-window powershell? (y/n)")));
 
@@ -4645,10 +5649,19 @@ fn choose_tree_prefix_sequence_ignored_overlay_stays_open() {
 /// `top`'s old math assumed. With a long, scrolled list and the selection
 /// at the very bottom, arming the kill-confirm (`x`) could push the
 /// selected/prompted row off the actually-painted area. 9 windows (10
-/// total with the session's original one) overflow a 10-row terminal;
-/// select the LAST row (the newest window, clamped there by sending far
-/// more `Down`s than there are rows) and arm `x` -- the selected row and
-/// its confirm prompt must both still be visible together.
+/// total with the session's original one) overflow a 10-row terminal.
+///
+/// SP6 wave 2, Task 8, `(b)` update: the default selection is now the
+/// CURRENT item -- window 9, the just-created, now-current window, is
+/// already the LAST row -- so it (and the scroll needed to show it) is
+/// immediate on opening, no `Down` presses required to reach it (the old
+/// version of this test drove 20 `Down`s from the OLD row-0 default to get
+/// there; that navigation is kept below, now purely as a defensive proof
+/// that clamping still holds at the end of the list, not as how the
+/// selection gets there). This 10-row terminal is also small enough that
+/// `choose_tree_list_height`'s NORMAL-mode `h < 10` rule drops the preview
+/// entirely (`sy=10`), so this test's msg_reserved/scrolling math is
+/// exercised exactly as before this task's preview work.
 #[test]
 fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     let name = unique_pipe_name();
@@ -4662,14 +5675,14 @@ fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     }
 
     c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
-    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 10 windows (attached)")));
-    // Selection starts at the header row (row 0, unscrolled): window 9's
-    // row is off the bottom of a 10-row terminal until we scroll down to
-    // it below.
-    assert!(!screen_text(&grid).iter().any(|l| l.contains("9: powershell")), "test setup: window 9's row must start OFF-screen (unscrolled)");
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("9: powershell*")));
+    // The header (and windows 0-8's rows) are scrolled OFF the top of the
+    // 10-row terminal instead, since window 9's row is the default
+    // selection, not the header.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("10 windows")), "test setup: header must be scrolled OFF (window 9 is the default selection)");
 
-    // Clamp-drive the selection all the way to the last row (far more Downs
-    // than there are rows), then arm the kill-confirm.
+    // Downs past the last row are still safely clamped there (defensive --
+    // the selection was already on window 9's row before this loop).
     for _ in 0..20 {
         c.send(&ClientMsg::Stdin(b"\x1b[B".to_vec()));
     }
@@ -4701,6 +5714,184 @@ fn choose_tree_scrolls_long_list_with_confirm_message_shown() {
     cli.send(&ClientMsg::Cli(vec!["kill-server".into()]));
     expect_cli_done(&cli, 0);
     server.join().expect("server exits after kill-server");
+}
+
+// ---- choose-tree: real tree view, default selection, preview (SP6 wave 2,
+// Task 8) --------------------------------------------------------------
+
+/// `(a)` tree structure: sessions are real tree PARENT rows with their
+/// windows as indented CHILD rows -- collapsed by default (`docs/tmux-
+/// reference/choose-tree.md` `## 1.1`: "sessions start collapsed"); `Right`
+/// reveals the (default-selected, current) session's window(s) as child
+/// rows underneath it.
+#[test]
+fn choose_tree_sessions_show_window_children() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+    // Collapsed by default: no window child row yet.
+    assert!(!screen_text(&grid).iter().any(|l| l.contains("0: powershell*")), "test setup: session must start collapsed");
+
+    // Right expands the (default-)selected session, revealing its window(s)
+    // as indented child rows.
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(a)`: expand/collapse state survives a round trip -- `Right` reveals the
+/// session's window child row, `Left` hides it again (jumps back up to the
+/// parent per the doc's "flat, move to parent" rule would only apply to a
+/// LEAF row; here the session row itself just collapses), and `Right` a
+/// second time restores it -- the `expanded` set is mutated in place, not
+/// reset on every rebuild.
+#[test]
+fn choose_tree_collapse_hides_children_expand_restores() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec())); // Right: expand
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[D".to_vec())); // Left: collapse
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"\x1b[C".to_vec())); // Right again: restored
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: powershell*")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(b)` default selection = current item: three sessions in creation order
+/// (sA, sB, sC); the acting client is attached to the MIDDLE one (sB).
+/// Opening `s` then immediately pressing Enter must be a no-op (committing
+/// to the ALREADY-current session) -- if the default selection had instead
+/// landed on row 0 (sA, the row-0-always behavior this task replaces),
+/// Enter would actually SWITCH this client to sA.
+#[test]
+fn choose_tree_default_selects_current_session() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+
+    let mut cli_a = cli_client(&name);
+    cli_a.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "sA".into()]));
+    expect_cli_done(&cli_a, 0);
+
+    let mut c = Client::connect(&name);
+    attach(&mut c, AttachMode::NewNamed, "sB", 80, 24);
+    let mut grid = Grid::new(80, 24, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    let mut cli_c = cli_client(&name);
+    cli_c.send(&ClientMsg::Cli(vec!["new-session".into(), "-d".into(), "-s".into(), "sC".into()]));
+    expect_cli_done(&cli_c, 0);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b's']));
+    c.recv_output_until(&mut grid, |g| {
+        let lines = screen_text(g);
+        lines.iter().any(|l| l.contains("sA:")) && lines.iter().any(|l| l.contains("sB:")) && lines.iter().any(|l| l.contains("sC:"))
+    });
+
+    c.send(&ClientMsg::Stdin(b"\r".to_vec()));
+    // Still on sB -- Enter on the default (current-session) selection was a
+    // no-op, not a switch to row 0 (sA).
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[sB]")));
+
+    let mut cli_kill = cli_client(&name);
+    cli_kill.send(&ClientMsg::Cli(vec!["kill-server".into()]));
+    expect_cli_done(&cli_kill, 0);
+    server.join().expect("server exits after kill-server");
+}
+
+/// `(c)` preview box: the preview shows the SELECTED row's live pane
+/// content -- a marker string printed in the current window's pane appears
+/// inside the rendered preview region below the list. `Windows` view's
+/// default selection is the current window (see `choose_tree_default_
+/// selects_current_session`'s sibling test for the session-view half of
+/// `(b)`), so the preview is already showing it with no navigation needed.
+#[test]
+fn choose_tree_preview_shows_selected_windows_content() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(b"echo PREVIEWMARK123\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PREVIEWMARK123")));
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    // The overlay clears the whole client area (the marker's OLD on-screen
+    // position is wiped); it must reappear -- now inside the preview box --
+    // for this to pass.
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("PREVIEWMARK123")));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `(c)`: `v` cycles the preview mode OFF -> BIG -> NORMAL -> OFF
+/// (`docs/tmux-reference/choose-tree.md` `## 3.1`/`## 7.1`), observable as
+/// the 0-based row the preview's top border line paints on. Starting state
+/// is NORMAL (the tmux/winmux default), so the FIRST `v` press advances to
+/// the state that follows NORMAL in that cycle, OFF -- not BIG (BIG comes
+/// right before NORMAL in the stated sequence, so it's only reached on the
+/// SECOND press). Worked out here for an 80x24 pane with a 2-row list
+/// (session header + 1 window), `choose_tree_list_height`'s formula: NORMAL
+/// -> `h = (24/3)*2 = 16`, `16 > line_size(2)` so `h = 24/2 = 12` (the
+/// "short list" branch) -> border at row 12. OFF -> `h = sy = 24` -> no
+/// preview at all (list fills the whole panel), so NO row contains a border
+/// character anywhere. BIG -> `h = 24/4 = 6`, `6 > line_size(2)` so `h =
+/// line_size = 2` -> border at row 2.
+#[test]
+fn choose_tree_v_toggles_preview() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(vec![0x02, b'w']));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("0: 1 windows (attached)")));
+    // Default preview mode is NORMAL: border row at 12.
+    c.recv_output_until(&mut grid, |g| screen_text(g)[12].contains('─'));
+
+    // v -> OFF: no border anywhere (the list now spans the whole panel).
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| !screen_text(g).iter().any(|l| l.contains('─')));
+
+    // v -> BIG: border row at 2.
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[2].contains('─'));
+
+    // v -> NORMAL again: border row at 12, same as the default.
+    c.send(&ClientMsg::Stdin(b"v".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g)[12].contains('─'));
+
+    c.send(&ClientMsg::Stdin(b"q".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:powershell*")));
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
 }
 
 /// automatic-rename (Task 9, sub-project 4): PowerShell's

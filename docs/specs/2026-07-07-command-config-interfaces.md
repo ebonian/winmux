@@ -792,9 +792,15 @@ two meta characters (everything else copies through verbatim):
 | `#{window_name}` | `ctx.window_name` |
 | `#{<anything else>}` | empty (documented SP3 simplification — no
   conditionals/modifiers, full tmux format-expression engine is SP4) |
+| `#[...]` | passed through VERBATIM, brackets included, up to and including
+  the first `]` (SP6 Task 4 addition — `#[fg=white]`-style inline style
+  markers are NOT interpreted by `expand_format`; they're left in the output
+  for `status::styled_runs` to split into styled spans afterward. An
+  unterminated marker — no closing `]` — is copied to end-of-string rather
+  than dropped) |
 | `#<any other char>`, trailing lone `#` | empty (unrecognized short code
   consumes the one following character; a `#` with nothing after it is
-  dropped) |
+  dropped; this does NOT apply to `#[`, handled above) |
 | `%%` | literal `%` |
 | `%H` `%M` `%S` `%d` `%m` | zero-padded 2-digit hour/min/sec/day/month
   from `ctx.now` |
@@ -1556,3 +1562,398 @@ simplifications.
 - `tests/e2e.rs` / `tests/e2e_sessions.rs`: untouched and green (they assert
   default-styled output through the real binary — the visual-stability
   proof).
+
+## `sp6-config-compat` — `.tmux.conf` compatibility batch (sub-project 6, Task 2)
+
+A real user's `.tmux.conf` (copied verbatim into
+`tests/fixtures/user.tmux.conf`) exposed 17 config-load errors against the
+tables/dispatch code locked above. This section amends `cmd`, `style`,
+`options`, and `server::dispatch` (all still within this file's scope) to
+close every one of them. No function SIGNATURE in the `cmd`/`style`/
+`server::dispatch` sections above changed — only `options.rs` gains new
+public surface (a user-option store plus new getters, below).
+
+### `cmd`: `setw`/`set-window-option` (§ Command table)
+
+`setw` and `set-window-option` are real tmux command entries (not
+config-level aliases) that share `set-option`'s exec function with an
+implied `-w`, per `commands-config-options-formats.md`'s note under §2.5
+("`set-window-option`/`setw` is a real separate command entry ... sharing
+the same exec function with an implied 'window' flag ... It is *not* a
+config-level alias"). `canonical()` now maps both spellings onto
+`"set-option"` alongside the existing `"set-option" | "set"` arm; because
+that collapse loses which spelling was typed, the `"set-option"` resolve arm
+additionally inspects `raw.name` (not `canon`) to seed `window: true` for
+`"setw"`/`"set-window-option"` even with no explicit `-w` token — `setw -g
+pane-base-index 1` now parses to the exact same `ParsedCmd::SetOption` as
+`set -w -g pane-base-index 1`. Test: `setw_is_set_option_alias`.
+
+### `style`: space/comma/newline delimiters, and `default` (§ Grammar)
+
+**Amendment, supersedes the "split on `,`" grammar rule above:** tmux's
+real delimiter set is space, comma, OR newline (`style.c:72`, `const char
+delimiters[] = " ,\n"`), not comma-only — `fg=white bg=black bold` is fully
+legal tmux (the fixture's `status-right-style`/`message-style`/etc use this
+exact shape). `parse_style` now splits on `[',', ' ', '\n']`; **runs of
+delimiters are skipped** (doubled/leading/trailing separators are no longer
+a parse error — this is a **behavior change** from the original grammar
+rule, which treated any empty component as a failure; `bad_style_err_string`
+was updated to no longer rely on a doubled comma as its trigger, and a new
+`doubled_delimiters_are_skipped` test pins the corrected behavior). Also
+added: the bare `default` term (from the grammar's "Anything else ->
+attribute lookup" -- see `commands-config-options-formats.md` §4.1's term
+table), which resets fg/bg/all five attribute fields back to "unmentioned"
+(NOT just attributes, unlike `none`/`noattr`) — represented as simply
+leaving every `PartialStyle` field at `None`, since that already means
+"leave base untouched" (tmux: "reset fg/bg/us/attr/flags to the base
+cell"). Required so `status-left-style`/`status-right-style`'s tmux-real
+default value, the literal string `"default"`, parses. Tests:
+`space_separated_terms`, `doubled_delimiters_are_skipped`,
+`default_term_resets_everything`.
+
+### `options`: user (`@name`) options + new SPECS entries + getters
+
+**New public surface** (Task-2 addition to the `options` contract block):
+
+```rust
+impl Options {
+    /// `-q`-aware read of a user (`@name`) option (commands-config-
+    /// options-formats.md:255): `quiet` true -> unset is silently
+    /// `Ok(None)`; false -> `Err("invalid option: @name")`. `name` may be
+    /// given with or without its leading `@`.
+    pub fn show_user_option(&self, name: &str, quiet: bool) -> Result<Option<String>, String>;
+
+    pub fn visual_activity(&self) -> &'static str;
+    pub fn visual_bell(&self) -> &'static str;
+    pub fn visual_silence(&self) -> &'static str;
+    pub fn bell_action(&self) -> &'static str;
+    pub fn monitor_activity(&self) -> bool;
+    pub fn clock_mode_colour(&self) -> crate::grid::Color;
+    pub fn window_status_bell_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_separator(&self) -> &str;
+    pub fn status_justify(&self) -> &'static str;
+    pub fn status_left_style(&self) -> &crate::style::PartialStyle;
+    pub fn status_right_style(&self) -> &crate::style::PartialStyle;
+    pub fn window_status_format(&self) -> &str;
+    pub fn window_status_current_format(&self) -> &str;
+}
+
+/// SP6 Task 4 fix round 1: the stored default for `window-status-format`/
+/// `window-status-current-format`, public so `status::status_spans` can
+/// recognize the default path and apply the flagless one-space padding
+/// shim (see the deviation note below).
+pub const DEFAULT_WINDOW_STATUS_FORMAT: &str = "#I:#W#F";
+```
+
+**User-option store (`@name`, `commands-config-options-formats.md` §3.4):**
+`Options` gains a private `user_options: BTreeMap<String, String>` field
+(keyed WITHOUT the leading `@`), starting empty — there is no "default" for
+a user option, only "never set". `set`/`show` both branch on a leading `@`
+BEFORE touching `SPECS`/`find_spec`: any `@`-prefixed name is accepted at
+any scope, string-typed (same control-char rejection and `-a`/`-u`
+semantics as a built-in `Str`-kind option, just with no default to unset
+back to — `-u` removes the entry entirely). `show("@name")` on a never-set
+name returns `None`, the SAME signal an unknown built-in name gives — so
+`server::dispatch::exec_show_options`'s existing `None -> Err("unknown
+option: ...")` mapping needs no dispatch-side change to reproduce tmux's
+DEFAULT (non-`-q`) "unset user option errors" behavior. `show_user_option`
+is the separate, explicit `-q`-aware entry point requested by the task
+brief's delegated judgment call — it is not yet wired into `server::
+dispatch` (CLI `-v`/`-q` flag parsing for `show-options` is future work);
+today it is directly unit-tested against `Options` only. `show_all` also
+lists any ACTUALLY-SET user options (never a "default" row, unlike every
+built-in option). Test: `user_option_set_show_roundtrip`.
+
+**New SPECS entries** (accepted+stored; getters above): `visual-activity` /
+`visual-bell` / `visual-silence` (Choice `off`/`on`/`both`, default `off`),
+`bell-action` (Choice `any`/`none`/`current`/`other`, default `any`),
+`monitor-activity` (Flag, default `off`), `clock-mode-colour` (Str, bare
+colour token like `display-panes-colour`, default `blue`, parsed on read via
+`style::parse_color` with the same graceful-fallback-to-`Idx(4)` pattern),
+`window-status-bell-style` (Style, default `reverse`), `window-status-separator`
+(Str, default `" "`), `status-justify` (Choice `left`/`centre`/`right`/
+`absolute-centre`, default `left`), `status-left-style` / `status-right-style`
+(Style, default the literal string `"default"` — see the `style` amendment
+above for why this now parses), `window-status-format` /
+`window-status-current-format` (Str, default `#I:#W#F` as of **SP6 Task 4**
+— originally stored verbatim as tmux's literal
+`#I:#W#{?window_flags,#{window_flags}, }` in this task (Task 2); Task 4
+changed the DEFAULT to `#I:#W#F` because the `expand_format` subset still
+does not evaluate a general `#{?cond,a,b}` conditional. The default is
+exposed as a new public const `options::DEFAULT_WINDOW_STATUS_FORMAT` (fix
+round 1): `status::status_spans` compares each tab's effective format
+against it and, on the default path ONLY, pads an EMPTY flags string to a
+single space before expansion — reproducing the tmux conditional's `, }`
+else-branch, so the DEFAULT rendering is byte-identical to real tmux for
+both flagged and flagless windows and tab widths are stable across focus
+changes. What REMAINS of the deviation: a CUSTOM format containing
+`#{?...}` still expands its conditional to empty (docs/follow-ups.md #70;
+the general format engine is deferred to the TPM plan,
+`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`)). All defaults
+verified against `commands-config-options-formats.md`'s options appendix.
+`visual-*`/`bell-action`/`monitor-activity`/`clock-mode-colour`/
+`window-status-bell-style` remain INERT (no alerts/bell/clock-mode subsystem
+exists — same bucket as `mouse`/`history-limit` before their own Tasks
+wired them up). `status-justify`/`status-left-style`/`status-right-style`/
+`window-status-format`/`window-status-current-format`/`window-status-separator`
+are now LIVE, rendering-wired in SP6 Task 4 — see `status::status_spans`'s
+amendment in `2026-07-07-server-client-interfaces.md`. Tests:
+`sp6_config_compat_options_defaults_and_roundtrip` (defaults + round trip),
+`expand_inline_style_marker_passthrough` (the `#[...]` passthrough this
+wiring depends on).
+
+### `server::dispatch`: copy-mode/copy-mode-vi bind tables, `~` expansion
+
+**`exec_bind_key`/`exec_unbind_key`** (private `impl Server` methods, no
+signature change): both table-name matches gain `"copy-mode" =>
+WhichTable::CopyMode` and `"copy-mode-vi" => WhichTable::CopyModeVi` arms —
+`cmd.rs`'s OWN `-T` validation already accepted these two table names (a
+pre-existing parser/executor mismatch, not a missing feature; the
+`WhichTable` variants already existed in `src/bindings.rs`). Additionally,
+`exec_unbind_key` now treats an UNBIND whose key token fails
+`keys::parse_key` (e.g. tmux's mouse pseudo-key names like
+`MouseDragEnd1Pane` — real tmux keys, but winmux's mouse handling is
+hardcoded dispatch logic, not table-driven via named pseudo-keys, so no such
+binding could ever exist to remove) as a silent no-op rather than an error;
+`exec_bind_key` is UNCHANGED in this respect and still errors on a bad key
+(creating a binding to a garbage key is a real mistake; removing a
+structurally-impossible one is not). Test: `bind_unbind_copy_mode_tables`.
+
+**`execute_source_file_headless`** (private, no signature change): the
+`path` argument is now passed through a new private `expand_tilde` helper
+before `PathBuf::from` — a leading bare `~` or `~/...`/`~\...` expands to
+`%USERPROFILE%` (`commands-config-options-formats.md` §2.6), matching real
+tmux's parse-time tilde expansion for the one path winmux resolves it for.
+`~user` (a different user's home) is deliberately unsupported (no passwd
+database on Windows) and left untouched. Test: `source_file_expands_tilde`,
+`expand_tilde_bare`.
+
+### Fixture and end-to-end proof
+
+`tests/fixtures/user.tmux.conf`: a verbatim copy of a real user's
+`.tmux.conf`, used by `tests/server_proto.rs`'s `user_config_loads_clean` —
+loaded at runtime via `source-file` (exercising the exact same
+`load_config_files` path startup `-f` loading uses), asserting a `CliDone`
+exit code of 0 with an empty `err` field (the strictest "zero config
+errors" signal available over the protocol; there is no direct wire-level
+error-count query, and the transient startup-only status-bar `config: N
+error(s)` notice is racy to assert the ABSENCE of across a whole test), plus
+spot-checks of a few real effects (`prefix` now `C-a`, `mouse` `on`, `|`
+bound to `split-window -h`). One fixture line is intentionally inert:
+`set -g @yank_action 'copy-pipe'` (handled entirely by the user-option store
+above). The fixture's other two `swap-window` lines (`bind -r "<"
+swap-window -d -t -1` / `bind -r ">" swap-window -d -t +1`) parse and bind
+cleanly as of Task 2 already (`bind-key`'s tail is stored unresolved, so
+binding never validated the command exists) but were functionally inert
+until `swap-window` itself was implemented — see the `## swap-window`
+section below (sub-project 6, Task 5).
+
+## `swap-window` — swap-window command (sub-project 6, Task 5)
+
+Adds `ParsedCmd::SwapWindow { src: Option<String>, dst: Option<String>,
+detach: bool }` to the `cmd` enum locked above (Task 3), plus a
+`server::dispatch` handler — closing the gap flagged by the SP6 gap
+analysis (`swap-pane` existed; `swap-window` did not). Full spec:
+`docs/tmux-reference/windows-and-sessions.md` §swap-window.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    SwapWindow { src: Option<String>, dst: Option<String>, detach: bool },
+}
+```
+
+- `canonical()`: `"swap-window" | "swapw" => "swap-window"`.
+- `usage("swap-window")`: `"usage: swap-window [-d] [-s src] -t dst"`.
+- `resolve`: `scan_flags` with `bools: ["-d"]`, `values: ["-s", "-t"]`, no
+  positionals. `-t` is REQUIRED — a missing `-t` is the usage error (`dst`'s
+  `Option<String>` shape is therefore always `Some` once `resolve` succeeds;
+  it mirrors `SwapPane`'s `Option` shape for consistency, not because `dst`
+  can legitimately be absent downstream). `-s` is optional — absent means
+  "the acting session's current window" at dispatch time (winmux has no
+  marked-pane concept, so unlike real tmux's `CMD_FIND_DEFAULT_MARKED`
+  default, `-s`'s absence always means "current", never "the mark"). Test:
+  `swap_window_flags` (covers the user's real `-d -t -1` / `-d -t +1`
+  bindings, an explicit `-s :2 -t :4`, and the missing-`-t` usage error).
+
+### `server::dispatch` (`src/server/dispatch.rs`)
+
+New private helpers, and one new handler, following the `swap-pane`/
+`move-window` pattern (`exec_swap_pane`, `exec_move_window`) exactly —
+same-session-only scope, no cross-session support (the same simplification
+`move-window` already documents):
+
+```rust
+fn resolve_swap_window_target(session: &Session, spec: Option<&str>) -> Result<WindowId, String>;
+fn parse_relative_offset(s: &str) -> Option<i64>;
+fn exec_swap_window(&mut self, src: Option<String>, dst: Option<String>, detach: bool, cs: Option<&str>) -> Result<String, String>;
+```
+
+- `resolve_swap_window_target`'s grammar (both `src`/`dst`; per the doc's
+  §"Target resolution"): absent -> `session.current`; a leading `:` is
+  stripped (tmux's "index N in the CURRENT session" form) before falling
+  back to the existing `resolve_window` free function's absolute-index/
+  name-then-prefix grammar; a bare `+N`/`-N` (`N` optional, default
+  magnitude 1) is a RELATIVE winlink offset, resolved via the new
+  `model::Session::window_relative` primitive (below), WRAPPING at either
+  end of the index-sorted window list — this is what makes the user's real
+  `bind -r "<" swap-window -d -t -1` / `bind -r ">" swap-window -d -t +1`
+  bindings work end to end.
+- `exec_swap_window` resolves `src` (defaulting to current) and `dst`
+  (required — re-checked here too, defensively, since `dst: Option<String>`
+  is the locked shape even though `resolve` never actually constructs a
+  `None`), then delegates the entire swap mechanism — including the
+  `detach`/`-d` current-and-last bookkeeping — to the new
+  `model::Session::swap_windows` primitive (see the `server-client`
+  contract's `## model` section amendment), and finishes with the existing
+  `apply_layout_for_session` (re-flows whichever window ends up current;
+  mirrors every other window-switching handler). Same-window swap (`src ==
+  dst`, e.g. a single-window session's own `-1`/`+1` wrap target) is a no-op
+  success (`Session::swap_windows` returns `false`, silently ignored —
+  matches real tmux's own "no-op success if both winlinks already point at
+  the same window" rule). Deliberately does NOT consult
+  `renumber-windows` — swapping trades two winlinks' indexes without ever
+  closing a gap, so there is nothing for `Session::renumber` to fix (per the
+  doc's own `renumber-windows` section, the only auto-trigger is
+  `server_kill_window`'s `renumber=1` path). Wired into BOTH the headless
+  (`SwapWindow { src, dst, detach } => self.exec_swap_window(src, dst,
+  detach, None)`) and client-context (`wrap(self.exec_swap_window(src, dst,
+  detach, Some(session_name.as_str())))`) dispatch tables, same pattern as
+  every other Task-6/7 window-op command.
+
+Tests: `tests/server_proto.rs`'s
+`swap_window_relative_target_moves_current_window` (the `-d` case: swaps
+the current window with the previous one by relative offset; the marked
+pane's content stays visible across the index change, proving focus
+followed the WINDOW OBJECT) and `swap_window_without_d_keeps_focus_on_index`
+(the no-`-d` case: after the same swap, the OTHER window's content becomes
+visible without any explicit `select-window`, proving focus stayed on the
+same INDEX/slot).
+
+## `clock-mode` — clock-mode command + `clock-mode-style` option (sub-project 6, Task 10)
+
+Adds `ParsedCmd::ClockMode` (zero fields) to the `cmd` enum locked above
+(Task 3), a `clock-mode-style` option (`options`), and a `t` prefix-table
+default (`bindings`) -- closing the `prefix-t` gap flagged by the SP6 gap
+analysis (`clock-mode-colour` already existed, accepted-and-stored but
+inert, from Task 2; clock-mode itself did not). Full spec:
+`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock mode`. The
+overlay STATE/RENDER machinery (`ClientMode::Clock`, `RenderOverlay::Clock`,
+`render::Overlay::Clock`, `Renderer::paint_clock`) is documented in the
+parity-polish contract doc's `## overlays` section amendment (Task 10),
+alongside the pre-existing choose-tree/display-panes machinery it mirrors --
+not repeated here.
+
+### `cmd` (`src/cmd.rs`)
+
+```rust
+pub enum ParsedCmd {
+    // ...
+    /// `clock-mode`: open the big-clock overlay on the acting client's
+    /// current window, on the pane FOCUSED at entry (mirrors `copy-mode`'s
+    /// own "binds to the pane focused at entry" rule).
+    ClockMode,
+}
+```
+
+- `canonical()`: `"clock-mode" => "clock-mode"` (no alias — matches real
+  tmux, which has none either).
+- `usage("clock-mode")`: `"usage: clock-mode"`.
+- `resolve`: `scan_flags` with no bools/values and no positionals — ANY
+  argument (including tmux's own `-t target-pane`) is a usage error. This is
+  a documented deviation: real tmux's `clock-mode [-t target-pane]` is not
+  modeled, following `display-panes`' own established precedent of a
+  client-scoped, no-target overlay command (`## overlays`,
+  `2026-07-07-parity-polish-interfaces.md`) — winmux's overlay lives in
+  per-CLIENT state (`ClientMode::Clock`), not addressable by an arbitrary
+  target pane the way a real command target is. `Err("no current client")`
+  from the headless (CLI/`.tmux.conf`) execution path, same rule as
+  `copy-mode`/`copy-*`/`choose-tree`/`display-panes`. Test: `clock_mode_no_args`.
+
+### `options` (`src/options.rs`)
+
+One new `Spec`:
+
+| Name | Kind | Default |
+|---|---|---|
+| `clock-mode-style` | Choice (`12`, `24`) | `24` |
+
+Real tmux's choice set is `12 \| 24 \| 12-with-seconds \| 24-with-seconds`
+(`docs/tmux-reference/status-line-and-messages.md` `## 6`/`## 9`); winmux
+implements only the plain two, a documented task-scope simplification (no
+seconds-resolution display).
+
+```rust
+impl Options {
+    /// `true` = `12` (`%l:%M ` + `AM`/`PM`), `false` = the `24` default
+    /// (`%H:%M`).
+    pub fn clock_mode_style_12(&self) -> bool;
+}
+```
+
+### `bindings` (`src/bindings.rs`)
+
+One new prefix-table default:
+
+| Key | Command |
+|---|---|
+| `t` | `clock-mode` |
+
+Matches real tmux's own default (`key-bindings.c:433`).
+
+Tests: `clock_mode_no_args` (`cmd`), `clock_mode_style_getter_and_roundtrip`
+(`options`), `defaults_cover_current_behavior`'s `("t", "clock-mode", &[],
+false)` entry (`bindings`), `clock_mode_opens_and_any_key_exits`
+(`tests/server_proto.rs`, full-stack: opens on `prefix-t`, a completed
+prefix sequence typed while open both dismisses the overlay AND does not
+execute the bound command underneath it, pane content is genuinely
+restored afterward).
+
+## `pane-border-indicators` — active-pane border indication (sub-project 6 wave 2, Task 11)
+
+Adds a `pane-border-indicators` option (`options`) and, on the `render`
+side, `render::BorderIndicators` + `Scene::border_indicators` plus a
+reworked border-cell OWNER attribution in `Renderer::compose_back`'s border
+pass -- fixing the user-visible bug that a 1:1 two-pane split painted the
+ENTIRE shared divider in the active style (indicating nothing). Full spec:
+`docs/tmux-reference/panes-and-layout.md` §7.1 (the half-border rule) and
+§7.4 (`pane-border-indicators`). The `render` changes are documented as a
+**LOCKED-CONTRACT AMENDMENT** directly on `docs/specs/2026-07-06-mvp-
+interfaces.md`'s `## render` section (following that file's own precedent
+for amending `Scene` in place, e.g. the SP4 Task 8 overlay amendment) --
+not repeated here; this section covers only the new `options` surface.
+
+### `options` (`src/options.rs`)
+
+One new `Spec`:
+
+| Name | Kind | Default |
+|---|---|---|
+| `pane-border-indicators` | Choice (`off`, `colour`, `arrows`, `both`) | `colour` |
+
+```rust
+impl Options {
+    /// `pane-border-indicators`: `off` (no indication), `colour` (default;
+    /// half-border cosmetic split on an exactly-two-tiled-pane divider,
+    /// general per-cell adjacency colouring otherwise), `arrows` (four
+    /// glyphs on the active pane's own border, no colouring), `both`.
+    /// 1:1 mapping onto `render::BorderIndicators`.
+    pub fn pane_border_indicators(&self) -> crate::render::BorderIndicators;
+}
+```
+
+This is the one option getter in this file that returns a type owned by
+`render` rather than `grid`/`style`/`keys` (already-established
+cross-module return types for other getters, e.g. `clock_mode_colour() ->
+crate::grid::Color`) -- a one-directional `options -> render` dependency,
+introducing no cycle (`render` has no dependency on `options`).
+
+Tests: `two_pane_vertical_divider_half_styled`,
+`two_pane_horizontal_divider_half_styled` (incl. the focus-flip inversion),
+`border_indicators_off_suppresses_active_styling`,
+`border_indicators_arrows_draws_glyphs_at_active_corners`,
+`three_pane_left_tall_right_split_general_rule_unchanged` (`render`);
+`pane_active_border_style_runtime` (`tests/server_proto.rs`, amended --
+see the Task 11 report for the sanctioned inversion).

@@ -303,77 +303,146 @@ fn area_at(root: &Node, path: &[bool], area: Rect) -> Rect {
 
 impl Layout {
     /// Geometric navigation: move focus to the pane adjacent in `dir`, per
-    /// tmux `select-pane -L/-R/-U/-D` semantics. A *candidate* is any pane
-    /// whose rect borders the focused rect in that direction (adjacent
-    /// across the single border cell) AND whose cross-axis range genuinely
-    /// OVERLAPS the focused pane's cross-axis range (a real interval
-    /// overlap test, not a single midpoint probe -- see the bugfix note
-    /// below). Among multiple candidates, tmux picks the most-recently-used
-    /// pane; winmux only tracks a single "last pane" (`last_focused`, the
-    /// `prefix ;` toggle target) rather than a full MRU stack, so this is
-    /// approximated as: prefer `last_focused` if it is itself a candidate,
-    /// else fall back to the first candidate in leaf-tree (pane) order.
+    /// tmux `select-pane -L/-R/-U/-D` semantics (`window_pane_find_{left,
+    /// right,up,down}`, window.c). Two rules, both from
+    /// `docs/tmux-reference/panes-and-layout.md` §1.1:
+    ///
+    /// 1. **Edge-flip wrap.** The search edge is normally the column/row
+    ///    immediately touching the focused pane's near side; but if the
+    ///    focused pane is ALREADY flush against that side of `area`, the
+    ///    edge flips to one past the FAR side, so candidates become the
+    ///    panes flush against the opposite edge -- navigation wraps
+    ///    (Left from the leftmost pane reaches the rightmost, symmetric in
+    ///    all four directions).
+    /// 2. **MRU tie-break via `activity`.** A candidate is any pane flush
+    ///    against the (possibly wrapped) edge AND whose cross-axis range
+    ///    genuinely OVERLAPS the focused pane's cross-axis range (a real
+    ///    interval-overlap test, not a single midpoint probe -- see the
+    ///    2026-07-08 hotfix note below, still true post-wrap; corner-
+    ///    touching counts, the range extends through the border line).
+    ///    Among multiple candidates, tmux picks the one with the greatest
+    ///    `active_point` (window_pane_choose_best, window.c:1790-1805) --
+    ///    `activity` is the caller-supplied read of that per-pane counter
+    ///    (server-side, since tmux's counter is global across the whole
+    ///    server, not just this Layout). Ties -- e.g. every candidate still
+    ///    at its default -- resolve to whichever was seen FIRST in leaf
+    ///    (pane-index) order, because only a STRICT `>` ever replaces the
+    ///    running best, mirroring tmux's own loop exactly. Replaces the old
+    ///    single-slot `last_focused` MRU approximation (follow-up #65,
+    ///    closed).
+    ///
     /// Returns false (no change) if there is no candidate in that direction.
-    pub fn focus_dir(&mut self, dir: Direction, area: Rect) -> bool {
+    //
+    // Hotfix note (2026-07-08): the original implementation tested only
+    // whether the focused pane's cross-axis MIDPOINT fell inside a
+    // candidate's range. When the focused pane spans the full cross-axis
+    // length opposite a split column/row (e.g. a full-height pane next to a
+    // top/bottom split), that midpoint could land exactly on the border
+    // between two candidates and match neither, so directional navigation
+    // silently no-op'd. Replaced with the real interval-overlap test kept
+    // below.
+    pub fn focus_dir(&mut self, dir: Direction, area: Rect, activity: &dyn Fn(PaneId) -> u64) -> bool {
         let rects = self.all_rects(area);
         let f = match rects.iter().find(|(id, _)| *id == self.focused) {
             Some((_, r)) => *r,
             None => return false,
         };
+
+        // u32 throughout: area/pane coordinates are u16, and near u16::MAX
+        // the "one past the far edge" wrap target can itself reach 65536+,
+        // which would overflow a u16 (the same overflow class follow-up #5
+        // guarded with `saturating_add`, now needed for the edge computation
+        // too, not just the near-side adjacency test it originally covered).
+        let area_x = area.x as u32;
+        let area_y = area.y as u32;
+        let area_r = area_x + area.w as u32; // one past area's right edge
+        let area_b = area_y + area.h as u32; // one past area's bottom edge
+        let f_x = f.x as u32;
+        let f_y = f.y as u32;
+        let f_r = f_x + f.w as u32;
+        let f_b = f_y + f.h as u32;
+
+        // Edge-flip wrap rule, transcribed 1:1 from
+        // `window_pane_find_left/right/up/down` (window.c:1838-2031; doc
+        // §1.1): compute the non-wrapped edge, then if it has run off the
+        // near/far side of `area`, flip it to the opposite side.
+        let edge: u32 = match dir {
+            Direction::Left => {
+                if f_x == area_x { area_r + 1 } else { f_x }
+            }
+            Direction::Right => {
+                let edge_pre = f_r + 1;
+                if edge_pre >= area_r { area_x } else { edge_pre }
+            }
+            Direction::Up => {
+                if f_y == area_y { area_b + 1 } else { f_y }
+            }
+            Direction::Down => {
+                let edge_pre = f_b + 1;
+                if edge_pre >= area_b { area_y } else { edge_pre }
+            }
+        };
+
         let mut candidates: Vec<PaneId> = Vec::new();
         for (id, r) in &rects {
             if *id == self.focused {
                 continue;
             }
-            // Adjacency accounts for the single border cell between siblings.
+            let r_x = r.x as u32;
+            let r_y = r.y as u32;
+            let r_r = r_x + r.w as u32;
+            let r_b = r_y + r.h as u32;
+            // A candidate's border touching `edge` (accounting for the
+            // single border cell between siblings, hence the `+1`s).
             let adjacent = match dir {
-                // saturating_add: `f.x + f.w + 1` (and the symmetric Down
-                // case below) is theoretically reachable near u16::MAX;
-                // saturating keeps this a total comparison instead of a
-                // debug-mode overflow panic (follow-up #5).
-                Direction::Right => r.x == f.x.saturating_add(f.w).saturating_add(1),
-                Direction::Left => f.x > 0 && r.x + r.w == f.x - 1,
-                Direction::Down => r.y == f.y.saturating_add(f.h).saturating_add(1),
-                Direction::Up => f.y > 0 && r.y + r.h == f.y - 1,
+                Direction::Right => r_x == edge,
+                Direction::Left => r_r + 1 == edge,
+                Direction::Down => r_y == edge,
+                Direction::Up => r_b + 1 == edge,
             };
             if !adjacent {
                 continue;
             }
-            // BUGFIX: this used to test only whether the focused pane's
-            // cross-axis MIDPOINT fell inside the candidate's range. When
-            // the focused pane spans the full cross-axis length opposite a
-            // split column/row (e.g. a full-height pane next to a
-            // top/bottom split), that midpoint can land exactly on the
-            // border row/column between the two candidates and match
-            // NEITHER -- navigation silently no-op'd. A real half-open
-            // interval overlap test (excluding degenerate zero-size rects,
-            // and saturating to stay total near u16::MAX) fixes this and
-            // matches tmux, which considers every pane whose range overlaps
-            // at all, not just one whose range contains a single point.
+            // Literal transcription of `window.c:1992-1998` (doc §1.2): three
+            // OR'd clauses, INCLUSIVE of `top`/`bottom` (`f_y`/`f_b`, where
+            // `f_b` is deliberately one PAST the focused pane's last real
+            // row/column -- the border line itself). A candidate whose near
+            // edge lands exactly on `f_b` (or, symmetrically containing,
+            // whose far edge reaches past it) still counts even though it
+            // shares no real row/column with the focused pane -- only a
+            // diagonal touch at the shared border corner (2026-07-10 review
+            // fix: the prior `r_y < f_b` / `r_x < f_r` strict tests wrongly
+            // excluded exactly this boundary case).
             let overlaps = match dir {
                 Direction::Left | Direction::Right => {
-                    r.h > 0
-                        && f.h > 0
-                        && r.y < f.y.saturating_add(f.h)
-                        && f.y < r.y.saturating_add(r.h)
+                    r.h > 0 && f.h > 0 && {
+                        let end = r_b - 1; // candidate's last real row
+                        (r_y < f_y && end > f_b) || (r_y >= f_y && r_y <= f_b) || (end >= f_y && end <= f_b)
+                    }
                 }
                 Direction::Up | Direction::Down => {
-                    r.w > 0
-                        && f.w > 0
-                        && r.x < f.x.saturating_add(f.w)
-                        && f.x < r.x.saturating_add(r.w)
+                    r.w > 0 && f.w > 0 && {
+                        let end = r_r - 1; // candidate's last real column
+                        (r_x < f_x && end > f_r) || (r_x >= f_x && r_x <= f_r) || (end >= f_x && end <= f_r)
+                    }
                 }
             };
             if overlaps {
                 candidates.push(*id);
             }
         }
-        let chosen = match self.last_focused {
-            Some(last) if candidates.contains(&last) => Some(last),
-            _ => candidates.first().copied(),
-        };
-        match chosen {
-            Some(id) => {
+
+        let mut best: Option<(PaneId, u64)> = None;
+        for &id in &candidates {
+            let a = activity(id);
+            match best {
+                None => best = Some((id, a)),
+                Some((_, best_a)) if a > best_a => best = Some((id, a)),
+                _ => {}
+            }
+        }
+        match best {
+            Some((id, _)) => {
                 self.set_focus(id);
                 true
             }
@@ -907,6 +976,34 @@ mod tests {
 
     const A: Rect = Rect { x: 0, y: 0, w: 80, h: 24 };
 
+    /// Test-only stand-in for the server-side `active_point` counter (SP6
+    /// parity wave 2, Task 3): `stamp` mimics `Server::stamp_active`, called
+    /// by hand after every `Layout` call that changes focus, exactly the
+    /// call sites `src/server/dispatch.rs` stamps in production (split/
+    /// new-window/new-session pane creation, `focus_pane`, `focus_dir`,
+    /// `focus_last`, mouse click focus). `get` is read through a `&dyn Fn`
+    /// closure the same way `focus_dir`'s `activity` parameter is used for
+    /// real, keeping these unit tests a faithful, server-free rehearsal of
+    /// tmux's `window_pane_choose_best` tie-break. An unstamped pane reads
+    /// as `0` (never focused), strictly below any real stamp (`next` starts
+    /// at 1), matching `Server::next_active_point`'s same convention.
+    struct Activity {
+        map: std::collections::HashMap<PaneId, u64>,
+        next: u64,
+    }
+    impl Activity {
+        fn new() -> Self {
+            Activity { map: std::collections::HashMap::new(), next: 1 }
+        }
+        fn stamp(&mut self, id: PaneId) {
+            self.map.insert(id, self.next);
+            self.next += 1;
+        }
+        fn get(&self, id: PaneId) -> u64 {
+            *self.map.get(&id).unwrap_or(&0)
+        }
+    }
+
     #[test]
     fn single_pane_gets_full_area() {
         let l = Layout::new(7);
@@ -1140,46 +1237,71 @@ mod tests {
     #[test]
     fn focus_dir_two_pane_horizontal() {
         // (1 | 2): pane1 {0,0,40,24}, pane2 {41,0,39,24}; focus starts on 2.
+        // Uniform (zero) activity throughout -- every direction here has at
+        // most one candidate, so the tie-break never engages.
+        let act = Activity::new();
+        let f = |id: PaneId| act.get(id);
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();
         assert_eq!(l.focused(), 2);
         // Left: pane1's right edge 0+40 == focused.x-1 (41-1=40); vertical
         // midpoint of pane2 = 0 + 24/2 = 12, inside pane1 y-range [0,24) -> 1.
-        assert!(l.focus_dir(Direction::Left, A));
+        assert!(l.focus_dir(Direction::Left, A, &f));
         assert_eq!(l.focused(), 1);
         // Right from 1: pane2.x 41 == 0+40+1; midpoint 12 inside pane2 -> 2.
-        assert!(l.focus_dir(Direction::Right, A));
+        assert!(l.focus_dir(Direction::Right, A, &f));
         assert_eq!(l.focused(), 2);
-        // Right at the right edge: no neighbor -> false, focus unchanged.
-        assert!(!l.focus_dir(Direction::Right, A));
+        // Right at the right edge: pane2 (x=41,w=39) is flush against
+        // area's right edge (41+39 == 80 == area.x+area.w), so per the
+        // edge-flip wrap rule (`panes-and-layout.md` §1.1) the search edge
+        // flips to the far (left) side: computed edge = area.x = 0, and
+        // pane1 (x=0) is flush there -- Right now WRAPS to pane1, inverting
+        // this assertion from the pre-wrap `false` (follow-up #65 review).
+        assert!(l.focus_dir(Direction::Right, A, &f));
+        assert_eq!(l.focused(), 1, "Right at the right edge wraps to the leftmost pane");
+        // Move back to pane2 to re-test Up/Down and the Left-edge wrap.
+        assert!(l.focus_dir(Direction::Right, A, &f));
         assert_eq!(l.focused(), 2);
-        // No vertical neighbor either way.
-        assert!(!l.focus_dir(Direction::Up, A));
-        assert!(!l.focus_dir(Direction::Down, A));
-        // Move to the left pane, then Left at the left edge -> false.
-        assert!(l.focus_dir(Direction::Left, A));
+        // No vertical neighbor in EITHER direction: both panes span the
+        // full height (y=0,h=24), so a candidate's cross-axis (x-)range
+        // would have to overlap the focused pane's x-range too -- the two
+        // columns are disjoint in x, so neither wraps into the other here
+        // (unlike Left/Right, wrapping alone can't manufacture a candidate
+        // when none exists on the perpendicular axis).
+        assert!(!l.focus_dir(Direction::Up, A, &f));
+        assert!(!l.focus_dir(Direction::Down, A, &f));
+        // Move to the left pane, then Left at the left edge: pane1 (x=0)
+        // is flush against area.x, so the edge flips to one past area's
+        // right edge (81); pane2's right border (41+39=80, +1=81) matches
+        // -- Left now WRAPS to pane2, inverting the pre-wrap `false`.
+        assert!(l.focus_dir(Direction::Left, A, &f));
         assert_eq!(l.focused(), 1);
-        assert!(!l.focus_dir(Direction::Left, A));
+        assert!(l.focus_dir(Direction::Left, A, &f));
+        assert_eq!(l.focused(), 2, "Left at the left edge wraps to the rightmost pane");
     }
 
     #[test]
     fn focus_dir_nested_adjacency() {
         // Tree = H(Leaf1, V(Leaf2, Leaf3)):
         // pane1 {0,0,40,24}, pane2 {41,0,39,12}, pane3 {41,13,39,11}; focus 3.
+        // None of these hops touch a window edge, so wrap never engages and
+        // uniform activity is enough (each hop has exactly one candidate).
+        let act = Activity::new();
+        let f = |id: PaneId| act.get(id);
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();
         l.split(SplitDir::Vertical, 3, A).unwrap();
         assert_eq!(l.focused(), 3);
         // Up from 3: pane2 bottom edge 0+12 == 13-1; horizontal midpoint of
         // pane3 = 41 + 39/2 = 60, inside pane2 x-range [41,80) -> 2.
-        assert!(l.focus_dir(Direction::Up, A));
+        assert!(l.focus_dir(Direction::Up, A, &f));
         assert_eq!(l.focused(), 2);
         // Down from 2: pane3 top 13 == 0+12+1; midpoint 60 inside pane3 -> 3.
-        assert!(l.focus_dir(Direction::Down, A));
+        assert!(l.focus_dir(Direction::Down, A, &f));
         assert_eq!(l.focused(), 3);
         // Left from 3: pane1 right edge 0+40 == 41-1; vertical midpoint of
         // pane3 = 13 + 11/2 = 18, inside pane1 y-range [0,24) -> 1.
-        assert!(l.focus_dir(Direction::Left, A));
+        assert!(l.focus_dir(Direction::Left, A, &f));
         assert_eq!(l.focused(), 1);
     }
 
@@ -1192,16 +1314,24 @@ mod tests {
         // candidate's range: 12 is exactly the border row between pane2
         // (0..12) and pane3 (13..24), so it matched NEITHER and `Right`
         // silently no-op'd. A real interval-overlap test must find both as
-        // candidates.
+        // candidates; among them the real `active_point` tie-break (not the
+        // old single-slot `last_focused` approximation) must pick whichever
+        // was actually focused most recently.
+        let mut act = Activity::new();
+        act.stamp(1); // Layout::new(1): pane1 starts focused.
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();
+        act.stamp(2); // split() focuses the new pane (tmux default).
         l.split(SplitDir::Vertical, 3, A).unwrap();
+        act.stamp(3);
         assert_eq!(l.focused(), 3);
-        assert!(l.focus_dir(Direction::Left, A)); // -> 1; last_focused becomes 3
+        assert!(l.focus_dir(Direction::Left, A, &|id| act.get(id))); // -> 1 (sole candidate)
+        act.stamp(1);
         assert_eq!(l.focused(), 1);
-        assert!(l.focus_dir(Direction::Right, A));
-        // Both pane2 and pane3 overlap pane1's full range; last_focused (3)
-        // is among the candidates, so tmux's MRU tie-break lands on 3.
+        assert!(l.focus_dir(Direction::Right, A, &|id| act.get(id)));
+        // Both pane2 and pane3 overlap pane1's full range; pane3's
+        // active_point (stamped last, at the 2nd split) is greater than
+        // pane2's, so it wins the tie-break.
         assert_eq!(l.focused(), 3);
     }
 
@@ -1212,38 +1342,213 @@ mod tests {
         // (bottom-left); pane3 {41,13,39,11} (bottom-right, focused after
         // the 2nd split). pane1's x-midpoint (0 + 80/2 = 40) is exactly the
         // border column between pane2 (0..40) and pane3 (41..80).
+        let mut act = Activity::new();
+        act.stamp(1);
         let mut l = Layout::new(1);
         l.split(SplitDir::Vertical, 2, A).unwrap();
+        act.stamp(2);
         l.split(SplitDir::Horizontal, 3, A).unwrap();
+        act.stamp(3);
         assert_eq!(l.focused(), 3);
-        assert!(l.focus_dir(Direction::Left, A)); // -> 2; last_focused becomes 3
+        assert!(l.focus_dir(Direction::Left, A, &|id| act.get(id))); // -> 2 (sole candidate)
+        act.stamp(2); // pane2 re-focused AFTER pane3 -- now the more recent of the two.
         assert_eq!(l.focused(), 2);
-        assert!(l.focus_dir(Direction::Up, A)); // -> 1; last_focused becomes 2
+        assert!(l.focus_dir(Direction::Up, A, &|id| act.get(id))); // -> 1 (sole candidate)
+        act.stamp(1);
         assert_eq!(l.focused(), 1);
-        assert!(l.focus_dir(Direction::Down, A));
-        // Both pane2 and pane3 overlap pane1's full range; last_focused (2)
-        // is among the candidates, so the MRU tie-break lands back on 2.
+        assert!(l.focus_dir(Direction::Down, A, &|id| act.get(id)));
+        // Both pane2 and pane3 overlap pane1's full range; pane2's
+        // active_point (re-stamped by the Left hop above, after pane3's)
+        // is greater, so it wins the tie-break.
         assert_eq!(l.focused(), 2);
     }
 
     #[test]
-    fn focus_dir_falls_back_to_first_candidate_when_last_focused_not_among_them() {
+    fn focus_dir_ties_fall_back_to_first_candidate_in_leaf_order() {
         // V(H(1, V(2,3)), 5): pane1 and the (2,3) column share the top
-        // region's full height; pane5 is an unrelated bottom region.
-        // Multiple Right candidates {2,3} exist for pane1, but
-        // `last_focused` is deliberately steered to pane5 (not a
-        // candidate) -- the MRU tie-break must fall back to the first
-        // candidate in leaf-tree order (pane2) instead of panicking or
-        // picking arbitrarily.
+        // region's full height; pane5 is an unrelated bottom region. Real
+        // tmux's `active_point` always has a definite value for every pane
+        // (no "unknown MRU" case the way winmux's old single-slot
+        // `last_focused` approximation had), so this now demonstrates the
+        // deterministic tie-break FLOOR instead: pane2 and pane3 are both
+        // Right-candidates for pane1, and neither is ever stamped after
+        // creation, so both read the same default (0) activity -- a genuine
+        // tie. `window_pane_choose_best`'s `>` (never `>=`) means only a
+        // STRICTLY greater candidate ever replaces the running best, so the
+        // first-seen (leaf/pane-index order: pane2 before pane3) tie wins.
+        let act = Activity::new();
         let mut l = Layout::new(1);
-        l.split(SplitDir::Vertical, 5, A).unwrap(); // V(1,5); focus 5, last 1
-        l.focus_pane(1); // focus 1, last 5
-        l.split(SplitDir::Horizontal, 2, A).unwrap(); // V(H(1,2),5); focus 2, last 1
-        l.split(SplitDir::Vertical, 3, A).unwrap(); // V(H(1,V(2,3)),5); focus 3, last 2
-        l.focus_pane(5); // focus 5, last 3
-        l.focus_pane(1); // focus 1, last 5 -- NOT a Right candidate for pane1
-        assert!(l.focus_dir(Direction::Right, A));
-        assert_eq!(l.focused(), 2, "fallback must pick the first candidate in leaf order");
+        l.split(SplitDir::Vertical, 5, A).unwrap(); // V(1,5); focus 5
+        l.focus_pane(1); // focus 1
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // V(H(1,2),5); focus 2
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // V(H(1,V(2,3)),5); focus 3
+        l.focus_pane(1); // focus 1 -- pane1 is the Right pivot; 2 and 3 stay unstamped
+        assert!(l.focus_dir(Direction::Right, A, &|id| act.get(id)));
+        assert_eq!(l.focused(), 2, "activity tie must fall back to the first candidate in leaf order");
+    }
+
+    #[test]
+    fn focus_dir_three_candidates_ranked_by_activity() {
+        // Follow-up #65's exact gap: winmux's old single-slot `last_focused`
+        // can only ever remember ONE previous pane, so with 3+ candidates it
+        // either matches (if that one slot happens to be a candidate) or
+        // falls back to "first in leaf order" -- losing any real ranking
+        // among the other candidates. Real per-pane `active_point` fixes
+        // this: the winner is whichever CANDIDATE was truly focused most
+        // recently, even when the pane focused immediately before the pivot
+        // (what the old single slot would have held) is a non-candidate.
+        //
+        // V(H(1, V(2, V(3,4))), 5): left column pane1 (full height of the
+        // top region) beside a 3-row right column (2 top, 3 mid, 4 bottom);
+        // pane5 is a distractor -- full width at the bottom, so it never
+        // qualifies as a Right-candidate for pane1 (disjoint x-adjacency).
+        let mut act = Activity::new();
+        act.stamp(1); // Layout::new(1)
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Vertical, 5, A).unwrap(); // V(1,5); focus 5
+        act.stamp(5);
+        l.focus_pane(1);
+        act.stamp(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // V(H(1,2),5); focus 2
+        act.stamp(2);
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // V(H(1,V(2,3)),5); focus 3
+        act.stamp(3);
+        l.split(SplitDir::Vertical, 4, A).unwrap(); // V(H(1,V(2,V(3,4))),5); focus 4
+        act.stamp(4);
+        // Re-touch the three candidates out of leaf order, ending with
+        // pane4 as the most recently active AMONG {2,3,4} -- but NOT the
+        // pane focused immediately before the pivot (that's pane5, a
+        // non-candidate, visited last below).
+        l.focus_pane(3);
+        act.stamp(3);
+        l.focus_pane(2);
+        act.stamp(2);
+        l.focus_pane(4);
+        act.stamp(4);
+        l.focus_pane(5); // distractor, NOT a Right-candidate for pane1
+        act.stamp(5);
+        l.focus_pane(1); // pivot; the old single "last pane" slot would now hold 5
+        act.stamp(1);
+        assert!(l.focus_dir(Direction::Right, A, &|id| act.get(id)));
+        assert_eq!(
+            l.focused(),
+            4,
+            "must pick the candidate with the greatest active_point (4), not the first \
+             candidate (2) nor whatever the single-slot approximation would have held (5, \
+             not even a candidate)"
+        );
+    }
+
+    #[test]
+    fn focus_dir_wraps_left_to_rightmost() {
+        // Three side-by-side columns, H(1, H(2,3)): pane1 (col 0, leftmost),
+        // pane2 (col 1), pane3 (col 2, rightmost). Left from the leftmost
+        // pane wraps (edge-flip rule): the search edge flips to one past
+        // area's right edge, so only the pane(s) flush against the RIGHT
+        // edge (pane3) match -- pane2 (the middle column) is not flush
+        // right, so it's excluded, and there's no tie to break.
+        let act = Activity::new();
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // H(1,2); focus 2
+        l.split(SplitDir::Horizontal, 3, A).unwrap(); // H(1,H(2,3)); focus 3
+        l.focus_pane(1); // -> leftmost column
+        assert_eq!(l.focused(), 1);
+        assert!(l.focus_dir(Direction::Left, A, &|id| act.get(id)));
+        assert_eq!(l.focused(), 3, "Left from the leftmost column wraps to the rightmost");
+    }
+
+    #[test]
+    fn focus_dir_wraps_down_to_top() {
+        // Three stacked rows, V(1, V(2,3)): pane1 (top), pane2 (middle),
+        // pane3 (bottom, focused right after the 2nd split). Down from the
+        // bottommost pane wraps to the topmost.
+        let act = Activity::new();
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Vertical, 2, A).unwrap(); // V(1,2); focus 2
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // V(1,V(2,3)); focus 3 (bottom)
+        assert_eq!(l.focused(), 3);
+        assert!(l.focus_dir(Direction::Down, A, &|id| act.get(id)));
+        assert_eq!(l.focused(), 1, "Down from the bottommost row wraps to the topmost");
+    }
+
+    #[test]
+    fn focus_dir_includes_corner_touching_candidate() {
+        // Finding 3 (review, 2026-07-10): the perpendicular-overlap test
+        // must be INCLUSIVE at the boundary (`window.c:1992-1998`, doc
+        // §1.2) -- a candidate whose near edge lands exactly on the focused
+        // pane's far boundary still counts, even though it shares no real
+        // row with it (only the border LINE, not any cell).
+        //
+        // H(V(1,4), V(2,3)) on A (80x24). H(1,2) at the default ratio gives
+        // pane1/pane4's column {x0,w40} and pane2/pane3's column
+        // {x41,w39} (`child_first(80,0.5)=round(79*0.5)=40`). Splitting
+        // pane1 vertically at the default ratio gives
+        // `child_first(24,0.5)=round(23*0.5)=12`: pane1 {y0,h12} (rows
+        // 0..12, so f_b = 0+12 = 12), pane4 {y13,h11}.
+        //
+        // The right column's V(2,3) split ratio is then nudged to 11/23
+        // (instead of the default-derived 12/23) via `set_ratio`, so
+        // `child_first(24,11/23)=11`: pane2 {y0,h11} (rows 0..11, still
+        // fully overlapping pane1's rows 0..11 -- an ordinary candidate
+        // either way) and pane3 {y=0+11+1=12,h12} (rows 12..24). Pane3's
+        // `r_y` (12) lands EXACTLY on pane1's `f_b` (12) -- a corner touch,
+        // not a real row overlap (pane1's real rows are 0..11; pane3's are
+        // 12..23). The old strict `r_y < f_b` test (12 < 12 = false)
+        // excluded pane3 as a Right-candidate from pane1; the new inclusive
+        // test (`r_y >= top && r_y <= bottom`, i.e. 12 >= 0 && 12 <= 12)
+        // includes it.
+        //
+        // Only pane3 is stamped, so if it's (correctly) a candidate it must
+        // win the tie-break against pane2 (default activity 0); if it's
+        // (incorrectly) excluded, Right would pick pane2 instead.
+        let mut act = Activity::new();
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // H(1,2); focus 2
+        l.focus_pane(1);
+        l.split(SplitDir::Vertical, 4, A).unwrap(); // H(V(1,4),2); focus 4
+        l.focus_pane(2);
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // H(V(1,4),V(2,3)); focus 3
+        let path3 = l.path_to(3).unwrap();
+        l.set_ratio(&path3[..path3.len() - 1], 11.0 / 23.0);
+        l.focus_pane(1);
+        act.stamp(3);
+        assert!(l.focus_dir(Direction::Right, A, &|id| act.get(id)));
+        assert_eq!(
+            l.focused(),
+            3,
+            "corner-touching pane3 (r_y == f_b) must be a Right-candidate from pane1, and \
+             being the only stamped one, must win the tie-break"
+        );
+    }
+
+    #[test]
+    fn focus_dir_wrap_picks_most_recently_active_of_two_far_candidates() {
+        // H(1, V(2,3)): pane1 (tall, left column, full height); pane2
+        // (top-right), pane3 (bottom-right, focused right after the 2nd
+        // split). Left from pane3 reaches pane1 (single candidate,
+        // non-wrapped). Left AGAIN from pane1 (now flush against area's
+        // left edge) wraps: the flipped edge matches BOTH pane2 and pane3
+        // (pane1 spans their combined height), a genuine 2-candidate wrap --
+        // the more recently active of the two must win.
+        let mut act = Activity::new();
+        act.stamp(1); // Layout::new(1)
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap(); // H(1,2); focus 2
+        act.stamp(2);
+        l.split(SplitDir::Vertical, 3, A).unwrap(); // H(1,V(2,3)); focus 3 (bottom-right)
+        act.stamp(3); // pane3 is now MORE recently active than pane2.
+        assert_eq!(l.focused(), 3);
+        assert!(l.focus_dir(Direction::Left, A, &|id| act.get(id))); // -> 1 (sole candidate)
+        act.stamp(1);
+        assert_eq!(l.focused(), 1);
+        assert!(l.focus_dir(Direction::Left, A, &|id| act.get(id))); // wraps; candidates {2,3}
+        assert_eq!(
+            l.focused(),
+            3,
+            "wrap tie-break must pick pane3 (active_point {} > pane2's {})",
+            act.get(3),
+            act.get(2)
+        );
     }
 
     #[test]
@@ -1325,7 +1630,7 @@ mod tests {
         // child1 40 -> 41; pane2 width = 80-1-41 = 38.
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();
-        assert!(l.focus_dir(Direction::Left, A));
+        assert!(l.focus_dir(Direction::Left, A, &|_| 0));
         assert_eq!(l.focused(), 1);
         assert!(l.resize_focused(Direction::Right, A, 1));
         assert_eq!(
@@ -1355,6 +1660,48 @@ mod tests {
         assert_eq!(l.focused(), 1);
         assert!(l.resize_from(2, Direction::Left, A, 1));
         assert_eq!(l.focused(), 1, "resize_from must not change focus");
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 39, h: 24 }),
+                (2, Rect { x: 40, y: 0, w: 40, h: 24 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_from_first_child_reference_rejects_shrink_direction() {
+        // (1 | 2), pane 1 is the split's FIRST child (left pane). This pins
+        // down the `resize_from` contract that follow-up #66 traces the
+        // mouse-border-drag bug to: `mouse_down`'s `VBorder{ left }` hit-test
+        // always binds the LEFT pane (the first child) as the drag's
+        // reference leaf, for the WHOLE gesture, regardless of which way the
+        // user later drags. `resize_from` only accepts a first-child
+        // reference for `Direction::Right`/`Down` (`want_first`) --
+        // `Direction::Left` (shrink pane 1 / grow pane 2) requires the
+        // SECOND child (pane 2) as reference instead. Calling it with pane 1
+        // + Left, exactly what pre-fix `mouse_drag_border` does for every
+        // leftward drag, is a silent no-op: this is the defect class at the
+        // layout level, independent of any mouse plumbing.
+        let mut l = Layout::new(1);
+        l.split(SplitDir::Horizontal, 2, A).unwrap();
+        assert!(
+            !l.resize_from(1, Direction::Left, A, 1),
+            "first-child (left pane) reference + Left must no-op per resize_from's documented want_first contract"
+        );
+        assert_eq!(
+            l.rects(A),
+            vec![
+                (1, Rect { x: 0, y: 0, w: 40, h: 24 }),
+                (2, Rect { x: 41, y: 0, w: 39, h: 24 }),
+            ],
+            "layout must be untouched by the rejected call"
+        );
+        // The fix `mouse_drag_border` must apply: resolve the SECOND-child
+        // (pane 2) as reference for a leftward drag on this same border --
+        // then it succeeds, same net rect change as
+        // `resize_from_reference_pane_ignores_focus` above.
+        assert!(l.resize_from(2, Direction::Left, A, 1));
         assert_eq!(
             l.rects(A),
             vec![
@@ -1448,7 +1795,11 @@ mod tests {
         let mut l = Layout::new(1);
         l.split(SplitDir::Vertical, 2, area).unwrap(); // focus 2 (bottom)
         // Must not panic ("attempt to add with overflow" in debug builds).
-        l.focus_dir(Direction::Right, area);
+        // This area is also an edge case for the wrap rule's own u32 edge
+        // math (area.x + area.w = 65536, itself > u16::MAX), exercising the
+        // same overflow class one level up from the original adjacency-only
+        // guard.
+        l.focus_dir(Direction::Right, area, &|_| 0);
     }
 
     #[test]
@@ -1458,7 +1809,7 @@ mod tests {
         let area = Rect { x: 0, y: 65500, w: 24, h: 36 };
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, area).unwrap(); // focus 2 (right)
-        l.focus_dir(Direction::Down, area);
+        l.focus_dir(Direction::Down, area, &|_| 0);
     }
 
     #[test]
@@ -1471,9 +1822,9 @@ mod tests {
         //   -> pane1 {0,0,20,24}, pane3 {21,0,19,24}.
         let mut l = Layout::new(1);
         l.split(SplitDir::Horizontal, 2, A).unwrap();
-        assert!(l.focus_dir(Direction::Left, A));
+        assert!(l.focus_dir(Direction::Left, A, &|_| 0));
         l.split(SplitDir::Horizontal, 3, A).unwrap();
-        assert!(l.focus_dir(Direction::Right, A));
+        assert!(l.focus_dir(Direction::Right, A, &|_| 0));
         assert_eq!(l.focused(), 2);
         assert_eq!(
             l.rects(A),

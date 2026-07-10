@@ -42,7 +42,7 @@ use crate::bindings::Bindings;
 use crate::buffers::Buffers;
 use crate::cmd::RawCmd;
 use crate::geom::Rect;
-use crate::grid::{Grid, Style};
+use crate::grid::{Cell, Grid, Style};
 use crate::input::{KeyInputEvent, KeyMachine, WhichTable};
 use crate::layout::{Layout, PaneId, MIN_PANE_H, MIN_PANE_W};
 use crate::model::{Registry, Session, WindowId};
@@ -50,8 +50,8 @@ use crate::options::{expand_format, FormatCtx, Options, SystemTimeParts};
 use crate::pipe::{PipeConn, PipeListener};
 use crate::protocol::{self, read_client_msg, write_server_msg, AttachMode, ClientMsg, ServerMsg};
 use crate::pty::Pty;
-use crate::render::{CopyView, ListOverlay, Overlay, PaneView, Renderer, Scene, StatusRow};
-use crate::status::{status_spans, WindowEntry};
+use crate::render::{CopyView, ListOverlay, Overlay, PaneView, PreviewBlock, Renderer, Scene, StatusRow, TreeRowCell};
+use crate::status::{status_spans, strip_style_markers, WindowEntry};
 
 /// Abbreviated month names for the status-bar clock (`DD-Mon-YY`) and the
 /// CLI's `ls` creation-time format.
@@ -177,17 +177,54 @@ enum ClientMode {
     /// mid-overlay simply stops being offered a digit rather than a stale
     /// key press acting on a dead `PaneId`.
     DisplayPanes(DisplayPanesState),
+    /// clock-mode overlay (Task 10, sub-project 6 wave 2; `t`, `clock-mode`):
+    /// a per-client mode bound to the pane that was FOCUSED at entry, same
+    /// binding rule as `Copy` (`docs/tmux-reference/status-line-and-
+    /// messages.md` `## 6. Clock mode`: "it is a window mode on the pane").
+    /// Unlike `DisplayPanes` there is no auto-dismiss deadline -- real
+    /// tmux's "any key exits" (`window_clock_key`/`window_pane_reset_mode`)
+    /// is the only way out (see `dispatch::Server::dispatch_clock_key`).
+    Clock(ClockState),
 }
 
 /// choose-tree's two views (Task 8): `Sessions` (`-s`) lists every session as
-/// one collapsed row; `Windows` (`-w`, the default) lists the CURRENT
-/// session's windows (a session header row + one indented row per window) --
-/// see the design spec's `## 7. Overlays` section for the documented
-/// "windows of the current session only" scope simplification.
+/// a real tree row (SP6 wave 2, Task 8: a `+`/`-` expand marker, collapsed by
+/// default per `docs/tmux-reference/choose-tree.md` `## 1.1` -- "sessions
+/// start collapsed"; `Right`/`+` reveals its windows as indented children);
+/// `Windows` (`-w`, the default) lists the CURRENT session's windows (a
+/// session header row + one indented row per window, unconditionally shown
+/// -- see the design spec's `## 7. Overlays` section for the documented
+/// "windows of the current session only" scope simplification, which this
+/// task does not change: real tmux's `-w` shows the whole multi-session
+/// tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChooseTreeView {
     Windows,
     Sessions,
+}
+
+/// choose-tree's live preview mode (SP6 wave 2, Task 8;
+/// `docs/tmux-reference/choose-tree.md` `## 3.1`/`## 7.1`): `v` cycles
+/// `Off -> Big -> Normal -> Off`. `Normal` (the tmux/winmux default) gives
+/// the row list two thirds of the panel; `Big` gives it one quarter (a
+/// bigger preview, smaller list); `Off` gives the list the whole panel.
+/// [`dispatch::Server::choose_tree_list_height`] turns this (plus the panel
+/// size and row count) into an actual row-count split every render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewMode {
+    Off,
+    Big,
+    Normal,
+}
+
+impl PreviewMode {
+    fn cycle(self) -> Self {
+        match self {
+            PreviewMode::Off => PreviewMode::Big,
+            PreviewMode::Big => PreviewMode::Normal,
+            PreviewMode::Normal => PreviewMode::Off,
+        }
+    }
 }
 
 /// choose-tree's per-client state (Task 8; review fix, Critical #1).
@@ -213,11 +250,24 @@ enum ChooseTreeView {
 /// every `Stdin` frame, which would make the prompt vanish before the user
 /// could answer it). `pending_kill` was already identity-based before this
 /// fix (`TreeTarget`, not an index) -- only `sel` needed the fix.
+///
+/// SP6 wave 2, Task 8 additions: `expanded` is the set of SESSION NAMES
+/// currently expanded in the `Sessions` view (keyed by session identity, same
+/// as `TreeTarget::Session`) -- sessions start collapsed (absent from the
+/// set) per `docs/tmux-reference/choose-tree.md` `## 1.1`; `Windows` view row
+/// generation ignores this set entirely (its window children are always
+/// shown, matching that doc section's "-w: sessions expanded" default and
+/// this project's pre-existing "current session only" scope simplification).
+/// `preview` is the `v`-cycled preview mode (`## 3.1`/`## 7.1`), starting at
+/// `Normal` (tmux's own default -- neither `-N` nor `-N -N` is ever passed by
+/// winmux's `w`/`s` bindings).
 struct ChooseTreeState {
     view: ChooseTreeView,
     sel: usize,
     selected: Option<TreeTarget>,
     pending_kill: Option<(TreeTarget, String)>,
+    expanded: HashSet<String>,
+    preview: PreviewMode,
 }
 
 /// Re-resolve choose-tree's selection identity to a display INDEX into a
@@ -267,6 +317,48 @@ struct DisplayPanesState {
     deadline: Instant,
 }
 
+/// clock-mode's per-client state (Task 10): `pane` is the pane the mode was
+/// entered on (mirrors `CopyState::pane` -- kept explicit rather than
+/// implicitly "whatever's focused now", the correct DRY shape even though in
+/// practice nothing inside clock mode can change focus before the mode
+/// exits, since ANY key immediately does). `text` is the CURRENTLY DISPLAYED
+/// already-formatted time string (`format_clock`, `clock-mode-style`-
+/// governed) -- the render path (`Server::build_render_overlay`/
+/// `render_one`) just draws it verbatim, which is the seam that lets the
+/// render unit test inject a fixed string and never touch wall-clock. The
+/// `Tick` handler recomputes the current formatted string every 50ms and
+/// only marks the client dirty when it actually differs from `text`,
+/// matching real tmux's own "redraw only if the time actually changed"
+/// rule (`window-clock.c:146-168`).
+struct ClockState {
+    pane: PaneId,
+    text: String,
+}
+
+/// Format the clock-mode display string per `clock-mode-style`
+/// (`docs/tmux-reference/status-line-and-messages.md` `## 6. Clock mode`):
+/// `style12 == false` (the `24` default) -> tmux's `%H:%M` (zero-padded);
+/// `style12 == true` -> tmux's `%l:%M ` (`%l` = space-padded, NOT
+/// zero-padded, 12-hour -- a POSIX strftime extension Windows lacks,
+/// special-cased here per the doc's `## 10` "Windows/winmux applicability"
+/// note) immediately followed by `AM`/`PM` with no extra space (matches
+/// `window-clock.c`'s literal `strftime(..., "%l:%M ", tm)` +
+/// `strcat(.., tm->tm_hour >= 12 ? "PM" : "AM")`). `hour24` is 0-23,
+/// `minute` 0-59; both are the caller's job to keep in range (from
+/// `system_time_parts`/`SYSTEMTIME`, always in range in practice).
+fn format_clock(hour24: u8, minute: u8, style12: bool) -> String {
+    if style12 {
+        let hour12 = match hour24 % 12 {
+            0 => 12,
+            h => h,
+        };
+        let ampm = if hour24 < 12 { "AM" } else { "PM" };
+        format!("{hour12:2}:{minute:02} {ampm}")
+    } else {
+        format!("{hour24:02}:{minute:02}")
+    }
+}
+
 /// Task 8 (display-panes): pane-index -> digit mapping, in the window's
 /// `layout.panes()` order (the SAME order the status bar's pane-index format
 /// and `select-pane -t <n>` use), capped at the first 10 panes -- digits
@@ -288,15 +380,43 @@ fn pane_digit_entries(window: &crate::model::Window) -> Vec<(PaneId, u32)> {
 /// clients`, neither of which the per-client `render_one` (called while
 /// `self.clients` is already mutably borrowed) can see directly.
 enum RenderOverlay {
-    /// Already-formatted row text, in order, plus which index is selected;
-    /// `render_one` turns this into a `render::Overlay::List` (padding/
-    /// scrolling is a rendering concern, computed there with the client's
-    /// own `rows`/`cols` in hand).
-    Tree { rows: Vec<String>, sel: usize },
+    /// Already-formatted row text (+ tree depth/expand-marker) in order,
+    /// plus which index is selected; `render_one` turns this into a
+    /// `render::Overlay::List` (padding/scrolling is a rendering concern,
+    /// computed there with the client's own `rows`/`cols` in hand).
+    /// `list_height` is the pre-sized row-list height (`Server::
+    /// choose_tree_list_height`, SP6 wave 2 Task 8) -- equal to the full
+    /// scene height whenever `preview` is `None` (preview OFF, or the panel
+    /// too small per the sizing rule), reproducing the pre-Task-8-wave-2
+    /// full-height list exactly in that case.
+    Tree {
+        rows: Vec<(String, u8, Option<char>)>,
+        sel: usize,
+        list_height: u16,
+        preview: Option<TreePreviewData>,
+    },
     /// The digit-to-pane mapping for the client's current window (see
     /// [`pane_digit_entries`]); `render_one` maps each `PaneId` to its
     /// current rect and active-ness.
     Digits(Vec<(PaneId, u32)>),
+    /// clock-mode (Task 10): the bound pane's id (`render_one` resolves it
+    /// to a current rect, same as `Digits` does per-entry) and the
+    /// already-formatted time string (`ClockState::text`) -- `render_one`
+    /// just hands both, plus `clock-mode-colour`, to `render::Overlay::Clock`.
+    Clock { pane: PaneId, text: String },
+}
+
+/// The selected tree row's live preview content (SP6 wave 2, Task 8),
+/// pre-composed by `dispatch::Server::build_tree_preview` from the raw
+/// pane `Grid`s `self.panes` owns -- `render_one` only needs to place it (the
+/// panel-relative rect is computed there from `list_height`/the client's own
+/// `rows`/`cols`, since `build_render_overlay` runs before that's known) as
+/// a `render::PreviewBlock`.
+struct TreePreviewData {
+    title: String,
+    content_w: u16,
+    content_h: u16,
+    content: Vec<Cell>,
 }
 
 /// Copy mode's per-client state. `scroll` == tmux `oy` (lines scrolled up
@@ -370,7 +490,8 @@ struct SearchPrompt {
 /// converted to the same key coordinate live at each use, so both
 /// endpoints are always compared in one coherent frame. `rect` toggles
 /// rectangle (column-bounding-box) selection vs. the default linear
-/// (reading-order) selection.
+/// (reading-order) selection. `kind` (Task 7, SP6 wave 2) is what unit the
+/// MOVING end snaps to while dragging -- see [`SelKind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SelState {
     anchor_scroll: u32,
@@ -379,6 +500,28 @@ struct SelState {
     /// `Grid::history_total()` at anchor time (see [`anchor_key_now`]).
     anchor_total: u64,
     rect: bool,
+    kind: SelKind,
+}
+
+/// What unit a copy-mode selection's MOVING end snaps to while dragging
+/// (Task 7, SP6 wave 2). `Char` is the default: keyboard `begin-selection`
+/// and a plain-click-then-drag extend cell by cell. `Word`/`Line` are
+/// installed by DoubleClick/TripleClick (`select_word_at`/`select_line_at`)
+/// and make every subsequent `Drag` event snap the moving end to whole
+/// word/line boundaries AND flip the fixed anchor end between the anchor
+/// word/line's start and end, matching tmux's `SEL_WORD`/`SEL_LINE`
+/// (`window_copy_synchronize_cursor_end`,
+/// `docs/tmux-reference/mouse.md` :636-642 and
+/// `docs/tmux-reference/copy-mode-and-buffers.md` :440-447): the selection
+/// is always a whole number of words/lines that always includes the anchor
+/// word/line. See `dispatch::move_drag_cursor`'s doc comment for the exact
+/// snap rule and `dispatch::word_bounds_at` for word-boundary detection
+/// (driven by the `word-separators` option, `Options::word_separators`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelKind {
+    Char,
+    Word,
+    Line,
 }
 
 /// A copy-mode view position's ordering/delta key AT ONE INSTANT: for a
@@ -523,6 +666,15 @@ const MOUSE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 /// event.
 const MOUSE_WHEEL_STEP: u32 = 5;
 
+/// Copy-mode drag autoscroll's repeat interval (Task 7, SP6 wave 2): while a
+/// drag selection is held with the pointer on the pane's first/last row, the
+/// view scrolls one line and the selection extends every time this much real
+/// time elapses -- tmux's `WINDOW_COPY_DRAG_REPEAT_TIME` (`window-copy.c:351`,
+/// documented in `docs/tmux-reference/mouse.md` §5.4/§8 as 50 000us / 20
+/// rows per second), serviced by the same 50ms `Tick` the escape-time flush
+/// already rides.
+const MOUSE_DRAG_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Per-client mouse session state (Task 5, sub-project 4): remembers the
 /// last left-button click (for double/triple-click detection, same cell +
 /// button within [`MOUSE_CLICK_WINDOW`]) and what an in-progress drag is
@@ -535,6 +687,31 @@ struct MouseClientState {
     /// window is treated the same as a 3rd, i.e. line selection again).
     last_click: Option<(Instant, u16, u16, u8, u8)>,
     drag: MouseDrag,
+    /// Armed while a drag selection's pointer sits on the pane's first/last
+    /// row (Task 7, SP6 wave 2): `None` otherwise. Serviced by
+    /// `Server::handle_event`'s `Tick` arm exactly like the escape-time
+    /// flush -- see [`AutoscrollState`].
+    autoscroll: Option<AutoscrollState>,
+}
+
+/// One armed copy-mode drag-autoscroll timer (Task 7, SP6 wave 2): `pane` is
+/// the pane the bound `ClientMode::Copy` selection lives on, `top` is `true`
+/// for the pane's FIRST row (scroll toward history) and `false` for its LAST
+/// row (scroll toward the live bottom), `cursor_x` is the pointer's last
+/// known pane-relative column (re-used every tick to re-evaluate a Word/Line
+/// selection's snap, since no new `Drag` event arrives while the pointer sits
+/// still), and `deadline` is when the next one-line scroll fires. Armed/
+/// refreshed by `dispatch::service_drag_edge` on every `Drag` event whose
+/// resulting cursor row is an edge row; cleared the moment a `Drag` lands
+/// off an edge row, the drag ends (`Up`), or the bound pane/copy-mode goes
+/// away -- matching tmux's "motion outside the pane is a no-op that stops
+/// the timer; leaving the edge row stops it too" (`mouse.md` §5.4).
+#[derive(Clone, Copy)]
+struct AutoscrollState {
+    pane: PaneId,
+    top: bool,
+    cursor_x: u16,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -546,16 +723,38 @@ enum MouseDrag {
     /// is `true` for a column border (left|right panes) and `false` for a
     /// row border (top/bottom panes).
     Border { pane: PaneId, vertical: bool },
-    /// A `Down1` inside the pane bound to this client's copy mode armed
-    /// selection tracking; each subsequent `Drag1` extends the selection's
-    /// cursor endpoint and sets `moved`, and the eventual `Up1` copies it
+    /// A `Down1` (button 1) armed possible selection tracking, but nothing
+    /// about the copy cursor/anchor/mode has been touched YET — real tmux
+    /// (`mouse.md` §2.5/§5.3) classifies a drag START at the *press*
+    /// position only once the first actual `Drag` event arrives, and a
+    /// plain click (`Down` then `Up`, no `Drag` in between) never runs
+    /// `begin-selection`/`copy-mode -M` at all, just `select-pane` (already
+    /// done by `mouse_down`'s unconditional focus call). `press_x`/`press_y`
+    /// are pane-relative, captured at `Down` time, matching tmux's `lx/ly`
+    /// (the previous event's position it drag-START classifies against).
+    /// `enter_copy` is `true` when the press landed on a pane NOT bound to
+    /// this client's copy mode (root `MouseDrag1Pane -> copy-mode -M`: the
+    /// first `Drag` must open copy mode on `pane` before installing the
+    /// anchor) and `false` when the press landed inside the pane already
+    /// bound to this client's copy mode (copy-mode table's own
+    /// `MouseDrag1Pane -> begin-selection`: the anchor installs directly).
+    PendingSelect { pane: PaneId, press_x: u16, press_y: u16, enter_copy: bool },
+    /// A drag's anchor has been installed (either directly, for double/
+    /// triple-click word/line selection, or via `PendingSelect`'s first
+    /// `Drag`); each subsequent `Drag1` extends the selection's cursor
+    /// endpoint and sets `moved`, and the eventual `Up1` copies it
     /// (`copy-selection-and-cancel`, matching tmux's `MouseDragEnd1Pane`
-    /// default) ONLY if `moved` is true. Real tmux's copy-mode binding table
-    /// has no default for a bare `MouseUp1Pane` (release with no prior
-    /// drag) — `Down` always arms `Selecting { moved: false }`, since SGR
-    /// button-event tracking guarantees an `Up` after every `Down` even with
-    /// zero motion, and without this flag a plain click would always look
-    /// like a (zero-width) completed drag.
+    /// default) ONLY if `moved` is true AND the release lands on the same
+    /// pane the selection is bound to (tmux resolves `MouseDragEnd1Pane`
+    /// against the pane under the pointer AT RELEASE, not the drag-origin
+    /// pane — releasing elsewhere has no copy-mode binding there, so no
+    /// copy). Real tmux's copy-mode binding table has no default for a bare
+    /// `MouseUp1Pane` (release with no prior drag) — `Down` always arms
+    /// `Selecting { moved: false }` (via double/triple-click) or
+    /// `PendingSelect` (via a plain first click), since SGR button-event
+    /// tracking guarantees an `Up` after every `Down` even with zero
+    /// motion, and without this flag a plain click would always look like a
+    /// (zero-width) completed drag.
     Selecting { moved: bool },
 }
 
@@ -614,6 +813,21 @@ struct Server {
     /// ones. One instance, shared by every session/client (tmux itself
     /// scopes buffers server-wide too, not per-session).
     buffers: Buffers,
+    /// tmux's per-pane `active_point` counter (`window.c:593`; SP6 parity
+    /// wave 2, Task 3), global across the whole server -- matching tmux,
+    /// whose counter is meaningful across windows/sessions, not scoped to
+    /// one. Stamped by [`Server::stamp_active`] at every
+    /// `window_set_active_pane`-equivalent call site (see that method's doc
+    /// for the full stamp/no-stamp map -- death handoffs deliberately do
+    /// NOT stamp) so `Layout::focus_dir`'s MRU tie-break can rank
+    /// candidates by real recency instead of the old single-slot
+    /// `last_focused` approximation (closes follow-up #65). A pane with no
+    /// entry here has never been focused; `next_active_point` starts at 1
+    /// so that default (read as 0) never collides with a real stamp.
+    /// Entries are pruned wherever panes are dropped (mirrors `last_rects`
+    /// cleanup exactly).
+    pane_activity: HashMap<PaneId, u64>,
+    next_active_point: u64,
 }
 
 /// Local wall-clock time formatted `HH:MM DD-Mon-YY`. Duplicated privately
@@ -984,7 +1198,56 @@ impl Server {
             pending_config_message: None,
             hostname: computer_name(),
             buffers: Buffers::new(),
+            pane_activity: HashMap::new(),
+            next_active_point: 1,
         }
+    }
+
+    /// Stamp `id` as the most recently active pane (tmux's `active_point`,
+    /// `window.c:593`; SP6 parity wave 2, Task 3). `saturating_add`: a u64
+    /// counter wrapping after ~1.8e19 focus changes is not a real concern,
+    /// but keeping the bump total (never panicking) matches this codebase's
+    /// convention for counters that are conceptually "never overflows"
+    /// (follow-up #5's spirit).
+    ///
+    /// Stamping happens ONLY where tmux calls `window_set_active_pane`
+    /// (which is the sole place `active_point` is ever bumped):
+    /// - explicit selection (`select-pane -t`, `exec_select_pane`'s target
+    ///   branch) and directional navigation (`focus_dir` commit);
+    /// - `exec_last_pane` (the `prefix ;` toggle);
+    /// - mouse click focus / `display-panes` digit jump
+    ///   (`mouse_focus_pane`);
+    /// - `rotate-window` (`cmd-rotate-window.c:109` calls
+    ///   `window_set_active_pane` -- `exec_rotate_window`);
+    /// - non-detached pane/window SPAWN (`spawn.c`: `exec_split_window`,
+    ///   `exec_new_window`, `exec_new_session` -- a freshly spawned pane
+    ///   takes focus with a bump).
+    ///
+    /// NEVER on death handoffs: tmux's `window_lost_pane` (window.c)
+    /// reassigns `w->active` directly (last_panes stack -> prev -> next)
+    /// with NO `active_point` bump, so `kill_pane_by_id`,
+    /// `exec_break_pane`'s source-window reassignment, and
+    /// `handle_exited`'s natural-exit reassignment all deliberately leave
+    /// the surviving pane's historical recency untouched (fix round 3,
+    /// controller-verified against the tmux C source -- do not "fix" them
+    /// by adding stamps).
+    ///
+    /// NEVER on break-pane's moved pane either (fix round 4): the classic
+    /// break-pane path (cmd-break-pane.c:153-158) sets `w->active = wp` by
+    /// DIRECT assignment, no bump -- tmux distinguishes a freshly SPAWNED
+    /// pane (stamped) from break-pane's RECYCLED pane (not stamped; the
+    /// `window_set_active_pane` at cmd-break-pane.c:80 belongs to the `-W`
+    /// floating feature only, which winmux doesn't implement). So
+    /// `exec_break_pane` stamps NOTHING, on either side.
+    ///
+    /// Also deliberately NOT stamped: `exec_select_window`/
+    /// `exec_step_window`/`exec_last_window` -- switching windows changes
+    /// the session's current *winlink* only, never any window's active
+    /// pane, so tmux doesn't bump `active_point` there either.
+    fn stamp_active(&mut self, id: PaneId) {
+        let point = self.next_active_point;
+        self.next_active_point = self.next_active_point.saturating_add(1);
+        self.pane_activity.insert(id, point);
     }
 
     /// How many rows the status bar takes out of a client's contribution to
@@ -1056,6 +1319,24 @@ impl Server {
                 // client from `self.clients` mid-iteration) and processed
                 // just after it ends.
                 let mut escape_flush: Vec<ClientId> = Vec::new();
+                // Copy-mode drag autoscroll (Task 7, SP6 wave 2): collected
+                // here (same borrow-checked reason as `escape_flush` --
+                // servicing needs `self.panes`/`self.clients.get_mut`
+                // together, which the ongoing `self.clients.iter_mut()`
+                // above can't provide) and serviced just after this loop
+                // ends.
+                let mut autoscroll_due: Vec<ClientId> = Vec::new();
+                // clock-mode (Task 10): the current formatted time string,
+                // computed ONCE per tick (same wall time for every client)
+                // rather than per-client -- compared against each Clock-mode
+                // client's stored `text` below, only marking dirty (and
+                // rebuilding) on an actual change, matching real tmux's own
+                // "redraw only if the time actually changed" rule
+                // (`window-clock.c:146-168`). Real time, therefore untested
+                // at unit level beyond `format_clock` itself (the pure
+                // formatting seam) -- see that function's test module.
+                let clock_style12 = self.options.clock_mode_style_12();
+                let clock_now = system_time_parts();
                 for (cid, client) in self.clients.iter_mut() {
                     if let Some((_, set_at)) = client.message {
                         if deadline.duration_since(set_at) >= MESSAGE_LIFETIME {
@@ -1071,8 +1352,32 @@ impl Server {
                         client.mode = ClientMode::Normal;
                         dirty = true;
                     }
+                    if let ClientMode::Clock(cs) = &mut client.mode {
+                        let text = format_clock(clock_now.hour, clock_now.min, clock_style12);
+                        if text != cs.text {
+                            cs.text = text;
+                            dirty = true;
+                        }
+                    }
                     if client.key_machine.escape_ready(deadline) {
                         escape_flush.push(*cid);
+                    }
+                    if let Some(a) = client.mouse.autoscroll {
+                        if deadline >= a.deadline {
+                            autoscroll_due.push(*cid);
+                        }
+                    }
+                }
+                // Autoscroll tick: one line of scroll (+ selection re-snap)
+                // per due client, then re-arm for the next
+                // `MOUSE_DRAG_AUTOSCROLL_INTERVAL` -- matches tmux's
+                // `dragtimer` callback re-checking and re-arming itself each
+                // time (`mouse.md` §5.4). `self` is fully free again here
+                // (the `iter_mut` above has ended), so this can freely touch
+                // `self.panes`/`self.options` alongside `self.clients`.
+                for cid in autoscroll_due {
+                    if self.service_autoscroll_tick(cid, deadline) {
+                        dirty = true;
                     }
                 }
                 // escape-time flush: a lone/partial pending ESC older than
@@ -1461,6 +1766,48 @@ impl Server {
         }
     }
 
+    /// Cancel any attached client's clock mode (Task 10) whose bound pane no
+    /// longer exists, or is no longer in that client's session's current
+    /// window — the exact same staleness rule (and same two call sites) as
+    /// [`Server::cancel_stale_copy_modes`], which this mirrors verbatim
+    /// (clock mode has no capture/search-prompt state to reset, unlike copy
+    /// mode, so this is the simpler half of that method).
+    fn cancel_stale_clock_modes(&mut self) {
+        let mut live_panes: HashSet<PaneId> = HashSet::new();
+        for s in self.registry.sessions() {
+            for w in &s.windows {
+                live_panes.extend(w.layout.panes());
+            }
+        }
+        let ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        for id in ids {
+            let stale = match self.clients.get(&id).map(|c| &c.mode) {
+                Some(ClientMode::Clock(cs)) => {
+                    if !live_panes.contains(&cs.pane) {
+                        true
+                    } else {
+                        match self.clients.get(&id).and_then(|c| c.session.as_deref()) {
+                            Some(session_name) => !self
+                                .registry
+                                .sessions()
+                                .iter()
+                                .find(|s| s.name == session_name)
+                                .map(|s| s.current_window().layout.panes().contains(&cs.pane))
+                                .unwrap_or(false),
+                            None => true,
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if stale {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.mode = ClientMode::Normal;
+                }
+            }
+        }
+    }
+
     /// Cancel any attached client's choose-tree (Task 8) `pending_kill`
     /// confirm whose snapshotted target no longer exists (killed by another
     /// client, or by this same client's own dispatch, while the `x` (y/n)
@@ -1556,6 +1903,15 @@ impl Server {
             .unwrap_or(false);
 
         if other_panes_alive {
+            // NOTE (fix round 3, reverting round 2's stamp): `Layout::
+            // remove` may hand focus to a surviving sibling here --
+            // deliberately NOT stamped. Round 2 stamped it on the premise
+            // that tmux routes pane death through `window_set_active_pane`;
+            // the controller's direct source check disproved that: tmux's
+            // `window_lost_pane` (window.c) reassigns `w->active` directly
+            // (last_panes stack -> prev -> next) with NO `active_point`
+            // bump, so the survivor keeps its historical recency. See
+            // `Server::stamp_active`'s doc for the full stamp/no-stamp map.
             if let Some(session) = self.registry.session_mut(&session_name) {
                 if let Some(window) = session.windows.iter_mut().find(|w| w.id == window_id) {
                     window.layout.remove(pane_id);
@@ -1563,6 +1919,7 @@ impl Server {
             }
             self.panes.remove(&pane_id);
             self.last_rects.remove(&pane_id);
+            self.pane_activity.remove(&pane_id); // Finding 2 (review): prune, mirrors last_rects
             self.apply_layout_for_session(&session_name);
         } else {
             let is_only_window = self
@@ -1589,6 +1946,7 @@ impl Server {
                 for pid in pane_ids {
                     self.panes.remove(&pid);
                     self.last_rects.remove(&pid);
+                    self.pane_activity.remove(&pid); // Finding 2 (review): prune, mirrors last_rects
                 }
                 self.apply_layout_for_session(&session_name);
             }
@@ -1597,6 +1955,7 @@ impl Server {
         // any confirm on it must be reset, or its `y` would act on stale state.
         self.cancel_stale_confirms();
         self.cancel_stale_copy_modes();
+        self.cancel_stale_clock_modes();
         self.cancel_stale_choose_trees();
         true
     }
@@ -1609,6 +1968,7 @@ impl Server {
             for pid in pane_ids {
                 self.panes.remove(&pid);
                 self.last_rects.remove(&pid);
+                self.pane_activity.remove(&pid); // Finding 2 (review): prune, mirrors last_rects
             }
         }
         self.registry.kill_session(name);
@@ -1752,6 +2112,17 @@ impl Server {
                                 break 'events;
                             }
                         }
+                    } else if matches!(client.mode, ClientMode::Clock(_)) {
+                        // clock-mode (Task 10): "any key exits"
+                        // (`window-clock.c:213-219`) with no digit/non-digit
+                        // split to make -- unlike display-panes there is
+                        // nothing to decode at all, the whole blob is simply
+                        // consumed and the mode closes.
+                        let outcome = self.dispatch_clock_key(&mut client);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
                     } else if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
                         if let Some(pane) = self.panes.get_mut(&fid) {
@@ -1811,6 +2182,20 @@ impl Server {
                     // it.
                     if matches!(client.mode, ClientMode::DisplayPanes(_)) {
                         let outcome = self.dispatch_display_panes_key(&key, &mut client, &session_name);
+                        dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
+                        if detach || destroy {
+                            break 'events;
+                        }
+                        continue;
+                    }
+                    // clock-mode (Task 10): same unconditional interception
+                    // as display-panes above -- "any key exits" per
+                    // `window-clock.c`'s own key handler, which has no key-
+                    // table lookup at all, so a completed prefix sequence
+                    // dismisses the overlay too, never running the bound
+                    // command underneath it.
+                    if matches!(client.mode, ClientMode::Clock(_)) {
+                        let outcome = self.dispatch_clock_key(&mut client);
                         dispatch::route_outcome(outcome, &mut client, &mut detach, &mut destroy, &mut session_switched);
                         if detach || destroy {
                             break 'events;
@@ -1942,6 +2327,9 @@ impl Server {
         // sequence, etc.) — re-check every client's copy mode after every
         // Stdin-driven dispatch batch.
         self.cancel_stale_copy_modes();
+        // Same idea for clock mode (Task 10): identical staleness rule to
+        // copy mode above.
+        self.cancel_stale_clock_modes();
         // Same idea for choose-tree's `pending_kill` (Task 8): a `y` from
         // this OR another client may have just removed the session/window
         // this client had a kill confirm armed on.
@@ -1956,7 +2344,7 @@ impl Server {
         let session_name = client.session.as_deref()?;
         match &client.mode {
             ClientMode::ChooseTree(state) => {
-                let rows = self.build_tree_rows(session_name, state.view);
+                let rows = self.build_tree_rows(session_name, state.view, &state.expanded);
                 // Task 8 review fix, Critical #1: resolve by IDENTITY, not
                 // a raw clamped index -- see `resolve_tree_sel`'s doc
                 // comment. `build_render_overlay` runs with `&self` only
@@ -1964,12 +2352,46 @@ impl Server {
                 // is a read-only re-derivation, same as every other render
                 // pass; the persisted `ChooseTreeState` is not mutated here.
                 let sel = resolve_tree_sel(&rows, &state.selected, state.sel);
-                Some(RenderOverlay::Tree { rows: rows.into_iter().map(|r| r.text).collect(), sel })
+                // SP6 wave 2, Task 8: sizing (`## 3.1`) + the selected row's
+                // live preview content, built here (not `render_one`) for the
+                // same reason the rows themselves are -- this is the one pass
+                // with `&self` (all panes' `Grid`s, the whole registry) in
+                // hand before `render_all`'s mutable per-client loop begins.
+                let sy = client.rows;
+                let w = client.cols;
+                let list_height = Server::choose_tree_list_height(sy, w, rows.len(), state.preview);
+                let preview = if list_height < sy {
+                    // Fix round 1 (`## 3.2`): the interior is inset inside
+                    // the full 4-sided box -- 2 cells horizontal each side
+                    // (`w - 4`), 1 row vertical each (top + bottom border:
+                    // `(sy - list_height) - 2`). `choose_tree_list_height`'s
+                    // box-size guard (`sy-h <= 4 || w <= 4` drops the
+                    // preview) guarantees both are >= 1 whenever this branch
+                    // is reached (region >= 5 rows -> interior >= 3 rows;
+                    // panel >= 5 cols -> interior >= 1 col), so no extra
+                    // "inset shrank the blit area below 1x1" drop rule is
+                    // needed here.
+                    let interior_h = sy.saturating_sub(list_height).saturating_sub(2);
+                    let interior_w = w.saturating_sub(4);
+                    rows.get(sel).map(|r| {
+                        let (title, content_w, content_h, content) = self.build_tree_preview(&r.target, interior_w, interior_h);
+                        TreePreviewData { title, content_w, content_h, content }
+                    })
+                } else {
+                    None
+                };
+                Some(RenderOverlay::Tree {
+                    rows: rows.into_iter().map(|r| (r.text, r.depth, r.marker)).collect(),
+                    sel,
+                    list_height,
+                    preview,
+                })
             }
             ClientMode::DisplayPanes(_) => {
                 let session = self.registry.sessions().iter().find(|s| s.name == session_name)?;
                 Some(RenderOverlay::Digits(pane_digit_entries(session.current_window())))
             }
+            ClientMode::Clock(state) => Some(RenderOverlay::Clock { pane: state.pane, text: state.text.clone() }),
             _ => None,
         }
     }
@@ -2059,11 +2481,15 @@ fn render_one(
         // never has a message of its own beyond the digits themselves.
         ClientMode::ChooseTree(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::DisplayPanes(_) if too_small => Some("terminal too small".to_string()),
+        ClientMode::Clock(_) if too_small => Some("terminal too small".to_string()),
         ClientMode::ChooseTree(state) => match &state.pending_kill {
             Some((_, prompt)) => Some(prompt.clone()),
             None => client.message.as_ref().map(|(msg, _)| msg.clone()),
         },
         ClientMode::DisplayPanes(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
+        // clock-mode (Task 10): no message of its own -- the time is drawn
+        // directly on the pane, same as display-panes' digits.
+        ClientMode::Clock(_) => client.message.as_ref().map(|(msg, _)| msg.clone()),
     }
     .map(|m| (m, msg_style));
 
@@ -2093,9 +2519,15 @@ fn render_one(
         // Option-length caps apply while building the strings (tmux
         // truncates left/right to status-left/right-length); the renderer's
         // spatial right-first truncation still applies on top when the
-        // capped strings don't fit the terminal width.
+        // capped strings don't fit the terminal width. status-right is run
+        // through `strip_style_markers` BEFORE the length cap: `render::
+        // StatusRow::right` has only one style slot (no room for inline
+        // `#[...]`-styled sub-runs the way the left/window-list spans have),
+        // so any markers are dropped to plain text rather than leaking their
+        // literal `#[...]` bytes onto the screen (SP6 Task 4).
         let left = truncate_chars(&expand_format(options.status_left(), &fctx), options.status_left_length());
-        let right = truncate_chars(&expand_format(options.status_right(), &fctx), options.status_right_length());
+        let right_expanded = strip_style_markers(&expand_format(options.status_right(), &fctx));
+        let right = truncate_chars(&right_expanded, options.status_right_length());
         let entries: Vec<WindowEntry> = session
             .windows
             .iter()
@@ -2109,19 +2541,27 @@ fn render_one(
             .collect();
         let spans = status_spans(
             &left,
+            options.status_left_style(),
             &entries,
+            &fctx,
+            options.window_status_format(),
+            options.window_status_current_format(),
             base,
             options.window_status_style(),
             options.window_status_current_style(),
+            options.window_status_separator(),
+            options.status_justify(),
+            session.size.0,
+            right.chars().count(),
         );
         Some(StatusRow {
             top: options.status_position_top(),
             base,
             spans,
             right,
-            // status-right styling via `#[]` inline styles is SP4; until
-            // then the right side is drawn with the row's base style.
-            right_style: base,
+            // status-right-style layered over base (SP6 Task 4; previously
+            // always bare `base` until this task wired the option in).
+            right_style: options.status_right_style().apply_to(base),
         })
     } else {
         None
@@ -2129,6 +2569,7 @@ fn render_one(
 
     let border = options.pane_border_style().apply_to(default_style);
     let border_active = options.pane_active_border_style().apply_to(default_style);
+    let border_indicators = options.pane_border_indicators();
     let mode_style = options.mode_style().apply_to(default_style);
     let display_panes_colour = Style { bg: options.display_panes_colour(), ..default_style };
     let display_panes_active_colour = Style { bg: options.display_panes_active_colour(), ..default_style };
@@ -2143,6 +2584,7 @@ fn render_one(
             message,
             border,
             border_active,
+            border_indicators,
             mode_style,
             display_panes_colour,
             display_panes_active_colour,
@@ -2196,7 +2638,9 @@ fn render_one(
         // cursor has nothing sensible to sit on, so it's simply hidden
         // (same end effect `message.is_none()` gating already gives every
         // OTHER overlay/message case above).
-        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) => (None, false),
+        // clock-mode (Task 10): "Cursor is hidden" (`s->mode &= ~MODE_CURSOR`
+        // in `window-clock.c`) -- same treatment as the other two overlays.
+        ClientMode::ChooseTree(_) | ClientMode::DisplayPanes(_) | ClientMode::Clock(_) => (None, false),
         _ => match (rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r), panes.get(&focused)) {
             (Some(r), Some(p)) => {
                 let (cx, cy) = p.grid.cursor();
@@ -2208,24 +2652,41 @@ fn render_one(
     };
 
     let overlay = overlay_data.map(|ov| match ov {
-        RenderOverlay::Tree { rows, sel } => {
+        RenderOverlay::Tree { rows, sel, list_height, preview } => {
             // Task 8 review fix, Important #3: `compose_back`'s actual paint
             // pass reserves the panel's OWN last row for `scene.message`
             // (choose-tree's `x` kill-confirm prompt) whenever it's `Some`
-            // -- `msg_reserved`/`visible` there, mirrored exactly here so
-            // `top`'s "keep `sel` on screen" math never assumes one more
-            // paintable row than `compose_back` will actually use. Without
-            // this, a scrolled selection at the bottom of a long list with
-            // a just-armed kill-confirm showing could be computed as
-            // "visible" here while `compose_back` paints one row less,
-            // pushing the selected/prompted row off-screen.
-            let msg_reserved = if message.is_some() { 1 } else { 0 };
-            let visible = (scene_size.1 as usize).saturating_sub(msg_reserved);
+            // AND there's no preview showing -- `msg_reserved`/`visible`
+            // there, mirrored exactly here so `top`'s "keep `sel` on screen"
+            // math never assumes one more paintable row than `compose_back`
+            // will actually use. Without this, a scrolled selection at the
+            // bottom of a long list with a just-armed kill-confirm showing
+            // could be computed as "visible" here while `compose_back`
+            // paints one row less, pushing the selected/prompted row
+            // off-screen. SP6 wave 2, Task 8: the list's paintable height is
+            // now `*list_height` (the preview-sizing rule, `## 3.1`) instead
+            // of the full scene height whenever a preview is showing --
+            // `*list_height == scene_size.1` in every other case, so this
+            // subsumes the pre-Task-8-wave-2 math exactly.
+            let msg_reserved = if message.is_some() && preview.is_none() { 1 } else { 0 };
+            let visible = (*list_height as usize).saturating_sub(msg_reserved);
             let top = sel.saturating_sub(visible.saturating_sub(1));
+            let preview_block = preview.as_ref().map(|p| PreviewBlock {
+                rect: Rect { x: 0, y: *list_height, w: scene_size.0, h: scene_size.1.saturating_sub(*list_height) },
+                title: p.title.clone(),
+                content_w: p.content_w,
+                content_h: p.content_h,
+                content: p.content.clone(),
+            });
             Overlay::List(ListOverlay {
                 title: String::new(),
-                rows: rows.iter().enumerate().map(|(i, t)| (t.clone(), i == *sel)).collect(),
+                rows: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (text, depth, marker))| TreeRowCell { text: text.clone(), depth: *depth, marker: *marker, selected: i == *sel })
+                    .collect(),
                 top,
+                preview: preview_block,
             })
         }
         RenderOverlay::Digits(entries) => {
@@ -2237,6 +2698,16 @@ fn render_one(
             }
             Overlay::PaneDigits(v)
         }
+        RenderOverlay::Clock { pane, text } => {
+            // Falls back to a zero-size rect if the bound pane's rect can't
+            // be found (unreachable in practice -- `cancel_stale_clock_modes`
+            // already guarantees the pane is live and in the current window
+            // by the time a render happens -- but zero-size rects are always
+            // tolerated per the project's own "every consumer must tolerate
+            // w==0/h==0" rule, so `paint_clock` simply no-ops on it).
+            let rect = rects.iter().find(|(id, _)| id == pane).map(|(_, r)| *r).unwrap_or(Rect { x: 0, y: 0, w: 0, h: 0 });
+            Overlay::Clock(rect, text.clone(), options.clock_mode_colour())
+        }
     });
 
     let scene = Scene {
@@ -2247,6 +2718,7 @@ fn render_one(
         message,
         border,
         border_active,
+        border_indicators,
         mode_style,
         display_panes_colour,
         display_panes_active_colour,
@@ -2382,5 +2854,33 @@ mod config_discovery_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, PathBuf::from("real.conf"));
         assert!(got[0].required);
+    }
+}
+
+/// Task 10 (clock-mode): the pure formatting seam `format_clock` -- unit
+/// tested directly (no wall-clock, no server/client plumbing) against the
+/// exact strings pinned by `docs/tmux-reference/status-line-and-
+/// messages.md` `## 6. Clock mode`.
+#[cfg(test)]
+mod format_clock_tests {
+    use super::format_clock;
+
+    #[test]
+    fn style_24_zero_pads_both_fields() {
+        assert_eq!(format_clock(9, 5, false), "09:05");
+        assert_eq!(format_clock(0, 0, false), "00:00");
+        assert_eq!(format_clock(23, 59, false), "23:59");
+    }
+
+    /// `%l:%M ` + `AM`/`PM`: hour is SPACE-padded (not zero-padded, tmux's
+    /// `%l`), minute IS zero-padded, and AM/PM is appended directly after
+    /// the trailing space baked into the `%l:%M ` format (no extra space).
+    #[test]
+    fn style_12_space_pads_hour_and_appends_am_pm() {
+        assert_eq!(format_clock(0, 5, true), "12:05 AM"); // midnight -> 12 AM
+        assert_eq!(format_clock(9, 5, true), " 9:05 AM"); // single digit -> space-padded
+        assert_eq!(format_clock(12, 0, true), "12:00 PM"); // noon -> 12 PM
+        assert_eq!(format_clock(13, 34, true), " 1:34 PM");
+        assert_eq!(format_clock(23, 59, true), "11:59 PM");
     }
 }

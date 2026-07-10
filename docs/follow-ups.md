@@ -470,6 +470,18 @@ None block the sub-project 4 merge.
     overlay is a flat, unfilterable, untaggable list with plain up/down
     navigation and no session/window content preview pane, unlike real
     tmux's `choose-tree`.
+
+    **NARROWED (SP6 parity wave 2, Task 8, 2026-07-10).** The tree-shape and
+    preview halves of this gap are now closed: `choose-tree` is a real
+    session/window tree with `Left`/`Right` expand/collapse (sessions
+    collapsed by default in `s`-view), the default selection lands on the
+    CURRENT item (not always the first row), and `v` cycles a live preview
+    box through off → BIG → normal with tmux's own sizing and full 4-sided
+    box chrome. What remains open from the original text: **tagging** (no
+    way to mark multiple rows for a bulk action) and **sort options** (real
+    tmux's `O`/`r` cycle the sort key and reverse it; winmux has no sort
+    concept at all, rows are always in registry-insertion order) — filtering
+    (`/`-style incremental search within the list) is also still absent.
 51. **No right-click context menus** (mouse, Task 5). Real tmux (recent
     versions) can show a right-click menu over a pane/status-line/border;
     winmux's mouse routing has no menu concept at all — every mouse event
@@ -612,10 +624,11 @@ None block the sub-project 4 merge.
     safe to delete whenever someone picks this up (no consumer anywhere
     reads it).
 
-64. **Stale `MouseDrag` state when an overlay opens mid-drag** (found in the
-    final SP4 fix-wave re-review). The overlay mouse guard in
-    `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse events while
-    choose-tree/display-panes are open but does not clear
+64. **RESOLVED** (SP6 parity wave 2, Task 1: mouse drag-state lifecycle
+    fix). *Original text:* Stale `MouseDrag` state when an overlay opens
+    mid-drag (found in the final SP4 fix-wave re-review). The overlay mouse
+    guard in `dispatch_mouse` (`src/server/dispatch.rs`) swallows mouse
+    events while choose-tree/display-panes are open but does not clear
     `client.mouse.drag`, unlike the sibling "outside pane area" guard which
     explicitly resets it. A drag armed before an overlay opens (keyboard-
     triggered overlay mid-drag, or a `display-panes -d` timer expiry) can
@@ -627,13 +640,288 @@ None block the sub-project 4 merge.
     in the overlay guard arm) plus a test that arms a drag, opens an
     overlay, and asserts the drag state is cleared.
 
-65. **Directional focus MRU tie-break is a single-slot approximation** (from
-    the focus-nav hotfix `6e6ff4d`, its review). When multiple panes are
-    valid candidates for `select-pane -L/-R/-U/-D`, real tmux picks the most
-    recently used; winmux uses the window's single last-pane slot if it is
-    among the candidates, else the first candidate in pane-index order.
-    Correct for the 2-candidate case and deterministic otherwise; a full
-    per-window MRU ordering would make 3+-candidate columns match tmux
-    exactly. Also noted by the review: no test drives the pre-fix bug via
-    Left/Up specifically (fix is symmetric per axis pair), and none
-    exercises focus_dir while zoomed — coverage niceties.
+    **Fixed:** a wider SP6 gap-analysis pass (`.superpowers/sdd/sp6-gap-analysis.md`
+    §D) found this exact defect class on two OTHER `dispatch_mouse`
+    early-return paths beyond the overlay guard this entry originally
+    ticketed — the status-row short-circuit (`ev.y == status row` diverts
+    Drag/Up to `dispatch_mouse_status`, which ignores them) and
+    `mouse_down`'s `MouseHit::None` arm (a press that misses every
+    pane/border cell) — and diagnosed the resulting user-visible symptom
+    ("border drag works once then dies"). All three now reset
+    `client.mouse.drag = MouseDrag::None` before their early return, mirroring
+    the "outside pane area" guard's existing pattern:
+    `src/server/dispatch.rs`'s `dispatch_mouse` (overlay guard and
+    status-row short-circuit) and `mouse_down`'s `MouseHit::None` arm.
+    Regression coverage: `tests/server_proto.rs`'s
+    `mouse_border_drag_twice_resizes_twice` (non-regression baseline for two
+    clean consecutive drags) and
+    `mouse_border_drag_release_on_status_row_then_drag_again` (genuine
+    RED/GREEN reproduction: an out-of-sequence `Drag` with no `Down`, sent
+    right after a status-row-swallowed release, must not spuriously move the
+    border), plus `src/server/dispatch.rs`'s `mouse_dispatch_tests` module
+    (`mouse_drag_cleared_when_overlay_swallows_release`,
+    `mouse_down_miss_clears_stale_drag`) for the overlay and
+    `MouseHit::None` legs, which — like this entry's original note says —
+    aren't reachable through a conformant SGR stream and are exercised
+    directly against `Server`/`ClientState` instead.
+
+65. **RESOLVED** (SP6 parity wave 2, Task 3: edge-wrap directional
+    navigation + real `active_point` MRU). *Original text:* Directional
+    focus MRU tie-break is a single-slot approximation (from the focus-nav
+    hotfix `6e6ff4d`, its review). When multiple panes are valid candidates
+    for `select-pane -L/-R/-U/-D`, real tmux picks the most recently used;
+    winmux uses the window's single last-pane slot if it is among the
+    candidates, else the first candidate in pane-index order. Correct for
+    the 2-candidate case and deterministic otherwise; a full per-window MRU
+    ordering would make 3+-candidate columns match tmux exactly. Also noted
+    by the review: no test drives the pre-fix bug via Left/Up specifically
+    (fix is symmetric per axis pair), and none exercises focus_dir while
+    zoomed — coverage niceties.
+
+    **Fixed:** two changes, both in `src/layout.rs::Layout::focus_dir`
+    (contract-amended in `docs/specs/2026-07-06-mvp-interfaces.md`). (a)
+    **Edge-flip wrap** (`docs/tmux-reference/panes-and-layout.md` §1.1,
+    `window_pane_find_left/right/up/down`): the four adjacency arms now
+    compute a search edge that flips to one past the FAR side of `area`
+    when the focused pane is already flush against the near side, so
+    directional navigation wraps (Left from the leftmost pane reaches the
+    rightmost, symmetric in all four directions) instead of silently
+    no-op'ing at a window edge. (b) **Real per-pane `active_point` MRU**:
+    the single-slot `last_focused` approximation is replaced by a real
+    tmux-style recency counter — `focus_dir` gained an `activity: &dyn
+    Fn(PaneId) -> u64` parameter, and the tie-break is now the candidate
+    with the greatest `activity(pane)` (ties fall back to first-in-leaf-
+    order, matching tmux's strict-`>` `window_pane_choose_best` loop
+    exactly), correctly ranking 3+-candidate columns. The counter itself
+    (`Server::pane_activity: HashMap<PaneId, u64>` +
+    `Server::next_active_point`, `src/server.rs`) is server-global (like
+    tmux's, meaningful across windows/sessions) and stamped by
+    `Server::stamp_active` at every `window_set_active_pane`-equivalent
+    call site in `src/server/dispatch.rs`: `exec_select_pane`'s
+    `focus_dir` and `focus_pane` branches, `exec_split_window`/
+    `exec_new_window`/`exec_new_session` (a newly created pane is
+    focused, hence most recent), `exec_last_pane`, `mouse_focus_pane`
+    (mouse click focus, also reused by the `display-panes` digit-jump),
+    and `exec_rotate_window` (tmux `cmd-rotate-window.c:109` calls
+    `window_set_active_pane`). Death handoffs (`kill_pane_by_id`,
+    `exec_break_pane`'s source-window reassignment, `handle_exited`'s
+    natural-exit reassignment) deliberately do NOT stamp: tmux's
+    `window_lost_pane` (window.c) reassigns `w->active` directly
+    (last_panes stack -> prev -> next) with no `active_point` bump, so
+    the surviving pane keeps its historical recency (SP6 Task 3 fix
+    round 3, verified directly against the tmux C source). Neither does
+    `exec_break_pane`'s moved pane (fix round 4): the classic break-pane
+    path (cmd-break-pane.c:153-158) sets `w->active = wp` by direct
+    assignment too -- tmux only stamps freshly SPAWNED panes (spawn.c),
+    not break-pane's recycled one -- so `exec_break_pane` stamps nothing
+    on either side. `pane_activity` entries are pruned wherever panes
+    are dropped (mirrors `last_rects` cleanup exactly).
+    `Layout::last_focused`
+    itself is RETAINED, but narrowed to its one remaining job,
+    `focus_last`/the `prefix ;` toggle — an unrelated tmux feature, not
+    part of `focus_dir`'s algorithm anymore. `Layout::focus_next` has no
+    production call site today (dead outside unit tests, `o` is bound to
+    `select-pane -t :.+` instead), so it was left unstamped; a future
+    binding of it would need the same `Server::stamp_active` call the other
+    five sites get. New tests: `src/layout.rs`'s
+    `focus_dir_wraps_left_to_rightmost`, `focus_dir_wraps_down_to_top`,
+    `focus_dir_wrap_picks_most_recently_active_of_two_far_candidates`,
+    `focus_dir_three_candidates_ranked_by_activity` (this entry's exact
+    3-candidate gap), and
+    `focus_dir_ties_fall_back_to_first_candidate_in_leaf_order` (replaces
+    the old last_focused-fallback test, whose premise no longer exists
+    once every pane always has a real activity value); the pre-existing
+    `focus_dir_two_pane_horizontal`'s at-edge `false` assertions were
+    inverted to the new wrap outcome (computed comments explain why).
+    `tests/server_proto.rs`'s `focus_wraps_at_window_edge` covers the same
+    wrap end-to-end through a real client/server pair. Zoom interaction
+    unchanged/preserved: `focus_dir` still reads `all_rects` (the unzoomed
+    full-tree geometry) regardless of `self.zoomed`, so directional nav
+    while zoomed moves which pane is zoomed-in, exactly as before this fix
+    — not itself a regression target of this task, still an
+    untested-but-unchanged edge per the original note.
+
+66. **RESOLVED** (SP6 parity wave 2, Task 1b). *Original text:* Mouse
+    border-drag toward the top/left edge never resizes (found while
+    building Task 1's regression tests, SP6 parity wave 2; separate root
+    cause from #64's staleness class, out of that task's scope). A vertical
+    border drag's reference pane, from `mouse_down`'s `MouseHit::VBorder {
+    left }` (and `HBorder { top }` for horizontal borders), is bound ONCE at
+    `Down` time and reused unchanged for the whole gesture in
+    `mouse_drag_border` (`src/server/dispatch.rs`). But
+    `Layout::resize_from` (`src/layout.rs`) only accepts that reference for
+    `Direction::Right`/`Direction::Down` (which grow the split's FIRST
+    child, matching `left`/`top`'s first-child position) — `Direction::Left`/
+    `Direction::Up` (shrink the first child / grow the second) require the
+    SECOND-child pane as reference instead (see
+    `layout::tests::resize_from_reference_pane_ignores_focus`), which
+    `mouse_drag_border` never resolves. Net effect: dragging a border toward
+    the pane's own left/top edge (shrinking the LEFT/TOP pane, growing the
+    RIGHT/BOTTOM one) is a silent no-op, unconditionally and reproducibly —
+    confirmed empirically with a single, otherwise-correct drag (no staleness
+    involved at all). Plausibly the dominant real-world contributor to the
+    "border drag works once then dies" user reports #64/this class of fix
+    addressed, since a user alternating drag directions would see exactly
+    that symptom. Fix sketch: `mouse_drag_border` (or `mouse_down`'s
+    `VBorder`/`HBorder` arms) needs to resolve the CORRECT reference pane
+    per-direction each call (or store both siblings at `Down` time and pick
+    based on `delta`'s sign), then re-verify against
+    `layout::tests::resize_from_reference_pane_ignores_focus`'s contract.
+    Not fixed here — orthogonal to Task 1's drag-STATE-lifecycle scope.
+
+    **RESOLVED** (SP6 parity wave 2, Task 1b): fixed in `mouse_drag_border`
+    (`src/server/dispatch.rs`) — rather than resizing against the `pane`
+    bound once at `Down` (always the first-child/`left`/`top` side), it now
+    resolves the correct `Layout::resize_from` reference fresh on every
+    `Drag` call, per the resolved direction: unchanged (`pane`) for
+    `Direction::Right`/`Down`, but for `Direction::Left`/`Up` it looks up
+    `pane`'s current neighbor across that exact border cell (the pane
+    starting one cell past the border, since a border occupies its own
+    column/row between panes) and uses that as the reference instead.
+    `Layout::resize_from`'s public contract and signature are unchanged (no
+    contract-doc update needed) — a pure `dispatch.rs`-side fix. Tests:
+    `layout::tests::resize_from_first_child_reference_rejects_shrink_direction`
+    (`src/layout.rs`, pins the pre-existing `resize_from` contract the bug
+    traces to) plus two new `tests/server_proto.rs` regression tests,
+    `mouse_border_drag_resizes_leftward` and
+    `mouse_border_drag_resizes_upward`, which reproduced the bug RED (timed
+    out waiting for the border to move) before the fix and pass GREEN after.
+    Full `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.
+
+67. **`unbind` on an unparseable key is unconditionally silent (not `-q`-gated), and
+    mouse pseudo-keys are not table-driven** (found in SP6 Task 2 review, 2026-07-10).
+    Two related fidelity gaps behind one shim: (a) `exec_unbind_key`
+    (`src/server/dispatch.rs`) silently no-ops for ANY token `keys::parse_key`
+    rejects — real tmux errors on `unknown key: %s` unless `-q` is given
+    (docs/tmux-reference/commands-config-options-formats.md:442), so a typo like
+    `unbind Ct-x` is swallowed today. Fix sketch: silence only tokens matching the
+    tmux mouse-pseudo-key name grammar (`MouseDown/Up/Drag/DragEnd{1,2,3}`,
+    `WheelUp/Down`, `Double/TripleClick{1,2,3}` × `Pane/Border/Status/StatusLeft/
+    StatusRight/StatusDefault`), error otherwise unless `-q`. (b) Deeper: winmux's
+    mouse actions are hardcoded in dispatch rather than resolved through the key
+    tables, so `unbind -T copy-mode-vi MouseDragEnd1Pane` (the user's real config —
+    tmux idiom for "don't copy/jump on mouse release in vi copy mode") parses clean
+    but cannot have its tmux effect. Real fix is table-driven mouse bindings
+    (synthesized mouse key names resolved through `Bindings` like tmux); sizeable,
+    interacts with SP6 Tasks 6-7's release-semantics work. LOW/MEDIUM.
+
+68. **`show-options -v`/`-q` CLI flags not wired into dispatch** (found in SP6
+    Task 2, 2026-07-10). `Options::show_user_option` implements tmux-correct
+    value-only/quiet semantics at the options layer (unit-tested), but `cmd.rs`
+    doesn't parse `-v`/`-q` for `show-options`/`show`, so `show -gqv "@foo"` — the
+    exact TPM rung-1 primitive (docs/superpowers/plans/2026-07-08-tpm-plugin-support.md)
+    — is not yet available end-to-end. Fix: parse the flags in cmd.rs, thread to
+    `exec_show_options`. SMALL. LOW (until SP5/TPM work starts).
+
+69. **`status-justify` has no overflow/scroll behavior, and `status-left`'s
+    length cap counts `#[...]` marker bytes as visible width** (SP6 Task 4,
+    2026-07-10, `status::list_offset`/`status_spans`). When `left` + the
+    window list + `right` together exceed the terminal width under
+    `centre`/`right`/`absolute-centre` justify, real tmux scrolls the window
+    list around the focused window and draws `<`/`>` overflow markers
+    (`docs/tmux-reference/status-line-and-messages.md` §1.4); winmux instead
+    saturates the computed padding to zero (list abuts `left` with no gap,
+    no markers, no scrolling) — the row can visually overlap/overrun in a
+    narrow terminal instead of scrolling. Separately, `status-left`'s
+    `status-left-length` cap (`server.rs`'s `truncate_chars`) is applied to
+    the RAW `expand_format` output, which may still contain verbatim
+    `#[...]` inline style markers (SP6 Task 4's `#[...]` passthrough) — a
+    marker's characters count toward the length budget even though they
+    draw zero visible columns, and a cap could theoretically bisect a
+    marker. `status-right` doesn't have this problem (`strip_style_markers`
+    runs before its length cap). Not exercised by any current config
+    (`status-left` is empty in the fixture, and no config combines
+    length-capping with inline `status-left` markers) — same "not
+    implementing tmux's degenerate-width scrolling" bucket as follow-up #46
+    (`find-window`) and #50 (`choose-tree` overflow). SMALL/MEDIUM. LOW.
+
+70. **Custom `window-status-format` values containing `#{?cond,a,b}` expand
+    the conditional to empty** (SP6 Task 4 + fix round 1, 2026-07-10). What
+    remains of the Task 4 default-format deviation after the fix-round-1
+    width-stability shim: winmux's stored DEFAULT is
+    `options::DEFAULT_WINDOW_STATUS_FORMAT` (`#I:#W#F`) plus a
+    default-path-only pad of an empty flags string to one space in
+    `status::status_spans` — together byte-identical to tmux's real default
+    `#I:#W#{?window_flags,#{window_flags}, }` for flagged AND flagless
+    windows, width-stable across focus changes. But a USER-set format that
+    itself uses `#{?...}` (or any other conditional/modifier outside the
+    `expand_format` subset) still renders that token as empty — the general
+    tmux format-expression engine is deliberately deferred to the TPM plan
+    (`docs/superpowers/plans/2026-07-08-tpm-plugin-support.md`). The three
+    doc sites describing the deviation: `src/options.rs`
+    (`DEFAULT_WINDOW_STATUS_FORMAT` + the `default_value` arm's note),
+    `docs/specs/2026-07-07-command-config-interfaces.md` (options SPECS
+    amendment), `docs/specs/2026-07-07-server-client-interfaces.md`
+    (`## status` flags-string/padding-shim rule). Not exercised by the
+    fixture config (its custom formats use only `#I`/`#W`/`#F`/`#[...]`).
+    MEDIUM (a format engine). LOW.
+
+71. **Per-window `FormatCtx` reuses the FOCUSED pane's `pane_index`/
+    `pane_title` for every window's tab expansion** (SP6 Task 4 review
+    Minor, 2026-07-10, `status::status_spans`). Each tab's
+    `window-status(-current)-format` expansion overrides
+    `window_index`/`window_name`/`window_flags` per window but carries the
+    caller's `pane_index`/`pane_title` (the acting client's focused pane in
+    the CURRENT window) unchanged — so `#P`/`#T` inside a per-window format
+    misrender for every non-focused window (they show the focused window's
+    values). Root cause: only one pane's title/index is threaded through
+    `server::render_one`'s status pipeline; fixing it needs per-window
+    active-pane data in `status::WindowEntry` (or the ctx). Not exercised
+    by the fixture config (`#I`/`#W`/`#F` only). SMALL. LOW.
+
+72. **No application mouse passthrough** (adjudicated in SP6 Task 6 review, 2026-07-10).
+    winmux never relays raw mouse bytes to pane applications: a pane program that
+    enables mouse reporting (vim, htop, less --mouse) receives nothing; wheel input
+    is translated to 3x arrow keys only (src/server/dispatch.rs wheel path). Real
+    tmux forwards encoded mouse events to panes whose program requested mouse mode
+    (docs/tmux-reference/mouse.md, passthrough rules: MOUSE_* pane flags gate
+    consume-vs-forward, input_key_get_mouse re-encodes per the pane's requested
+    protocol). Consequence: SP6's drag-on-live-pane-enters-copy-mode is
+    unconditional where tmux would defer to a mouse-owning app. Real fix: track
+    DECSET 1000/1002/1003/1006 from pane output in grid, re-encode and forward in
+    dispatch, and gate copy-mode-entry/wheel translation on the pane's mouse mode.
+    MEDIUM effort. Interacts with #67(b) table-driven mouse bindings.
+
+73. **choose-tree degenerate tiny-pane guard reverts to a full-height list where
+    tmux would draw a short list + blank remainder** (SP6 wave 2 Task 8 review,
+    self-found, 2026-07-10, `dispatch::Server::choose_tree_list_height`). winmux
+    folds tmux's mode_tree_draw paint-time guard (`sy <= 4 || h < 2 ||
+    sy - h <= 4 || w <= 4`, mode-tree.c:980-981 — "don't draw the box") into the
+    HEIGHT function by setting `h = sy` (list takes the whole panel). Real tmux
+    keeps the computed `h` and simply skips painting the preview box, leaving rows
+    `h..sy-1` blank — so in a degenerate-size pane (e.g. BIG preview mode in a
+    panel 5-6 rows tall) tmux shows a short list over blank rows where winmux
+    shows a full-height list. Defensible (winmux's behavior is arguably more
+    useful — no dead rows) and reachable only in degenerate geometries; ticketed
+    for the record. TINY. LOW.
+
+## Follow-ups from Task 9 (SP6 parity wave 2 closeout, 2026-07-10)
+
+74. **Alerts subsystem (`visual-activity`/`visual-bell`/`visual-silence`/
+    `bell-action`/`monitor-activity`) is accepted/stored but has zero runtime
+    effect.** `src/options.rs` has typed getters for all five
+    (`visual_activity`/`visual_bell`/`visual_silence`/`bell_action`/
+    `monitor_activity`), round-tripping through `set`/`show` with tmux's real
+    defaults, but no other module in the codebase calls any of them (`grep`
+    confirms every reference outside `options.rs` itself is in that same
+    file's own unit tests) — there is no bell/activity DETECTION at all (no
+    code watches for a BEL byte, an inactive window's pane producing new
+    output, or a window going silent for `silence-monitor` seconds), let
+    alone the window-flag (`#F` `~`/`#`/`!`) or visual-flash/message
+    reaction real tmux would produce. The user's real `.tmux.conf` fixture
+    (`tests/fixtures/user.tmux.conf`) sets all five to their
+    least-surprising values (`off`/`off`/`off`/`none`/`off`) precisely
+    because they don't want alerts, so this gap is invisible to that
+    config's own test coverage — SP6's config-compat batch made every one of
+    these options PARSE cleanly (closing the "unknown option" class of
+    error), but implementing the alert-detection/reaction behavior itself
+    was out of that batch's scope. Fix sketch: bell detection needs a BEL
+    (`\x07`) hook in `grid`'s VT parser surfaced as a pane event; activity
+    detection needs an "this pane produced output and its window isn't
+    focused" check in the server's output-handling path; both would then
+    feed a window-flags bit (already partially modeled via `#F`'s existing
+    `*`/`-` flags, `src/options.rs`'s `expand_format`) plus, for the visual-*
+    variants, a status-line flash/message. MEDIUM effort (new detection
+    machinery, not just wiring an existing signal to an existing option).
+    LOW priority (no known user config actually turns these on and depends
+    on the behavior; the one polled fixture explicitly turns them off).
