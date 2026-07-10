@@ -151,9 +151,14 @@ fn mouse_decset_private_mode_is_not_relayed_by_conpty() {
     // One command emits BOTH a mouse-mode DECSET and an ordinary SGR color
     // sequence, so a single capture proves the discrimination: SGR survives,
     // DECSET does not (ruling out "the reader just isn't working").
+    // The done marker is built by concatenation ('MARKER'+'DONE') so the
+    // literal MARKERDONE can only appear in EXECUTED output — PSReadLine
+    // echoes the typed command line back through ConPTY, and on a slow
+    // machine that echo arrives a poll cycle before execution output, so a
+    // marker readable from the echo breaks the wait loop too early.
     pty.write_input(
         b"[Console]::Out.Write([char]27 + '[?1000h' + [char]27 + '[31mRED' + [char]27 + '[0m'); \
-          Write-Host 'MARKERDONE'\r",
+          Write-Host ('MARKER' + 'DONE')\r",
     )
     .expect("send probe command");
 

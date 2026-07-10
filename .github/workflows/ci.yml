@@ -32,5 +32,7 @@ jobs:
       # e2e/protocol tests poll transient output or compare wall-clock margins
       # and flake under full parallelism on loaded machines (see CLAUDE.md,
       # follow-up #89). Hosted runners are exactly that case.
+      # --no-fail-fast so one failing test binary doesn't hide failures in
+      # binaries that would have run after it.
       - name: Test
-        run: cargo test -- --test-threads=4
+        run: cargo test --no-fail-fast -- --test-threads=4

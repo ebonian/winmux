@@ -40,9 +40,10 @@ jobs:
       - name: Clippy (lint gate)
         run: cargo clippy --all-targets -- -D warnings
 
-      # Same flake-aware thread cap as ci.yml (see CLAUDE.md, follow-up #89).
+      # Same flake-aware thread cap as ci.yml (see CLAUDE.md, follow-up #89);
+      # --no-fail-fast so one failing binary doesn't hide later ones.
       - name: Test
-        run: cargo test -- --test-threads=4
+        run: cargo test --no-fail-fast -- --test-threads=4
 
       - name: Build release binary
         run: cargo build --release
