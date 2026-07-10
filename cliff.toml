@@ -1,0 +1,56 @@
+# git-cliff configuration — changelog generation for winmux.
+# https://git-cliff.org/docs/configuration
+#
+# Used two ways:
+#   - Locally, when cutting a release (optional, keeps CHANGELOG.md current):
+#       git cliff --tag vX.Y.Z -o CHANGELOG.md
+#   - By .github/workflows/release.yml, to generate the GitHub release notes
+#     for the pushed tag:
+#       git cliff --latest --strip all
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to winmux are documented here. Entries are generated
+from [Conventional Commits](https://www.conventionalcommits.org) by
+[git-cliff](https://git-cliff.org).
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{% endfor %}\
+{% endfor %}\
+"""
+trim = true
+
+[git]
+conventional_commits = true
+# Keep the handful of non-conventional subjects (early MVP commits) instead
+# of dropping them silently; the catch-all parser below groups them.
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^ci", group = "<!-- 6 -->CI/CD" },
+  { message = "^chore", group = "<!-- 7 -->Miscellaneous" },
+  # Merge commits carry no changelog information of their own.
+  { message = "^Merge", skip = true },
+  { message = ".*", group = "<!-- 8 -->Other" },
+]

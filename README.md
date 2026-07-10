@@ -106,6 +106,7 @@ Note: a running winmux server locks `target\release\winmux.exe` — run
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md)
 - [Project overview and roadmap](docs/overview.md)
 - [Known issues / follow-ups](docs/follow-ups.md)
 - Interface contracts and design specs: [docs/specs/](docs/specs/)

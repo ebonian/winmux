@@ -17,6 +17,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags: git-cliff derives the release notes from the
+          # commit range between the previous tag and this one.
+          fetch-depth: 0
 
       - name: Verify tag matches Cargo.toml version
         shell: pwsh
@@ -66,6 +70,17 @@ jobs:
           [IO.File]::WriteAllText("dist\SHA256SUMS", "$hash  $zip`n")
           Get-Content dist\SHA256SUMS
 
+      # Pinned git-cliff release, downloaded directly (no third-party action);
+      # config in cliff.toml. --latest = the range since the previous tag.
+      - name: Generate release notes (git-cliff)
+        shell: pwsh
+        run: |
+          $ver = '2.13.1'
+          Invoke-WebRequest "https://github.com/orhun/git-cliff/releases/download/v$ver/git-cliff-$ver-x86_64-pc-windows-msvc.zip" -OutFile git-cliff.zip
+          Expand-Archive git-cliff.zip -DestinationPath cliff-bin
+          & "cliff-bin\git-cliff-$ver\git-cliff.exe" --latest --strip all -o release-notes.md
+          Get-Content release-notes.md
+
       - name: Publish GitHub release
         shell: pwsh
         env:
@@ -73,5 +88,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME `
             --title "winmux $env:GITHUB_REF_NAME" `
-            --generate-notes `
+            --notes-file release-notes.md `
             (Get-ChildItem dist\* | ForEach-Object FullName)
