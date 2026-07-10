@@ -704,7 +704,7 @@ template can only ever expand to a clean result.
 | `history-limit` | number (inert) | 2000 |
 | `escape-time` | number (inert) | 500 |
 | `automatic-rename` | on/off (inert) | on |
-| `allow-rename` | on/off (inert) | on |
+| `allow-rename` | on/off | off (**AMENDED, SP7 Task 3 — closes follow-up #52**: default corrected from an unverified `on` to tmux's real default, off since 2.6; now LIVE via `Options::allow_rename`, gating the direct `ESC k` rename path — when on, an ESC k title renames the window and clears the window's `auto_rename` flag; when off, ESC k titles are captured but cause no rename. OSC 0/2 stays unconditional. See `grid::Grid::title_from_esc_k` in `2026-07-07-parity-polish-interfaces.md`'s `## grid-v2` amendment) |
 | `mode-keys` | choice (`emacs`/`vi`, inert) | emacs |
 | `default-terminal` | string (inert) | `screen` |
 | `exit-empty` | on/off (inert) | on |

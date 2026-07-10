@@ -240,7 +240,13 @@ fn default_value(name: &str) -> Value {
         "history-limit" => Value::Number(2000),
         "escape-time" => Value::Number(500),
         "automatic-rename" => Value::Flag(true),
-        "allow-rename" => Value::Flag(true),
+        // Verified against `docs/tmux-reference/windows-and-sessions.md`
+        // "allow-rename -- what it actually gates" (options-table.c:
+        // 1295-1301; CHANGES:1858): default OFF since tmux 2.6. This
+        // corrects a prior (unverified) `Flag(true)` default now that SP7
+        // Task 3 makes the option live (gates ESC-k-sourced
+        // automatic-rename; see `Options::allow_rename`).
+        "allow-rename" => Value::Flag(false),
         "mode-keys" => Value::Choice("emacs"),
         "default-terminal" => Value::Str("screen".to_string()),
         "exit-empty" => Value::Flag(true),
@@ -720,6 +726,17 @@ impl Options {
     /// and the design spec's `## 9. automatic-rename` section.
     pub fn automatic_rename(&self) -> bool {
         self.flag("automatic-rename")
+    }
+
+    /// `allow-rename` (SP7 Task 3, closes follow-up #52): gates ONLY the
+    /// historical `ESC k <name> ESC \` rename escape, tmux default off
+    /// since 2.6 -- does NOT affect `automatic-rename` or OSC 0/2 (see
+    /// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what
+    /// it actually gates"). Consumed by `server::Server::maybe_auto_rename`'s
+    /// caller to decide whether an ESC-k-sourced title participates in
+    /// automatic-rename at all; the OSC 0/2 path is unconditional.
+    pub fn allow_rename(&self) -> bool {
+        self.flag("allow-rename")
     }
 
     /// `visual-activity`/`visual-bell`/`visual-silence` (SP6 Task 2): how an

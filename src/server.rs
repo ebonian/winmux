@@ -1074,13 +1074,19 @@ fn derive_auto_name(title: &str) -> Option<String> {
 /// Resize every pane whose computed rect changed (pty + grid), caching the
 /// last applied rect per pane so unchanged panes are skipped. Same shape as
 /// `app.rs`'s `apply_layout`, keyed by `HashMap` instead of a `Vec` (panes
-/// now span every session/window, not just one flat list).
+/// now span every session/window, not just one flat list). Returns the
+/// `PaneId`s that were actually resized (rect changed, either axis) so the
+/// caller (`apply_layout_for_session`) can invalidate any copy-mode
+/// selection bound to one of them -- see that function's doc comment for
+/// why (SP7 review fix, closes the `Grid::history_total()` width-reflow
+/// regression).
 fn apply_layout(
     layout: &Layout,
     area: Rect,
     panes: &mut HashMap<PaneId, PaneRuntime>,
     last_rects: &mut HashMap<PaneId, Rect>,
-) {
+) -> Vec<PaneId> {
+    let mut resized = Vec::new();
     for (id, rect) in layout.rects(area) {
         if last_rects.get(&id) == Some(&rect) {
             continue;
@@ -1092,7 +1098,9 @@ fn apply_layout(
             p.grid.resize(rect.w.max(1), rect.h.max(1));
         }
         last_rects.insert(id, rect);
+        resized.push(id);
     }
+    resized
 }
 
 /// Writer thread: owns the write half of the connection, drains an
@@ -1311,14 +1319,32 @@ impl Server {
             ServerEvent::Output(id, bytes) => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.grid.feed(&bytes);
-                    // automatic-rename (Task 9, sub-project 4): OSC 0/2
-                    // titles are edge-triggered (`take_title_changed`) --
-                    // refresh the cached `#T` value and, if this pane is the
-                    // ACTIVE pane of some window, consider renaming it.
+                    // automatic-rename (Task 9, sub-project 4): OSC 0/2 and
+                    // ESC-k (SP7 Task 3, closes follow-up #52) titles are
+                    // both edge-triggered (`take_title_changed`) -- refresh
+                    // the cached `#T` value unconditionally (the grid always
+                    // captures both sources into the same slot), but only
+                    // feed an ESC-k-sourced title into automatic-rename when
+                    // `allow-rename` is on -- real tmux's `allow-rename`
+                    // gates ONLY the `ESC k` escape, never OSC 0/2 (see
+                    // `docs/tmux-reference/windows-and-sessions.md`
+                    // "allow-rename -- what it actually gates").
                     if p.grid.take_title_changed() {
+                        let from_esc_k = p.grid.title_from_esc_k();
                         let title = p.grid.title().unwrap_or("").to_string();
                         p.title = title.clone();
-                        self.maybe_auto_rename(id, &title);
+                        if from_esc_k {
+                            // `ESC k` goes through its OWN path (SP7-B
+                            // review fix of cae6af2), NOT `maybe_auto_rename`
+                            // -- see `rename_window_from_esc_k`'s doc
+                            // comment for why real tmux's `allow-rename`
+                            // gate is independent of `automatic-rename`.
+                            if self.options.allow_rename() {
+                                self.rename_window_from_esc_k(id, &title);
+                            }
+                        } else {
+                            self.maybe_auto_rename(id, &title);
+                        }
                     }
                 }
                 true
@@ -1436,6 +1462,20 @@ impl Server {
         }
     }
 
+    /// Locate the `(session name, window id)` of the window whose ACTIVE
+    /// pane (`window.layout.focused()`) is `pane_id`, if any -- shared by
+    /// `maybe_auto_rename` and `rename_window_from_esc_k` so a background
+    /// pane's title changing never renames anything, from either path,
+    /// matching tmux (only the active pane's title is ever tracked).
+    fn window_for_active_pane(&self, pane_id: PaneId) -> Option<(String, WindowId)> {
+        self.registry.sessions().iter().find_map(|s| {
+            s.windows
+                .iter()
+                .find(|w| w.layout.focused() == pane_id)
+                .map(|w| (s.name.clone(), w.id))
+        })
+    }
+
     /// automatic-rename (Task 9, sub-project 4): if `pane_id` is the ACTIVE
     /// pane of some window (`window.layout.focused() == pane_id`), and both
     /// the global `automatic-rename` option and that window's own
@@ -1450,18 +1490,19 @@ impl Server {
     /// actual rename happens, so a title that keeps re-deriving to the
     /// SAME name never gets throttled against a later, genuinely different
     /// one.
+    ///
+    /// This function is used ONLY for OSC 0/2 titles (`automatic-rename`'s
+    /// actual gate). `ESC k` titles go through `rename_window_from_esc_k`
+    /// instead -- see that function's doc comment for why the two paths
+    /// must NOT share logic beyond the active-pane lookup above (SP7-B
+    /// review fix of cae6af2, which had wrongly routed `allow-rename`-gated
+    /// `ESC k` titles through this function).
     fn maybe_auto_rename(&mut self, pane_id: PaneId, title: &str) {
         if !self.options.automatic_rename() {
             return;
         }
         let Some(name) = derive_auto_name(title) else { return };
-        let target = self.registry.sessions().iter().find_map(|s| {
-            s.windows
-                .iter()
-                .find(|w| w.layout.focused() == pane_id)
-                .map(|w| (s.name.clone(), w.id))
-        });
-        let Some((session_name, wid)) = target else { return };
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
         let Some(session) = self.registry.session_mut(&session_name) else { return };
         let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
         if !window.auto_rename || window.name == name {
@@ -1475,6 +1516,45 @@ impl Server {
         }
         window.name = name;
         window.last_auto_rename = Some(now);
+    }
+
+    /// `ESC k <name> ESC \` rename escape, gated ONLY by `allow-rename`
+    /// (SP7-B review fix of cae6af2 -- the previous implementation routed
+    /// this through `maybe_auto_rename`, which wrongly made it ALSO require
+    /// `automatic-rename` to be on and blocked it once a window had ever
+    /// been manually renamed). Verified against real tmux's
+    /// `input_exit_rename` (input.c:2799-2830; see
+    /// `docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what
+    /// it actually gates", lines 358-374): when `allow-rename` is on and the
+    /// captured name is non-empty, tmux renames the window UNCONDITIONALLY
+    /// -- it never reads `automatic-rename` first, and a prior manual
+    /// rename never blocks it -- then sets `automatic-rename` off for that
+    /// window as a side effect
+    /// (`options_set_number(w->options, "automatic-rename", 0)`), exactly
+    /// like a manual `rename-window` does. Reproduced here: the name is
+    /// validated with the SAME `model::validate_name` gate the manual
+    /// `rename-window` path (`exec_rename_window` in
+    /// `src/server/dispatch.rs`) uses -- deliberately NOT
+    /// `derive_auto_name`'s basename/extension-stripping transform, since
+    /// real tmux's `window_set_name(w, ictx->input_buf, 1)` uses the
+    /// captured text as-is, with no derivation. An invalid name (empty,
+    /// containing `:`/`.`, or a control character -- `validate_name`'s
+    /// gate, a winmux-specific invariant since window names double as
+    /// `session:window`/`session.window` target syntax) is silently
+    /// ignored rather than surfaced as an error, since there is no
+    /// client-facing command invocation here to report one to; this also
+    /// means winmux does not (yet) reproduce tmux's special empty-name
+    /// case (reverting the window-local `automatic-rename` override) --
+    /// documented as a residual divergence in follow-up #52.
+    fn rename_window_from_esc_k(&mut self, pane_id: PaneId, title: &str) {
+        if crate::model::validate_name(title, "window").is_err() {
+            return;
+        }
+        let Some((session_name, wid)) = self.window_for_active_pane(pane_id) else { return };
+        let Some(session) = self.registry.session_mut(&session_name) else { return };
+        let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) else { return };
+        window.name = title.to_string();
+        window.auto_rename = false;
     }
 
     fn handle_connected(&mut self, conn: PipeConn) {
@@ -1892,13 +1972,45 @@ impl Server {
         }
     }
 
+    /// Resizes every pane of `name`'s current window whose rect changed, then
+    /// (SP7 review fix, tmux ruling) clears any copy-mode selection bound to
+    /// one of those panes: real tmux's `window_pane_resize`
+    /// (`window.c:1362-1388`) calls the active mode's `resize` callback
+    /// whenever a pane's width OR height actually changes at all; for copy
+    /// mode that's `window_copy_resize` (`window-copy.c:1196-1227`), which
+    /// unconditionally ends by calling `window_copy_size_changed`
+    /// (`window-copy.c:1174-1193`) -- and THAT unconditionally clears the
+    /// selection (`window_copy_clear_selection`, `window-copy.c:5914-5929`)
+    /// regardless of whether the resize actually reflowed anything. `Grid`'s
+    /// `history_total()` shift-invariant (see its doc comment) only holds
+    /// for mutations that don't change the grid's WIDTH -- a width-changing
+    /// resize reflows scrollback non-uniformly (`reflow_to_width`), so a
+    /// stored selection anchor keyed to a pre-reflow `(anchor_scroll,
+    /// anchor_y, anchor_total)` can silently resolve to unrelated content
+    /// after such a resize (there is no single "shift count" that could
+    /// repair it). Rather than attempt that repair, this matches tmux
+    /// exactly: any actual resize of the bound pane drops the selection
+    /// (`cs.sel = None`) and leaves copy mode itself active, with the copy
+    /// cursor (`scroll`/`cx`/`cy`) left as-is (already view-relative, same
+    /// simplification the pre-existing "new pane output mid-selection"
+    /// handling uses).
     fn apply_layout_for_session(&mut self, name: &str) {
         let area_y = self.pane_area_y();
         let Some(session) = self.registry.session_mut(name) else { return };
         let size = session.size;
         let area = Rect { x: 0, y: area_y, w: size.0, h: size.1 };
         let window = session.current_window_mut();
-        apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        let resized = apply_layout(&window.layout, area, &mut self.panes, &mut self.last_rects);
+        if resized.is_empty() {
+            return;
+        }
+        for client in self.clients.values_mut() {
+            if let ClientMode::Copy(cs) = &mut client.mode {
+                if resized.contains(&cs.pane) {
+                    cs.sel = None;
+                }
+            }
+        }
     }
 
     /// Natural pane exit: tmux `remain-on-exit off` parity. If other panes in

@@ -6252,3 +6252,292 @@ fn unbound_space_still_forwards_to_pane() {
     c.expect_exit(0, "[exited]");
     server.join().expect("server exits after last session dies");
 }
+
+/// SP7 review fix: a width-changing resize while a copy-mode selection is
+/// active must CLEAR the selection, not silently keep it pointing at
+/// whatever content its (now-stale) anchor resolves to. `Grid`'s
+/// `history_total()` shift invariant (used by `anchor_key_now` to keep a
+/// selection anchor pinned to content) only holds across mutations that
+/// don't change the grid's width -- `reflow_to_width` restructures rows
+/// non-uniformly and never bumps `history_total` to match, so there is no
+/// corrected shift count that could repair a stored anchor after such a
+/// resize.
+///
+/// Verified against real tmux (`window-copy.c`): `window_pane_resize`
+/// (`window.c:1362-1388`) calls the active mode's `resize` callback whenever
+/// a pane's width OR height actually changes; for copy mode that's
+/// `window_copy_resize` (`window-copy.c:1196-1227`), which unconditionally
+/// ends by calling `window_copy_size_changed` (`window-copy.c:1174-1193`) --
+/// and THAT unconditionally clears the selection
+/// (`window_copy_clear_selection`, `window-copy.c:5914-5929`) regardless of
+/// whether the resize actually reflowed anything (the cursor is separately
+/// remapped/preserved via `grid_wrap_position`/`grid_unwrap_position`, only
+/// when width changed, but the clear itself is unconditional). winmux's
+/// `Server::apply_layout_for_session` mirrors this: it clears `cs.sel`
+/// whenever a pane bound to an active copy-mode selection is actually
+/// resized, but leaves copy mode itself active and the copy cursor
+/// (`scroll`/`cx`/`cy`) untouched.
+///
+/// This test builds a selection over known non-blank text ("selmark4"),
+/// resizes the client's terminal width (80 -> 60, rows unchanged -- a pure
+/// width-changing resize, the exact case that breaks the anchor), then
+/// tries to copy the selection (`Enter`, vi table's
+/// `copy-selection-and-cancel`). If the selection had survived the resize
+/// (the pre-fix bug), this would extract SOME text (right or wrong -- the
+/// point of the bug is the anchor can't be trusted either way) into a new
+/// automatic paste buffer; `list-buffers` reporting "no buffers" instead
+/// proves the selection was cleared rather than silently carried across the
+/// reflow.
+#[test]
+fn copy_mode_selection_clears_on_width_resize() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["set".into(), "-g".into(), "mode-keys".into(), "vi".into()]));
+    expect_cli_done(&cli, 0);
+
+    // Known non-blank marker lines to select against.
+    c.send(&ClientMsg::Stdin(b"1..5 | ForEach-Object { \"selmark$_\" }\r".to_vec()));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("selmark5")));
+
+    // Enter copy mode (cursor seeds from the live cursor -- the fresh
+    // prompt row just below the marker lines).
+    c.send(&ClientMsg::Stdin(vec![0x02, b'[']));
+    c.recv_output_until(&mut grid, |g| has_indicator(g, "[0/"));
+
+    // vi table: move up 2 rows onto a marker line ("selmark4"), jump to
+    // start-of-line (`0`), begin a selection (`Space`), then extend right
+    // 5 columns across the marker text (`l` x5) -- all in one Stdin frame,
+    // same coalesced-Forward-blob pattern as the existing `KKK`/vi tests.
+    c.send(&ClientMsg::Stdin(b"kk0 lllll".to_vec()));
+
+    // Pure WIDTH-changing resize (rows unchanged) -- the exact case that
+    // breaks the selection anchor. The local mirror grid is resized
+    // in lockstep (a real terminal resizes itself instantly, independent of
+    // the server's re-render), and frame ordering on this single connection
+    // guarantees the server has fully processed the selection keys above
+    // before it sees this Resize frame.
+    c.send(&ClientMsg::Resize { cols: 60, rows: 24 });
+    grid.resize(60, 24);
+
+    // Try to copy the (should now be cleared) selection and exit copy mode.
+    c.send(&ClientMsg::Stdin(vec![b'\r']));
+    c.recv_output_until(&mut grid, |g| !has_indicator(g, ""));
+
+    // No buffer should have been created: query via a separate headless CLI
+    // connection (`list-buffers`'s headless path returns an EMPTY string
+    // when there are no buffers -- see `exec_list_buffers_headless` -- a
+    // deterministic assertion, unlike waiting on the attached client's
+    // transient status-line message).
+    let mut cli2 = cli_client(&name);
+    cli2.send(&ClientMsg::Cli(vec!["list-buffers".into()]));
+    let (out, err) = expect_cli_done(&cli2, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "", "a buffer was created from a selection that should have been cleared by the width resize");
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// `allow-rename` (SP7 Task 3, closes follow-up #52): default is OFF (tmux
+/// since 2.6), and it gates ONLY the historical `ESC k <name> ESC \` rename
+/// escape -- the OSC 0/2 path (`pane_title_updates_window_name`, above)
+/// stays unconditional. With the default `allow-rename off`, the window
+/// must stay named "powershell" (its startup default) -- NOT "esckname".
+///
+/// **Command shape -- verified against real ConPTY, not just guessed:** a
+/// standalone `Pty`-level probe (bypassing grid/server entirely) proved
+/// Windows conhost's OWN legacy title-escape support silently drops the
+/// literal 2-byte `ESC \` (ST) terminator from a child process's `ESC k
+/// ... ESC \` output before it ever reaches the pty client's `ReadFile` --
+/// conhost recognizes and consumes the ST for its OWN internal
+/// `SetConsoleTitle`-equivalent handling but does not relay it, so a
+/// single statement that emits `ESC k <name> ESC \` arrives at winmux's
+/// grid missing its terminator and (correctly, matching tmux parity --
+/// `EscKScan`'s doc comment: BEL never terminates a title either) never
+/// commits. The same probe proved an *unrelated* real escape sequence
+/// emitted by a SEPARATE, later statement (e.g. `Write-Host
+/// -ForegroundColor`'s own SGR `ESC[...m`) DOES survive intact and lands
+/// right after the ESC-k content -- so two separate `Write-Host` calls
+/// (title escape, then ANY statement that emits its own real escape) is
+/// what reliably round-trips a committed ESC-k title through a live pane
+/// on this platform; PowerShell has no purpose-built cmdlet for the
+/// escape itself, hence the raw `[char]27` construction.
+#[test]
+fn allow_rename_off_ignores_esc_k_title_rename() {
+    let name = unique_pipe_name();
+    let server = start_server(&name);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-esck-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:powershell*")),
+        "allow-rename off must ignore an ESC-k rename escape; screen:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "the ESC-k title must not have renamed the window; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+}
+
+/// Mirror of `allow_rename_off_ignores_esc_k_title_rename` with `allow-rename`
+/// turned on: the SAME `ESC k` escape now DOES rename the window, through
+/// `Server::rename_window_from_esc_k` (SP7-B review fix of cae6af2) -- a
+/// path SEPARATE from `maybe_auto_rename`/`derive_auto_name`, which uses the
+/// captured name as-is (`model::validate_name`-gated only, no
+/// basename/extension derivation), matching real tmux's literal direct
+/// `window_set_name` call in `input_exit_rename`. `allow-rename on` is
+/// loaded from a STARTUP config file (rather than a live `set` command after
+/// attaching) purely to keep the test shape minimal; see the sibling test's
+/// doc comment for the verified reason behind the two-statement command
+/// shape.
+#[test]
+fn allow_rename_on_esc_k_renames_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename` must gate `ESC k`
+/// INDEPENDENTLY of `automatic-rename` -- real tmux's `input_exit_rename`
+/// never reads `automatic-rename` before renaming
+/// (`docs/tmux-reference/windows-and-sessions.md` "allow-rename -- what it
+/// actually gates", lines 358-374). Both options are set from a STARTUP
+/// config file: `allow-rename on` (so `ESC k` is honored) AND
+/// `automatic-rename off` (which would previously have blocked the rename,
+/// back when this path wrongly funneled through `maybe_auto_rename`, whose
+/// very first check is `automatic_rename()`).
+#[test]
+fn allow_rename_on_with_automatic_rename_off_still_renames_via_esc_k() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-auto-off");
+    std::fs::write(&conf_path, "set -g allow-rename on\nset -g automatic-rename off\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: an `ESC k` rename must clear the window's
+/// `auto_rename` flag exactly like a manual `rename-window`, so a LATER OSC
+/// 0/2 title change does not silently override it -- mirrors
+/// `manual_rename_disables_auto`, except the initial rename is the `ESC k`
+/// escape (`allow-rename on`) instead of a CLI `rename-window`. The
+/// title-setting command and the `done-osc-check` marker run as ONE
+/// PowerShell statement list so the marker appearing on screen proves the
+/// OSC has already had its chance to reach and be processed by the server
+/// before the assertion below runs.
+#[test]
+fn esc_k_rename_clears_window_auto_rename_flag() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-clears-flag");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"$Host.UI.RawUI.WindowTitle='mytool'; echo done-osc-check\r".to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("done-osc-check")));
+    let lines = screen_text(&grid);
+    assert!(
+        lines.iter().any(|l| l.contains("[0] 0:esckname*")),
+        "an ESC-k rename must survive a later OSC title change, same as a manual rename; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}
+
+/// SP7-B review fix of cae6af2: `allow-rename`-gated `ESC k` must rename the
+/// window even if it was PREVIOUSLY manually renamed -- real tmux's
+/// `input_exit_rename` never consults any "has this window been manually
+/// renamed before" history, unlike the old (buggy) implementation, which
+/// funneled `ESC k` through `maybe_auto_rename` and was therefore blocked by
+/// `!window.auto_rename` the instant any manual rename (CLI, `,` prompt, or
+/// a prior `ESC k`) had ever happened.
+#[test]
+fn allow_rename_on_renames_previously_manually_renamed_window() {
+    let name = unique_pipe_name();
+    let conf_path = temp_conf_path("allow-rename-on-after-manual");
+    std::fs::write(&conf_path, "set -g allow-rename on\n").expect("write temp conf");
+    let config_files = vec![conf_path.to_string_lossy().into_owned()];
+    let server = start_server_with_config(&name, &config_files);
+    let mut c = Client::connect(&name);
+    let mut grid = attach_auto_and_wait_prompt(&mut c, 80, 24);
+
+    let mut cli = cli_client(&name);
+    cli.send(&ClientMsg::Cli(vec!["rename-window".into(), "manual".into()]));
+    expect_cli_done(&cli, 0);
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:manual*")));
+
+    c.send(&ClientMsg::Stdin(
+        b"Write-Host -NoNewline ([char]27+'k'+'esckname'); Write-Host -ForegroundColor Red done-esck-check\r"
+            .to_vec(),
+    ));
+    c.recv_output_until(&mut grid, |g| screen_text(g).iter().any(|l| l.contains("[0] 0:esckname*")));
+    let lines = screen_text(&grid);
+    assert!(
+        !lines.iter().any(|l| l.contains("[0] 0:manual*")),
+        "an allow-rename ESC-k must override a prior manual rename, not be blocked by it; screen:\n{}",
+        lines.join("\n")
+    );
+
+    c.send(&ClientMsg::Stdin(b"exit\r".to_vec()));
+    c.expect_exit(0, "[exited]");
+    server.join().expect("server exits after last session dies");
+    let _ = std::fs::remove_file(&conf_path);
+}

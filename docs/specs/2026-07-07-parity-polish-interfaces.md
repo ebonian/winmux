@@ -23,10 +23,17 @@ impl Grid {
     pub fn new(cols: u16, rows: u16, history_limit: u32) -> Self;
     /// Feed raw VT bytes from the pane's ConPTY output.
     pub fn feed(&mut self, bytes: &[u8]);
-    /// Content is clipped (shrink) or padded with default cells (grow);
-    /// cursor is clamped into range. While in alt-screen mode the saved
-    /// primary buffer is ALSO clipped/padded in lockstep, so a subsequent
-    /// leave-alt restores a primary screen consistent with the new size.
+    /// **AMENDED (SP7, Task 2 — closes follow-up #47):** on the primary
+    /// (non-alt) screen, a column-WIDTH change now REFLOWS scrollback + the
+    /// live screen to the new width, tmux (`grid_reflow`)-style, instead of
+    /// clipping/padding — see "Reflow on resize" below. A row-COUNT-only
+    /// change still clips (shrink)/pads (grow), preserving the overlapping
+    /// top-left region, and leaves history untouched. The alternate screen
+    /// still NEVER reflows (tmux clears/redraws it) — any resize while
+    /// showing it keeps the original clip/pad behavior for BOTH axes, and
+    /// the saved primary buffer is ALSO clipped/padded in lockstep, so a
+    /// subsequent leave-alt restores a primary screen consistent with the
+    /// new size. Cursor is clamped into range in all cases.
     pub fn resize(&mut self, cols: u16, rows: u16);
     pub fn cols(&self) -> u16;
     pub fn rows(&self) -> u16;
@@ -46,7 +53,18 @@ impl Grid {
     /// "lines-ever-captured" coordinate system copy-mode selection anchors
     /// are pinned to (see the `## copy-mode` Task 3 selection-math
     /// amendment). Stays 0 when `history_limit == 0` (nothing is ever
-    /// captured).
+    /// captured). **Caveat (SP7 review fix):** this invariant holds only
+    /// across mutations that do NOT change the grid's width —
+    /// `reflow_to_width` (see "Reflow on resize" below) does not increment
+    /// `history_total` to match the non-uniform row restructuring it
+    /// performs, so a coordinate (e.g. a copy-mode selection anchor) pinned
+    /// before a width-changing resize cannot be repaired by any single
+    /// corrected shift count afterward. The server layer does not attempt
+    /// to: it clears any copy-mode selection bound to a pane that actually
+    /// gets resized (`Server::apply_layout_for_session`), matching real
+    /// tmux's `window_copy_size_changed` (`window-copy.c`), which
+    /// unconditionally clears the copy-mode selection on ANY resize of the
+    /// pane (width or height), not just width changes.
     pub fn history_total(&self) -> u64;
     /// Look up a cell in view coordinates: `scroll_back` lines scrolled up
     /// from the live bottom (0 = live screen), clamped to `history_len()`.
@@ -60,12 +78,47 @@ impl Grid {
     /// Convenience: collect a whole view row into a `String` (e.g. for
     /// copy-mode search).
     pub fn view_row_text(&self, scroll_back: u32, row: u16) -> String;
-    /// The pane's title as last captured via OSC 0/2, if any has ever been set.
+    /// The pane's title as last captured via OSC 0/2, if any has ever been
+    /// set. **AMENDED (SP7, Task 3 — closes follow-up #52):** ALSO captures
+    /// the historical `ESC k <name> ESC \` rename escape into this same
+    /// slot — see `title_from_esc_k` below for how a consumer tells the two
+    /// sources apart.
     pub fn title(&self) -> Option<&str>;
     /// Edge-triggered: true the first time this is called after the title
     /// has changed, then false until it changes again. Intended to be
-    /// polled by the server after each `feed`.
+    /// polled by the server after each `feed`. Fires for either title
+    /// source (SP7, Task 3).
     pub fn take_title_changed(&mut self) -> bool;
+    /// **NEW (SP7, Task 3 — closes follow-up #52):** `true` if the CURRENT
+    /// `title()` was last set by `ESC k` rather than OSC 0/2. Not
+    /// edge-triggered — reflects the source of whatever `title()` currently
+    /// holds. `ESC k` is pre-scanned and stripped out of the raw byte
+    /// stream inside `feed`, BEFORE `vte::Parser::advance` ever sees those
+    /// bytes (the `vte` crate has no string-capturing path for `ESC k`: in
+    /// its `Escape` state, `k` falls in the generic `0x60..=0x7e ->
+    /// (Ground, EscDispatch)` bucket, so every subsequent title byte would
+    /// otherwise `Print`-leak into the pane's visible cells). The pre-scan
+    /// persists across `feed` calls (a sequence split across chunk
+    /// boundaries, including a lone trailing `ESC`, is still captured
+    /// correctly) and, verified against tmux's real `input.c` state
+    /// machine (`input_state_rename_string_table`/`input_exit_rename`):
+    /// commits the title the instant a bare `ESC` is seen after the opening
+    /// `ESC k` (tmux's `rename_string` state's `exit` callback fires on
+    /// ANY state change away from it, before the following byte — the
+    /// expected `\` — is even read), and treats `BEL` inside the title as a
+    /// silent no-op, NOT a terminator (unlike OSC 0/2, whose terminator IS
+    /// BEL-or-ST) — `input_state_rename_string_table` has no `BEL` arm,
+    /// unlike OSC's dedicated one. The server handles `ESC k`-sourced titles
+    /// according to the `allow-rename` option (`options::Options::allow_rename`,
+    /// default off — see the `## options` amendment in
+    /// `2026-07-07-command-config-interfaces.md`): when `allow-rename` is on,
+    /// an ESC k title renames the window directly (independent of
+    /// `automatic-rename` and of any prior manual rename), then clears that
+    /// window's `auto_rename` flag — matching tmux's `input_exit_rename` per
+    /// `docs/tmux-reference/windows-and-sessions.md:358-374`. When `allow-rename`
+    /// is off, ESC k titles are captured by the grid but cause no rename. The
+    /// OSC 0/2 path is unconditional, matching real tmux.
+    pub fn title_from_esc_k(&self) -> bool;
     /// Task 5 (mouse) addition: `true` while the pane is showing the
     /// alternate screen (`CSI ?1049h` seen more recently than a matching
     /// `?1049l`). Consumed by `server::dispatch::mouse_wheel` to decide
@@ -75,7 +128,53 @@ impl Grid {
     /// translation, since alt-screen apps like `less`/vim have their own
     /// paging, not winmux's). See the `## mouse` section below.
     pub fn alt_screen(&self) -> bool;
+
+    /// **NEW (SP7, Task 3 — closes follow-up #52; prerequisite for Task 9's
+    /// mouse re-encoding/forwarding):** the pane app's requested mouse
+    /// REPORTING protocol, tracked from DECSET/DECRST 9 (X10) / 1000
+    /// (VT200 "normal"/click-only) / 1002 ("button-event"/drag) / 1003
+    /// ("any-event"/all motion) in `csi_dispatch`'s existing `?`-private
+    /// mode match. Verified against tmux's own pane-mode tracking
+    /// (`input_csi_dispatch_sm_private`/`_rm_private`, tmux `input.c`):
+    /// these 4 mode numbers are MUTUALLY EXCLUSIVE — SET of any one first
+    /// clears every other mouse-mode bit before setting its own (so the
+    /// LAST one set simply wins outright, not a priority order), and RESET
+    /// of ANY of the four unconditionally clears to `Off`, regardless of
+    /// which specific mode number is named in the reset or which one was
+    /// actually active. Modern tmux has no `MODE_MOUSE_X10` bit at all
+    /// (mode 9 is pane-side-unimplemented legacy in current tmux), but
+    /// winmux tracks it with the identical mutual-exclusion rule since
+    /// Task 9's interface promise requires the `X10` variant to exist. This
+    /// task only TRACKS the mode; forwarding/re-encoding mouse events to
+    /// the pane app based on it is Task 9's job.
+    pub fn mouse_proto(&self) -> MouseProto;
+    /// **NEW (SP7, Task 3):** the pane app's requested mouse COORDINATE
+    /// ENCODING, tracked from DECSET/DECRST 1005 (UTF-8) / 1006 (SGR) —
+    /// independent bits (`MODE_MOUSE_UTF8`/`MODE_MOUSE_SGR` in real tmux),
+    /// not mutually exclusive with each other or with `mouse_proto`. SGR
+    /// wins if both are set, else UTF-8, else the legacy default — matching
+    /// tmux's own forwarding precedence (`input-keys.c`
+    /// `input_key_get_mouse`).
+    pub fn mouse_encoding(&self) -> MouseEncoding;
+    /// **NEW (SP7, Task 3; prerequisite for a later alerts task, follow-up
+    /// #74/Task 17):** edge-triggered — true the first time this is called
+    /// after a BEL (`\x07`) byte has been fed via `execute`, then false
+    /// until another BEL arrives. BEL never prints as a visible character
+    /// and does not affect cursor/wrap state.
+    pub fn take_bell(&mut self) -> bool;
 }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse REPORTING
+/// protocol — see `Grid::mouse_proto`'s doc comment for the tmux-verified
+/// mutual-exclusion semantics among the 4 variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProto { #[default] Off, X10, Normal, Button, Any }
+
+/// **NEW (SP7, Task 3):** a pane application's requested mouse COORDINATE
+/// ENCODING — see `Grid::mouse_encoding`'s doc comment for the resolution
+/// precedence when multiple encoding bits are set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding { #[default] Default, Utf8, Sgr }
 ```
 
 **Scrollback capture rules:**
@@ -90,9 +189,13 @@ impl Grid {
 - Each captured line is a `Vec<Cell>` exactly `cols` cells wide AT CAPTURE
   TIME. `view_cell`/`view_row_text` clip (extra columns read as blank) or
   pad (missing columns read as blank) a captured line lazily on read if the
-  grid's width has since changed — **no reflow** (documented divergence from
-  tmux ≥1.9, which does reflow; ticketed in `docs/follow-ups.md` at SP4
-  closeout).
+  grid's width has since changed. **SUPERSEDED (SP7, Task 2 — closes
+  follow-up #47):** this "no reflow" divergence from tmux ≥1.9 is fixed —
+  see "Reflow on resize" below. The clip/pad-on-read behavior described here
+  now only fires in the residual case where a captured line's width somehow
+  still differs from the current `cols` outside of a `resize` call (it
+  shouldn't in practice, since `reflow_to_width` rewrites every history line
+  to the current width immediately).
 - Eviction: once a push brings the scrollback length to `>= history_limit`,
   the oldest `max(1, history_limit / 10)` lines are dropped in one chunk
   (mirrors tmux's `grid_collect_history` batch-eviction, not evict-one-at-
@@ -133,7 +236,44 @@ row `index - history_len`.
 - `resize` while in alt mode also clips/pads the saved primary buffer (and
   clamps its saved cursor) in lockstep with the active alt buffer, so a
   later leave restores a primary screen consistent with the grid's current
-  dimensions.
+  dimensions. This is unconditional clip/pad on BOTH axes (never reflow) —
+  the alternate screen itself never reflows even on a width change (SP7
+  Task 2), since tmux clears/redraws the alt screen on resize rather than
+  reflowing it.
+
+**Reflow on resize (SP7, Task 2 — closes follow-up #47):** on the primary
+(non-alt) screen, `resize` reflows scrollback + the live screen whenever the
+column WIDTH changes (row-count-only changes are unaffected and still
+clip/pad, matching tmux: reflow is a width-axis operation only).
+- **Wrapped-row tracking:** a new private per-row `wrapped: bool` (tmux's
+  `GRID_LINE_WRAPPED`), one for each live-screen row and one carried on
+  every captured `HistLine`. Set ONLY at the instant the cursor auto-wraps
+  off the right margin while printing (consuming `wrap_pending`); cleared
+  on an explicit linefeed (`0x0A`) even if it was (stale-)true. Row
+  shifts (`scroll_up`/`scroll_down`/`insert_lines`/`delete_lines`, and
+  capture into `HistLine` on `scroll_up`) carry the flag along with the
+  row's cells; newly-blanked rows get `wrapped = false`.
+- **Algorithm (`grid_reflow`-equivalent):** the combined history+screen rows
+  are grouped into "logical lines" by following `wrapped` chains — a run of
+  `wrapped = true` rows (always fully used at the OLD width, since a row is
+  only ever marked wrapped once completely filled) followed by exactly one
+  `wrapped = false` terminal row, whose trailing never-written cells are
+  trimmed. Each logical line's content is re-split at the new width into
+  `ceil(len / new_cols)` rows (1 row for an empty line), every row but the
+  last marked wrapped. If the reflowed total needs more rows than the
+  screen has, the extra rows accumulate into `history` (oldest first,
+  subject to the normal `history_limit`/eviction rules — discarded outright
+  when `history_limit == 0`); if fewer, blank rows pad the tail (tmux:
+  `grid_reflow_add`).
+- **Cursor mapping** follows tmux's `grid_wrap_position`/
+  `grid_unwrap_position`: the cursor's offset within its OWN logical line is
+  preserved; a cursor sitting past that row's real content (trailing blank
+  padding) collapses to "end of the logical line" (tmux's `UINT_MAX`
+  sentinel); if the mapped position ends up scrolled into history (only
+  possible when eviction drops the cursor's own line), the cursor resets to
+  `(0, 0)` (tmux `screen_resize_cursor`).
+- Implemented entirely in `src/grid.rs` (`TermState::reflow_to_width`,
+  private); `Grid::resize`'s public signature is unchanged.
 
 **OSC title capture (`osc_dispatch`):**
 - OSC `0` (icon + title) and OSC `2` (title) both set the title: OSC
@@ -540,6 +680,22 @@ model:
   `Grid::view_row_text`/`view_cell` that reproduces a CURRENT key in view
   coordinates (`Grid` clamps `scroll_back` to its actual `history_len`
   internally, so an over-large value is harmless).
+- **SP7 review fix — width-changing resize invalidates the anchor, it is
+  NOT remapped:** `anchor_key_now`'s `history_total` delta is only exact
+  across mutations that don't change the grid's width; a width-changing
+  resize reflows scrollback non-uniformly (`reflow_to_width`, `## grid-v2`
+  amendment above) without bumping `history_total` to match, so there is no
+  single corrected shift count that could keep a stored anchor pointing at
+  the same content afterward. Rather than attempt that repair,
+  `Server::apply_layout_for_session` (`src/server.rs`) clears (`cs.sel =
+  None`) any client's active copy-mode selection whose pane actually gets
+  resized — matching real tmux's `window_copy_size_changed`
+  (`window-copy.c:1174-1193`, called unconditionally from
+  `window_copy_resize` whenever `window_pane_resize` fires, i.e. on ANY
+  actual resize of the pane, width or height, not just width changes; see
+  `window_copy_clear_selection`, `window-copy.c:5914-5929`). The copy
+  cursor (`scroll`/`cx`/`cy`) is left as-is (already view-relative) and
+  copy mode itself stays active — only the selection is dropped.
 
 **Task 3 amendment — text extraction** (`extract_selection_text` in
 `src/server/dispatch.rs`, a free `fn(grid: &Grid, sel: &SelState, cx: u16,
