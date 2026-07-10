@@ -1039,6 +1039,13 @@ before `main.rs` prints the error. Loop behavior:
   and relays them to the main loop over an `mpsc` channel, so the main loop
   can ALSO wake up on a 50ms tick (a plain blocking read on the main thread
   can't do both).
+- **Follow-up #16 (stdin-reader panic):** the stdin thread's body runs inside
+  `std::panic::catch_unwind`. A panic there previously left the main loop
+  waiting on the reader channel forever (stdin forwarding silently dead, but
+  nothing told the main loop) — now the stdin thread sends an `Err` through
+  the SAME channel the reader thread uses (it holds its own clone of `tx`),
+  which the main loop's existing fatal-error handling (below) already turns
+  into a clean non-zero exit.
 - Main loop: `recv_timeout(50ms)`. `Output` → `host.write`. `Exit{code,
   msg}` → drop `Host` FIRST (restores the console), THEN print `msg`
   (stdout if `code == 0`, else stderr), THEN return `code as i32` — this
@@ -1046,13 +1053,21 @@ before `main.rs` prints the error. Loop behavior:
   restored normal screen, not the alt screen the pane content was drawn
   into. `CliDone` is ignored (not expected on an attached connection).
   Reader error/EOF without an `Exit`, or the reader thread hanging up
-  (`RecvTimeoutError::Disconnected`) → drop `Host`, print `"[lost server]"`
-  to stderr, return `1`. On `RecvTimeoutError::Timeout`: poll `host.size()`;
-  if changed since the last known size, send a `Resize` frame over the
-  ORIGINAL connection (not a clone — the reader/writer split only needs two
-  of the three duplicates to be independent, since only the main thread
-  ever writes `Resize`/the initial `Attach`, and only the stdin thread ever
-  writes `Stdin`/`Detach`).
+  (`RecvTimeoutError::Disconnected`) → drop `Host`, then (**follow-up #19,
+  kill-server race**) print `"[lost server]"` to stderr IF at least one real
+  `ServerMsg` was ever received on this connection, else print the cleaner
+  `"no server running on <pipe>"` (same text `main.rs`'s
+  `report_connect_error` uses) — a connection that raced a `kill-server`
+  teardown window (connected, `Attach` sent, but the server tore itself down
+  before serving even one reply) is indistinguishable in EFFECT from the pipe
+  never having existed, so it now gets the same message a client connecting
+  slightly later (once the pipe is fully gone) would see. Either way, return
+  `1`. On `RecvTimeoutError::Timeout`: poll `host.size()`; if changed since
+  the last known size, send a `Resize` frame over the ORIGINAL connection
+  (not a clone — the reader/writer split only needs two of the three
+  duplicates to be independent, since only the main thread ever writes
+  `Resize`/the initial `Attach`, and only the stdin thread ever writes
+  `Stdin`/`Detach`).
 - **Documented caveat** (task brief, verified true): `host::read_stdin` has
   no clean cancellation — it blocks in `ReadFile` until the NEXT keystroke
   even after `attach` has returned. This is fine ONLY because every caller
