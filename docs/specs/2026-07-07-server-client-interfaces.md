@@ -640,9 +640,11 @@ various free helper functions) is private to the module.
   spawning a pane, and rolls the pane back if `Registry::create_session`
   still rejects the name (bad chars); `Existing` resolves the name via
   `Registry::find` (tmux `-t` prefix rules) and — when `detach_others` is
-  set — sends every OTHER client currently attached to that session a plain
-  `Exit{0, "[detached]"}` (distinct from the named `Detach`-action/-frame
-  message) before attaching the new one. First window is always index 0,
+  set — sends every OTHER client currently attached to that session
+  `Exit{0, "[detached (from session <name>)]"}` (follow-up #17, SP7 Task 4:
+  previously a bare `[detached]` with no session name; now identical text to
+  the named `Detach`-action/-frame message) before attaching the new one.
+  First window is always index 0,
   name `powershell`; shell is `powershell.exe -NoLogo`. A fresh `Renderer`
   is constructed and immediately `resize()`d to its own dimensions (forcing
   `force_full`) so the very first `compose()` is a guaranteed full repaint.
@@ -877,6 +879,37 @@ pane-exit auto-close, and the CLI subset) plus a few more added during
 Task 7's review-fix passes, and Task 8's
 `attach_empty_target_picks_most_recent` covering the empty-target
 `Existing` attach amendment above.
+
+**LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #14, per-pane writer
+thread architecture note):** `PaneRuntime` (private; current shape per the
+table-driven SP3+ rewrite, superseding the `{pty, grid, dead}` sketch in the
+historical "Internal shape" paragraph above) gains one field:
+`input_tx: Sender<Vec<u8>>`. `spawn_pane` now ALSO spawns a dedicated
+per-pane writer thread — owning an independent duplicate of the pty's input
+write handle via the new `Pty::try_clone_writer` (see
+`2026-07-06-mvp-interfaces.md`'s sibling `## pty` amendment) — that drains
+this channel, mirroring the existing per-client `spawn_writer` design
+EXACTLY (same unbounded `mpsc<Vec<u8>>`-drained-by-a-dedicated-thread shape).
+The server's own hot Forward/Key-forwarding path (`Server::
+process_client_events`'s `KeyInputEvent::Forward`/unbound-`Root`-`Key` arms)
+now enqueues onto `pane.input_tx` instead of calling `pty.write_input`
+INLINE on the main-loop thread — closing the gap follow-up #14 tracked
+(a pane whose child stops draining stdin, e.g. a hung app or a huge paste,
+previously blocked `write_input`, which blocked the ENTIRE main loop —
+rendering and input for every session, not just the stalled pane's).
+`PaneRuntime` is dropped exactly the same way as before (pane removal is the
+only way one is ever dropped); dropping it now ALSO drops `input_tx`, which
+closes the channel and lets the writer thread's `recv()` loop end on its
+own — no new explicit shutdown/join path needed. `src/server/dispatch.rs`'s
+LOWER-volume write sites (send-keys, paste-buffer, mouse-drag forwarding)
+are UNCHANGED — they still call `pty.write_input` directly; only the two
+hottest, most frequently-hit call sites (ordinary keystroke/paste forwarding)
+moved onto the new channel. Regression coverage:
+`tests/server_proto.rs::stalled_pane_stdin_does_not_block_other_sessions`
+(a session whose pane never reads stdin at all is flooded with raw `Stdin`
+frames; a concurrent CLI round trip against a DIFFERENT session, sharing the
+same main loop, must stay fast — reproduced RED against the pre-fix inline
+`write_input` call, ~3.8s, GREEN after the fix, ~1s).
 
 ## `cli` — argv parser (pure, Task 8; amended Task 7 SP3 for `-f`)
 

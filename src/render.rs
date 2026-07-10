@@ -4,13 +4,21 @@ use crate::layout::PaneId;
 
 /// Copy-mode rendering data for one pane (Task 2, sub-project 4): the pane's
 /// content is read via `Grid::view_cell(scroll, ..)` instead of the live
-/// `cell` when this is `Some`, a `[scroll/history_len]` position indicator is
-/// painted right-aligned on the pane's top row in `Scene::mode_style`, and
-/// `cursor` (view coordinates) replaces the pane's live cursor for terminal
-/// cursor placement.
+/// `cell` when this is `Some`, and a `[scroll/history_len]` position
+/// indicator is painted right-aligned on the pane's top row in
+/// `Scene::mode_style`.
+///
+/// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):** the `cursor:
+/// (u16, u16)` field this struct originally carried is REMOVED. It was dead:
+/// `Renderer::compose_back` never read it (only `scroll` and `sel` are
+/// consumed) — the actual terminal cursor placement during copy mode is
+/// computed independently by `server::render_one`'s own `(cursor,
+/// cursor_visible)` match on `client.mode`, which clamps the copy state's
+/// `(cx, cy)` into the pane rect directly and was never routed through
+/// `CopyView` at all. See `docs/specs/2026-07-06-mvp-interfaces.md`'s sibling
+/// amendment for the `PaneView`/`CopyView` history.
 pub struct CopyView {
     pub scroll: u32,
-    pub cursor: (u16, u16),
     /// Selection highlight (Task 3, sub-project 4), precomputed by the
     /// SERVER in VIEW coordinates (`start_col, start_row, end_col, end_row,
     /// rect`) and already clamped into the visible pane rect -- `None` when

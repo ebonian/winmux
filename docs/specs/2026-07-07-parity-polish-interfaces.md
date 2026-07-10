@@ -650,9 +650,13 @@ the sense the brief was steering away from.
 ### `render` amendment
 
 ```rust
+// **LOCKED-CONTRACT AMENDMENT (SP7 Task 4 — follow-up #63):** the `cursor:
+// (u16, u16)` field this struct originally carried here is REMOVED — it was
+// dead (`Renderer::compose_back` never read it; see
+// `2026-07-06-mvp-interfaces.md`'s sibling amendment for the full history).
+// The construction site below is updated in the same commit to drop it.
 pub struct CopyView {
     pub scroll: u32,
-    pub cursor: (u16, u16),
     // Task 3: precomputed by the server in VIEW coordinates, already
     // clamped into the pane's visible rows/cols; None = no active
     // selection, or it's wholly scrolled out of the current view.
@@ -694,10 +698,11 @@ to 0/`cols-1`, so this same shape logic paints it correctly as a full-width
 "middle" row — see `compute_sel_view`'s doc comment in `src/server.rs`.)
 
 `server::render_one`: when `client.mode` is `Copy(cs)`, the `PaneView` whose
-`id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, cursor: (cs.cx,
-cs.cy), sel: cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
+`id == cs.pane` gets `copy: Some(CopyView{scroll: cs.scroll, sel:
+cs.sel.as_ref().and_then(|sel| compute_sel_view(sel, cs.cx,
 cs.cy, cs.scroll, rect.h, rect.w, p.grid.history_len(),
-p.grid.history_total()))})` (the two trailing grid readings are the Task 3
+p.grid.history_total()))})` (SP7 Task 4, follow-up #63: no more `cursor`
+field — see the amendment above; the two trailing grid readings are the Task 3
 review fix's content-pinning inputs — see the position/ordering-key
 amendment above; every other pane, including a DIFFERENT client's
 focused/zoomed pane, renders live as before); the terminal cursor is placed

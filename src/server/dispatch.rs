@@ -4281,7 +4281,8 @@ mod mouse_dispatch_tests {
             grid.feed(b"\x1b[?1049h");
             assert!(grid.alt_screen(), "test setup: grid must report alt_screen after CSI ?1049h");
         }
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid, dead: false, title: String::new(), input_tx });
         let session_name = server
             .registry
             .create_session(Some("0"), pane_id, (20, 10), 0)
@@ -4437,7 +4438,8 @@ mod choose_tree_dispatch_tests {
 
     fn insert_blank_pane(server: &mut Server) -> PaneId {
         let pane_id = server.mint_pane_id();
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(20, 10, 0), dead: false, title: String::new(), input_tx });
         pane_id
     }
 
@@ -4647,7 +4649,8 @@ mod focus_activity_fix_tests {
 
     fn insert_blank_pane(server: &mut Server) -> PaneId {
         let pane_id = server.mint_pane_id();
-        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new() });
+        let (input_tx, _input_rx) = channel();
+        server.panes.insert(pane_id, super::super::PaneRuntime { pty: None, grid: Grid::new(80, 24, 0), dead: false, title: String::new(), input_tx });
         pane_id
     }
 

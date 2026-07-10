@@ -103,6 +103,21 @@ struct PaneRuntime {
     /// call site can hand out `&str` directly without an `unwrap_or("")` at
     /// every use.
     title: String,
+    /// Per-pane writer channel (follow-up #14): the main loop's hot
+    /// Forward/Key-forwarding path (`Server::process_client_events`) enqueues
+    /// here instead of calling `pty.write_input` inline, so a pane whose
+    /// child stops draining stdin (hung app, huge paste) only blocks the
+    /// dedicated writer thread draining this channel — never the main loop,
+    /// never any OTHER session/client. Mirrors the existing per-client
+    /// writer design (`spawn_writer`) exactly. `spawn_pane` is the only
+    /// producer of a real one (a `PtyWriter`-backed thread); a pane inserted
+    /// directly by a unit test with `pty: None` gets a channel with no
+    /// writer thread behind it, which is fine — sends into it just pile up
+    /// harmlessly until the `Sender` drops with the `PaneRuntime`. Dropping
+    /// `PaneRuntime` (pane removal — the ONLY way one is ever dropped) drops
+    /// this field, which closes the channel and lets the writer thread's
+    /// `recv()` loop end on its own; no explicit shutdown/join needed.
+    input_tx: Sender<Vec<u8>>,
 }
 
 /// Which status-line prompt is in progress (`,` rename-window, `$`
@@ -947,8 +962,22 @@ fn spawn_pane(
         let _ = wait_tx.send(ServerEvent::Exited(id));
     });
 
+    // Per-pane writer thread (follow-up #14): owns an independent duplicate
+    // of the pty's input write handle and drains an unbounded channel of
+    // pending writes, mirroring `spawn_writer`'s per-client design exactly —
+    // see `PaneRuntime::input_tx`'s doc comment.
+    let mut writer = pty.try_clone_writer()?;
+    let (input_tx, input_rx) = channel::<Vec<u8>>();
+    thread::spawn(move || {
+        while let Ok(bytes) = input_rx.recv() {
+            if writer.write(&bytes).is_err() {
+                break;
+            }
+        }
+    });
+
     let grid = Grid::new(cols.max(1), rows.max(1), history_limit);
-    Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new() })
+    Ok(PaneRuntime { pty: Some(pty), grid, dead: false, title: String::new(), input_tx })
 }
 
 /// Recognized Windows executable/script suffixes stripped from an
@@ -1567,9 +1596,14 @@ impl Server {
     /// Common tail of a successful attach: register the client, then
     /// recompute the session's shared size and reapply its layout.
     fn finish_attach(&mut self, id: ClientId, tx: Sender<Vec<u8>>, session_name: String, cols: u16, rows: u16) {
-        let mut renderer = Renderer::new(cols.max(1), rows.max(1));
-        // Force a full repaint on the very first compose (see module docs /
-        // task brief: "use a fresh Renderer (or resize) at attach").
+        // Follow-up #21: `Renderer::new` starts with `force_full: false`, so
+        // constructing at the real size and then immediately `resize`-ing to
+        // that SAME size (as this used to do) allocated the front/back
+        // buffers twice for no reason — `resize`'s only OTHER job, setting
+        // `force_full: true` so the very first `compose()` is a guaranteed
+        // full repaint (see module docs / task brief: "use a fresh Renderer
+        // (or resize) at attach"), doesn't need a same-size `new` first.
+        let mut renderer = Renderer::new(0, 0);
         renderer.resize(cols.max(1), rows.max(1));
         // First-attach-only config-error notice (Task 7): `take()` so a
         // SECOND client attaching later never sees it again.
@@ -1609,9 +1643,12 @@ impl Server {
         self.apply_layout_for_session(&session_name);
     }
 
-    /// `detach_others`: every OTHER client currently attached to `session_name`
-    /// gets a plain `[detached]` (distinct from the `Detach`-action/-frame
-    /// message, which names the session).
+    /// `detach_others`: every OTHER client currently attached to
+    /// `session_name` gets `Exit{0, "[detached (from session <name>)]"}` —
+    /// follow-up #17: previously a bare `[detached]` with no session name,
+    /// inconsistent with every OTHER detach exit path in this module (the
+    /// `d`-key/`Detach`-frame action and the `detach-client` CLI command both
+    /// already name the session). Now identical text to those.
     fn detach_others(&mut self, session_name: &str) {
         let ids: Vec<ClientId> = self
             .clients
@@ -1621,7 +1658,7 @@ impl Server {
             .collect();
         for id in ids {
             if let Some(c) = self.clients.remove(&id) {
-                send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: "[detached]".to_string() });
+                send_msg(&c.tx, &ServerMsg::Exit { code: 0, msg: format!("[detached (from session {session_name})]") });
             }
         }
     }
@@ -1962,6 +1999,17 @@ impl Server {
 
     /// Tear down a session: drop all its panes, remove it from the
     /// registry, and tell every attached client `Exit{0, "[exited]"}`.
+    ///
+    /// Follow-up #18: the loop below (dropping every pane) runs sequentially
+    /// on the main-loop thread. Each pane drop runs a synchronous
+    /// `TerminateProcess` plus `ClosePseudoConsole` plus `CloseHandle` (see
+    /// `src/pty.rs`'s `Drop for Pty`). This is not a real scaling concern
+    /// today. It is bounded by one session's pane count, typically a small
+    /// number. Each `TerminateProcess` call is fast. And unlike follow-up
+    /// #14's concern (a STALLED child that never drains its stdin), killing
+    /// an already-alive process is not something a hung child can
+    /// meaningfully stall. Worth revisiting only if a future workflow makes
+    /// sessions with very many panes common.
     fn destroy_session(&mut self, name: &str) {
         if let Some(session) = self.registry.session_mut(name) {
             let pane_ids: Vec<PaneId> = session.windows.iter().flat_map(|w| w.layout.panes()).collect();
@@ -2125,10 +2173,14 @@ impl Server {
                         }
                     } else if let Some(session) = self.registry.session_mut(&session_name) {
                         let fid = session.current_window().layout.focused();
-                        if let Some(pane) = self.panes.get_mut(&fid) {
-                            if let Some(pty) = pane.pty.as_mut() {
-                                let _ = pty.write_input(&data);
-                            }
+                        if let Some(pane) = self.panes.get(&fid) {
+                            // Follow-up #14: enqueue onto the pane's OWN
+                            // writer thread instead of calling
+                            // `pty.write_input` inline here — this is the
+                            // server's single main-loop thread, which must
+                            // never block on one pane's (possibly stalled)
+                            // stdin.
+                            let _ = pane.input_tx.send(data);
                         }
                     }
                 }
@@ -2237,10 +2289,12 @@ impl Server {
                             WhichTable::Root => {
                                 if let Some(session) = self.registry.session_mut(&session_name) {
                                     let fid = session.current_window().layout.focused();
-                                    if let Some(pane) = self.panes.get_mut(&fid) {
-                                        if let Some(pty) = pane.pty.as_mut() {
-                                            let _ = pty.write_input(&raw);
-                                        }
+                                    if let Some(pane) = self.panes.get(&fid) {
+                                        // Follow-up #14: see the Forward-blob
+                                        // arm above — same per-pane writer
+                                        // channel, not an inline blocking
+                                        // `pty.write_input`.
+                                        let _ = pane.input_tx.send(raw);
                                     }
                                 }
                             }
@@ -2616,7 +2670,7 @@ fn render_one(
                             p.grid.history_total(),
                         )
                     });
-                    Some(CopyView { scroll: cs.scroll, cursor: (cs.cx, cs.cy), sel })
+                    Some(CopyView { scroll: cs.scroll, sel })
                 }
                 _ => None,
             };
