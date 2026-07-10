@@ -136,7 +136,7 @@ Delivered:
 - Half-border active-pane indication for exactly-two-pane windows, plus
   `pane-border-indicators`
 
-New follow-up tickets from this wave: #67-#73. Resolved this wave: #64,
+New follow-up tickets from this wave: #67-#74. Resolved this wave: #64,
 #65, #66. See `docs/follow-ups.md` for the full accounting.
 
 ## Specs
